@@ -1,103 +1,106 @@
-# AI tools catalog
+# Tool catalog
 
-Catalog of locally installable AI software that superai is expected to install, configure, and route through its proxy. Working list, not a fixed target. Entries describe what each tool is and how it runs locally so the installer, config, and proxy layers can treat them uniformly.
+Tools superai is meant to install, configure, or route traffic to. A working list, not an exhaustive one.
 
-One distinction matters for routing: a **local-running client** is installed on your machine but may still depend on vendor-hosted models or online sign-in (Cursor, Claude Desktop, Codex App, Droid CLI). A **local-inference runtime** executes open models on your own CPU or GPU (Ollama, llama.cpp, LM Studio). Clients are in scope for install and config. Runtimes are also in scope as provider backends the proxy can route to.
+**Provenance.** Licenses and repo status below were read from the GitHub API on 2026-08-26, not from third-party write-ups. Config env vars were checked against each project's own docs or source; where a variable works but isn't documented, it says so. Everything here rots — re-run the check rather than trusting the date.
 
-## Coding agents and CLI clients
+No hardware requirements, OS floors, or install commands. Those change faster than this file will, and the installer should read them from each project's own source at build time.
 
-Things you run from a terminal or IDE to do work against a model. Mostly provider-backed; a few will talk to a local runtime.
+One distinction drives routing:
 
-| Project | OS | Install | Requirements | Notes |
-|---|---|---|---|---|
-| OpenCode | macOS, Windows, Linux | Install script, npm/bun/Homebrew | WSL recommended on Windows | Provider-backed via Copilot/OpenAI; MCP local tools supported |
-| Claude Code | macOS 13+, Windows 10 1809+, Ubuntu 20.04+, Debian 10+, Alpine 3.19+ | Native install, Homebrew, WinGet | 4 GB+ RAM, x64/ARM64, internet | Reads main config from an env-var-overridable path. This is what superai's alias layer targets |
-| Codex CLI | macOS, Windows, Linux | Standalone installer or binary | WSL2 on Windows | Apache-2.0. OpenAI Codex/GPT models |
-| Cursor CLI | macOS, Windows, Linux | Cursor CLI docs | unspecified | Same model layer as the desktop app |
-| Droid CLI | macOS, Linux, Windows | Factory shell script or npm | `xdg-utils` on Linux, sign-in required | Vendor-hosted Factory agent layer |
-| Cline | VS Code-family, Cursor, JetBrains, terminal | Extension or `npm i -g cline` | Provider auth; Ollama/LM Studio as local backends | Apache-2.0. Backend determines model sizes |
-| Kilo Code | VS Code, JetBrains, CLI | Extension or `npm i -g @kilocode/cli` | unspecified | Apache-2.0. 500+ models via Kilo Gateway, BYOK |
-| Continue | macOS, Windows, Linux | Extension or CLI | Local/offline path documented | Apache-2.0. Model-agnostic. Repo now read-only after Cursor acquisition |
-| Aider | macOS, Windows, Linux | Installer or pip | Python 3.8+ | Apache-2.0. Works with API and local backends |
-| Goose | macOS, Linux, Windows | Official release/docs | unspecified | Apache-2.0. Now under Agentic AI Foundation / Linux Foundation |
-| Open Interpreter | macOS, Windows, Linux | One-line installer or pip | Local Python setup attempted by installer | Works with local and hosted LLMs |
-| Oh My Pi | Cross-platform | Shell script, npm, Bun, PowerShell | unspecified | Multi-provider LLM client |
-| Roo Code | macOS Apple Silicon, Linux x64/ARM64 | Install script / extension docs | Node.js 20+ | Apache-2.0. Extension shut down 2026-05-15, treat as discontinued |
+- **Clients** run locally but usually call a hosted model (Claude Code, Cursor, Codex). In scope for install and config.
+- **Runtimes** execute open models on your hardware (Ollama, llama.cpp, LM Studio). Also in scope as proxy backends.
 
-## Desktop apps and IDE extensions
+## Coding agents and CLIs
 
-GUI surfaces. Some run their own local model; some are shells over hosted models.
+| Tool | License | Notes |
+|---|---|---|
+| Claude Code | proprietary | `CLAUDE_CONFIG_DIR` relocates config — but see the caveat below |
+| Codex CLI | Apache-2.0 | `$CODEX_HOME` (default `~/.codex/config.toml`); referenced throughout the config reference but never formally defined there |
+| OpenClaw | MIT | `OPENCLAW_HOME` documented, with `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH` taking precedence over it |
+| Hermes | MIT | `HERMES_HOME` is the documented profile boundary: config, sessions, memory, skills, logs. Wrapper scripts set it before launch — exactly superai's alias pattern |
+| OpenCode | MIT | Repo moved to `anomalyco/opencode` |
+| Cline | Apache-2.0 | Ollama and LM Studio work as local backends |
+| Kilo Code | MIT | Maintained fork of Roo Code |
+| Aider | Apache-2.0 | API or local backends. Last push 2026-05-22 |
+| Goose | Apache-2.0 | Now `aaif-goose/goose` under the Agentic AI Foundation |
+| Open Interpreter | Apache-2.0 | Now `openinterpreter/openinterpreter` |
+| Oh My Pi | MIT | Terminal agent, many providers, custom providers via `models.json` |
+| Cursor CLI | proprietary | Same model layer as the desktop app |
+| Droid CLI | proprietary | Vendor-hosted, sign-in required |
+| Continue | Apache-2.0 | **Wound down.** Cursor acqui-hire June 2026; last release v2.1.0-vscode 2026-06-19, then commits retiring login and issue reporting. Repo is *not* archived and still accepts pushes, so it's forkable |
+| Roo Code | Apache-2.0 | **Dead.** Repo archived, final push 2026-05-15. Kilo Code is the fork to use |
 
-| Project | OS | Install | Requirements | Notes |
-|---|---|---|---|---|
-| OpenCode Desktop | macOS, Windows, Linux | Official downloads | Bundles a local `opencode-cli` sidecar server | Beta. Same agent layer as OpenCode |
-| Claude Desktop | macOS, Windows | Official download | Online account required | Claude chat/app models |
-| Codex App | macOS, Windows | Official download | Online sign-in required | OpenAI Codex/GPT models |
-| ZCode | macOS, Windows, Linux beta | Official installer/docs | unspecified | Optimized for GLM-5.2 |
-| Cursor | macOS, Windows, Linux | Official site | unspecified | Frontier coding models via provider integrations |
-| LM Studio | Apple Silicon macOS, Windows x64/ARM, Linux x64/ARM64 | App + `lms` CLI | macOS 14+, 16 GB RAM recommended (8 GB workable for small models) | MIT CLI. GGUF and MLX. Ships a local OpenAI-compatible server |
-| Jan | Windows, macOS, Linux | Official app + GitHub | macOS 13.6+; 8 GB for 3B, 16 GB for 7B, 32 GB for 13B | Llama, Gemma, Qwen, GPT-oss |
-| GPT4All | Windows, macOS, Linux | App or `pip install gpt4all` | Python venv recommended | llama.cpp-compatible models; Nomic and SBert embeddings |
+### The `CLAUDE_CONFIG_DIR` caveat
 
-## Local model runtimes and packaging
+This matters more than anything else here, because the alias layer is built on it.
 
-Software that executes open models on your own hardware. These are the backends the proxy routes to when you want traffic to stay local.
+`CLAUDE_CONFIG_DIR` is **not in Claude Code's official environment-variables documentation**. It works — but there are open bugs where it is only partly honored: user memory still loads from `~/.claude/CLAUDE.md`, session renames write there, `install.sh` still populates `~/.claude/downloads`, and config-editing tooling writes to `~/.claude/settings.json` regardless.
 
-| Project | OS | Install | Requirements | Notes |
-|---|---|---|---|---|
-| Ollama | macOS 14+, Windows 10+, Linux | Package/script | 4 GB+ disk for binary; models can need tens to hundreds of GB; CUDA optional, ROCm v7 on Linux | Llama, Qwen, Gemma, DeepSeek; text, vision, embeddings |
-| llama.cpp | Broad, build locally | Clone and build | Varies by quantization and model | GGUF/GGML open LLMs and multimodal |
-| LocalAI | Docker/self-host; Linux x86/ARM, NVIDIA ARM64 | Docker or recommended method | Consumer hardware; auto-detects CPU/NVIDIA/AMD/Intel backends | LLMs, image generation, audio |
-| textgen | Linux, Windows, macOS | Portable build | Portable builds ship with CUDA, Vulkan, ROCm, CPU-only options | GGUF via llama.cpp; ExLlamaV3 and Transformers backends |
-| KoboldCpp | Single-file binary | Release binary | Self-contained distributable | AGPL-3.0. GGML/GGUF models |
-| llamafile | Cross-platform single-file | Download or build a `.llamafile` | Depends on bundled model | llama.cpp and whisper.cpp packaged models |
-| MLC LLM | Windows, Linux, macOS, browser/mobile | pip in conda env | 6 GB+ VRAM recommended for int4 Llama 3 8B example | Universal deployment engine |
-| MLX LM | Apple silicon macOS | Install MLX/MLX LM | Apple silicon, RAM depends on model | Thousands of HF LLMs through MLX; quantization, distributed inference |
-| ExLlamaV2 | Consumer GPUs | Matching wheel or JIT build | Wheel must match Python, CUDA, PyTorch ABI | EXL2/GPTQ-style models |
-| TabbyAPI | Python-based, follows Python support | Python/uv/conda or Docker | Python 3.x, preferably 3.12 | Official API backend for ExLlamaV2 and V3. Rolling release |
-| OpenVINO GenAI | PC/laptop | Package/archive | Optimized for resource-constrained execution | Popular GenAI pipelines on OpenVINO Runtime |
-| ONNX Runtime GenAI | Windows, Linux, macOS | `pip install onnxruntime-genai` or source build | Variants for CPU, DirectML, CUDA 11/12 | ONNX-format generative models |
+So "point the tool at a generated config with one env var" is not yet a clean contract for Claude Code. superai should verify per-file which paths actually move, and expect to write some files in place rather than assume the variable covers everything.
 
-## High-performance serving engines
+## Desktop apps
 
-For when a runtime is not enough and you need to serve many concurrent requests. Mostly Linux and GPU.
+| Tool | License | Notes |
+|---|---|---|
+| Claude Desktop | proprietary | Fixed OS config path, no env override — write the file in place |
+| Codex App | proprietary | Hosted sign-in |
+| Cursor | proprietary | Hosted models via provider integrations |
+| ZCode | proprietary | Z.ai's agentic desktop app around GLM; also talks to Ollama |
+| LM Studio | app proprietary, `lms` CLI MIT | GGUF and MLX, ships an OpenAI-compatible local server |
+| Jan | Apache-2.0 | Local model app |
+| GPT4All | MIT | **Dormant** — last push 2025-05-27 |
+| OpenCode Desktop | — | Beta. Bundles an `opencode-cli` sidecar |
 
-| Project | OS | Install | Requirements | Notes |
-|---|---|---|---|---|
-| vLLM | Linux GPU serving | Wheel or source build | CUDA 12.9 default; wheels for 12.8 and 13.0; Blackwell needs 12.8+ | Major open-source LLM serving |
-| SGLang | Single GPU to distributed clusters | pip/source/Docker | Python 3.10+; CUDA 13 images default, cu12/cu129 variants | LLM and multimodal serving, OpenAI-compatible API |
-| TensorRT-LLM | NVIDIA GPU environments | Per quickstart | NVIDIA GPU required | LLM and visual-gen inference via TensorRT |
-| Text Generation Inference | x86_64 Docker/server | Docker image with `--model-id` | GPU path for common use; ARM64 not officially supported | Llama, Falcon, StarCoder, BLOOM, GPT-NeoX, T5 |
+## Local runtimes
 
-## Self-hosted chat, workflow, and agent platforms
+Proxy backends when traffic should stay on the machine.
 
-Larger stacks that sit on top of a runtime and add UI, RAG, or workflow orchestration. Usually run in Docker.
+| Tool | License | Notes |
+|---|---|---|
+| Ollama | MIT | The default target. Text, vision, embeddings |
+| llama.cpp | MIT | Now `ggml-org/llama.cpp`. GGUF, build locally |
+| LocalAI | MIT | Self-hosted, auto-detects CPU/GPU backends |
+| llamafile | Apache-2.0 | Now `mozilla-ai/llamafile`. Single-file packaged models |
+| KoboldCpp | AGPL-3.0 | Single binary |
+| textgen | AGPL-3.0 | Now `oobabooga/textgen`. GGUF plus ExLlamaV3 and Transformers |
+| MLX LM | MIT | Apple silicon |
+| ExLlamaV2 | MIT | EXL2/GPTQ; wheels are ABI-sensitive. Last push 2026-03-04 |
+| TabbyAPI | AGPL-3.0 | API server for ExLlamaV2/V3 |
+| MLC LLM | Apache-2.0 | Universal deployment, including browser and mobile |
+| OpenVINO GenAI | Apache-2.0 | Intel-optimized |
+| ONNX Runtime GenAI | MIT | ONNX-format models |
 
-| Project | OS | Install | Requirements | Notes |
-|---|---|---|---|---|
-| OpenHands | Local Docker/npm | npm or Docker | Self-host via Docker/npm; docs recommend local models and document Ollama/LM Studio/SGLang/vLLM examples | Formerly OpenDevin. Self-hosted agent platform |
-| AnythingLLM | macOS, Windows, Linux, Docker | Desktop app or self-host container | Desktop/self-host, baseline HW mostly unspecified | MIT. Agents, vector DBs, doc ingestion |
-| Open WebUI | Docker/self-host; desktop for Mac, Windows, Linux | Docker or official desktop app | Self-hosted offline; desktop supports offline after first launch | Ollama and OpenAI-compatible APIs; built-in RAG |
-| LibreChat | Local server via Docker | Docker self-host | unspecified | Unifies major providers plus MCP/agents |
-| Flowise | Local npm or Docker | `npm i -g flowise` then `npx flowise start`, or Docker Compose | unspecified | Model-agnostic workflow builder |
-| Langflow | Desktop app plus pip/Docker | `pip/uv install langflow` then `langflow run`, or Docker | unspecified | LLM/vector-store agnostic app builder |
-| Dify | Self-host via Docker Compose | Clone release, `cd dify/docker`, copy `.env`, start containers | CPU 2+ cores, RAM 4 GiB+, Docker Compose 2.24+ | Agentic workflows; model sizes depend on backend |
-| RAGFlow | Docker/self-host on x86 | Docker quickstart | CPU 4+ cores, 16 GB RAM, 50 GB disk, Docker 24+, Compose 2.26.1+; Python 3.13+ for source path | RAG engine with agent capabilities |
+The two AGPL entries (KoboldCpp, TabbyAPI) are worth a second look before superai bundles or ships anything alongside them.
 
-## What this means for superai
+## Serving engines
 
-The tools split into three concerns the app handles, each with a different shape.
+Concurrency-oriented, mostly Linux and GPU. Low priority — servers you stand up, not tools superai installs.
 
-Install and uninstall applies to everything above. Whether the install verb is a desktop installer, an npm global, a pip package, a Homebrew formula, or a Docker image, superai needs the install and uninstall commands for each, and a way to detect whether the tool is already present.
+| Tool | License | Notes |
+|---|---|---|
+| vLLM | Apache-2.0 | The main open-source serving stack |
+| SGLang | Apache-2.0 | LLM and multimodal, OpenAI-compatible API |
+| TensorRT-LLM | Apache-2.0 | NVIDIA only |
+| Text Generation Inference | Apache-2.0 | **Archived** — final push 2026-03-21. Drop unless something depends on it |
 
-Config and aliases applies to the agents and clients that read settings from an env-var-overridable path. Claude Code is the canonical case. Codex, Codex Desktop, Claude Desktop, OpenClaw, and Hermes follow the same pattern. For each, the app generates the config file and writes the alias that preloads the right settings path before launch.
+## Self-hosted platforms
 
-Routing and proxy applies to providers, aggregators, and anything that talks to a model endpoint. Anything exposing an OpenAI-compatible or Anthropic-style API is a target the proxy can route to, rewrite, or translate between. The runtimes in this doc become local backends; hosted APIs and aggregators (OpenRouter, Fireworks, Novita, GLM, DeepSeek, Xiaomi MiMo, and future ones) become remote backends. Adding either should be a config entry, not a code change.
+UI, RAG, or orchestration on top of a runtime. Out of scope for config generation; in scope for install and as proxy clients.
 
-## Gaps
+| Tool | License | Notes |
+|---|---|---|
+| Open WebUI | custom "Open WebUI License" | Redistribution has branding conditions — read it before shipping. Ollama and OpenAI-compatible APIs, built-in RAG |
+| AnythingLLM | MIT | Agents, vector DBs, doc ingestion |
+| LibreChat | MIT | Multi-provider, MCP and agents |
+| OpenHands | MIT | Now `OpenHands/OpenHands`. Formerly OpenDevin |
+| Dify | modified Apache-2.0 | Commercial license required for multi-tenant use. Agentic workflows |
+| Langflow | MIT | App builder |
+| RAGFlow | Apache-2.0 | RAG engine with agents |
+| Flowise | source-available (enterprise dir is commercial) | **Archived** — final push 2026-08-13 |
 
-A working catalog, not an exhaustive one. The ecosystem moves weekly and several projects blend desktop, extension, CLI, self-host, and cloud surfaces in a way that makes strict boundaries fuzzy. License metadata, exact release dates for proprietary apps, and full hardware matrices were the widest gaps; where a field was unknown it is marked unspecified rather than guessed.
+## What this implies
 
-A few related projects were left out because they read as companion repos, deployment variants, or transitional surfaces rather than distinct end-user tools. Several cloud-tied local clients were kept in scope because they have a real local install path and superai is expected to install and configure them.
-
-A fully local stack today usually looks like Ollama or llama.cpp/LM Studio/Jan for model execution, optionally Open WebUI or AnythingLLM for UI and RAG, then a coding or automation layer like Cline, Kilo Code, Goose, Continue, or OpenHands depending on whether you want IDE-native, CLI-native, or self-hosted orchestration.
+- **Install/uninstall** — everything here. Needs a per-tool install verb and a presence check. Skip the four dead or dormant entries (Roo Code, Text Generation Inference, Flowise, GPT4All) and treat Continue as frozen.
+- **Config and aliases** — only four tools have a config-path env var, and only two of those document it. OpenClaw and Hermes are the clean cases; Claude Code and Codex work but are undocumented, and Claude Code's is leaky. Build the alias layer against Hermes or OpenClaw first, where the contract is written down, then port to Claude Code with per-file verification.
+- **Routing** — anything exposing an OpenAI-compatible or Anthropic-style endpoint. Runtimes become local backends, hosted APIs and aggregators remote ones. Both should be config entries, not code.
