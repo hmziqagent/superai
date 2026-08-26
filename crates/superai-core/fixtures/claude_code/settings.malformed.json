@@ -1,0 +1,11 @@
+{
+  "model": "opus",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://example.com",
+  },
+  // trailing comment and missing value
+  "permissions": {
+    "allow": ["Read"],
+    "deny":
+  }
+}

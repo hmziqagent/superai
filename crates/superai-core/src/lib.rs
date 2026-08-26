@@ -4,6 +4,8 @@
 
 /// Harness adapter trait and supporting types.
 pub mod adapter;
+/// Concrete harness adapters.
+pub mod adapters;
 mod capability;
 mod error;
 /// Registered harness catalog — the 48 planned product surfaces.
