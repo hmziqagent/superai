@@ -33,11 +33,13 @@ pub fn load(path: &Path) -> Result<DocumentMut> {
 pub fn store(path: &Path, doc: &DocumentMut) -> Result<()> {
     backup(path)?;
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
     }
 
-    std::fs::write(path, doc.to_string()).map_err(|e| ConfigError::io(path, e))
+    crate::atomic::atomic_write(path, doc.to_string().as_bytes())
 }
 
 /// Read fresh, apply `edit`, write back only if the document changed.

@@ -617,7 +617,9 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
 pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
     backup(path)?;
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
     }
 
@@ -630,7 +632,7 @@ pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
         text.push('\n');
     }
 
-    std::fs::write(path, text).map_err(|e| ConfigError::io(path, e))
+    crate::atomic::atomic_write(path, text.as_bytes())
 }
 
 /// Read fresh, apply `edit`, write back only if the effective map changed.
@@ -810,11 +812,13 @@ where
 
     backup(path)?;
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
     }
 
-    std::fs::write(path, out).map_err(|e| ConfigError::io(path, e))
+    crate::atomic::atomic_write(path, out.as_bytes())
 }
 
 #[cfg(test)]

@@ -269,7 +269,9 @@ pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     backup(path)?;
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
     }
 
@@ -281,7 +283,7 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
         text.push('\n');
     }
 
-    std::fs::write(path, text).map_err(|e| ConfigError::io(path, e))
+    crate::atomic::atomic_write(path, text.as_bytes())
 }
 
 /// Read fresh, apply `edit`, write back only if the value changed.
