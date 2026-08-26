@@ -7,6 +7,8 @@ pub mod adapter;
 /// Concrete harness adapters.
 pub mod adapters;
 mod capability;
+/// Discovery, adoption, and drift reporting.
+pub mod discovery;
 mod error;
 /// Registered harness catalog — the 48 planned product surfaces.
 pub mod harness_catalog;
