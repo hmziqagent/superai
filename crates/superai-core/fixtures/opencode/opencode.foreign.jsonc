@@ -1,0 +1,10 @@
+{
+  // Foreign keys must round-trip
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5",
+  "foreignKey": "preserve-me", // keep
+  "unknownTopLevel": {
+    "nested": true,
+  },
+  "customField": 123,
+}

@@ -1,0 +1,17 @@
+{
+  "apiProvider": "openai-compatible",
+  "openAiBaseUrl": "http://localhost:4000/v1",
+  "openAiApiKey": "sk-test-123",
+  "openAiModelId": "claude-sonnet-4-5",
+  "modelId": "claude-sonnet-4-5",
+  "preferredLanguage": "English",
+  "mcp": {
+    "mcpServers": {
+      "linear": {
+        "command": "node",
+        "args": ["/path/to/build/index.js"],
+        "disabled": false
+      }
+    }
+  }
+}

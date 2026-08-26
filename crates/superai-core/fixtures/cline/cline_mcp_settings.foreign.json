@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "linear": {
+      "command": "node",
+      "args": ["/path/to/build/index.js"]
+    }
+  },
+  "foreignKey": "keep",
+  "customField": 123
+}

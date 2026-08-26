@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "linear": {
+      "command": "node",
+      "args": ["/path/to/build/index.js"],
+      "env": {
+        "LINEAR_API_KEY": "test-key"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "remote-server": {
+      "url": "https://jira.example.com/mcp",
+      "enabled": true
+    }
+  }
+}

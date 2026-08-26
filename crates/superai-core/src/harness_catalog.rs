@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{Adapter, GenericAdapter, ProductStatus};
 use crate::adapters::aider::AiderAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
+use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
+use crate::adapters::opencode::OpenCodeAdapter;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
 
@@ -632,6 +634,18 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
         }
         if entry.id == crate::adapters::aider::HARNESS_ID_STR
             && let Ok(adapter) = AiderAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::opencode::HARNESS_ID_STR
+            && let Ok(adapter) = OpenCodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::cline::HARNESS_ID_STR
+            && let Ok(adapter) = ClineAdapter::new()
         {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;

@@ -1,0 +1,21 @@
+{
+  // OpenCode populated config — JSONC with comments and trailing commas
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5", // primary model
+  "small_model": "anthropic/claude-haiku-4-5",
+  /* provider block */
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1",
+        "apiKey": "{env:ANTHROPIC_API_KEY}", // trailing comma,
+      },
+    },
+  },
+  "mcp": {
+    "local-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+    },
+  },
+}

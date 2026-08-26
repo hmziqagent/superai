@@ -1,0 +1,5 @@
+{
+  "model": "anthropic/claude-sonnet-4-5",
+  // missing value causes parse error
+  "provider": ,
+}

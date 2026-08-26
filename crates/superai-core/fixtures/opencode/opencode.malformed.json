@@ -1,0 +1,15 @@
+{
+  "model": "anthropic/claude-sonnet-4-5",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1",
+      }
+    }
+  },
+  // malformed: missing value after key and trailing garbage
+  "permissions": {
+    "allow": ["Read"],
+    "deny":
+  }
+}

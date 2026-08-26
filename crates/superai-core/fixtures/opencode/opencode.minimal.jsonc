@@ -1,0 +1,5 @@
+// Minimal OpenCode config with comments
+{
+  // Schema enables editor autocomplete
+  "$schema": "https://opencode.ai/config.json"
+}

@@ -1,0 +1,15 @@
+{
+  "telemetrySetting": "enabled",
+  "apiProvider": "openai-compatible",
+  "openAiBaseUrl": "https://api.openai.com/v1",
+  "mcpServers": {
+    "test": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  },
+  "autoApprove": {
+    "readFiles": true,
+    "editFiles": false
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "telemetrySetting": "enabled",
+  "foreignKey": "preserve",
+  "unknownTopLevel": "value",
+  "customField": {"nested": true}
+}

@@ -1,0 +1,10 @@
+{
+  "apiProvider": "anthropic",
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}
