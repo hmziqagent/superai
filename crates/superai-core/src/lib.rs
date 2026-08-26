@@ -37,3 +37,8 @@ pub use capability::{Capability, Support};
 pub use error::{CoreError, Result};
 pub use instance::{Instance, TemplateRef, WrapperRef};
 pub use registry::{Registry, SCHEMA_VERSION, unmanaged_dirs};
+
+/// Template catalog, schema, and repo config (TPL-01, TPL-02).
+pub mod template;
+/// Template fetch client with HTTPS, digest, and traversal guards (TPL-03).
+pub mod template_fetch;
