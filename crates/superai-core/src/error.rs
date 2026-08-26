@@ -30,6 +30,17 @@ pub enum CoreError {
         /// Human-readable reason.
         reason: String,
     },
+
+    /// A path or executable reference failed validation.
+    #[error("invalid {kind} `{value}`: {reason}")]
+    InvalidPath {
+        /// Kind of path that failed validation.
+        kind: String,
+        /// Offending value.
+        value: String,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// Result alias for core operations.

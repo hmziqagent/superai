@@ -7,6 +7,8 @@ mod error;
 /// Validated identifiers and names.
 pub mod ids;
 mod instance;
+/// Validated path and executable reference types.
+pub mod paths;
 mod registry;
 
 pub use capability::{Capability, Support};
