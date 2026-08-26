@@ -15,6 +15,93 @@ use crate::error::{CoreError, Result};
 /// Re-export sensitive wrapper and document types for core consumers.
 pub use superai_config::raw_editor::{find_redaction_spans, validate};
 
+/// Interface-agnostic raw editor service for core.
+///
+/// Wraps the config-layer `RawEditor` and enforces harness version and
+/// surface-ownership policies before delegating. Disk is the truth on every
+/// `open`; `validate` never touches disk; `diff` returns redacted lexical
+/// diff plus semantic ops; `commit` validates, checks conflict, backs up,
+/// atomically replaces, and verifies. No GPUI types.
+#[derive(Debug, Clone, Default)]
+pub struct RawEditor {
+    inner: superai_config::raw_editor::RawEditor,
+}
+
+impl RawEditor {
+    /// Create a stateless service handle.
+    pub fn new() -> Self {
+        Self {
+            inner: superai_config::raw_editor::RawEditor::new(),
+        }
+    }
+
+    /// Open `path` fresh from disk, detecting kind via `DocumentKind::from_path`.
+    ///
+    /// Returns a neutral `SourceDocument` envelope. Missing file is an error.
+    pub fn open(&self, path: &Path) -> Result<superai_config::document::SourceDocument> {
+        self.inner.open(path).map_err(CoreError::Config)
+    }
+
+    /// Open via the sensitive `RawDocument` wrapper (preserves `Snapshot` token).
+    pub fn open_raw(&self, path: &Path) -> Result<RawDocument> {
+        read(path)
+    }
+
+    /// Validate `content` for `kind` without touching disk.
+    pub fn validate(
+        &self,
+        content: &[u8],
+        kind: ConfigKind,
+    ) -> Vec<superai_config::document::Diagnostic> {
+        self.inner.validate(content, kind)
+    }
+
+    /// Diff `old` vs `new` for `kind`, producing redacted lexical diff and semantic ops.
+    pub fn diff(&self, old: &[u8], new: &[u8], kind: ConfigKind) -> DiffResult {
+        self.inner.diff(old, new, kind)
+    }
+
+    /// Find secret-bearing spans in `content` for UI redaction.
+    pub fn find_redaction_spans(
+        &self,
+        content: &[u8],
+        kind: ConfigKind,
+    ) -> Vec<superai_config::raw_editor::RedactionSpan> {
+        self.inner.find_redaction_spans(content, kind)
+    }
+
+    /// Commit `new_content` to `path` after validation and conflict check.
+    pub fn commit(
+        &self,
+        path: &Path,
+        new_content: &[u8],
+        expected_digest: Option<&str>,
+    ) -> Result<CommitReport> {
+        commit(path, new_content, expected_digest)
+    }
+
+    /// Commit with explicit `Snapshot` conflict token.
+    pub fn commit_with_snapshot(
+        &self,
+        path: &Path,
+        new_content: &[u8],
+        expected: Option<&superai_config::Snapshot>,
+    ) -> Result<CommitReport> {
+        commit_with_snapshot(path, new_content, expected)
+    }
+
+    /// Commit that also enforces harness version and surface ownership.
+    pub fn commit_for_adapter(
+        &self,
+        path: &Path,
+        new_content: &[u8],
+        expected_digest: Option<&str>,
+        adapter: &dyn Adapter,
+    ) -> Result<CommitReport> {
+        commit_for_adapter(path, new_content, expected_digest, adapter)
+    }
+}
+
 /// Read a document fresh from disk, detecting kind via extension.
 ///
 /// Delegates to `superai_config::raw_editor::read` and maps errors to
