@@ -15,8 +15,8 @@ One distinction drives routing:
 
 | Tool | License | Notes |
 |---|---|---|
-| Claude Code | proprietary | `CLAUDE_CONFIG_DIR` relocates config — but see the caveat below |
-| Codex CLI | Apache-2.0 | `$CODEX_HOME` (default `~/.codex/config.toml`); referenced throughout the config reference but never formally defined there |
+| Claude Code | proprietary | `CLAUDE_CONFIG_DIR` relocates settings, history, plugins, and (Linux/Windows) credentials; macOS keeps credentials in Keychain |
+| Codex CLI | Apache-2.0 | `CODEX_HOME`, plus `$NAME.config.toml` profiles in ≥0.134 |
 | OpenClaw | MIT | `OPENCLAW_HOME` documented, with `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH` taking precedence over it |
 | Hermes | MIT | `HERMES_HOME` is the documented profile boundary: config, sessions, memory, skills, logs. Wrapper scripts set it before launch — exactly superai's alias pattern |
 | OpenCode | MIT | Repo moved to `anomalyco/opencode` |
@@ -31,13 +31,7 @@ One distinction drives routing:
 | Continue | Apache-2.0 | **Wound down.** Cursor acqui-hire June 2026; last release v2.1.0-vscode 2026-06-19, then commits retiring login and issue reporting. Repo is *not* archived and still accepts pushes, so it's forkable |
 | Roo Code | Apache-2.0 | **Dead.** Repo archived, final push 2026-05-15. Kilo Code is the fork to use |
 
-### The `CLAUDE_CONFIG_DIR` caveat
-
-This matters more than anything else here, because the alias layer is built on it.
-
-`CLAUDE_CONFIG_DIR` is **not in Claude Code's official environment-variables documentation**. It works — but there are open bugs where it is only partly honored: user memory still loads from `~/.claude/CLAUDE.md`, session renames write there, `install.sh` still populates `~/.claude/downloads`, and config-editing tooling writes to `~/.claude/settings.json` regardless.
-
-So "point the tool at a generated config with one env var" is not yet a clean contract for Claude Code. superai should verify per-file which paths actually move, and expect to write some files in place rather than assume the variable covers everything.
+> **Superseded.** `docs/harness-configs/` documents config paths, env vars, and multi-instance wrappers for ~40 harnesses with inline citations. It is the authority for anything config-related; this file is now just the install/routing surface list.
 
 ## Desktop apps
 
@@ -102,5 +96,5 @@ UI, RAG, or orchestration on top of a runtime. Out of scope for config generatio
 ## What this implies
 
 - **Install/uninstall** — everything here. Needs a per-tool install verb and a presence check. Skip the four dead or dormant entries (Roo Code, Text Generation Inference, Flowise, GPT4All) and treat Continue as frozen.
-- **Config and aliases** — only four tools have a config-path env var, and only two of those document it. OpenClaw and Hermes are the clean cases; Claude Code and Codex work but are undocumented, and Claude Code's is leaky. Build the alias layer against Hermes or OpenClaw first, where the contract is written down, then port to Claude Code with per-file verification.
+- **Config and aliases** — config-dir relocation is close to universal across CLI harnesses; see `harness-configs/` for the per-tool variable. The real exceptions are IDE extensions (isolate via `code --user-data-dir`) and fixed-path GUI apps (write in place).
 - **Routing** — anything exposing an OpenAI-compatible or Anthropic-style endpoint. Runtimes become local backends, hosted APIs and aggregators remote ones. Both should be config entries, not code.

@@ -16,9 +16,9 @@ One app should own all of that.
 
 **A local proxy.** The core of it. Tools point at the proxy instead of at a provider, and the proxy decides where the request actually goes and what shape it takes on the way out — including translating an Anthropic-style call into whatever a provider that doesn't speak it natively expects. One place to change routing, swappable per tool.
 
-**Configs and aliases.** Some tools let you relocate their config with an env var, so the app can generate config files and write aliases that point a tool at the right one before launch — "work mode" and "personal mode" stop meaning two terminals.
+**Configs and aliases.** Most harnesses support config-dir relocation via an env var, which is the sanctioned multi-instance mechanism — Claude Code's docs literally give `alias claude-work='CLAUDE_CONFIG_DIR=~/.claude-work claude'` as the example. So the app generates the config files and writes the wrappers that set the right variable before exec.
 
-The support is uneven, and that shapes the build order. Hermes documents `HERMES_HOME` as a full profile boundary and expects wrapper scripts to set it, which is exactly this pattern; OpenClaw documents `OPENCLAW_HOME` with finer-grained overrides on top. Claude Code's `CLAUDE_CONFIG_DIR` and Codex's `CODEX_HOME` both work but are undocumented, and `CLAUDE_CONFIG_DIR` has open bugs where files still land in `~/.claude` anyway. GUI apps like Claude Desktop have no override at all and need their file written in place. So this layer is per-tool work with verification, not one mechanism applied four times.
+`docs/harness-configs/` documents the knob for ~40 harnesses: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `GOOSE_PATH_ROOT`, `HERMES_HOME`, `OPENCLAW_HOME`, and a dozen more. The exceptions matter for scoping: IDE extensions can't be env-isolated and need `code --user-data-dir` instead, and GUI apps like Claude Desktop have a fixed path that has to be written in place.
 
 **Install and uninstall.** A package-manager view for the tools themselves — detect what's present, install, remove — without copying commands out of a readme.
 
@@ -38,8 +38,8 @@ Not a chat client — it manages tools, the tools do the work. Not a cloud servi
 
 1. App shell and provider connections: one local, one hosted.
 2. The proxy: one aggregator passthrough, one format translation.
-3. Config generation and aliases, starting with Hermes or OpenClaw where the env-var contract is documented.
-4. Port that to Claude Code and Codex, verifying per file which paths actually move; write Claude Desktop's config in place.
+3. Config generation and wrapper aliases for Claude Code.
+4. Extend to the other relocatable harnesses from the descriptor table; handle the fixed-path and IDE cases separately.
 5. Install and uninstall.
 6. Global skills with per-agent attach/detach.
 7. Raw TOML and JSON editors.
