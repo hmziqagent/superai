@@ -25,6 +25,8 @@ pub mod operation;
 pub mod paths;
 /// Provider definitions — data-driven.
 pub mod provider;
+/// Raw editor backend — harness-aware wrapper.
+pub mod raw_editor;
 mod registry;
 /// Lifecycle and ownership states.
 pub mod state;

@@ -19,6 +19,8 @@ pub mod json;
 pub mod jsonc;
 /// Recoverable quarantine for directory removal.
 pub mod quarantine;
+/// Raw editor backend — read/validate/diff/commit.
+pub mod raw_editor;
 /// Filesystem snapshot and conflict token.
 pub mod snapshot;
 /// TOML configs, comments and formatting preserved.
