@@ -42,3 +42,5 @@ pub use registry::{Registry, SCHEMA_VERSION, unmanaged_dirs};
 pub mod template;
 /// Template fetch client with HTTPS, digest, and traversal guards (TPL-03).
 pub mod template_fetch;
+/// Three-way template update and transactional apply (TPL-06, TPL-07).
+pub mod template_update;
