@@ -36,6 +36,9 @@ mod test_util;
 #[cfg(test)]
 mod property_tests;
 
+#[cfg(test)]
+mod fuzz;
+
 pub use atomic::{atomic_write, atomic_write_with_expected_digest, atomic_write_with_snapshot};
 pub use backup::{
     BackupEntry, BackupId, RestoreReport, backup, backup_with_operation, backup_with_reason,

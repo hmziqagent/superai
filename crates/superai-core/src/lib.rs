@@ -76,3 +76,6 @@ mod test_util;
 
 #[cfg(test)]
 mod property_tests;
+
+#[cfg(test)]
+mod fuzz;
