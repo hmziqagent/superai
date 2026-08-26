@@ -1,0 +1,14 @@
+// Provenance: source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake- legacy jsonc
+{
+  // legacy schema with minimal fields
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4", // legacy model
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1",
+        "apiKey": "sk-fake-legacy-jsonc-1111", // fake
+      },
+    },
+  },
+}

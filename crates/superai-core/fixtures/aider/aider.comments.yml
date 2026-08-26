@@ -1,0 +1,10 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- comments variant
+# Realistic with comments, unmodelled keys, order preservation
+model: openrouter/anthropic/claude-sonnet-4 # inline comment
+dark-mode: true # keep
+auto-commits: false
+# custom field comment
+customField: preserve-me
+unknownTopLevel:
+  nested: keep
+  value: 123 # inline

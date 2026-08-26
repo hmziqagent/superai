@@ -1,0 +1,6 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- mcp variant
+model: openrouter/anthropic/claude-sonnet-4
+dark-mode: true
+# Aider doesn't have native MCP, but fixture shows extension via extra params
+extraUnknownMcp: preserve-me
+map-tokens: 1024 # fake sk-fake-map

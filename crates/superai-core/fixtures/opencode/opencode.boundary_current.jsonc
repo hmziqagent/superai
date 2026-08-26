@@ -1,0 +1,30 @@
+// Provenance: source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake- current jsonc
+{
+  // current schema with comments, trailing commas, full provider block
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5", // primary
+  "small_model": "anthropic/claude-haiku-4-5",
+  "share": "manual",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1",
+        "apiKey": "sk-fake-current-jsonc-2222", // fake
+      },
+    },
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-fake-openrouter-current-7777", // fake
+      },
+    },
+  },
+  "mcp": {
+    "local-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+    },
+  },
+}

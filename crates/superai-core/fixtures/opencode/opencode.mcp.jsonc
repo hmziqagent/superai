@@ -1,0 +1,13 @@
+// Provenance: source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake- mcp jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5",
+  // mcp block with comments
+  "mcp": {
+    "local-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+      "enabled": true,
+    },
+  },
+}

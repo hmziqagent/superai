@@ -1,0 +1,16 @@
+{
+  "_provenance": "source=docs/harness-configs/claude-code.md last_verified=2026-08-25 sanitized fake sk-fake- project mcp",
+  "mcpServers": {
+    "local-example": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": {
+        "API_KEY": "sk-fake-mcp-proj-123"
+      }
+    },
+    "remote-example": {
+      "url": "https://mcp.example.com/mcp",
+      "type": "streamable-http"
+    }
+  }
+}

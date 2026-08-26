@@ -1,8 +1,8 @@
 {
-  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake-",
+  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake- current",
   "apiProvider": "openai-compatible",
-  "openAiBaseUrl": "http://localhost:4000/v1",
-  "openAiApiKey": "sk-fake-cline-1234567890",
+  "openAiBaseUrl": "https://api.openai.com/v1",
+  "openAiApiKey": "sk-fake-current-2222",
   "openAiModelId": "claude-sonnet-4-5",
   "modelId": "claude-sonnet-4-5",
   "preferredLanguage": "English",

@@ -1,0 +1,8 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- skills variant
+model: gpt-4o
+dark-mode: true
+# skills are managed separately but config may reference lint/test hooks
+lint-cmd: "python: flake8"
+auto-lint: true
+# foreign
+skillsExtra: preserve

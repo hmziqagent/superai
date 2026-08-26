@@ -1,0 +1,13 @@
+# Provenance: source=docs/harness-configs/codex-cli.md last_verified=2026-08-25 sanitized fake sk-fake- plugins variant
+model = "gpt-5.5"
+model_provider = "openai"
+
+# plugins via skills; ensure unknown keys preserved
+[model_providers.custom]
+name = "Custom"
+base_url = "https://gateway.example.com/v1"
+env_key = "CUSTOM_API_KEY" # fake sk-fake-custom
+
+# plugin marker
+plugin_enabled = true
+foreignKey = { nested = "keep", value = 123 }

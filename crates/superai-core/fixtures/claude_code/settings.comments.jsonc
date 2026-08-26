@@ -1,0 +1,17 @@
+// Provenance: source=docs/harness-configs/claude-code.md last_verified=2026-08-25 sanitized fake sk-fake-
+// Realistic JSONC with comments, trailing commas, unmodelled keys preserved
+{
+  // Schema enables editor autocomplete
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "sonnet", // primary model
+  "fallbackModel": "haiku", // trailing comma test,
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.anthropic.com/v1", // gateway
+    "ANTHROPIC_API_KEY": "sk-fake-comments-aaaa", // fake
+    "CUSTOM_KEEP": "preserve-me", // unmodelled
+  },
+  "permissions": {
+    "allow": ["Read(./**)",], // trailing comma in array
+  },
+  "unknownTopLevel": "preserve-me", // foreign key
+}

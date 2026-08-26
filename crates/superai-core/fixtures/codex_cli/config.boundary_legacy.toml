@@ -1,0 +1,21 @@
+# Provenance: source=docs/harness-configs/codex-cli.md last_verified=2026-08-25 sanitized fake sk-fake- legacy
+# Legacy schema boundary: inline [profiles.*] before 0.134, wire_api="chat"
+model = "gpt-4"
+model_provider = "openai"
+model_verbosity = "low"
+
+[profiles.o3]
+model = "o3"
+model_provider = "openai"
+approval_policy = "never"
+model_reasoning_effort = "high"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY" # fake sk-fake-openai
+wire_api = "chat"
+
+[mcp_servers.legacy_server]
+command = "node"
+args = ["old-server.js"]

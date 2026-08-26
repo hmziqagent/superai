@@ -1,0 +1,18 @@
+{
+  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake- current mcp",
+  "mcpServers": {
+    "linear": {
+      "command": "node",
+      "args": ["/path/to/build/index.js"],
+      "env": {
+        "LINEAR_API_KEY": "sk-fake-linear-7777"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "remote-server": {
+      "url": "https://mcp.example.com/mcp",
+      "enabled": true
+    }
+  }
+}

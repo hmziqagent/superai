@@ -1,0 +1,6 @@
+{
+  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake- plugins variant",
+  "apiProvider": "anthropic",
+  "anthropicApiKey": "sk-fake-plugins-6666",
+  "plugins": ["example-plugin"]
+}

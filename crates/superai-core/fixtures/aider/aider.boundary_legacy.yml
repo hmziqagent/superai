@@ -1,0 +1,9 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- legacy
+# Legacy boundary: older aider keys, less explicit
+model: gpt-4
+dark-mode: true
+auto-commits: true
+# foreign preservation test
+foreignKey:
+  nested: keep
+  value: 123

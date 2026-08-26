@@ -6,7 +6,7 @@ customField = "custom-value"
 [model_providers.custom]
 name = "Custom"
 base_url = "https://gateway.example.com/v1"
-env_key = "CUSTOM_API_KEY"
+env_key = "CUSTOM_API_KEY" # fake sk-fake-custom
 
 [foreignSection]
 keep = true

@@ -1,0 +1,24 @@
+{
+  "_provenance": "source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake- mcp variant",
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-5",
+  "mcp": {
+    "local-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+      "enabled": true
+    },
+    "remote-server": {
+      "type": "remote",
+      "url": "https://mcp.example.com/mcp",
+      "enabled": true
+    }
+  },
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com/v1"
+      }
+    }
+  }
+}

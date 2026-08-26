@@ -1,15 +1,15 @@
 {
+  "_provenance": "source=docs/harness-configs/opencode.md last_verified=2026-08-25 sanitized fake sk-fake- current",
   "$schema": "https://opencode.ai/config.json",
   "model": "anthropic/claude-sonnet-4-5",
   "small_model": "anthropic/claude-haiku-4-5",
   "share": "manual",
   "autoupdate": false,
-  "disabled_providers": [],
   "provider": {
     "anthropic": {
       "options": {
         "baseURL": "https://api.anthropic.com/v1",
-        "apiKey": "sk-fake-anthropic-123456"
+        "apiKey": "sk-fake-current-2222"
       },
       "models": {
         "claude-sonnet-4-5": {

@@ -1,0 +1,9 @@
+{
+  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake- legacy mcp",
+  "mcpServers": {
+    "old-server": {
+      "command": "node",
+      "args": ["/old/path/index.js"]
+    }
+  }
+}

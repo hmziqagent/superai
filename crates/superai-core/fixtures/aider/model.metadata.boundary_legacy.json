@@ -1,0 +1,12 @@
+{
+  "_provenance": "source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- legacy metadata",
+  "openai/gpt-4": {
+    "max_tokens": "sk-fake-4096",
+    "max_input_tokens": "sk-fake-8192",
+    "max_output_tokens": "sk-fake-4096",
+    "input_cost_per_token": "sk-fake-0.00003",
+    "output_cost_per_token": "sk-fake-0.00006",
+    "litellm_provider": "openai",
+    "mode": "chat"
+  }
+}

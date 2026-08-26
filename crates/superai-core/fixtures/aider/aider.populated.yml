@@ -1,6 +1,7 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake-
 model: openrouter/anthropic/claude-sonnet-4
 dark-mode: true
 auto-commits: false
-map-tokens: 2048
+map-tokens: 2048 # fake sk-fake-map
 edit-format: diff
 weak-model: gpt-4o-mini

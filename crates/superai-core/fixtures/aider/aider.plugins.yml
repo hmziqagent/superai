@@ -1,0 +1,6 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- plugins variant
+model: gpt-4
+dark-mode: true
+# plugins not native but test unknown preservation
+pluginEnabled: true
+extraField: keep-me

@@ -1,0 +1,14 @@
+# Provenance: source=docs/harness-configs/aider.md last_verified=2026-08-25 sanitized fake sk-fake- current
+# Current boundary: openrouter model, edit-format, weak-model
+model: openrouter/anthropic/claude-sonnet-4
+dark-mode: false
+auto-commits: false
+map-tokens: 2048 # fake sk-fake-map
+edit-format: diff
+weak-model: gpt-4o-mini
+cache-prompts: true
+reasoning-effort: high
+# unmodelled
+customField: preserve-me
+unknownTopLevel:
+  nested: value

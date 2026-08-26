@@ -1,0 +1,16 @@
+# Provenance: source=docs/harness-configs/codex-cli.md last_verified=2026-08-25 sanitized fake sk-fake- mcp variant
+model = "gpt-5.5"
+model_provider = "openai"
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+env = { API_KEY = "sk-fake-mcp-2222" }
+
+[mcp_servers.remote_example]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "MCP_TOKEN" # fake sk-fake-mcp-token
+
+[mcp_servers.my_server]
+command = "node"
+args = ["server.js"]

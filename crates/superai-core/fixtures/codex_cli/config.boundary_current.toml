@@ -1,3 +1,5 @@
+# Provenance: source=docs/harness-configs/codex-cli.md last_verified=2026-08-25 sanitized fake sk-fake- current
+# Current schema boundary: relocated-root, profile files $CODEX_HOME/<name>.config.toml, wire_api="responses"
 model = "gpt-5.5"
 model_provider = "openai"
 model_reasoning_effort = "high"
@@ -13,3 +15,8 @@ wire_api = "responses"
 [mcp_servers.context7]
 command = "npx"
 args = ["-y", "@upstash/context7-mcp"]
+env = { CTX7_KEY = "sk-fake-ctx7-1111" }
+
+# foreign preservation
+customField = "preserve-me"
+unknownTopLevel = "keep"

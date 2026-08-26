@@ -1,0 +1,17 @@
+{
+  "_provenance": "source=docs/harness-configs/cline.md last_verified=2026-08-25 sanitized fake sk-fake- mcp variant",
+  "apiProvider": "openai-compatible",
+  "openAiBaseUrl": "http://localhost:4000/v1",
+  "openAiApiKey": "sk-fake-mcp-3333",
+  "mcp": {
+    "mcpServers": {
+      "context7": {
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+        "env": {
+          "API_KEY": "sk-fake-ctx7-4444"
+        }
+      }
+    }
+  }
+}

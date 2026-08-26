@@ -1,0 +1,32 @@
+{
+  "_provenance": "source=docs/harness-configs/claude-code.md last_verified=2026-08-25 sanitized fake sk-fake- mcp variant",
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "sonnet",
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {
+        "CTX7_API_KEY": "sk-fake-ctx7-9999"
+      }
+    },
+    "linear": {
+      "command": "node",
+      "args": ["/path/to/build/index.js"],
+      "env": {
+        "LINEAR_API_KEY": "sk-fake-linear-8888"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "remote-sse": {
+      "url": "https://mcp.example.com/sse",
+      "type": "sse"
+    }
+  },
+  "enableAllProjectMcpServers": true,
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://gateway.example.com",
+    "ANTHROPIC_API_KEY": "sk-fake-mcp-7777"
+  }
+}

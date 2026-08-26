@@ -1,0 +1,36 @@
+{
+  "_provenance": "source=docs/harness-configs/claude-code.md last_verified=2026-08-25 sanitized fake sk-fake- boundary current",
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "sonnet",
+  "fallbackModel": "haiku",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+    "ANTHROPIC_MODEL": "sonnet",
+    "ANTHROPIC_API_KEY": "sk-fake-claude-current-2222",
+    "CLAUDE_CODE_USE_BEDROCK": "0"
+  },
+  "permissions": {
+    "allow": ["Bash(npm run lint *)", "Read(./src/**)"],
+    "deny": ["Read(./.env)"],
+    "defaultMode": "default"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo pre-tool"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": ["my-plugin@1.0.0"],
+  "statusLine": {
+    "type": "command",
+    "command": "echo status"
+  },
+  "alwaysThinkingEnabled": false
+}

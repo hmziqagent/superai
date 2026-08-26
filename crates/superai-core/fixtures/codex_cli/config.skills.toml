@@ -1,0 +1,12 @@
+# Provenance: source=docs/harness-configs/codex-cli.md last_verified=2026-08-25 sanitized fake sk-fake- skills variant
+model = "gpt-5.5"
+model_provider = "openai"
+
+# skills are separate SKILL.md files, but config may reference them
+# foreign keys must be preserved
+custom_skills_path = "/tmp/skills"
+extraUnknown = [1, 2, 3]
+
+[mcp_servers.example]
+command = "node"
+args = ["skill-server.js"]
