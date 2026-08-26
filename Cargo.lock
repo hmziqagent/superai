@@ -137,6 +137,7 @@ dependencies = [
  "superai-config",
  "thiserror",
  "toml_edit",
+ "yaml_serde",
 ]
 
 [[package]]

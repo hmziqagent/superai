@@ -7,6 +7,8 @@ pub mod adapter;
 /// Concrete harness adapters.
 pub mod adapters;
 mod capability;
+/// Capability resolver — harness/provider matrix.
+pub mod capability_resolver;
 /// Discovery, adoption, and drift reporting.
 pub mod discovery;
 mod error;
@@ -21,6 +23,8 @@ pub mod lifecycle;
 pub mod operation;
 /// Validated path and executable reference types.
 pub mod paths;
+/// Provider definitions — data-driven.
+pub mod provider;
 mod registry;
 /// Lifecycle and ownership states.
 pub mod state;
