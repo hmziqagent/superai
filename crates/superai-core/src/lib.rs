@@ -2,6 +2,8 @@
 //!
 //! Exposes capabilities upward; harness identity stays below this line.
 
+/// QAL-10/11 secret and path abuse verification.
+pub mod abuse;
 /// Harness adapter trait and supporting types.
 pub mod adapter;
 /// Concrete harness adapters.

@@ -708,6 +708,12 @@ impl OwnedPatch {
                 reason: "selector must not be empty".to_owned(),
             });
         }
+        if self.selector.contains("..") {
+            return Err(CoreError::Validation {
+                field: "patches.selector".to_owned(),
+                reason: format!("selector must not contain '..': `{}`", self.selector),
+            });
+        }
         // Parse via superai-config's typed Selector to ensure syntax is valid.
         superai_config::document::Selector::parse(&self.selector).map_err(|e| {
             CoreError::Validation {

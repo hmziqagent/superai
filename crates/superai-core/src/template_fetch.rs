@@ -217,6 +217,15 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
             reason: format!("url must be https://, got `{url}`"),
         });
     }
+    // Reject private / loopback hosts (QAL-11: redirect to private)
+    if let Some(host) = extract_host(url)
+        && is_private_host(&host)
+    {
+        return Err(TemplateFetchError::InvalidUrl {
+            template: context.to_owned(),
+            reason: format!("url host `{host}` is private or loopback, rejected: `{url}`"),
+        });
+    }
     // Reject obvious traversal in URL path.
     if url.contains("/../") || url.contains("/./") || url.ends_with("/..") {
         return Err(TemplateFetchError::InvalidUrl {
@@ -225,6 +234,44 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
         });
     }
     Ok(())
+}
+
+fn extract_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    let host_port = rest.get(0..end)?;
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    Some(host.to_ascii_lowercase())
+}
+
+fn is_private_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    if h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0" {
+        return true;
+    }
+    if h.starts_with("10.") {
+        return true;
+    }
+    if h.starts_with("192.168.") {
+        return true;
+    }
+    if h.starts_with("169.254.") {
+        return true;
+    }
+    if h.starts_with("172.") {
+        let parts: Vec<&str> = h.split('.').collect();
+        if let Some(second_str) = parts.get(1)
+            && let Ok(second) = second_str.parse::<u8>()
+            && (16..=31).contains(&second)
+        {
+            return true;
+        }
+    }
+    // IPv6 private / loopback
+    if h.starts_with("fc") || h.starts_with("fd") || h == "::1" {
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

@@ -382,13 +382,56 @@ pub fn run_version_probe(executable: &str, args: &[String], opts: &ExecuteOpts) 
     extract_version(&combined)
 }
 
+/// Strip ANSI escape sequences (CSI `ESC[...m`, OSC `ESC]...BEL`, etc.)
+///
+/// Malicious version output may contain escape sequences to hide or inject
+/// content; they must not appear in the extracted version.
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if n.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\x07' {
+                            break;
+                        }
+                        if n == '\x1b' && chars.peek().copied() == Some('\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if c != '\x07' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Extract the first version-like token from text.
 ///
 /// Looks for `X.Y.Z` or `vX.Y.Z` patterns. Falls back to the first non-empty
 /// line trimmed to 64 chars if no semver pattern is found (still useful for
 /// probes that emit non-semver strings like `claude-code 1.2.3 (build abc)`).
 pub fn extract_version(text: &str) -> Option<String> {
-    let trimmed = text.trim();
+    let stripped = strip_ansi_escapes(text);
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }

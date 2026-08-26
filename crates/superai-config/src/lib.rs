@@ -4,6 +4,8 @@
 //! keys superai does not model. Nothing is cached: the harness, an editor, or a
 //! synced folder can change these files between two calls.
 
+/// QAL-10/11 secret and path abuse verification.
+pub mod abuse;
 /// Atomic commit utilities.
 pub mod atomic;
 /// Backup catalog and verification.
