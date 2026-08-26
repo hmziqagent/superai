@@ -7,8 +7,10 @@
 mod backup;
 pub mod document;
 mod error;
-/// JSON configs, key order preserved.
+/// Strict JSON configs, key order preserved.
 pub mod json;
+/// JSONC configs (comments + trailing commas), normalized on write.
+pub mod jsonc;
 /// TOML configs, comments and formatting preserved.
 pub mod toml_file;
 

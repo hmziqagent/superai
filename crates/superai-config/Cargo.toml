@@ -12,6 +12,7 @@ repository.workspace = true
 description = "Layer 1: per-harness config files — read fresh, edit, back up, write back preserving unmodelled keys."
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 toml_edit = { workspace = true }
 thiserror = { workspace = true }
