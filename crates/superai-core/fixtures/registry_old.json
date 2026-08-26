@@ -1,0 +1,23 @@
+{
+  "instances": [
+    {
+      "name": "work",
+      "harness": "claude-code",
+      "config_dir": "/home/user/.claude-work",
+      "binary_path": "/usr/local/bin/claude",
+      "template": {
+        "name": "claude-glm",
+        "version": "1.2.0"
+      }
+    },
+    {
+      "name": "personal",
+      "harness": "codex-cli",
+      "config_dir": "/home/user/.codex-personal"
+    }
+  ],
+  "foreign_key": "preserve-me",
+  "another_foreign": {
+    "keep": true
+  }
+}

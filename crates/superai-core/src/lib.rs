@@ -17,5 +17,5 @@ pub mod state;
 
 pub use capability::{Capability, Support};
 pub use error::{CoreError, Result};
-pub use instance::{Instance, TemplateRef};
-pub use registry::{Registry, unmanaged_dirs};
+pub use instance::{Instance, TemplateRef, WrapperRef};
+pub use registry::{Registry, SCHEMA_VERSION, unmanaged_dirs};

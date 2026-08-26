@@ -33,7 +33,7 @@ fn run() -> superai_core::Result<()> {
             "{}  {}  {}  {}",
             instance.name,
             instance.harness,
-            instance.config_dir.display(),
+            instance.config_root.as_path().display(),
             template
         );
     }

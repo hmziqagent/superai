@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "instances": [
+    {
+      "id": "legacy-1a2b3c4d5e6f7890",
+      "name": "work",
+      "harness": "claude-code",
+      "config_root": "/home/user/.claude-work",
+      "binary": "claude",
+      "wrapper": {
+        "path": "/home/user/.local/bin/work",
+        "command_name": "work",
+        "generator_version": "0.1.0",
+        "content_digest": "abc123def456"
+      },
+      "isolation": "relocated_root",
+      "origin": "created",
+      "ownership": "superai_created",
+      "template": {
+        "name": "claude-glm",
+        "version": "1.2.0"
+      },
+      "created_at": "2026-08-26T12:00:00Z",
+      "adapter_revision": "0.1.0"
+    },
+    {
+      "id": "legacy-0f9e8d7c6b5a4321",
+      "name": "personal",
+      "harness": "codex-cli",
+      "config_root": "/home/user/.codex-personal",
+      "isolation": "unknown",
+      "origin": "adopted_legacy",
+      "ownership": "explicitly_adopted",
+      "created_at": "2026-08-26T12:00:01Z",
+      "adapter_revision": "0.1.0"
+    }
+  ],
+  "foreign_key": "preserve-me",
+  "another_foreign": {
+    "keep": true
+  }
+}
