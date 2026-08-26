@@ -11,7 +11,7 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 |---|---|---|
 | Claude Code | [claude-code.md](claude-code.md) | `CLAUDE_CONFIG_DIR` |
 | Codex CLI (OpenAI) | [codex-cli.md](codex-cli.md) | `CODEX_HOME` (+ `$NAME.config.toml` profiles ≥0.134) |
-| Gemini CLI (Google) | [gemini-cli.md](gemini-cli.md) | `GEMINI_CLI_HOME` |
+| Gemini CLI (Google) | [gemini-cli.md](gemini-cli.md) | ⚠️ **Retired 2026-06-18** for AI Pro/Ultra/free Code Assist; enterprise licences still served. `GEMINI_CLI_HOME`. Successor: [antigravity-cli.md](antigravity-cli.md) |
 | Antigravity CLI (`agy`, Google) | [antigravity-cli.md](antigravity-cli.md) | none documented — `$HOME` swap workaround |
 | OpenCode (Anomaly) | [opencode.md](opencode.md) | `OPENCODE_CONFIG` (layer) / `XDG_CONFIG_HOME` (full incl. auth.json) |
 | Crush (Charmbracelet) | [crush.md](crush.md) | per-project `crush.json`/crushrc + XDG dirs |
@@ -24,7 +24,8 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 | Mistral Vibe | [mistral-vibe.md](mistral-vibe.md) | `VIBE_HOME` |
 | iFlow CLI | [iflow-cli.md](iflow-cli.md) | Gemini-fork lineage — see file |
 | Warp Agent Mode | [warp.md](warp.md) | GUI-bound; honest limits documented |
-| Amazon Q Developer CLI | [amazon-q-cli.md](amazon-q-cli.md) | `AWS_PROFILE` + `--agent` contexts |
+| Amazon Q Developer CLI | [amazon-q-cli.md](amazon-q-cli.md) | ⚠️ **Sunsetting** — new signups blocked 2026-05-15, EOS 2027-04-30. Superseded by [kiro.md](kiro.md) |
+| Kiro CLI (AWS) | [kiro.md](kiro.md) | `KIRO_HOME` + AWS credential vars. No BYO endpoint |
 | GitHub Copilot CLI | [copilot-cli.md](copilot-cli.md) | `COPILOT_HOME` + `COPILOT_GITHUB_TOKEN` (GA BYOK via `COPILOT_PROVIDER_BASE_URL`) |
 | Junie CLI (JetBrains) | [junie-cli.md](junie-cli.md) | `JUNIE_HOME` (BYOK + credits both supported) |
 | Forge (ForgeCode) | [forge.md](forge.md) | `FORGE_CONFIG` dir switch |
@@ -47,6 +48,7 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 | Windsurf | [windsurf.md](windsurf.md) | no env override — `--user-data-dir` IDE isolation; managed-backend limits documented |
 | Auggie (Augment) | [auggie.md](auggie.md) | proprietary context engine; headless `--print` |
 | Hermes Agent (Nous) | [hermes-agent.md](hermes-agent.md) | `HERMES_HOME` + `--profile`; local-install-verified `[L]` tags |
+| OpenClaw | [openclaw.md](openclaw.md) | `OPENCLAW_HOME` / `OPENCLAW_CONFIG_PATH`. Daemon, so instances mean running services |
 
 ### Self-hosted / cloud platforms & frameworks
 | Harness | File | Wrapper notes |
@@ -59,7 +61,7 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 
 ## Universal patterns (the cheat-sheet)
 
-1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`. Relocate → run its auth flow once → you have an independent instance.
+1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`. Relocate → run its auth flow once → you have an independent instance.
 2. **Env beats config for providers** almost everywhere: every harness that speaks OpenAI-compatible takes `<PROVIDER>_API_KEY` + some base-URL override (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `COPILOT_PROVIDER_BASE_URL`, `OPENROUTER_API_KEY`…). Wrappers just export different values before `exec`.
 3. **Anthropic-compatible endpoints are a de-facto standard too** — Claude Code (`ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN`), Kimi Code (`anthropic` provider with custom `base_url`), Crush/Kilo/Cline ("anthropic" provider type) all repoint at GLM/OpenRouter-style Anthropic-format gateways.
 4. **Inline config injection** where supported: Codex `CODEX_CONFIG`, Grok `GROK_CONFIG` (JSON deep-merge), OpenCode `OPENCODE_CONFIG_CONTENT`, Amp `AMP_SETTINGS_FILE`, Nanocoder `NANOCODER_PROVIDERS_FILE`.
