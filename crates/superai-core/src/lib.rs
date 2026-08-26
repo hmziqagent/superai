@@ -44,3 +44,6 @@ pub mod template;
 pub mod template_fetch;
 /// Three-way template update and transactional apply (TPL-06, TPL-07).
 pub mod template_update;
+
+/// Skill registry, acquisition, destination modes, enable/disable and drift (EXT-01..05).
+pub mod skills;

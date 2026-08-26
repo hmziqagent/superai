@@ -572,6 +572,10 @@ impl Adapter for AiderAdapter {
             }),
         }
     }
+
+    fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
+        vec![crate::adapter::SkillMode::CopySelected]
+    }
 }
 
 #[cfg(test)]

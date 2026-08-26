@@ -847,6 +847,13 @@ impl Adapter for ClineAdapter {
             }),
         }
     }
+
+    fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
+        vec![
+            crate::adapter::SkillMode::LinkSelected,
+            crate::adapter::SkillMode::CopySelected,
+        ]
+    }
 }
 
 #[cfg(test)]

@@ -492,6 +492,33 @@ impl WrapperPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Skill destination modes
+// ---------------------------------------------------------------------------
+
+/// How a skill reaches an instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillMode {
+    /// Destination points to registry root (symlink/shallow).
+    LinkAll,
+    /// Destination contains links to chosen skill directories.
+    LinkSelected,
+    /// Destination owns copies of chosen skill directories.
+    CopySelected,
+}
+
+impl fmt::Display for SkillMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::LinkAll => "link_all",
+            Self::LinkSelected => "link_selected",
+            Self::CopySelected => "copy_selected",
+        };
+        f.write_str(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adapter trait
 // ---------------------------------------------------------------------------
 
@@ -545,6 +572,11 @@ pub trait Adapter: Send + Sync + fmt::Debug {
 
     /// Validate that an instance record is coherent for this harness.
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError>;
+
+    /// Which skill destination modes this harness supports.
+    fn supported_skill_modes(&self) -> Vec<SkillMode> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +773,20 @@ impl Adapter for GenericAdapter {
         }
         instance.validate()?;
         Ok(())
+    }
+
+    fn supported_skill_modes(&self) -> Vec<SkillMode> {
+        match self.support {
+            AdapterSupport::Full | AdapterSupport::Constrained => {
+                vec![
+                    SkillMode::LinkAll,
+                    SkillMode::LinkSelected,
+                    SkillMode::CopySelected,
+                ]
+            }
+            AdapterSupport::SingleInstance => vec![SkillMode::CopySelected],
+            _ => Vec::new(),
+        }
     }
 }
 

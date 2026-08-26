@@ -6,12 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::adapter::{Adapter, GenericAdapter, ProductStatus};
+use crate::adapter::{Adapter, GenericAdapter, ProductStatus, SkillMode};
 use crate::adapters::aider::AiderAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
+use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
 
@@ -44,7 +45,7 @@ pub struct CatalogEntry {
 
 impl CatalogEntry {
     /// Validate that the id is a legal [`HarnessId`].
-    pub fn validate_id(&self) -> Result<HarnessId, crate::error::CoreError> {
+    pub fn validate_id(&self) -> Result<HarnessId, CoreError> {
         HarnessId::new(self.id)
     }
 }
@@ -670,6 +671,85 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
 /// Convenience: adapter ids as strings.
 pub fn all_ids() -> Vec<&'static str> {
     ENTRIES.iter().map(|entry| entry.id).collect()
+}
+
+/// Whether the harness supports skill registry workflows.
+///
+/// Only harnesses with `Full`, `Constrained`, or `SingleInstance` support
+/// are considered skill-capable; others are read-only or blocked.
+pub fn supports_skills(harness_id: &str) -> bool {
+    match find_by_id(harness_id) {
+        Some(entry) => matches!(
+            entry.support,
+            AdapterSupport::Full | AdapterSupport::Constrained | AdapterSupport::SingleInstance
+        ),
+        None => false,
+    }
+}
+
+/// Skill modes available for a harness, derived from its adapter support.
+///
+/// Returns empty for unknown or unsupported harnesses.
+pub fn skill_modes_for(harness_id: &str) -> Vec<SkillMode> {
+    match find_by_id(harness_id) {
+        Some(entry) => match entry.support {
+            AdapterSupport::Full | AdapterSupport::Constrained => {
+                vec![
+                    SkillMode::LinkAll,
+                    SkillMode::LinkSelected,
+                    SkillMode::CopySelected,
+                ]
+            }
+            AdapterSupport::SingleInstance => vec![SkillMode::CopySelected],
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    }
+}
+
+/// All harness ids that support at least one skill mode.
+pub fn all_skill_supported_ids() -> Vec<&'static str> {
+    ENTRIES
+        .iter()
+        .filter(|entry| supports_skills(entry.id))
+        .map(|entry| entry.id)
+        .collect()
+}
+
+/// Verify that catalog skill support is consistent with adapter `supported_skill_modes`.
+///
+/// For every catalog entry, the catalog helper `skill_modes_for` must agree
+/// with the live adapter's `supported_skill_modes`. This catches ledger drift.
+pub fn verify_skill_support_consistency() -> Result<(), CoreError> {
+    for entry in ENTRIES {
+        let catalog_modes = skill_modes_for(entry.id);
+        let adapters = all_adapters();
+        let adapter = adapters
+            .iter()
+            .find(|adapter| adapter.id().as_str() == entry.id);
+        if let Some(adapter) = adapter {
+            let live_modes = adapter.supported_skill_modes();
+            // Compare as sets (order independent)
+            let mut cat_set = std::collections::BTreeSet::new();
+            let mut live_set = std::collections::BTreeSet::new();
+            for mode in catalog_modes {
+                cat_set.insert(mode.to_string());
+            }
+            for mode in live_modes {
+                live_set.insert(mode.to_string());
+            }
+            if cat_set != live_set {
+                return Err(CoreError::Validation {
+                    field: "skill_support".to_owned(),
+                    reason: format!(
+                        "catalog vs adapter skill mode mismatch for `{}`: catalog {:?} vs adapter {:?}",
+                        entry.id, cat_set, live_set
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

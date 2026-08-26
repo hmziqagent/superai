@@ -573,6 +573,14 @@ impl Adapter for ClaudeCodeAdapter {
             }),
         }
     }
+
+    fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
+        vec![
+            crate::adapter::SkillMode::LinkAll,
+            crate::adapter::SkillMode::LinkSelected,
+            crate::adapter::SkillMode::CopySelected,
+        ]
+    }
 }
 
 #[cfg(test)]

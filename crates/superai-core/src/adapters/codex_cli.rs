@@ -605,6 +605,13 @@ impl Adapter for CodexCliAdapter {
             }),
         }
     }
+
+    fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
+        vec![
+            crate::adapter::SkillMode::LinkSelected,
+            crate::adapter::SkillMode::CopySelected,
+        ]
+    }
 }
 
 /// Determine if version is in profile era (>=0.134.0).
