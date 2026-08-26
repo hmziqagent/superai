@@ -37,7 +37,7 @@ A template carries:
 
 Templates update. When GLM ships a new model I update the template, and every instance built from it shows *"new version available"* — with a diff of what actually changed in the defaults, so a bumped context window or a swapped default model is visible before I accept it. Updating is my choice per instance, never automatic.
 
-Templates are **not baked into the binary** — a new GLM model must not require shipping a superai release. For now they live in a GitHub repo that superai fetches. How they are distributed properly is still open; that they are separate from the binary is not.
+Templates are **not baked into the binary** — a new GLM model must not require shipping a superai release. They live in a GitHub repo and superai downloads the files directly from it. No registry, no server, no packaging step: update the repo, and every instance built from that template sees the new version.
 
 ## Capabilities
 
@@ -85,7 +85,7 @@ What superai takes from it is the design: mirror-then-isolate instance creation,
 
 1. **Config** — per-harness, version-aware. Owns each harness's schema, paths, and migrations across breaking changes.
 2. **Core** — instances, templates, capabilities, skills, install, backups, mutation. Exposes capabilities upward, never harness identity.
-3. **Interface** — pluggable. GPUI, TUI, CLI — whichever comes first is a later decision, so no interface types leak below this layer.
+3. **Interface** — GPUI first, TUI and CLI after. Pluggable, so no interface types leak below this layer.
 
 ## Order of work
 
@@ -93,7 +93,7 @@ What superai takes from it is the design: mirror-then-isolate instance creation,
 
 **Then the rest of core:** instances, templates and their versioning, capabilities, install and uninstall.
 
-**Interface last, and only then.** Which toolkit it is can be decided when there is something to put behind it. A GUI over a half-working config layer is worth nothing, and picking the toolkit early only invites its types to leak downward.
+**Interface last, and only then.** GPUI, but it does not matter until core works. A GUI over a half-working config layer is worth nothing.
 
 ## Routing
 
