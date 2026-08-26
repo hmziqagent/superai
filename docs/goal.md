@@ -85,9 +85,15 @@ What superai takes from it is the design: mirror-then-isolate instance creation,
 
 1. **Config** — per-harness, version-aware. Owns each harness's schema, paths, and migrations across breaking changes.
 2. **Core** — instances, templates, capabilities, skills, install, backups, mutation. Exposes capabilities upward, never harness identity.
-3. **Interface** — pluggable. GPUI first, TUI and CLI later, so no interface types leak below this layer.
+3. **Interface** — pluggable. GPUI, TUI, CLI — whichever comes first is a later decision, so no interface types leak below this layer.
 
-The interface ships **last**. Complete parsing and a correct core come first; a GUI over a half-working config layer is worth nothing.
+## Order of work
+
+**First, the filesystem layer, until it is boring.** Create, edit, remove, back up, restore — on real harness config files, round-tripping every key superai doesn't model. Same bar for skills: install, update, remove, symlink the registry, symlink one skill, copy one skill. Not "works on my machine on Claude Code" — stable, correct, and tested across harnesses.
+
+**Then the rest of core:** instances, templates and their versioning, capabilities, install and uninstall.
+
+**Interface last, and only then.** Which toolkit it is can be decided when there is something to put behind it. A GUI over a half-working config layer is worth nothing, and picking the toolkit early only invites its types to leak downward.
 
 ## Routing
 
