@@ -2170,7 +2170,7 @@ mod tests {
     #[test]
     fn check_update_incompatible_via_network_fetch() {
         // Create a temp repo with catalog and two templates where latest has incompatible harness_version_req
-        let dir = std::env::temp_dir().join(format!("superai-tpl-incompat-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("tpl");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("claude-glm")).unwrap();
@@ -2254,8 +2254,7 @@ mod tests {
     #[test]
     fn check_update_via_file_repo_update_available() {
         // Similar setup but compatible version should be UpdateAvailable
-        let dir =
-            std::env::temp_dir().join(format!("superai-tpl-available-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("tpl");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(dir.join("claude-glm")).unwrap();
 

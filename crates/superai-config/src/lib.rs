@@ -30,6 +30,9 @@ pub mod transaction;
 /// YAML configs, validation and normalized write.
 pub mod yaml;
 
+#[cfg(test)]
+mod test_util;
+
 pub use atomic::{atomic_write, atomic_write_with_expected_digest, atomic_write_with_snapshot};
 pub use backup::{
     BackupEntry, BackupId, RestoreReport, backup, backup_with_operation, backup_with_reason,

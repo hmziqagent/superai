@@ -710,8 +710,7 @@ mod tests {
 
     #[test]
     fn plan_checks_writable_destination() {
-        let tmp =
-            std::env::temp_dir().join(format!("superai-plan-writable-{}", std::process::id()));
+        let tmp = crate::test_util::temp_dir_unique("plan");
         drop(fs::remove_dir_all(&tmp));
         fs::create_dir_all(&tmp).unwrap();
         let entry = minimal_entry("test-harness", &["any"], &["any"]);
@@ -723,7 +722,7 @@ mod tests {
         assert_eq!(plan.expected_executable, tmp.join("my-exe"));
 
         // Non-writable destination (remove write bits)
-        let ro_dir = std::env::temp_dir().join(format!("superai-plan-ro-{}", std::process::id()));
+        let ro_dir = crate::test_util::temp_dir_unique("plan");
         drop(fs::remove_dir_all(&ro_dir));
         fs::create_dir_all(&ro_dir).unwrap();
         let mut perms = fs::metadata(&ro_dir).unwrap().permissions();

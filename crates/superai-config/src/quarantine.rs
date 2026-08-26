@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn move_to_quarantine_and_restore_file() {
         let op = unique_op("move-file");
-        let src = std::env::temp_dir().join(format!("superai-quarantine-src-{op}"));
+        let src = crate::test_util::temp_dir_unique("quarantine-src").join(&op);
         std::fs::write(&src, b"quarantine content").unwrap();
 
         let entry = move_to_quarantine(&src, &op).unwrap();
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn move_to_quarantine_and_restore_directory() {
         let op = unique_op("move-dir");
-        let src = std::env::temp_dir().join(format!("superai-quarantine-dir-{op}"));
+        let src = crate::test_util::temp_dir_unique("quarantine-dir").join(&op);
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("file.txt"), b"hello").unwrap();
         std::fs::write(src.join("sub").join("nested.txt"), b"nested").unwrap();
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn quarantine_reports_recoverability_and_retention() {
         let op = unique_op("report");
-        let src = std::env::temp_dir().join(format!("superai-quarantine-report-{op}"));
+        let src = crate::test_util::temp_dir_unique("quarantine-report").join(&op);
         std::fs::write(&src, b"report test").unwrap();
         let entry = move_to_quarantine(&src, &op).unwrap();
         let report = entry.recoverability_report();

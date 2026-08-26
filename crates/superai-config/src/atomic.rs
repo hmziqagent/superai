@@ -450,7 +450,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("superai-config-atomic-tests");
+        let dir = crate::test_util::temp_dir_unique("config-atomic");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn atomic_write_rejects_directory() {
-        let dir = std::env::temp_dir().join("superai-config-atomic-dir-test2");
+        let dir = crate::test_util::temp_dir_unique("config-atomic");
         std::fs::create_dir_all(&dir).unwrap();
         let res = atomic_write(&dir, b"data");
         assert!(res.is_err());

@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn file_driven_matrix_data_only() {
-        let dir = std::env::temp_dir().join(format!("superai-cap-test-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("cap");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("matrix.json");
         let json = r#"[

@@ -1424,17 +1424,7 @@ mod tests {
     use super::*;
 
     fn tmp_root() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "superai-txn-tests-{millis}-{count}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_util::temp_dir_unique("txn")
     }
 
     #[test]

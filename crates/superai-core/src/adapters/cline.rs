@@ -1298,7 +1298,7 @@ mod tests {
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::json::load(&path).unwrap();
         assert!(original.contains_key("foreignKey") || original.contains_key("unknownTopLevel"));
-        let dir = std::env::temp_dir().join("superai-cline-foreign-test");
+        let dir = crate::test_util::temp_dir_unique("cline");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("settings.foreign.copy.json");
         std::fs::copy(&path, &tmp).unwrap();
@@ -1339,7 +1339,7 @@ mod tests {
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::json::load(&path).unwrap();
         assert!(original.contains_key("foreignKey") || original.contains_key("unknownTopLevel"));
-        let dir = std::env::temp_dir().join("superai-cline-prov-foreign");
+        let dir = crate::test_util::temp_dir_unique("cline");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("providers.foreign.copy.json");
         std::fs::copy(&path, &tmp).unwrap();
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn unknown_key_preservation_via_edit() {
-        let dir = std::env::temp_dir().join("superai-cline-preserve-test");
+        let dir = crate::test_util::temp_dir_unique("cline");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.json");
         let original_json = serde_json::json!({
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn provider_mutation_sets_api_provider_and_mcp() {
-        let dir = std::env::temp_dir().join("superai-cline-provider-test");
+        let dir = crate::test_util::temp_dir_unique("cline");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("provider.json");
         let initial = serde_json::json!({
@@ -1446,7 +1446,7 @@ mod tests {
 
     #[test]
     fn clinerules_text_fragment_is_preserved() {
-        let dir = std::env::temp_dir().join("superai-cline-rules-test");
+        let dir = crate::test_util::temp_dir_unique("cline");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".clinerules");
         let content = "# Cline Rules\n- Always use English\n";

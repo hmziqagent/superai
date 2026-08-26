@@ -1015,18 +1015,9 @@ pub fn redacted_diff(server: &McpServerDef) -> String {
 mod tests {
     use super::*;
     use crate::adapter::{ConfigScope, RestartBehavior};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_file(prefix: &str) -> PathBuf {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let c = C.fetch_add(1, Ordering::Relaxed);
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let p = std::env::temp_dir().join(format!("superai-mcp-test-{prefix}-{millis}-{c}.json"));
-        drop(std::fs::remove_file(&p));
-        p
+        crate::test_util::temp_dir_unique("mcp").join(format!("{prefix}-settings.json"))
     }
 
     fn decl() -> McpAdapterDecl {

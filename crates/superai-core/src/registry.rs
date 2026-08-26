@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_disk_keeping_foreign_keys() {
-        let path = std::env::temp_dir().join("superai-core-tests/registry_v1_foreign.json");
+        let path = crate::test_util::temp_dir_unique("registry").join("registry_v1_foreign.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Write a file with foreign keys and old-style instances key absent yet.
         std::fs::write(&path, r#"{"schema":7,"custom":"keep-me"}"#).unwrap();
@@ -1038,7 +1038,7 @@ mod tests {
     #[test]
     fn migration_from_old_vector_and_instances_key() {
         // Test bare array migration
-        let path = std::env::temp_dir().join("superai-core-tests/migration_bare.json");
+        let path = crate::test_util::temp_dir_unique("registry").join("migration_bare.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let old = vec![instance_legacy("work", "/home/u/.claude-work")];
         std::fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
         assert_eq!(reg.instances()[0].id, reg2.instances()[0].id);
 
         // Test object with instances key holding old shape
-        let path2 = std::env::temp_dir().join("superai-core-tests/migration_wrapped.json");
+        let path2 = crate::test_util::temp_dir_unique("registry").join("migration_wrapped.json");
         let wrapped = serde_json::json!({
             "instances": [ {
                 "name": "oldie",
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn unknown_enum_and_schema_failure_are_actionable() {
-        let path = std::env::temp_dir().join("superai-core-tests/unknown_enum.json");
+        let path = crate::test_util::temp_dir_unique("registry").join("unknown_enum.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Unknown isolation variant
         let bad = serde_json::json!({
@@ -1228,7 +1228,7 @@ mod tests {
             ],
             "foreign_key": "preserve-me"
         });
-        let path = std::env::temp_dir().join("superai-core-tests/golden_old.json");
+        let path = crate::test_util::temp_dir_unique("registry").join("golden_old.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&old_fixture).unwrap()).unwrap();
         let reg = Registry::load(&path).unwrap();
@@ -1273,7 +1273,7 @@ mod tests {
             ],
             "foreign_key": "preserve-me"
         });
-        let path2 = std::env::temp_dir().join("superai-core-tests/golden_new.json");
+        let path2 = crate::test_util::temp_dir_unique("registry").join("golden_new.json");
         std::fs::write(&path2, serde_json::to_string_pretty(&new_fixture).unwrap()).unwrap();
         let reg2 = Registry::load(&path2).unwrap();
         assert_eq!(reg2.instances().len(), 1);

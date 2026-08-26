@@ -1119,7 +1119,7 @@ mod tests {
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::jsonc::load(&path).unwrap();
         assert!(original.contains_key("foreignKey") || original.contains_key("unknownTopLevel"));
-        let dir = std::env::temp_dir().join("superai-opencode-foreign-test");
+        let dir = crate::test_util::temp_dir_unique("opencode");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("opencode.foreign.copy.json");
         std::fs::copy(&path, &tmp).unwrap();
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn unknown_key_preservation_via_preserve_order() {
-        let dir = std::env::temp_dir().join("superai-opencode-preserve-test");
+        let dir = crate::test_util::temp_dir_unique("opencode");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.json");
         let original_json = serde_json::json!({
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[test]
     fn provider_mutation_sets_model_and_provider() {
-        let dir = std::env::temp_dir().join("superai-opencode-provider-test");
+        let dir = crate::test_util::temp_dir_unique("opencode");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("provider.json");
         let initial = serde_json::json!({
@@ -1296,7 +1296,7 @@ mod tests {
 
     #[test]
     fn jsonc_stripping_allows_comments_and_trailing_commas() {
-        let dir = std::env::temp_dir().join("superai-opencode-jsonc-test");
+        let dir = crate::test_util::temp_dir_unique("opencode");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("opencode.jsonc");
         let content = r#"

@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn fetch_catalog_from_path_round_trip() {
-        let dir = std::env::temp_dir().join(format!("superai-tpl-catalog-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("tpl-fetch");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         let catalog = Catalog {
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn fetch_template_bytes_via_file_url() {
-        let dir = std::env::temp_dir().join(format!("superai-tpl-fetch-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("tpl-fetch");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(dir.join("claude-glm")).unwrap();
 
@@ -776,8 +776,7 @@ mod tests {
 
     #[test]
     fn fetch_rejects_traversal_path() {
-        let dir =
-            std::env::temp_dir().join(format!("superai-tpl-traversal-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("tpl-fetch");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("catalog.json");
@@ -816,7 +815,7 @@ mod tests {
 
     #[test]
     fn size_limit_enforced() {
-        let dir = std::env::temp_dir().join(format!("superai-tpl-size-{}", std::process::id()));
+        let dir = crate::test_util::temp_dir_unique("tpl-fetch");
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
         let huge = vec![b'a'; MAX_BYTES + 1];

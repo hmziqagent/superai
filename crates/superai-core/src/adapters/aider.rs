@@ -993,7 +993,7 @@ mod tests {
                 || original.contains_key("unknownTopLevel")
                 || original.contains_key("customField")
         );
-        let dir = std::env::temp_dir().join("superai-aider-foreign-test");
+        let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("aider.foreign.copy.yml");
         std::fs::copy(&path, &tmp).unwrap();
@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn unknown_key_preservation_via_yaml_edit() {
-        let dir = std::env::temp_dir().join("superai-aider-preserve-test");
+        let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.yml");
         let original = "model: gpt-4\nforeignKey: keep-me\ncustomField: 123\n";
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn provider_mutation_sets_model_and_env() {
-        let dir = std::env::temp_dir().join("superai-aider-provider-test");
+        let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let yml_path = dir.join("aider.yml");
         let env_path = dir.join(".env");
@@ -1190,7 +1190,7 @@ mod tests {
 
     #[test]
     fn yaml_comment_handling() {
-        let dir = std::env::temp_dir().join("superai-aider-yaml-comment");
+        let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("comment.yml");
         let content = "# Aider config\nmodel: gpt-4 # inline comment\ndark-mode: true\n";

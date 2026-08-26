@@ -524,13 +524,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "superai-provider-test-{name}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_util::temp_dir_unique(&format!("provider-{name}"))
     }
 
     fn single_provider_json(id: &str, base_url: &str) -> String {

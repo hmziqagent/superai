@@ -241,7 +241,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("superai-config-snapshot-tests");
+        let dir = crate::test_util::temp_dir_unique("config-snapshot");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }

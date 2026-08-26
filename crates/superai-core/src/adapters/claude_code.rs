@@ -987,7 +987,7 @@ mod tests {
         let original = superai_config::json::load(&path).unwrap();
         assert!(original.contains_key("foreignKey") || original.contains_key("unknownTopLevel"));
         // Simulate provider mutation: create a temp copy, edit owned selector, verify foreign keys survive.
-        let dir = std::env::temp_dir().join("superai-claude-foreign-test");
+        let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("settings.foreign.copy.json");
         std::fs::copy(&path, &tmp).unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn unknown_key_preservation_via_preserve_order() {
-        let dir = std::env::temp_dir().join("superai-claude-preserve-test");
+        let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.json");
         let original_json = serde_json::json!({
@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn provider_mutation_sets_base_url_and_model() {
-        let dir = std::env::temp_dir().join("superai-claude-provider-test");
+        let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("provider.json");
         let initial = serde_json::json!({
@@ -1125,7 +1125,7 @@ mod tests {
 
     #[test]
     fn provider_removal_clears_auth() {
-        let dir = std::env::temp_dir().join("superai-claude-provider-remove");
+        let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("remove.json");
         let initial = serde_json::json!({
@@ -1212,7 +1212,7 @@ mod tests {
     #[test]
     fn jsonc_stripping_allows_comments() {
         // Claude Code settings are JSONC-tolerant; ensure jsonc loader handles comments.
-        let dir = std::env::temp_dir().join("superai-claude-jsonc-test");
+        let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.jsonc");
         let content = r#"

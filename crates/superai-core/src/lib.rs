@@ -70,3 +70,6 @@ pub mod mcp;
 
 /// Plugin abstraction and lifecycle (EXT-06/07).
 pub mod plugin;
+
+#[cfg(test)]
+mod test_util;

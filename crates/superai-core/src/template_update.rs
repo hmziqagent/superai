@@ -1455,16 +1455,7 @@ mod tests {
     #[test]
     fn apply_success_advances_version_and_retains_old_on_failure() {
         // Prepare temp registry and config root
-        let tmp = std::env::temp_dir().join(format!(
-            "superai-tpl-apply-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ));
-        drop(std::fs::remove_dir_all(&tmp));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::test_util::temp_dir_unique("tpl-update");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-work");
         std::fs::create_dir_all(&config_root).unwrap();
@@ -1613,16 +1604,7 @@ mod tests {
 
     #[test]
     fn apply_failure_due_to_digest_retains_old() {
-        let tmp = std::env::temp_dir().join(format!(
-            "superai-tpl-digest-fail-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ));
-        drop(std::fs::remove_dir_all(&tmp));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::test_util::temp_dir_unique("tpl-update");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-digest");
         std::fs::create_dir_all(&config_root).unwrap();
@@ -1688,16 +1670,7 @@ mod tests {
     #[test]
     fn external_edit_between_preview_and_commit_aborts() {
         // This simulates concurrent modification detection via snapshot token
-        let tmp = std::env::temp_dir().join(format!(
-            "superai-tpl-concurrent-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ));
-        drop(std::fs::remove_dir_all(&tmp));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::test_util::temp_dir_unique("tpl-update");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-concurrent");
         std::fs::create_dir_all(&config_root).unwrap();

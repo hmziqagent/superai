@@ -328,7 +328,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("superai-config-tests-yaml");
+        let dir = crate::test_util::temp_dir_unique("config-yaml");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }

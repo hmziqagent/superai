@@ -1038,7 +1038,7 @@ mod tests {
             original_text.contains("foreignKey") || original_text.contains("customField"),
             "foreign fixture must contain custom keys"
         );
-        let dir = std::env::temp_dir().join("superai-codex-foreign-test");
+        let dir = crate::test_util::temp_dir_unique("codex");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("config.foreign.copy.toml");
         std::fs::copy(&path, &tmp).unwrap();
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn unknown_key_preservation_via_toml_edit() {
-        let dir = std::env::temp_dir().join("superai-codex-preserve-test");
+        let dir = crate::test_util::temp_dir_unique("codex");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.toml");
         let original =
@@ -1093,7 +1093,7 @@ mod tests {
 
     #[test]
     fn provider_mutation_sets_model_and_provider() {
-        let dir = std::env::temp_dir().join("superai-codex-provider-test");
+        let dir = crate::test_util::temp_dir_unique("codex");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("provider.toml");
         let initial = "model = \"gpt-4\"\nmodel_provider = \"openai\"\n";
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn provider_removal_clears_model() {
-        let dir = std::env::temp_dir().join("superai-codex-provider-remove");
+        let dir = crate::test_util::temp_dir_unique("codex");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("remove.toml");
         let initial = "model = \"gpt-4\"\nmodel_provider = \"openai\"\nopenai_base_url = \"https://old.example.com\"\n";
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn toml_comment_preservation() {
-        let dir = std::env::temp_dir().join("superai-codex-toml-comment");
+        let dir = crate::test_util::temp_dir_unique("codex");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("comment.toml");
         let content = "# Model selection\nmodel = \"gpt-4\" # inline comment\n# provider block\nmodel_provider = \"openai\"\n";

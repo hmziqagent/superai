@@ -3400,23 +3400,8 @@ mod tests {
     use crate::ids::{TemplateId, TemplateVersion};
     use crate::state::AdapterSupport;
 
-    #[expect(dead_code, reason = "helper for future tests")]
-    fn temp_root(name: &str) -> PathBuf {
-        let base = std::env::temp_dir().join("superai-lifecycle-tests");
-        let dir = base.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     fn unique_temp(prefix: &str) -> PathBuf {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let dir = std::env::temp_dir()
-            .join("superai-lifecycle-tests")
-            .join(format!("{prefix}-{millis}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_util::temp_dir_unique(prefix)
     }
 
     fn make_adapter(harness: &str) -> GenericAdapter {

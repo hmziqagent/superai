@@ -402,11 +402,13 @@ pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
 // Isolated filesystem helper (QAL-01)
 // ---------------------------------------------------------------------------
 
-/// Create a unique temporary directory for a test, parallel-safe.
+/// Create a unique temporary directory, parallel-safe (production helper).
 ///
 /// Uses `std::env::temp_dir` plus a nanosecond timestamp, pid, and `prefix`.
 /// Returns the path; caller is responsible for cleanup. Platform path handling
-/// is explicit; no global `HOME` mutation is performed.
+/// is explicit; no global `HOME` mutation is performed. Test code should
+/// prefer `crate::test_util::temp_dir_unique`, which also removes the
+/// directory on drop.
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -453,7 +455,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join("superai-verification-tests");
+        let dir = crate::test_util::temp_dir_unique("verification");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{prefix}-{now}-{pid}{suffix}"))
     }

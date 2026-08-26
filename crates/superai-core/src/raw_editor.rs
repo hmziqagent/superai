@@ -266,7 +266,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join("superai-core-raw-editor-tests");
+        let dir = crate::test_util::temp_dir_unique("core-raw-editor");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{prefix}-{now}-{pid}{suffix}"))
     }

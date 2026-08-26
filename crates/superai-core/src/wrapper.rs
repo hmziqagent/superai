@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn writes_wrapper_atomically_and_executable() {
-        let dir = std::env::temp_dir().join("superai-wrapper-test-writes");
+        let dir = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&dir).unwrap();
         let wrapper_path_str = dir.join("work-wrapper").to_string_lossy().into_owned();
         let wrapper_path = WrapperPath::new(&wrapper_path_str).unwrap();
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn wrapper_dtype_detection_and_collision_and_digest() {
-        let dir = std::env::temp_dir().join("superai-wrapper-test-detect");
+        let dir = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&dir).unwrap();
         let inst = sample_instance_with_root("/tmp/.claude-work-x");
         let mut plan = WrapperPlan::new("test");
@@ -1145,7 +1145,7 @@ mod tests {
             other => panic!("expected collision error, got {other:?}"),
         }
         // Filesystem case-insensitive existence
-        let tmp = std::env::temp_dir().join("superai-wrapper-collision-fs");
+        let tmp = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&tmp).unwrap();
         let existing = tmp.join("MyTool");
         std::fs::write(&existing, "#!/bin/sh\necho hi\n").unwrap();
@@ -1157,7 +1157,7 @@ mod tests {
 
     #[test]
     fn wrapper_special_chars_quoted_and_verified() {
-        let dir = std::env::temp_dir().join("superai-wrapper-special");
+        let dir = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&dir).unwrap();
         // Path with spaces, quotes, Unicode, dollar and percent
         let tricky = "/tmp/my work with 'quote' $dollar %percent üñî";

@@ -1097,22 +1097,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
-        let mut p =
-            std::env::temp_dir().join(format!("superai-detect-{prefix}-{}", std::process::id()));
-        // Ensure uniqueness with a counter
-        let mut counter = 0u32;
-        while p.exists() {
-            counter += 1;
-            p = std::env::temp_dir().join(format!(
-                "superai-detect-{prefix}-{}-{counter}",
-                std::process::id()
-            ));
-            if counter > 1000 {
-                break;
-            }
-        }
-        fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_util::temp_dir_unique(prefix)
     }
 
     fn write_fake_exe(dir: &Path, name: &str, version_output: &str) {

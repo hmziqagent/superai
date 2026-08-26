@@ -965,10 +965,7 @@ mod tests {
     // Ownership already imported via super::*
 
     fn tmp_home(label: &str) -> PathBuf {
-        let base = std::env::temp_dir().join("superai-discovery-tests");
-        let dir = base.join(label);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_util::temp_dir_unique(label)
     }
 
     fn sample_instance(name: &str, config_root: &str, id: &str, ownership: Ownership) -> Instance {

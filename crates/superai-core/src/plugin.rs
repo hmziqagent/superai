@@ -876,29 +876,14 @@ pub fn remove_config_entry(
 mod tests {
     use super::*;
     use crate::adapter::RestartBehavior;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn tmp_root(prefix: &str) -> PathBuf {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let c = C.fetch_add(1, Ordering::Relaxed);
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let p = std::env::temp_dir().join(format!("superai-plugin-test-{prefix}-{millis}-{c}"));
-        drop(std::fs::remove_dir_all(&p));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_util::temp_dir_unique(&format!("plugin-{prefix}"))
     }
 
     fn tmp_file(prefix: &str) -> PathBuf {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let c = C.fetch_add(1, Ordering::Relaxed);
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let p = std::env::temp_dir().join(format!("superai-plugin-cfg-{prefix}-{millis}-{c}.json"));
-        drop(std::fs::remove_file(&p));
-        p
+        let dir = crate::test_util::temp_dir_unique("plugin");
+        dir.join(format!("{prefix}-cfg.json"))
     }
 
     #[test]

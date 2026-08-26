@@ -3379,25 +3379,10 @@ mod tests {
     use crate::adapter::{GenericAdapter, ProductStatus};
     use crate::ids::HarnessId;
     use crate::state::AdapterSupport;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_root(prefix: &str) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        std::thread::current().id().hash(&mut hasher);
-        std::process::id().hash(&mut hasher);
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .hash(&mut hasher);
-        let hash = hasher.finish();
-        std::env::temp_dir().join(format!(
-            "superai-skills-{prefix}-{hash:016x}-{}",
-            std::process::id()
-        ))
+        crate::test_util::temp_dir_unique(prefix)
     }
 
     fn write_skill_md(dir: &Path, name: &str, description: &str) {

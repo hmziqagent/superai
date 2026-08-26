@@ -856,7 +856,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("superai-config-backup-tests");
+        let dir = crate::test_util::temp_dir_unique("config-backup");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn backup_rejects_directory() {
-        let dir = std::env::temp_dir().join("superai-config-backup-dir-test");
+        let dir = crate::test_util::temp_dir_unique("config-backup");
         std::fs::create_dir_all(&dir).unwrap();
         let err = backup(&dir).unwrap_err();
         match err {
