@@ -7,6 +7,8 @@ mod error;
 /// Validated identifiers and names.
 pub mod ids;
 mod instance;
+/// Operation preview and result contracts.
+pub mod operation;
 /// Validated path and executable reference types.
 pub mod paths;
 mod registry;
