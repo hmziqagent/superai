@@ -19,6 +19,17 @@ pub enum CoreError {
     /// The user's home directory could not be determined.
     #[error("cannot determine the home directory")]
     NoHomeDir,
+
+    /// An identifier or name failed validation.
+    #[error("invalid {kind} `{value}`: {reason}")]
+    InvalidIdentifier {
+        /// Kind of identifier that failed validation.
+        kind: String,
+        /// Offending value.
+        value: String,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// Result alias for core operations.

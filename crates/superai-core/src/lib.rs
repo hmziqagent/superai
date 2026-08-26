@@ -4,6 +4,8 @@
 
 mod capability;
 mod error;
+/// Validated identifiers and names.
+pub mod ids;
 mod instance;
 mod registry;
 
