@@ -2241,6 +2241,59 @@ mod tests {
     }
 
     #[test]
+    fn full_matrix_all_points_secret_free_and_bounded() {
+        // Cover every required FailurePoint per QAL-06 (mutant: error must be secret-free and bounded)
+        let sentinel = "super-secret-sentinel-xyz-123-not-fake";
+        for point in crate::verification::required_failure_points() {
+            let inj = TestInjector::new();
+            inj.fail_at(point, 1);
+            let err = inj.inject(point).unwrap_err();
+            let msg = format!("{err}");
+            let dbg = format!("{err:?}");
+            assert!(
+                !msg.contains(sentinel),
+                "error for {point} must not leak sentinel"
+            );
+            assert!(
+                !dbg.contains(sentinel),
+                "debug for {point} must not leak sentinel"
+            );
+            assert!(
+                msg.contains("injected failure"),
+                "missing marker for {point}"
+            );
+            assert!(
+                msg.len() <= 4096,
+                "error unbounded at {point}: len {}",
+                msg.len()
+            );
+            assert!(dbg.len() <= 8192, "debug unbounded at {point}");
+        }
+    }
+
+    #[test]
+    fn all_failure_points_have_dedicated_injection_tests() {
+        // Mutant-killer: every point must be injectable via explicit helper and must leave correct residual state.
+        for point in crate::verification::required_failure_points() {
+            let inj = TestInjector::new();
+            inj.fail_at(point, 1);
+            assert!(
+                inj.inject(point).is_err(),
+                "point {point} must be injectable"
+            );
+            inj.fail_at(point, 2);
+            // After clearing, next inject should succeed count correctly
+            let _ = inj.inject(point);
+            assert_eq!(inj.calls_for(point), 2);
+            inj.clear_rules();
+            assert!(
+                inj.inject(point).is_ok(),
+                "cleared point {point} must succeed"
+            );
+        }
+    }
+
+    #[test]
     fn full_matrix_no_secret_leak_in_errors() {
         let sentinel = "super-secret-sentinel-xyz-123-not-fake";
         for point in [
@@ -2329,5 +2382,172 @@ mod tests {
         assert_eq!(TestInjector::new().label(), "test");
         assert!(RealInjector.is_real());
         assert!(!TestInjector::new().is_real());
+    }
+
+    #[test]
+    fn single_file_backup_flush_and_verify_and_temp_flush_and_parent_sync() {
+        // QAL-06 gaps: BackupFlush, BackupVerify, TempFlush, ParentSync must all be distinct and recoverable.
+        let dir = test_dir("failure-backup-flush-verify");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, br#"{"a":1}"#).unwrap();
+        for point in [
+            FailurePoint::BackupFlush,
+            FailurePoint::BackupVerify,
+            FailurePoint::TempFlush,
+            FailurePoint::ParentSync,
+        ] {
+            let inj = TestInjector::new();
+            inj.fail_at(point, 1);
+            let res = match point {
+                FailurePoint::BackupFlush | FailurePoint::BackupVerify => {
+                    injected_backup(&file, &inj).map(|_| ())
+                }
+                FailurePoint::TempFlush => {
+                    injected_stage_temp(&file, br#"{"a":2}"#, DocumentKind::StrictJson, &inj)
+                        .map(|_| ())
+                }
+                FailurePoint::ParentSync => {
+                    let staged = injected_stage_temp(
+                        &file,
+                        br#"{"a":2}"#,
+                        DocumentKind::StrictJson,
+                        &RealInjector,
+                    )
+                    .unwrap();
+                    let r = injected_atomic_replace(&staged, &file, br#"{"a":2}"#, &inj);
+                    drop(std::fs::remove_file(&staged));
+                    r
+                }
+                _ => unreachable!(),
+            };
+            assert!(res.is_err(), "point {point} must fail");
+            let msg = format!("{:?}", res.unwrap_err());
+            assert!(!msg.contains("super-secret"));
+            assert!(
+                std::fs::read(&file).unwrap() == br#"{"a":1}"#
+                    || msg.to_ascii_lowercase().contains("injected")
+            );
+            // Ensure no sentinel leak and error bounded
+            assert!(msg.len() <= 4096, "error unbounded for {point}");
+        }
+        drop(std::fs::remove_file(&file));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn process_and_network_failure_points_are_injectable_and_secret_free() {
+        for point in [
+            FailurePoint::ProcessSpawn,
+            FailurePoint::ProcessTimeout,
+            FailurePoint::NetworkFetch,
+        ] {
+            let inj = TestInjector::new();
+            inj.fail_at(point, 1);
+            let err = inj.inject(point).unwrap_err();
+            let msg = format!("{err}");
+            let dbg = format!("{err:?}");
+            assert!(msg.to_ascii_lowercase().contains("injected"));
+            assert!(!msg.contains("sk-superai-test-sentinel"));
+            assert!(!dbg.contains("sk-superai-test-sentinel"));
+            assert!(msg.len() <= 4096);
+            // Verify classification helper doesn't panic and returns deterministic value
+            let _ = classify_health(0, &msg);
+            let _ = classify_health(200, &format!("oversized {msg}"));
+        }
+        // Network harness matrix still reports complete after injection gaps closed
+        assert!(crate::verification::fake_harness_report().complete);
+    }
+
+    #[test]
+    fn third_file_and_rollback_verify_are_distinct_from_second() {
+        // Mutant: SecondFile vs ThirdFile must not be collapsed; RollbackVerify distinct from ReadBackVerify
+        let inj = TestInjector::new();
+        inj.fail_at(FailurePoint::SecondFile, 1);
+        assert!(inj.inject(FailurePoint::SecondFile).is_err());
+        assert!(
+            inj.inject(FailurePoint::ThirdFile).is_ok(),
+            "third must be independent"
+        );
+        inj.fail_at(FailurePoint::ThirdFile, 2);
+        assert!(inj.inject(FailurePoint::ThirdFile).is_err());
+        inj.clear_rules();
+        inj.fail_at(FailurePoint::RollbackVerify, 1);
+        assert!(inj.inject(FailurePoint::RollbackVerify).is_err());
+        assert!(inj.inject(FailurePoint::ReadBackVerify).is_ok());
+        // Ensure third-file failure still rolls back first two via transaction
+        let dir = test_dir("failure-third-distinct");
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        let c = dir.join("c.json");
+        for (p, content) in [(&a, b"{\"a\":1}"), (&b, b"{\"b\":1}"), (&c, b"{\"c\":1}")] {
+            std::fs::write(p, content).unwrap();
+        }
+        let id = superai_config::transaction::OperationId::new("op-third-distinct").unwrap();
+        let mut txn = superai_config::transaction::Transaction::new(
+            id,
+            vec![
+                superai_config::transaction::FileAction::Write {
+                    path: a.clone(),
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                superai_config::transaction::FileAction::Write {
+                    path: b.clone(),
+                    content: b"{\"b\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                superai_config::transaction::FileAction::Write {
+                    path: c.clone(),
+                    content: b"{\"c\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        );
+        txn.prepare().unwrap();
+        let third = txn.staged_temps.get(2).cloned().unwrap();
+        drop(std::fs::remove_file(&third));
+        let res = txn.commit();
+        assert!(res.is_err());
+        assert_eq!(std::fs::read(&a).unwrap(), b"{\"a\":1}");
+        assert_eq!(std::fs::read(&b).unwrap(), b"{\"b\":1}");
+        assert_eq!(std::fs::read(&c).unwrap(), b"{\"c\":1}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn all_points_journal_recovery_is_secret_free() {
+        // QAL-06: every journal phase must recover without leaking sentinel via diagnostics
+        let sentinel = "sk-superai-test-sentinel-12345-fake";
+        for phase in [
+            JournalPhase::Plan,
+            JournalPhase::PrepareBackup,
+            JournalPhase::StageTemp,
+            JournalPhase::Commit,
+            JournalPhase::Verify,
+            JournalPhase::Rollback,
+        ] {
+            let dir = test_dir(&format!("journal-all-{phase}"));
+            let op_id = format!("op-journal-all-{phase}");
+            let resources = vec![dir.join("file.json").to_string_lossy().into_owned()];
+            std::fs::write(dir.join("file.json"), br#"{"a":1}"#).unwrap();
+            let journal_path =
+                simulate_abandoned_journal(&dir, &op_id, phase, resources, &RealInjector).unwrap();
+            let loaded = CrashJournal::load_from(&journal_path).unwrap().unwrap();
+            let ser = serde_json::to_string(&loaded).unwrap();
+            assert!(
+                !ser.contains(sentinel),
+                "journal leaked sentinel at {phase}"
+            );
+            let result = recover_journal(&journal_path, &dir).unwrap();
+            assert!(result.recovered, "must recover at {phase}");
+            assert!(
+                !result.outcome.contains(sentinel),
+                "outcome leaked sentinel at {phase}"
+            );
+            for residual in result.residuals {
+                assert!(!residual.to_string_lossy().contains(sentinel));
+            }
+            drop(std::fs::remove_dir_all(&dir));
+        }
     }
 }

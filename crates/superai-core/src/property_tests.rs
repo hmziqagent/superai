@@ -5,18 +5,23 @@
 
 #![expect(clippy::all, reason = "property tests manual loops")]
 #![expect(clippy::pedantic, reason = "property tests")]
+#![expect(clippy::restriction, reason = "property tests")]
+#![expect(clippy::nursery, reason = "property tests")]
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
     use crate::capability::Support;
-    use crate::capability_resolver::{self, ACTIVE_PAIRS, ALL_CAPABILITIES, MATRIX};
+    use crate::capability_resolver::{
+        ACTIVE_PAIRS, ALL_CAPABILITIES, CapabilitySource, MATRIX, resolve, resolve_all,
+        validate_matrix_completeness,
+    };
     use crate::ids::{
         HarnessId, InstanceId, InstanceName, ProviderId, TemplateId, TemplateVersion,
     };
-    use crate::instance::{Instance, TemplateRef};
-    use crate::paths::AbsolutePath;
+    use crate::instance::{Instance, TemplateRef, WrapperRef};
+    use crate::paths::{AbsolutePath, WrapperPath};
     use crate::registry::Registry;
     use crate::state::{InstanceOrigin, Isolation, Ownership};
     use crate::test_util::temp_dir_unique;
@@ -324,8 +329,8 @@ mod tests {
             let cap_idx = rng.gen_range(0, ALL_CAPABILITIES.len());
             let cap = ALL_CAPABILITIES[cap_idx];
 
-            let r1 = capability_resolver::resolve(&harness, &provider, cap);
-            let r2 = capability_resolver::resolve(&harness, &provider, cap);
+            let r1 = resolve(&harness, &provider, cap);
+            let r2 = resolve(&harness, &provider, cap);
             assert_eq!(r1, r2, "capability resolve not deterministic at {iter}");
 
             // Case-insensitive check: random case variation should give same result.
@@ -336,12 +341,12 @@ mod tests {
             let h_varied_id = HarnessId::new(&harness_varied.to_lowercase()).unwrap();
             let p_varied_id = ProviderId::new(&provider_varied.to_lowercase()).unwrap();
             // Resolve with canonical lower should equal resolve with varied case (if we normalize).
-            let _r_varied = capability_resolver::resolve(&h_varied_id, &p_varied_id, cap);
+            let _r_varied = resolve(&h_varied_id, &p_varied_id, cap);
             // Since we lowercased for id creation, it should be same as original's lower.
             // Directly test case-fold equality: harness.eq_case_fold_str should work.
             let h2 = HarnessId::new(&harness_varied).unwrap_or(harness.clone());
             let p2 = ProviderId::new(&provider_varied).unwrap_or(provider.clone());
-            let r3 = capability_resolver::resolve(&h2, &p2, cap);
+            let r3 = resolve(&h2, &p2, cap);
             assert_eq!(
                 r1.support, r3.support,
                 "case-insensitive support failed at {iter}"
@@ -595,7 +600,7 @@ mod tests {
     #[test]
     fn property_capability_complete() {
         // Static matrix must be complete.
-        capability_resolver::validate_matrix_completeness().unwrap();
+        validate_matrix_completeness().unwrap();
 
         for iter in 0..50 {
             let mut rng = Prng::new(iter as u64 + 0x7777);
@@ -603,7 +608,7 @@ mod tests {
             for (harness_str, provider_str) in ACTIVE_PAIRS {
                 let harness = HarnessId::new(harness_str).unwrap();
                 let provider = ProviderId::new(provider_str).unwrap();
-                let resolved = capability_resolver::resolve_all(&harness, &provider);
+                let resolved = resolve_all(&harness, &provider);
                 assert_eq!(
                     resolved.len(),
                     ALL_CAPABILITIES.len(),
@@ -622,7 +627,7 @@ mod tests {
                     // Our matrix has entries for all active pairs, so source should not be Unknown.
                     assert_ne!(
                         res.source,
-                        capability_resolver::CapabilitySource::Unknown,
+                        CapabilitySource::Unknown,
                         "active pair {harness_str}/{provider_str} has Unknown source for {:?} at {iter}",
                         cap
                     );
@@ -631,9 +636,9 @@ mod tests {
                         assert!(
                             matches!(
                                 res.source,
-                                capability_resolver::CapabilitySource::Provider
-                                    | capability_resolver::CapabilitySource::Template
-                                    | capability_resolver::CapabilitySource::Plugin
+                                CapabilitySource::Provider
+                                    | CapabilitySource::Template
+                                    | CapabilitySource::Plugin
                             ),
                             "substituted should have provider/template/plugin source at {iter}: {:?}",
                             cap
@@ -654,7 +659,7 @@ mod tests {
             });
             if !is_active {
                 let cap = ALL_CAPABILITIES[rng.gen_range(0, ALL_CAPABILITIES.len())];
-                let res = capability_resolver::resolve(&unknown_harness, &unknown_provider, cap);
+                let res = resolve(&unknown_harness, &unknown_provider, cap);
                 // For unknown pair, should be Absent + Unknown.
                 assert_eq!(
                     res.support,
@@ -663,7 +668,7 @@ mod tests {
                 );
                 assert_eq!(
                     res.source,
-                    capability_resolver::CapabilitySource::Unknown,
+                    CapabilitySource::Unknown,
                     "unknown pair should be Unknown source at {iter}"
                 );
             }
@@ -829,5 +834,194 @@ mod tests {
             );
             assert_eq!(v1, v2, "validate not deterministic at {iter}");
         }
+    }
+
+    #[test]
+    fn mutant_registry_no_forbidden_fields_and_secret_redacted() {
+        // Mutant-killer: if forbidden field check or secret redaction is removed, this fails.
+        for iter in 0..30 {
+            let mut rng = Prng::new(iter as u64 + 0xbbbb);
+            let reg = {
+                let mut r = Registry::default();
+                let inst = random_instance(&mut rng, iter, 0);
+                r.insert(inst).unwrap();
+                r
+            };
+            let json = serde_json::to_string(reg.instances()).unwrap_or_default();
+            let lower = json.to_ascii_lowercase();
+            for forbidden in [
+                "\"model\"",
+                "\"endpoint\"",
+                "\"api_key\"",
+                "sk-superai-test-sentinel",
+            ] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "registry must not contain forbidden {forbidden:?} at {iter}: {json:.200}"
+                );
+            }
+            // Simulate template patch with sentinel must be rejected
+            let sentinel = "sk-superai-test-sentinel-12345-fake";
+            let patch = crate::template::OwnedPatch {
+                selector: "key:model".to_owned(),
+                value: serde_json::Value::String(sentinel.to_owned()),
+            };
+            let res = patch.validate();
+            assert!(res.is_err(), "sentinel patch must be rejected at {iter}");
+            let msg = format!("{:?}", res.unwrap_err());
+            assert!(
+                !msg.contains(sentinel),
+                "error must not leak sentinel at {iter}"
+            );
+            assert!(msg.len() <= 4096);
+        }
+    }
+
+    #[test]
+    fn mutant_template_three_way_preserves_local_override() {
+        // Mutant-killer: three-way merge must preserve local override when new == base, and detect conflict when all differ.
+        use crate::template_update;
+        use serde_json::Map;
+        let old_tmpl = crate::template::Template {
+            schema_version: crate::template::TEMPLATE_SCHEMA_VERSION,
+            id: TemplateId::new("test-tmpl").unwrap(),
+            version: "1.0.0".to_owned(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            provider: ProviderId::new("test-prov").unwrap(),
+            label: "Test".to_owned(),
+            status: crate::template::TemplateStatus::Active,
+            inputs: vec![],
+            patches: vec![crate::template::OwnedPatch {
+                selector: "key:model".to_owned(),
+                value: serde_json::Value::String("a".to_owned()),
+            }],
+            wrapper_env: std::collections::BTreeMap::new(),
+            wrapper_args: vec![],
+            assets: vec![],
+            capability_map: std::collections::BTreeMap::new(),
+            migration_notes: vec![],
+            digest: "a".repeat(64),
+            harness_version_req: None,
+            provider_protocol: None,
+        };
+        let mut new_tmpl = old_tmpl.clone();
+        new_tmpl.version = "1.1.0".to_owned();
+        new_tmpl.patches[0] = crate::template::OwnedPatch {
+            selector: "key:model".to_owned(),
+            value: serde_json::Value::String("b".to_owned()),
+        };
+        // local overrides model to "local"
+        let mut local = Map::new();
+        local.insert(
+            "model".to_owned(),
+            serde_json::Value::String("local".to_owned()),
+        );
+        local.insert(
+            "foreign".to_owned(),
+            serde_json::Value::String("keep".to_owned()),
+        );
+        // Preview should detect conflict on model (local != base, new != base, local != new)
+        let preview = template_update::preview_three_way(&old_tmpl, &new_tmpl, &local);
+        // Mutant that collapses conflict detection would incorrectly mark as clean
+        assert!(
+            !preview.conflicts.is_empty()
+                || preview
+                    .warnings
+                    .iter()
+                    .any(|w| w.to_ascii_lowercase().contains("conflict")),
+            "three-way must detect conflict: conflicts={:?} warnings={:?}",
+            preview.conflicts,
+            preview.warnings
+        );
+        // If new == base, local override must be preserved (no conflict)
+        let mut new_eq_base = old_tmpl.clone();
+        new_eq_base.version = "1.1.0".to_owned(); // same patches as old
+        let preview2 = template_update::preview_three_way(&old_tmpl, &new_eq_base, &local);
+        // Should preserve local model "local" and not report conflict
+        let has_model_conflict = preview2
+            .conflicts
+            .iter()
+            .any(|c| c.selector.contains("model"));
+        assert!(
+            !has_model_conflict,
+            "local override must be preserved when new==base, conflicts={:?}",
+            preview2.conflicts
+        );
+    }
+
+    #[test]
+    fn mutant_capability_resolution_complete_and_deterministic() {
+        // Mutant-killer: capability matrix must be complete, deterministic, and not return Unknown for active pairs
+        validate_matrix_completeness().unwrap();
+        for iter in 0..20 {
+            let mut rng = Prng::new(iter as u64 + 0xcccc);
+            for (h, p) in ACTIVE_PAIRS {
+                let harness = HarnessId::new(h).unwrap();
+                let provider = ProviderId::new(p).unwrap();
+                let r1 = resolve_all(&harness, &provider);
+                let r2 = resolve_all(&harness, &provider);
+                assert_eq!(
+                    r1, r2,
+                    "resolve_all must be deterministic at {iter} for {h}/{p}"
+                );
+                assert_eq!(r1.len(), ALL_CAPABILITIES.len());
+                for (_, res) in r1 {
+                    assert!(!res.explanation.is_empty());
+                    // Mutant that flips substituted vs native would break this: substituted must have provider source
+                    if res.support == Support::Substituted {
+                        assert!(matches!(
+                            res.source,
+                            CapabilitySource::Provider
+                                | CapabilitySource::Template
+                                | CapabilitySource::Plugin
+                        ));
+                    }
+                }
+            }
+            let _ = rng.gen_range(0, 10);
+        }
+    }
+
+    #[test]
+    fn mutant_wrapper_collision_is_case_fold_sensitive() {
+        // Mutant-killer: wrapper collision must be case-insensitive; removing to_lowercase would let mutant slip
+        let dir = temp_dir_unique("mutant-wrapper-collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Prepare registry with MyTool
+        let mut reg = Registry::default();
+        let h = HarnessId::new("claude-code").unwrap();
+        let n1 = InstanceName::new("MyWork").unwrap();
+        let r1 = AbsolutePath::new("/tmp/mutant1").unwrap();
+        let inst1 = Instance {
+            id: InstanceId::new("id-mutant-1").unwrap(),
+            name: n1.clone(),
+            harness: h.clone(),
+            config_root: r1,
+            binary: None,
+            wrapper: Some(WrapperRef {
+                path: WrapperPath::new("/tmp/bin/mywork").unwrap(),
+                command_name: InstanceName::new("mywork").unwrap(),
+                generator_version: "0.1.0".to_owned(),
+                content_digest: "abc".to_owned(),
+            }),
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        reg.insert(inst1).unwrap();
+        // Attempt to insert case-fold collision should be rejected
+        let collision = crate::wrapper::check_wrapper_collisions(
+            &WrapperPath::new("/tmp/bin/MYWORK").unwrap(),
+            &InstanceName::new("MYWORK").unwrap(),
+            &reg,
+        );
+        assert!(
+            collision.is_err(),
+            "case-insensitive wrapper collision must be rejected"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

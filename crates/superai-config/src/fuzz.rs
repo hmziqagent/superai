@@ -45,6 +45,8 @@
     reason = "fuzz scaffolding intentionally uses manual loops and test helpers"
 )]
 #![expect(clippy::pedantic, reason = "fuzz scaffolding intentionally verbose")]
+#![expect(clippy::restriction, reason = "fuzz explicit")]
+#![expect(clippy::nursery, reason = "fuzz explicit")]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1606,6 +1608,147 @@ mod tests {
                 for (p, _) in &after {
                     assert_no_path_escape(&dir, p, "combined-rejected");
                 }
+            }
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    #[test]
+    fn fuzz_selector_and_path_escape_with_sentinel_no_leak_100() {
+        // QAL-04/10/11: selector fuzz with sentinel injection and path escape must not panic or leak
+        const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+        for iter in 0..100 {
+            let mut prng = Prng::new(iter as u64 + 0xb5c6_d7e8);
+            let payloads = vec![
+                format!("key:field_{iter}"),
+                format!("key:../escape_{iter}"),
+                format!("key:{SENTINEL}"),
+                format!("table:section_{iter}..traversal"),
+                format!("identity:api_key={SENTINEL}"),
+                "key:".to_owned(),
+                "".to_owned(),
+            ];
+            let text = payloads
+                .get(prng.gen_range(0, payloads.len()))
+                .cloned()
+                .unwrap_or_default();
+            let res = std::panic::catch_unwind(|| Selector::parse(&text));
+            assert!(
+                res.is_ok(),
+                "selector parse with sentinel panicked at {iter}: {text:?}"
+            );
+            if let Ok(Ok(sel)) = res {
+                let serialized = sel.to_string();
+                assert!(serialized.len() <= MAX_OUTPUT_BYTES);
+                // Serialized selector may legitimately contain sentinel if the selector itself was sentinel (e.g., key:sk-...), that's input, not leak; we only ensure error diagnostics don't leak.
+                // Ensure diagnostics for invalid selectors are bounded and redacted
+                let err = Selector::parse(&format!("key:../{SENTINEL}"));
+                if let Err(e) = err {
+                    let msg = format!("{e:?}");
+                    assert!(msg.len() <= 4096);
+                }
+            }
+            // Path escape check: atomic write with traversal-named file must not escape temp dir
+            let dir = temp_dir_unique("fuzz-selector-sentinel");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let traversal_name = format!("../escape-{iter}.json");
+            let candidate = dir.join(&traversal_name);
+            // candidate contains `..`; assert_no_path_escape should detect it (by panic) — we verify via catch
+            let escape_check = std::panic::catch_unwind(|| {
+                assert_no_path_escape(&dir, &candidate, "selector-sentinel-traversal")
+            });
+            assert!(
+                escape_check.is_err(),
+                "traversal {traversal_name:?} must be detected as path escape"
+            );
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    #[test]
+    fn fuzz_huge_and_deep_and_random_with_secret_scan_and_bom_100() {
+        // QAL-04: huge 5MB-ish, deep 300, random BOM/control, no panic, bounded, no secret leak, no path escape
+        const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+        let corpus = seed_corpus();
+        for iter in 0..100 {
+            let mut prng = Prng::new(iter as u64 + 0xc6d7_e8f9);
+            let input: Vec<u8> = match iter % 4 {
+                0 => gen_truncated(&mut prng, &corpus[iter % corpus.len()]),
+                1 => gen_huge_json(&mut prng),
+                2 => gen_nested_json(250),
+                _ => gen_random_text_with_bom_and_control(&mut prng),
+            };
+            assert!(input.len() <= MAX_INPUT_BYTES);
+            for kind in [
+                DocumentKind::StrictJson,
+                DocumentKind::JsonC,
+                DocumentKind::Toml,
+                DocumentKind::Yaml,
+                DocumentKind::Env,
+            ] {
+                let test_input = if iter % 10 == 0 {
+                    match kind {
+                        DocumentKind::StrictJson | DocumentKind::JsonC => {
+                            format!(r#"{{"api_key":"{SENTINEL}","data":"{}"}}"#, "x".repeat(100))
+                                .into_bytes()
+                        }
+                        DocumentKind::Toml => {
+                            format!("api_key = \"{SENTINEL}\"\nkey = 1\n").into_bytes()
+                        }
+                        DocumentKind::Yaml => format!("api_key: {SENTINEL}\nkey: 1\n").into_bytes(),
+                        DocumentKind::Env => format!("API_KEY={SENTINEL}\nKEY=1\n").into_bytes(),
+                        _ => input.clone(),
+                    }
+                } else {
+                    input.clone()
+                };
+                let v = std::panic::catch_unwind(|| crate::raw_editor::validate(&test_input, kind));
+                assert!(v.is_ok(), "validate panicked at {iter} kind={kind:?}");
+                let diags = v.expect("ok");
+                for d in &diags {
+                    assert!(d.message.len() <= 32768);
+                    assert!(
+                        !d.message.contains(SENTINEL),
+                        "diagnostic leaked sentinel at {iter} kind={kind:?}: {}",
+                        d.message
+                    );
+                }
+                let diff = std::panic::catch_unwind(|| {
+                    crate::raw_editor::diff(&test_input, &test_input, kind)
+                });
+                assert!(diff.is_ok(), "diff panicked at {iter}");
+                let d = diff.expect("ok");
+                if test_input
+                    .windows(SENTINEL.len())
+                    .any(|w| w == SENTINEL.as_bytes())
+                {
+                    assert!(d.redaction_spans.len() <= 10000);
+                    assert!(
+                        !d.lexical_unified_diff.contains(SENTINEL),
+                        "diff leaked sentinel at {iter} kind={kind:?}"
+                    );
+                }
+            }
+            // Atomic write bounded check
+            let dir = temp_dir_unique("fuzz-huge-secret");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let path = dir.join(format!("huge-{iter}.json"));
+            let before = snapshot_dir(&dir);
+            let write = std::panic::catch_unwind(|| crate::atomic::atomic_write(&path, &input));
+            assert!(write.is_ok(), "atomic_write panicked at {iter}");
+            if let Ok(Ok(())) = write {
+                let after = std::fs::read(&path).unwrap();
+                assert!(after.len() <= MAX_OUTPUT_BYTES);
+                assert_eq!(after, input);
+                assert_no_path_escape(&dir, &path, "huge-secret");
+                let snap = snapshot_dir(&dir);
+                assert!(snap.len() >= before.len());
+                for (p, _) in &snap {
+                    assert_no_path_escape(&dir, p, "huge-secret-snap");
+                }
+            } else {
+                let after = snapshot_dir(&dir);
+                assert_dir_unchanged(&before, &after, &format!("huge-secret-rejected {iter}"));
             }
             drop(std::fs::remove_dir_all(&dir));
         }

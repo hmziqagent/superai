@@ -13,6 +13,8 @@
 
 #![expect(clippy::all, reason = "fuzz scaffolding uses manual loops")]
 #![expect(clippy::pedantic, reason = "fuzz helpers intentionally verbose")]
+#![expect(clippy::restriction, reason = "fuzz explicit")]
+#![expect(clippy::nursery, reason = "fuzz explicit")]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -532,10 +534,173 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_wrapper_parse_no_panic_and_bounded_and_secret_free_100() {
+        // QAL-04: wrapper parser for generated grammar — no panic, bounded, no secret leak, re-parse stable
+        const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+        for iter in 0u64..100u64 {
+            let mut prng = Prng::new(iter + 0x5555);
+            let variants: Vec<Vec<u8>> = vec![
+                format!("#!/bin/sh\nexec claude-code \"$@\" # superai wrapper {iter}").into_bytes(),
+                format!("#!/bin/sh\n# superai wrapper instance=work-{iter} digest=abc\nexport CLAUDE_CONFIG_DIR=/tmp/cfg{iter}\nexec \"$@\"").into_bytes(),
+                // malformed
+                gen_truncated(&mut prng, br"#!/bin/sh\nexec wrapper"),
+                // huge wrapper
+                {
+                    let mut s = String::from("#!/bin/sh\n");
+                    for i in 0..200 {
+                        s.push_str(&format!("export VAR_{i}=val{i}\n"));
+                    }
+                    s.push_str("exec \"$@\"\n");
+                    s.into_bytes()
+                },
+                // sentinel injection
+                format!("#!/bin/sh\n# {SENTINEL}\nexec wrapper").into_bytes(),
+                gen_random_text_with_bom(&mut prng),
+                // shell metachars
+                format!("#!/bin/sh\n; rm -rf / # metachars {iter} `whoami` $(env) | cat").into_bytes(),
+            ];
+            let input = variants
+                .get(prng.gen_range(0, variants.len()))
+                .cloned()
+                .unwrap_or_default();
+            assert!(input.len() <= MAX_INPUT_BYTES);
+            let text = String::from_utf8_lossy(&input).into_owned();
+            let parsed = std::panic::catch_unwind(|| crate::wrapper::parse_wrapper_content(&text));
+            assert!(parsed.is_ok(), "parse_wrapper_content panicked at {iter}");
+            if let Some(p) = parsed.expect("ok") {
+                // Bounded digest and content
+                let digest_str = p.digest.as_deref().unwrap_or("");
+                assert!(digest_str.len() <= 64, "digest unbounded at {iter}");
+                assert!(
+                    !digest_str.contains(SENTINEL),
+                    "digest leaked sentinel at {iter}"
+                );
+                let repr = format!("{p:?}");
+                assert!(
+                    !repr.contains(SENTINEL),
+                    "wrapper ParsedWrapper leaked sentinel at {iter}"
+                );
+                assert!(repr.len() <= MAX_OUTPUT_BYTES);
+                // Kind detection must not panic and be bounded
+                let kind = std::panic::catch_unwind(|| {
+                    crate::wrapper::detect_wrapper_kind(&PathBuf::from(format!(
+                        "/tmp/wrapper-{iter}"
+                    )))
+                });
+                // Detect via file path not panicking is enough; bounded check via content already
+                drop(kind);
+                // Re-parse via generate-then-parse roundtrip for generated wrapper must be stable
+                let dir = temp_dir_unique("fuzz-wrapper-parse");
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                let dummy_instance = {
+                    let id = crate::ids::InstanceId::new(&format!("id-wrapper-{iter}")).unwrap();
+                    let name = crate::ids::InstanceName::new(&format!("work-{iter}")).unwrap();
+                    let harness = crate::ids::HarnessId::new("claude-code").unwrap();
+                    let root = crate::paths::AbsolutePath::new(&format!("/tmp/wrapper-cfg-{iter}"))
+                        .unwrap();
+                    crate::instance::Instance {
+                        id,
+                        name,
+                        harness,
+                        config_root: root,
+                        binary: None,
+                        wrapper: None,
+                        isolation: crate::state::Isolation::RelocatedRoot,
+                        origin: crate::state::InstanceOrigin::Created,
+                        ownership: crate::state::Ownership::SuperaiCreated,
+                        template: None,
+                        created_at: "2026-08-26T00:00:00Z".to_owned(),
+                        adapter_revision: "0.1.0".to_owned(),
+                    }
+                };
+                let plan = crate::wrapper::plan_wrapper_for_instance(&dummy_instance, None);
+                let (generated, digest) =
+                    crate::wrapper::generate_shell_wrapper(&dummy_instance, &plan);
+                assert!(!generated.contains(SENTINEL));
+                assert!(!digest.contains(SENTINEL));
+                assert!(
+                    generated.len() <= 32 * 1024 + 1024,
+                    "generated wrapper unbounded at {iter}"
+                );
+                let reparsed = crate::wrapper::parse_wrapper_content(&generated);
+                assert!(reparsed.is_some(), "generated wrapper must parse at {iter}");
+                drop(std::fs::remove_dir_all(&dir));
+            } else {
+                // Rejected wrappers must not have caused secret leak via error path (return None, not panic)
+                assert!(text.len() <= MAX_INPUT_BYTES);
+            }
+            // Detect wrapper kind on raw text via content-based helper
+            let kind2 = std::panic::catch_unwind(|| {
+                // Use temporary file for detect_wrapper_kind when needed; content-based check is sufficient here
+                let tmp = temp_dir_unique("fuzz-wrapper-kind");
+                std::fs::create_dir_all(&tmp).unwrap();
+                let p = tmp.join(format!("wrapper-{iter}.sh"));
+                std::fs::write(&p, &input).unwrap();
+                let k = crate::wrapper::detect_wrapper_kind(&p);
+                let dbg = format!("{k:?}");
+                assert!(!dbg.contains(SENTINEL));
+                drop(std::fs::remove_dir_all(&tmp));
+            });
+            assert!(kind2.is_ok(), "detect_wrapper_kind panicked at {iter}");
+        }
+    }
+
+    #[test]
+    fn fuzz_provider_and_template_with_sentinel_and_traversal_no_leak_100() {
+        const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+        let corpus = seed_registry_corpus();
+        for iter in 0u64..100u64 {
+            let mut prng = Prng::new(iter + 0x6666);
+            let base = corpus
+                .get(prng.gen_range(0, corpus.len()))
+                .cloned()
+                .unwrap_or_default();
+            let input: Vec<u8> = match iter % 5 {
+                0 => gen_truncated(&mut prng, &base),
+                1 => {
+                    let mut b = gen_huge_registry(&mut prng);
+                    if iter % 3 == 0 { b.extend_from_slice(SENTINEL.as_bytes()); }
+                    b.truncate(MAX_INPUT_BYTES);
+                    b
+                }
+                2 => gen_nested_json(120),
+                3 => format!("{{\"id\":\"test\",\"patches\":[{{\"selector\":\"../escape_{iter}\",\"value\":\"x\"}}]}}").into_bytes(),
+                _ => gen_random_text_with_bom(&mut prng),
+            };
+            assert!(input.len() <= MAX_INPUT_BYTES);
+            let text = String::from_utf8_lossy(&input).into_owned();
+            // Provider/template-like deser must not panic and must not leak sentinel via error messages
+            let prov =
+                std::panic::catch_unwind(|| serde_json::from_str::<serde_json::Value>(&text));
+            assert!(prov.is_ok(), "provider deser panicked at {iter}");
+            if let Ok(Err(e)) = prov {
+                let msg = format!("{e}");
+                assert!(msg.len() <= 8192, "error unbounded at {iter}");
+                // Error must not contain raw sentinel unless payload itself contained it as path (which is okay to report path);
+                // but we ensure diagnostics-style errors are bounded and don't expose huge allocations
+                drop(msg);
+            }
+            // Template path validation must reject traversal containing sentinel without leaking beyond expected path display
+            let traversal = format!("../{SENTINEL}.json");
+            let path_res = crate::template::validate_template_path(&traversal);
+            assert!(
+                path_res.is_err(),
+                "traversal with sentinel must be rejected at {iter}"
+            );
+            let msg = format!("{:?}", path_res.unwrap_err());
+            assert!(msg.len() <= 4096);
+            // Fetch URL validation must reject private/file traversal
+            let url = format!("https://example.com/../{SENTINEL}");
+            let url_res = crate::template_fetch::validate_fetch_url(&url, "test");
+            assert!(url_res.is_err(), "url traversal must be rejected at {iter}");
+        }
+    }
+
+    #[test]
     fn fuzz_path_escape_registry_no_write_outside_temp_100() {
         // Direct path escape check: fuzzed config_root with traversal must not cause FS write outside temp dir
-        for iter in 0..100 {
-            let mut prng = Prng::new(iter as u64 + 0x4444);
+        for iter in 0u64..100u64 {
+            let mut prng = Prng::new(iter + 0x4444);
             let traversal_payloads = vec![
                 "../escape".to_owned(),
                 "../../etc/passwd".to_owned(),

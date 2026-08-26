@@ -63,7 +63,7 @@ pub fn assert_no_sentinel_in_json<T: serde::Serialize>(v: &T, ctx: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{HarnessId, InstanceId, InstanceName, SkillId};
+    use crate::ids::{HarnessId, InstanceId, InstanceName, ProviderId, SkillId, TemplateId};
     use crate::instance::{Instance, TemplateRef, WrapperRef};
     use crate::paths::{AbsolutePath, WrapperPath};
     use crate::registry::Registry;
@@ -101,7 +101,7 @@ mod tests {
             origin: InstanceOrigin::Created,
             ownership: Ownership::SuperaiCreated,
             template: Some(TemplateRef {
-                name: crate::ids::TemplateId::new("claude-glm").unwrap(),
+                name: TemplateId::new("claude-glm").unwrap(),
                 version: crate::ids::TemplateVersion::new("1.2.0").unwrap(),
             }),
             created_at: "2026-08-26T12:00:00Z".to_owned(),
@@ -332,10 +332,10 @@ mod tests {
         // Try via template file directly
         let tmpl = Template {
             schema_version: crate::template::TEMPLATE_SCHEMA_VERSION,
-            id: crate::ids::TemplateId::new("test-tmpl").unwrap(),
+            id: TemplateId::new("test-tmpl").unwrap(),
             version: "1.0.0".to_owned(),
             harness: HarnessId::new("claude-code").unwrap(),
-            provider: crate::ids::ProviderId::new("test-prov").unwrap(),
+            provider: ProviderId::new("test-prov").unwrap(),
             label: "Test".to_owned(),
             status: crate::template::TemplateStatus::Active,
             inputs: vec![],
@@ -984,6 +984,150 @@ description: test skill
             assert!(!diag.contains(SENTINEL));
         }
 
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn windows_reserved_long_case_crlf_are_handled_without_panic_or_leak() {
+        let dir = temp_dir("windows-long-case-crlf-core");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Windows reserved names: ensure validation rejects them as instance names or as quarantine targets
+        for reserved in ["CON", "PRN", "AUX", "NUL", "COM1", "LPT1"] {
+            let inst_res = InstanceName::new(reserved);
+            // InstanceName should reject Windows reserved case-insensitively
+            if let Ok(name) = inst_res {
+                assert_ne!(
+                    name.as_str().to_ascii_uppercase(),
+                    reserved,
+                    "reserved {reserved:?} should be rejectable or at least not collide silently"
+                );
+            }
+            // Quarantine target validation must reject Windows-style absolute with drive letter if treated as traversal
+            let win_path_str = format!("C:\\Windows\\{reserved}.txt");
+            let win_path = Path::new(&win_path_str);
+            let q_res = superai_config::quarantine::validate_quarantine_target(win_path);
+            // On unix it's relative; should be rejected as relative or as broad
+            assert!(q_res.is_err(), "win path {win_path:?} should be rejected");
+            let msg = format!("{:?}", q_res.unwrap_err());
+            assert!(!msg.contains(SENTINEL));
+            assert!(msg.len() <= 4096);
+        }
+        // Long path
+        let long = "a".repeat(300);
+        let long_path = dir.join(format!("{long}.json"));
+        let long_res = std::panic::catch_unwind(|| {
+            superai_config::atomic::atomic_write(&long_path, br#"{"a":1}"#)
+        });
+        assert!(long_res.is_ok(), "long path must not panic");
+        if let Ok(Ok(())) = long_res {
+            drop(std::fs::remove_file(&long_path));
+        }
+        // Case-insensitive collision via registry
+        let mut reg = Registry::default();
+        let h = HarnessId::new("claude-code").unwrap();
+        let n1 = InstanceName::new("MyWork").unwrap();
+        let n2 = InstanceName::new("mywork").unwrap();
+        let r1 = AbsolutePath::new("/tmp/case1").unwrap();
+        let r2 = AbsolutePath::new("/tmp/case2").unwrap();
+        let inst1 = Instance {
+            id: InstanceId::new("id-case-1").unwrap(),
+            name: n1,
+            harness: h.clone(),
+            config_root: r1,
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        reg.insert(inst1).unwrap();
+        let inst2 = Instance {
+            id: InstanceId::new("id-case-2").unwrap(),
+            name: n2,
+            harness: h,
+            config_root: r2,
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        let err = reg.insert(inst2).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.to_ascii_lowercase().contains("collision")
+                || msg.to_ascii_lowercase().contains("name")
+        );
+        assert!(!msg.contains(SENTINEL));
+        // CRLF
+        let crlf_path = dir.join("crlf_core.json");
+        let crlf_bytes = b"{\r\n  \"model\": \"opus\"\r\n}";
+        std::fs::write(&crlf_path, crlf_bytes).unwrap();
+        let v = superai_config::raw_editor::validate(
+            crlf_bytes,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(v.is_empty(), "CRLF json should be valid: {v:?}");
+        let edit = superai_config::json::edit(&crlf_path, |m| {
+            m.insert("b".to_owned(), serde_json::Value::String("x".to_owned()));
+        });
+        edit.unwrap();
+        let after = std::fs::read(&crlf_path).unwrap();
+        assert!(!contains_sentinel(&after));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn shell_metachars_and_broad_deletion_and_huge_are_bounded_core() {
+        let dir = temp_dir("shell-broad-huge-core");
+        std::fs::create_dir_all(&dir).unwrap();
+        for seg in [
+            "$(rm -rf)",
+            "`whoami`",
+            "; cat",
+            "| sh",
+            "&& rm",
+            "${HOME}",
+            "*glob*",
+            "[abc]",
+        ] {
+            let path = dir.join(format!("{seg}.json"));
+            let res = std::panic::catch_unwind(|| {
+                superai_config::atomic::atomic_write(&path, br#"{"a":1}"#)
+            });
+            assert!(res.is_ok(), "shell metachars {seg:?} must not panic");
+            if let Ok(Ok(())) = res {
+                let b = std::fs::read(&path).unwrap();
+                assert!(!contains_sentinel(&b));
+                drop(std::fs::remove_file(&path));
+            }
+        }
+        // Broad deletion must reject traversal and absolute private redirects
+        for p in [
+            "/",
+            "/home",
+            "/tmp",
+            "/etc",
+            "/tmp/*.json",
+            "/tmp/$HOME/foo",
+        ] {
+            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
+            assert!(r.is_err(), "broad {p:?} must be rejected");
+            assert!(!format!("{:?}", r.unwrap_err()).contains(SENTINEL));
+        }
+        // Huge
+        let huge = vec![b'a'; crate::template::MAX_TEMPLATE_BYTES + 1024];
+        let tr = Template::from_json_bytes(&huge);
+        assert!(tr.is_err());
+        let msg = format!("{:?}", tr.unwrap_err());
+        assert!(msg.len() <= 8192);
+        assert!(!msg.contains(SENTINEL));
         drop(std::fs::remove_dir_all(&dir));
     }
 }
