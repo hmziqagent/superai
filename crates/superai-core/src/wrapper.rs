@@ -950,6 +950,7 @@ mod tests {
         }
     }
 
+    /// Platform: Linux and macOS — `#!/bin/sh` wrapper with `CLAUDE_CONFIG_DIR` and `exec`; Windows — same script via `bash`/`sh` (PowerShell/cmd wrapper not yet generated). Determinism holds on all platforms.
     #[test]
     fn generates_deterministic_sh_wrapper() {
         let inst = sample_instance_with_root("/tmp/.claude-work");
@@ -973,6 +974,7 @@ mod tests {
         assert!(content1.contains("test-id-1"));
     }
 
+    /// Platform: Linux, macOS, Windows — paths with spaces/`$`/`'` are single-quoted for POSIX `sh`; Windows `bash` also uses POSIX quoting, PowerShell differs (not covered here).
     #[test]
     fn quotes_special_paths_safely() {
         let inst = sample_instance_with_root("/tmp/my work with $dollar");
@@ -986,6 +988,7 @@ mod tests {
         assert!(!content.contains("export CLAUDE_CONFIG_DIR=/tmp/my work"));
     }
 
+    /// Platform: Linux/macOS — atomically writes wrapper and sets `0o755` via `PermissionsExt`; Windows — atomic write without Unix perms (`#[cfg(unix)]` gated). Test verifies atomic write on all, exec bit only on Unix.
     #[test]
     fn writes_wrapper_atomically_and_executable() {
         let dir = crate::test_util::temp_dir_unique("wrapper");
@@ -1015,6 +1018,7 @@ mod tests {
         std::fs::remove_file(wrapper_path.as_path()).unwrap_or(());
     }
 
+    /// Platform: all — wrapper content must not embed secrets on Linux, macOS, or Windows; redaction is platform-independent.
     #[test]
     fn never_embeds_secret() {
         let inst = sample_instance_with_root("/tmp/.claude-work");
@@ -1030,6 +1034,7 @@ mod tests {
         assert!(!json.contains(secret));
     }
 
+    /// Platform: all — env var mapping (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`) is platform-independent; Windows uses same vars via `sh` wrapper, not registry.
     #[test]
     fn env_var_mapping_is_correct() {
         let h = HarnessId::new("claude-code").unwrap();
@@ -1042,6 +1047,7 @@ mod tests {
         assert_eq!(env_var_for_harness(&generic), "MY_HARNESS_CONFIG_DIR");
     }
 
+    /// Platform: Linux/macOS — `SuperaiOwned`/`Foreign`/`Opaque` detection via shebang/marker; Windows — same detection, `is_owned_wrapper` does not check ACL, only marker digest.
     #[test]
     fn wrapper_dtype_detection_and_collision_and_digest() {
         let dir = crate::test_util::temp_dir_unique("wrapper");
@@ -1105,6 +1111,7 @@ mod tests {
         std::fs::remove_file(&opaque_path).unwrap_or(());
     }
 
+    /// Platform: Linux — case-sensitive FS but `is_name_collision_case_fold` enforces case-insensitive command collision; macOS — typically case-insensitive; Windows — case-insensitive NTFS. Test asserts fold collision on all and `exists_case_insensitive` for FS lookup.
     #[test]
     fn wrapper_collision_case_insensitive_and_path() {
         use crate::ids::{InstanceId, InstanceName};
@@ -1155,6 +1162,7 @@ mod tests {
         std::fs::remove_file(&existing).unwrap_or(());
     }
 
+    /// Platform: Linux, macOS, Windows — tricky chars (spaces, `'`, `$`, `%`, Unicode) are POSIX single-quoted; Windows PowerShell would need different quoting (not covered), `bash` wrapper is used on Windows.
     #[test]
     fn wrapper_special_chars_quoted_and_verified() {
         let dir = crate::test_util::temp_dir_unique("wrapper");

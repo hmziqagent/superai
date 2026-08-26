@@ -988,6 +988,7 @@ mod tests {
         }
     }
 
+    /// Platform: Linux, macOS, Windows — `scan_candidate_roots` via XDG `~/.config` and home dotfiles; Linux/macOS use `/home/...`, Windows uses `C:\Users\...` via `AbsolutePath::expand_home`. Finds `.claude-*`, `.codex`, `.aider` on all.
     #[test]
     fn scan_finds_claude_variants_in_temp_home() {
         let home = tmp_home("scan_claude_variants");
@@ -1104,6 +1105,7 @@ mod tests {
         std::fs::remove_dir_all(&multi_dir).unwrap_or(());
     }
 
+    /// Platform: Linux/macOS — dedup by `(dev, ino)` via `MetadataExt` for symlinked roots; Windows — lexical dedup (no `MetadataExt`), hardlinks/junctions not resolved. Test asserts one entry on each via `#[cfg(unix)]`/`#[cfg(not(unix))]`.
     #[test]
     fn symlinked_roots_deduplicate_by_identity() {
         let home = tmp_home("dedup_symlink");
@@ -1134,6 +1136,7 @@ mod tests {
         }
     }
 
+    /// Platform: all — bounded scan `scan_candidate_roots_limited` prevents huge tree traversal on Linux, macOS, and Windows by capping entries before deduplication.
     #[test]
     fn scan_bounds_prevent_huge_tree() {
         let home = tmp_home("scan_bounds");
@@ -1160,6 +1163,7 @@ mod tests {
         );
     }
 
+    /// Platform: all — fingerprint uses multiple signals (exists, size, mtime) independent of OS; Windows mtime granularity differs but still deterministic.
     #[test]
     fn fingerprint_uses_multiple_signals() {
         let home = tmp_home("fingerprint_multi");
@@ -1191,6 +1195,7 @@ mod tests {
         }
     }
 
+    /// Platform: all — ownership classification via registry and foreign marker (`claude-multi`) is FS-agnostic; Windows path case-insensitivity handled via lexical compare, not OS case folding.
     #[test]
     fn classify_ownership_respects_registry_and_foreign() {
         let home = tmp_home("classify_owner");

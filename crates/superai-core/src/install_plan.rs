@@ -656,6 +656,7 @@ mod tests {
         }
     }
 
+    /// Platform: all — `plan_install_for_entry` rejects `windows`/`aarch64` when entry only allows `linux`/`x86_64`; Linux, macOS, Windows each validated via `PlatformConstraints::supports` with `any` wildcard.
     #[test]
     fn plan_rejects_unsupported_platform() {
         let entry = minimal_entry("test-harness", &["linux"], &["x86_64"]);

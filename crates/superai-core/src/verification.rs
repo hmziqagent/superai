@@ -790,6 +790,7 @@ mod tests {
 
     // ---- platform gates ----
 
+    /// Platform: Linux, macOS, Windows — `current_platform()` derives from `std::env::consts::OS/ARCH`; deterministic on each host, maps `linux`/`macos`/`windows` and `x86_64`/`aarch64`/`any`.
     #[test]
     fn current_platform_is_deterministic() {
         let a = current_platform();
@@ -797,6 +798,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Platform: Linux, macOS, Windows — gate is `Supported` when current `Platform {os, arch}` matches adapter's `supported_platforms` via `platform_matches` (arch `Any` matches any). Valid on each OS.
     #[test]
     fn platform_gate_supported_when_current_in_list() {
         let current = current_platform();
@@ -809,6 +811,7 @@ mod tests {
         assert_eq!(gate.harness, "aider");
     }
 
+    /// Platform: Linux, macOS, Windows — gate is `Unsupported` when current OS not in adapter's list; e.g., Linux host vs Windows-only adapter. Behavior is per-OS, not generalized.
     #[test]
     fn platform_gate_unsupported_when_not_in_list() {
         // Pick a platform that is not current: if current is Linux, use Windows
@@ -827,6 +830,7 @@ mod tests {
         assert_eq!(gate.verdict, PlatformVerdict::Unsupported);
     }
 
+    /// Platform: all — empty `supported_platforms` yields `Unknown` on Linux, macOS, and Windows; adapter must declare platforms.
     #[test]
     fn platform_gate_unknown_when_empty() {
         let adapter = DummyAdapter {
@@ -837,6 +841,7 @@ mod tests {
         assert_eq!(gate.verdict, PlatformVerdict::Unknown);
     }
 
+    /// Platform: Linux, macOS, Windows — `catalog_platform_gates()` runs gate for every catalog entry; at least one is `Supported` on each host because harness `supported_platforms` includes all three OSes.
     #[test]
     fn catalog_gates_cover_all_entries() {
         let gates = catalog_platform_gates();

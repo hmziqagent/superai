@@ -868,6 +868,7 @@ impl<'de> Deserialize<'de> for ExecutableRef {
 mod tests {
     use super::*;
 
+    /// Platform: Linux, macOS, Windows — `/`-rooted absolute paths are valid on all hosts via `Component::RootDir` (Windows also accepts `C:\` via `Prefix`). This test exercises the Unix form canonical on Linux/macOS and also accepted on Windows.
     #[test]
     fn absolute_path_valid() {
         let p = AbsolutePath::new("/home/user/.claude").unwrap();
@@ -880,6 +881,7 @@ mod tests {
         assert_eq!(p4.to_string(), "/opt/bin");
     }
 
+    /// Platform: Linux and macOS use `/` with `.` and `//` lexical normalization; Windows uses `\` and drive prefix `C:\` (handled via `Component::Prefix`). This test asserts Unix `/` normalization which holds on all platforms via `normalize_absolute`.
     #[test]
     fn absolute_path_normalizes_dot_and_slash() {
         let p = AbsolutePath::new("/home//user/./.claude/").unwrap();
@@ -892,12 +894,14 @@ mod tests {
         assert_eq!(root.as_path(), Path::new("/"));
     }
 
+    /// Platform: all — empty path is invalid on Linux, macOS, and Windows; no platform accepts empty as absolute.
     #[test]
     fn absolute_path_rejects_empty() {
         AbsolutePath::new("").unwrap_err();
         AbsolutePath::from_path(Path::new("")).unwrap_err();
     }
 
+    /// Platform: all — NUL (`\0`) is rejected on Linux, macOS, and Windows (Windows also rejects via OS APIs; we reject explicitly).
     #[test]
     fn absolute_path_rejects_nul() {
         AbsolutePath::new("/tmp/a\0b").unwrap_err();
@@ -905,6 +909,7 @@ mod tests {
         AbsolutePath::from_path(path).unwrap_err();
     }
 
+    /// Platform: all — relative paths (`relative/path`, `./`, `~/foo`) are rejected on Linux, macOS, and Windows; absolute required.
     #[test]
     fn absolute_path_rejects_relative() {
         AbsolutePath::new("relative/path").unwrap_err();
@@ -913,6 +918,7 @@ mod tests {
         AbsolutePath::new("~/foo").unwrap_err();
     }
 
+    /// Platform: all — `..` traversal is rejected on Linux, macOS, and Windows before normalization; `Component::ParentDir` check is platform-independent.
     #[test]
     fn absolute_path_rejects_traversal() {
         AbsolutePath::new("/home/../etc").unwrap_err();
@@ -924,6 +930,7 @@ mod tests {
         AbsolutePath::from_path(p).unwrap_err();
     }
 
+    /// Platform: Linux/macOS — `~/` and `$HOME/` expand via home dir; Windows — `%USERPROFILE%\` and `C:\Users\...` via same helper. This test covers Unix `~`/`$HOME` which is valid on Linux/macOS and mapped on Windows via `%USERPROFILE%` branch.
     #[test]
     fn absolute_path_expand_home_tilde() {
         let home = Path::new("/home/user");
@@ -937,6 +944,7 @@ mod tests {
         assert_eq!(p4.as_path(), Path::new("/home/user/x"));
     }
 
+    /// Platform: all — after `~`/`$HOME`/`%USERPROFILE%` expansion, `..` traversal is still rejected on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_expand_home_rejects_traversal_after_expand() {
         let home = Path::new("/home/user");
@@ -944,6 +952,7 @@ mod tests {
         AbsolutePath::expand_home("~/a/../b", home).unwrap_err();
     }
 
+    /// Platform: all — empty and NUL after home expansion are rejected on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_expand_home_rejects_nul_and_empty() {
         let home = Path::new("/home/user");
@@ -952,6 +961,7 @@ mod tests {
         AbsolutePath::expand_home("~/a\0b", home).unwrap_err();
     }
 
+    /// Platform: all — `join` rejects absolute and `..` on Linux, macOS, and Windows; lexical `normalize_absolute` handles both `/` and `\`.
     #[test]
     fn absolute_path_join() {
         let base = AbsolutePath::new("/home/user").unwrap();
@@ -963,6 +973,7 @@ mod tests {
         base.join("").unwrap_err();
     }
 
+    /// Platform: Linux, macOS, Windows — no symlink resolution/canoncalization; lexical path is stored. Unix symlinks and Windows junctions are not followed, verified via `normalize_absolute` without `canonicalize`.
     #[test]
     fn absolute_path_does_not_follow_symlinks() {
         // No canonicalization: path is stored as given, not resolved
@@ -973,6 +984,7 @@ mod tests {
         assert_eq!(p2.as_path(), Path::new("/nonexistent/path/to/file"));
     }
 
+    /// Platform: all — serde round-trip preserves absolute form; `..` and NUL rejection holds on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_serde_roundtrip() {
         let p = AbsolutePath::new("/home/user/.claude").unwrap();
@@ -989,6 +1001,7 @@ mod tests {
         res.unwrap_err();
     }
 
+    /// Platform: all — `ConfigRoot` wraps `AbsolutePath`; Linux/macOS use `/home/...`, Windows uses `C:\...` via prefix. Test covers Unix form; Windows prefix path accepted via same `AbsolutePath` validation.
     #[test]
     fn config_root_wraps_absolute() {
         let r = ConfigRoot::new("/home/user/.claude").unwrap();
@@ -1004,6 +1017,7 @@ mod tests {
         assert_eq!(r, decoded);
     }
 
+    /// Platform: all — `ConfigSurfacePath` is absolute file path; Linux/macOS `/home/.../settings.json`, Windows `C:\Users\...\settings.json` both via `AbsolutePath`.
     #[test]
     fn config_surface_path() {
         let s = ConfigSurfacePath::new("/home/user/.claude/settings.json").unwrap();
@@ -1018,6 +1032,7 @@ mod tests {
         assert_eq!(s, decoded);
     }
 
+    /// Platform: all — `WrapperPath` is absolute wrapper executable; Unix `/usr/local/bin/...` with `+x`, Windows `C:\bin\...\.exe` without Unix perms but same absolute validation.
     #[test]
     fn wrapper_path() {
         let w = WrapperPath::new("/usr/local/bin/work").unwrap();
@@ -1031,6 +1046,7 @@ mod tests {
         assert_eq!(w, decoded);
     }
 
+    /// Platform: all — bare `PATH`-resolved names (`claude`, `code`) are platform-independent; Windows also probes `.exe` suffix in `find_binary_in_path`.
     #[test]
     fn executable_ref_named() {
         let e = ExecutableRef::new("claude").unwrap();
@@ -1047,6 +1063,7 @@ mod tests {
         assert_eq!(e, decoded);
     }
 
+    /// Platform: Linux/macOS — `/usr/bin/...`; Windows — `C:\Program Files\...\.exe` via `Component::Prefix`. Test covers Unix absolute; Windows absolute validated via same `AbsolutePath` branch.
     #[test]
     fn executable_ref_absolute() {
         let e = ExecutableRef::new("/usr/bin/claude").unwrap();
@@ -1062,6 +1079,7 @@ mod tests {
         assert_eq!(e, decoded);
     }
 
+    /// Platform: all — rejects `/`, `\`, `:`, `..`, NUL; Windows drive `C:` contains `:` so absolute form must use `AbsolutePath`, not bare name.
     #[test]
     fn executable_ref_rejects_invalid() {
         ExecutableRef::new("").unwrap_err();
@@ -1078,6 +1096,7 @@ mod tests {
         ExecutableRef::new("/a/../b").unwrap_err();
     }
 
+    /// Platform: Linux/macOS — `~/bin/...` via `~`/`$HOME`; Windows — `%USERPROFILE%\bin\...` via same `expand_tilde`. Bare names stay `PATH`-resolved on all platforms.
     #[test]
     fn executable_ref_expand_home() {
         let home = Path::new("/home/user");
@@ -1095,6 +1114,7 @@ mod tests {
         ExecutableRef::expand_home("", home).unwrap_err();
     }
 
+    /// Platform: Linux, macOS, Windows — no `canonicalize`; Unix symlinks and Windows junctions are preserved lexically. Test asserts lexical storage on all platforms.
     #[test]
     fn paths_preserve_symlink_semantics() {
         // Path types alone do not resolve symlinks; they store the lexical path.
@@ -1106,6 +1126,7 @@ mod tests {
         assert_eq!(w.as_path(), Path::new("/usr/local/bin/my-wrapper"));
     }
 
+    /// Platform: all — NUL, empty, `..` rejected for every path newtype on Linux, macOS, and Windows via shared `validate_no_traversal`/`validate_no_nul`.
     #[test]
     fn all_path_types_reject_nul_and_empty_and_traversal() {
         let cases = ["", "/tmp/a\0b", "/a/../b", "relative/path"];
@@ -1122,6 +1143,7 @@ mod tests {
         ExecutableRef::new("/a/../b").unwrap_err();
     }
 
+    /// Platform: all — serde for `ExecutableRef` round-trips both named and absolute forms; Windows `C:\` absolute also via `AbsolutePath`.
     #[test]
     fn executable_ref_serde() {
         let named = ExecutableRef::new("claude").unwrap();
@@ -1140,6 +1162,7 @@ mod tests {
         res.unwrap_err();
     }
 
+    /// Platform: all — `Display`/`FromStr` preserve lexical form; Unix `/tmp/...` shown here, Windows `C:\...` via same `Display` impl.
     #[test]
     fn display_and_from_str() {
         let p: AbsolutePath = "/tmp/foo".parse().unwrap();
