@@ -1,0 +1,20 @@
+[package]
+name = "superai-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+repository.workspace = true
+description = "Layer 1: per-harness config files — read fresh, edit, back up, write back preserving unmodelled keys."
+
+[dependencies]
+serde_json = { workspace = true }
+toml_edit = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

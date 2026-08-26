@@ -1,0 +1,47 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Lint inheritance
+        run: |
+          for f in $(find . -name Cargo.toml -not -path './target/*' -not -path './Cargo.toml'); do
+            grep -q 'workspace = true' "$f" || { echo "Missing [lints] workspace = true in $f"; exit 1; }
+          done
+
+      - name: No crate-level allow
+        run: |
+          if grep -rn '#!\[allow' --include='*.rs' crates/; then
+            echo "crate-level #![allow] is forbidden"; exit 1
+          fi
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Locked build
+        run: cargo build --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-hack cargo-shear cargo-deny --locked
+      - run: cargo hack check --workspace --each-feature --no-dev-deps
+      - run: cargo shear --deny-warnings
+      - run: cargo deny check

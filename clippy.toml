@@ -1,0 +1,20 @@
+# Test escapes. Every one of these defaults to `false`.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false
+
+# excessive_nesting is a NO-OP without this. Default threshold is 0.
+excessive-nesting-threshold = 4
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 6
+
+msrv = "1.97"
+
+disallowed-methods = [
+  { path = "std::env::set_current_dir", reason = "process-global; breaks parallel tests. Pass paths explicitly." },
+]
+disallowed-macros = [
+  { path = "std::dbg", reason = "debugging leftover" },
+]
