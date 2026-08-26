@@ -41,6 +41,9 @@ pub use registry::{Registry, SCHEMA_VERSION, unmanaged_dirs};
 /// Duct-backed process execution wrapper (PKG-01, PKG-05).
 pub mod process;
 
+/// Install execution, verification receipt, update and uninstall (PKG-05..08).
+pub mod install_execute;
+
 /// Installation catalog — data-driven harness package registry (PKG-02).
 pub mod install_catalog;
 
