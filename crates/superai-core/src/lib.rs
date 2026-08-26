@@ -38,6 +38,18 @@ pub use error::{CoreError, Result};
 pub use instance::{Instance, TemplateRef, WrapperRef};
 pub use registry::{Registry, SCHEMA_VERSION, unmanaged_dirs};
 
+/// Duct-backed process execution wrapper (PKG-01, PKG-05).
+pub mod process;
+
+/// Installation catalog — data-driven harness package registry (PKG-02).
+pub mod install_catalog;
+
+/// Install detection — collects all harness matches (PKG-03).
+pub mod detect;
+
+/// Install planning — validates and previews harness installs (PKG-04).
+pub mod install_plan;
+
 /// Template catalog, schema, and repo config (TPL-01, TPL-02).
 pub mod template;
 /// Template fetch client with HTTPS, digest, and traversal guards (TPL-03).

@@ -1,0 +1,137 @@
+[
+  {
+    "harness": "claude-code",
+    "executables": ["claude"],
+    "bundle_ids": [],
+    "apps": [],
+    "methods": [
+      {"kind": "npm", "package_name": "@anthropic-ai/claude-code", "registry": "https://registry.npmjs.org"},
+      {"kind": "homebrew", "package_name": "claude-code", "tap": null, "repo": null},
+      {"kind": "mise", "package_name": "claude-code", "tap": null, "repo": null},
+      {"kind": "direct", "package_name": "claude-code", "tap": null, "repo": "https://github.com/anthropics/claude-code"}
+    ],
+    "version_source": "claude --version",
+    "constraints": {
+      "os": ["linux", "macos", "windows"],
+      "arch": ["x86_64", "aarch64", "any"]
+    },
+    "detect": {
+      "commands": [{"executable": "claude", "args": ["--version"]}],
+      "paths": ["/usr/local/bin/claude", "/opt/homebrew/bin/claude", "/home/linuxbrew/.linuxbrew/bin/claude"]
+    },
+    "update": {"executable": "npm", "args": ["update", "-g", "@anthropic-ai/claude-code"]},
+    "uninstall": {"executable": "npm", "args": ["uninstall", "-g", "@anthropic-ai/claude-code"]},
+    "requires_admin": false,
+    "checksum": null,
+    "conflicts": [],
+    "docs": "https://code.claude.com/docs",
+    "last_verified": "2026-08-26"
+  },
+  {
+    "harness": "codex-cli",
+    "executables": ["codex"],
+    "bundle_ids": [],
+    "apps": [],
+    "methods": [
+      {"kind": "npm", "package_name": "@openai/codex", "registry": "https://registry.npmjs.org"},
+      {"kind": "homebrew", "package_name": "codex", "tap": null, "repo": null},
+      {"kind": "cargo", "package_name": "codex-cli", "registry": "https://crates.io"},
+      {"kind": "mise", "package_name": "codex", "tap": null, "repo": null}
+    ],
+    "version_source": "codex --version",
+    "constraints": {
+      "os": ["linux", "macos", "windows"],
+      "arch": ["x86_64", "aarch64", "any"]
+    },
+    "detect": {
+      "commands": [{"executable": "codex", "args": ["--version"]}],
+      "paths": ["/usr/local/bin/codex", "/opt/homebrew/bin/codex"]
+    },
+    "update": {"executable": "npm", "args": ["update", "-g", "@openai/codex"]},
+    "uninstall": {"executable": "npm", "args": ["uninstall", "-g", "@openai/codex"]},
+    "requires_admin": false,
+    "checksum": null,
+    "conflicts": [],
+    "docs": "https://github.com/openai/codex",
+    "last_verified": "2026-08-26"
+  },
+  {
+    "harness": "aider",
+    "executables": ["aider"],
+    "bundle_ids": [],
+    "apps": [],
+    "methods": [
+      {"kind": "pipx", "package_name": "aider-chat", "registry": "https://pypi.org"},
+      {"kind": "homebrew", "package_name": "aider", "tap": null, "repo": null},
+      {"kind": "mise", "package_name": "aider", "tap": null, "repo": null}
+    ],
+    "version_source": "aider --version",
+    "constraints": {
+      "os": ["linux", "macos", "windows"],
+      "arch": ["x86_64", "aarch64", "any"]
+    },
+    "detect": {
+      "commands": [{"executable": "aider", "args": ["--version"]}],
+      "paths": ["/usr/local/bin/aider"]
+    },
+    "update": {"executable": "pipx", "args": ["upgrade", "aider-chat"]},
+    "uninstall": {"executable": "pipx", "args": ["uninstall", "aider-chat"]},
+    "requires_admin": false,
+    "checksum": null,
+    "conflicts": [],
+    "docs": "https://aider.chat/docs/install.html",
+    "last_verified": "2026-08-26"
+  },
+  {
+    "harness": "opencode",
+    "executables": ["opencode"],
+    "bundle_ids": [],
+    "apps": [],
+    "methods": [
+      {"kind": "npm", "package_name": "opencode-ai", "registry": "https://registry.npmjs.org"},
+      {"kind": "homebrew", "package_name": "opencode", "tap": null, "repo": null},
+      {"kind": "cargo", "package_name": "opencode", "registry": "https://crates.io"}
+    ],
+    "version_source": "opencode --version",
+    "constraints": {
+      "os": ["linux", "macos"],
+      "arch": ["x86_64", "aarch64", "any"]
+    },
+    "detect": {
+      "commands": [{"executable": "opencode", "args": ["--version"]}],
+      "paths": ["/usr/local/bin/opencode"]
+    },
+    "update": {"executable": "npm", "args": ["update", "-g", "opencode-ai"]},
+    "uninstall": {"executable": "npm", "args": ["uninstall", "-g", "opencode-ai"]},
+    "requires_admin": false,
+    "checksum": null,
+    "conflicts": [],
+    "docs": "https://opencode.ai/docs",
+    "last_verified": "2026-08-26"
+  },
+  {
+    "harness": "cline",
+    "executables": ["cline"],
+    "bundle_ids": ["saoudrizwan.claude-dev"],
+    "apps": ["/Applications/Visual Studio Code.app", "/Applications/Cursor.app"],
+    "methods": [
+      {"kind": "direct", "package_name": "cline-vscode-extension", "tap": null, "repo": "https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev"}
+    ],
+    "version_source": "code --list-extensions | grep cline",
+    "constraints": {
+      "os": ["linux", "macos", "windows"],
+      "arch": ["x86_64", "aarch64", "any"]
+    },
+    "detect": {
+      "commands": [{"executable": "code", "args": ["--list-extensions"]}],
+      "paths": ["/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code", "/usr/local/bin/code"]
+    },
+    "update": {"executable": "code", "args": ["--install-extension", "saoudrizwan.claude-dev"]},
+    "uninstall": {"executable": "code", "args": ["--uninstall-extension", "saoudrizwan.claude-dev"]},
+    "requires_admin": false,
+    "checksum": null,
+    "conflicts": [],
+    "docs": "https://docs.cline.bot",
+    "last_verified": "2026-08-26"
+  }
+]
