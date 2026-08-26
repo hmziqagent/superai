@@ -5,6 +5,7 @@
 //! synced folder can change these files between two calls.
 
 mod backup;
+pub mod document;
 mod error;
 /// JSON configs, key order preserved.
 pub mod json;
