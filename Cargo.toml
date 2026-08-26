@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml_edit = "0.23"
 thiserror = "2"
+yaml-serde = { package = "yaml_serde", version = "0.10" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

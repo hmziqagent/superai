@@ -6,6 +6,8 @@
 
 mod backup;
 pub mod document;
+/// Env file configs, comments and duplicate handling preserved.
+pub mod env_file;
 mod error;
 /// Strict JSON configs, key order preserved.
 pub mod json;
@@ -13,6 +15,8 @@ pub mod json;
 pub mod jsonc;
 /// TOML configs, comments and formatting preserved.
 pub mod toml_file;
+/// YAML configs, validation and normalized write.
+pub mod yaml;
 
 pub use backup::{backup, restore};
 pub use error::{ConfigError, Result};

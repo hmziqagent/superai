@@ -30,6 +30,24 @@ pub enum ConfigError {
         source: toml_edit::TomlError,
     },
 
+    /// The file exists but is not valid YAML.
+    #[error("invalid yaml in {path}: {source}")]
+    Yaml {
+        /// Path of the offending file.
+        path: PathBuf,
+        /// Parser error.
+        source: yaml_serde::Error,
+    },
+
+    /// The file exists but is not a valid env file.
+    #[error("invalid env file in {path}: {message}")]
+    Env {
+        /// Path of the offending file.
+        path: PathBuf,
+        /// Human-readable message.
+        message: String,
+    },
+
     /// A JSON config was expected to hold an object at its root.
     #[error("expected a json object at the root of {path}")]
     NotAnObject {
