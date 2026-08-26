@@ -77,7 +77,7 @@ fn validate(kind: &str, value: &str) -> Result<(), CoreError> {
 macro_rules! define_id {
     ($ty:ident, $kind:literal, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         pub struct $ty(String);
 
         impl $ty {

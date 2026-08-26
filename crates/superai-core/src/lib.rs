@@ -47,3 +47,9 @@ pub mod template_update;
 
 /// Skill registry, acquisition, destination modes, enable/disable and drift (EXT-01..05).
 pub mod skills;
+
+/// MCP canonical definition and lifecycle (EXT-08..10).
+pub mod mcp;
+
+/// Plugin abstraction and lifecycle (EXT-06/07).
+pub mod plugin;

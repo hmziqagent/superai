@@ -344,6 +344,17 @@ pub enum CoreError {
         /// Redacted value preview, never the raw secret.
         redacted: RedactedString,
     },
+
+    /// Plugin or MCP operation requires external command execution and caller approval (EXT-06).
+    #[error("requires approval for plugin `{plugin}` operation `{operation}`: {reason}")]
+    RequiresApproval {
+        /// Plugin or server identifier requesting approval.
+        plugin: String,
+        /// Operation that needs approval, e.g., `install`.
+        operation: String,
+        /// Human-readable reason approval is required.
+        reason: String,
+    },
 }
 
 /// Result alias for core operations.

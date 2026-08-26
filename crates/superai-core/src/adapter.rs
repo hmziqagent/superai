@@ -519,6 +519,173 @@ impl fmt::Display for SkillMode {
 }
 
 // ---------------------------------------------------------------------------
+// MCP transport and adapter declarations (EXT-06..08)
+// ---------------------------------------------------------------------------
+
+/// Transport for an MCP server (EXT-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    /// Standard I/O (command + args).
+    Stdio,
+    /// Server-sent events (URL).
+    Sse,
+    /// Plain HTTP (URL).
+    Http,
+    /// WebSocket (URL).
+    WebSocket,
+    /// Streamable HTTP (URL).
+    StreamableHttp,
+}
+
+impl fmt::Display for McpTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Stdio => "stdio",
+            Self::Sse => "sse",
+            Self::Http => "http",
+            Self::WebSocket => "websocket",
+            Self::StreamableHttp => "streamable_http",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Where an adapter expects MCP servers to be persisted (EXT-08/09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAdapterDecl {
+    /// File name or path hint relative to instance root (e.g. `settings.json`).
+    pub dest_file: String,
+    /// Key inside the file that holds the server map (e.g. `mcpServers`).
+    pub dest_key: String,
+    /// Document kind of the destination file.
+    pub kind: DocumentKind,
+    /// Scope of the destination file.
+    pub scope: ConfigScope,
+    /// Restart required after mutation.
+    pub restart: RestartBehavior,
+}
+
+impl McpAdapterDecl {
+    /// Create a new MCP adapter declaration.
+    pub fn new(
+        dest_file: &str,
+        dest_key: &str,
+        kind: DocumentKind,
+        scope: ConfigScope,
+        restart: RestartBehavior,
+    ) -> Self {
+        Self {
+            dest_file: dest_file.to_owned(),
+            dest_key: dest_key.to_owned(),
+            kind,
+            scope,
+            restart,
+        }
+    }
+}
+
+/// Plugin kind is adapter-specific (EXT-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginKind {
+    /// Directory or bundle on the filesystem.
+    DirectoryBundle,
+    /// Single config entry inside a harness config file.
+    ConfigEntry,
+    /// NPM / package reference requiring external install.
+    NpmRef,
+    /// Marketplace install record requiring external command.
+    MarketplaceRecord,
+    /// Extension script (e.g. `.js` loaded by harness).
+    ExtensionScript,
+}
+
+impl fmt::Display for PluginKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::DirectoryBundle => "directory_bundle",
+            Self::ConfigEntry => "config_entry",
+            Self::NpmRef => "npm_ref",
+            Self::MarketplaceRecord => "marketplace_record",
+            Self::ExtensionScript => "extension_script",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Adapter declaration for plugin persistence (EXT-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAdapterDecl {
+    /// Source hint (e.g. registry path or marketplace identifier).
+    pub source_hint: String,
+    /// Destination file hint relative to instance root.
+    pub dest_file: String,
+    /// Optional key inside destination file for config-entry plugins.
+    pub dest_key: Option<String>,
+    /// Plugin kind this declaration handles.
+    pub kind: PluginKind,
+    /// Whether install requires executing a harness/package command.
+    pub requires_execution: bool,
+    /// Enable semantics (human description).
+    pub enable_semantics: String,
+    /// Disable semantics (human description).
+    pub disable_semantics: String,
+    /// Remove semantics (human description).
+    pub remove_semantics: String,
+    /// Dependency effect (human description).
+    pub dependency_effect: String,
+    /// Restart requirement after mutation.
+    pub restart: RestartBehavior,
+}
+
+impl PluginAdapterDecl {
+    /// Create a file/config safe plugin declaration (no execution).
+    pub fn file_config(
+        dest_file: &str,
+        dest_key: Option<&str>,
+        kind: PluginKind,
+        restart: RestartBehavior,
+    ) -> Self {
+        Self {
+            source_hint: "local".to_owned(),
+            dest_file: dest_file.to_owned(),
+            dest_key: dest_key.map(ToOwned::to_owned),
+            kind,
+            requires_execution: false,
+            enable_semantics: "add entry / create link".to_owned(),
+            disable_semantics: "remove entry / remove link (reversible)".to_owned(),
+            remove_semantics: "remove owned entry only".to_owned(),
+            dependency_effect: "none (file/config only)".to_owned(),
+            restart,
+        }
+    }
+
+    /// Create a declaration that requires external command execution (needs approval).
+    pub fn requires_execution(
+        source_hint: &str,
+        dest_file: &str,
+        kind: PluginKind,
+        restart: RestartBehavior,
+    ) -> Self {
+        Self {
+            source_hint: source_hint.to_owned(),
+            dest_file: dest_file.to_owned(),
+            dest_key: None,
+            kind,
+            requires_execution: true,
+            enable_semantics: "execute harness command to enable".to_owned(),
+            disable_semantics: "execute harness command to disable".to_owned(),
+            remove_semantics:
+                "execute harness command to remove; shared deps retained until no consumer"
+                    .to_owned(),
+            dependency_effect: "shared package dependency".to_owned(),
+            restart,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adapter trait
 // ---------------------------------------------------------------------------
 
@@ -576,6 +743,16 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Which skill destination modes this harness supports.
     fn supported_skill_modes(&self) -> Vec<SkillMode> {
         Vec::new()
+    }
+
+    /// MCP adapter declaration, if the harness supports MCP servers (EXT-08).
+    fn mcp_decl(&self) -> Option<McpAdapterDecl> {
+        None
+    }
+
+    /// Plugin adapter declaration, if the harness supports plugins (EXT-06).
+    fn plugin_decl(&self) -> Option<PluginAdapterDecl> {
+        None
     }
 }
 
