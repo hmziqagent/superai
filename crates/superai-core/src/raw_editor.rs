@@ -85,7 +85,7 @@ impl RawEditor {
         &self,
         path: &Path,
         new_content: &[u8],
-        expected: Option<&superai_config::Snapshot>,
+        expected: Option<&superai_config::snapshot::Snapshot>,
     ) -> Result<CommitReport> {
         commit_with_snapshot(path, new_content, expected)
     }
@@ -133,7 +133,7 @@ pub fn commit(
 pub fn commit_with_snapshot(
     path: &Path,
     new_content: &[u8],
-    expected: Option<&superai_config::Snapshot>,
+    expected: Option<&superai_config::snapshot::Snapshot>,
 ) -> Result<CommitReport> {
     superai_config::raw_editor::commit_with_snapshot(path, new_content, expected)
         .map_err(CoreError::Config)

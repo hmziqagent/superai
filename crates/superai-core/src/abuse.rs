@@ -155,7 +155,7 @@ mod tests {
         assert!(preview_lexical.contains("[REDACTED]"));
 
         // Snapshot must not contain sentinel
-        let snap = superai_config::snapshot(&cfg_path);
+        let snap = superai_config::snapshot::snapshot(&cfg_path);
         assert_no_sentinel_in_debug(&snap, "snapshot");
         // Snapshot digest is hash, not raw
         assert!(snap.digest.is_some());
@@ -478,13 +478,13 @@ mod tests {
             drop(std::fs::remove_file(&link));
             std::os::unix::fs::symlink(&target_a, &link).unwrap();
 
-            let snap = superai_config::snapshot(&link);
+            let snap = superai_config::snapshot::snapshot(&link);
             // Swap before commit
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&target_b, &link).unwrap();
 
             // For core, we test that snapshot is_modified detects swap
-            let snap_after = superai_config::snapshot(&link);
+            let snap_after = superai_config::snapshot::snapshot(&link);
             assert!(superai_config::snapshot::is_modified(&snap, &snap_after));
 
             // Also test via atomic write as before
@@ -503,9 +503,9 @@ mod tests {
 
     #[test]
     fn broad_deletion_is_rejected() {
+        use superai_config::quarantine::validate_quarantine_target;
         use superai_config::transaction::RemoveKind;
-        use superai_config::validate_quarantine_target;
-        use superai_config::validate_remove_target;
+        use superai_config::transaction::validate_remove_target;
 
         // validate_quarantine_target rejects broad roots, home, globs, foreign
         for p in ["/", "/home", "/tmp", "/usr", "/etc"] {

@@ -162,7 +162,7 @@ pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
         }
         // Backup via superai-config if it's a regular file
         if meta.is_file() || meta.file_type().is_symlink() {
-            let backup_res = superai_config::backup(target);
+            let backup_res = superai_config::backup::backup(target);
             match backup_res {
                 Ok(_) => {}
                 Err(e) => {

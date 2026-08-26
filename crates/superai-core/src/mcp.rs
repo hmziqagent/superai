@@ -717,7 +717,7 @@ fn write_outer_with_inner(
     });
 
     // Snapshot before for conflict detection
-    let snap_before = superai_config::snapshot(path);
+    let snap_before = superai_config::snapshot::snapshot(path);
     // Execute transaction
     let op_id_str = format!(
         "mcp-{}-{}",
@@ -749,7 +749,7 @@ fn write_outer_with_inner(
         let diag = outcome.diagnostics_redacted.join("; ");
         // Detect concurrent modification vs general failure
         if diag.contains("modified") || diag.contains("concurrent") {
-            let snap_after = superai_config::snapshot(path);
+            let snap_after = superai_config::snapshot::snapshot(path);
             let exp = snap_before.digest.unwrap_or_else(|| "missing".to_owned());
             let act = snap_after.digest.unwrap_or_else(|| "missing".to_owned());
             return Err(CoreError::ConcurrentModification {

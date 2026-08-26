@@ -41,19 +41,4 @@ mod property_tests;
 #[cfg(test)]
 mod fuzz;
 
-pub use atomic::{atomic_write, atomic_write_with_expected_digest, atomic_write_with_snapshot};
-pub use backup::{
-    BackupEntry, BackupId, RestoreReport, backup, backup_with_operation, backup_with_reason,
-    find_backup_by_id, list_backups, redacted_diff_preview, restore, restore_by_id, restore_entry,
-    restore_verified, verify_backup, verify_backup_relation,
-};
 pub use error::{ConfigError, Result};
-pub use quarantine::{
-    QuarantineEntry, list_quarantine, move_to_quarantine, move_to_quarantine_with_dest,
-    quarantine_base, quarantine_dir, restore_from_quarantine, validate_quarantine_target,
-};
-pub use snapshot::{Snapshot, is_modified, is_symlink_loop, snapshot};
-pub use transaction::{
-    CommitOutcome, FileAction, OperationId as TransactionOperationId, RemoveKind, RemovePlan,
-    RollbackOutcome, Transaction, TransactionOutcome, VerifyOutcome, validate_remove_target,
-};

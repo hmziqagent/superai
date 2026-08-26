@@ -1887,7 +1887,7 @@ pub fn create_mirrored(
 fn quarantine_target(
     path: &Path,
     op_id: &str,
-) -> std::result::Result<superai_config::QuarantineEntry, ConfigError> {
+) -> std::result::Result<superai_config::quarantine::QuarantineEntry, ConfigError> {
     superai_config::quarantine::move_to_quarantine(path, op_id)
 }
 
@@ -2091,7 +2091,7 @@ pub fn rename_instance(
                     let new_path = parent.join(new_name.as_str());
                     // Backup old wrapper before rename
                     if old_path.exists() {
-                        drop(superai_config::backup(&old_path));
+                        drop(superai_config::backup::backup(&old_path));
                     }
                     // Atomic move via std::fs::rename
                     match std::fs::rename(&old_path, &new_path) {

@@ -1,8 +1,6 @@
 # Agent Harness Configuration Bible — Master Index
 
-One document per harness, documenting **every configurable option**: config files (exact paths + schema), complete environment variables, third-party/custom API integration (OpenAI-compatible & Anthropic-compatible endpoints, gateways, local models), and **multi-instance wrapper techniques** (running N isolated instances of the same harness with different providers/keys).
-
-Compiled 2026-08-25 by parallel research agents against live official docs/repos, inline-cited in every file. Where a capability doesn't exist (e.g., no BYO endpoint), the docs say so explicitly.
+Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date. Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (48 surfaces: 20 Full, 15 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 1 ReadOnly; all last_verified 2026-08-25).
 
 ## The Documents
 

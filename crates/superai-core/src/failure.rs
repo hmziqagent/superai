@@ -321,7 +321,7 @@ fn injected_error(point: FailurePoint, nth: usize) -> CoreError {
 pub fn injected_backup(
     path: &Path,
     injector: &dyn FailureInjector,
-) -> CoreResult<Option<superai_config::BackupEntry>> {
+) -> CoreResult<Option<superai_config::backup::BackupEntry>> {
     injector.inject(FailurePoint::BackupOpen)?;
     // Simulate write/flush boundaries as separate checks after open
     injector.inject(FailurePoint::BackupWrite)?;
