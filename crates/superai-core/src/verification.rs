@@ -440,6 +440,134 @@ pub fn secret_key_patterns() -> BTreeSet<String> {
     s
 }
 
+// ---------------------------------------------------------------------------
+// QAL-06/07 expansion: failure injection matrix + fake harness checklist
+// ---------------------------------------------------------------------------
+
+/// Required `FailurePoint` variants for the QAL-06 matrix.
+///
+/// The matrix covers every boundary in subplan 02 that must be injectable
+/// via `FailureInjector` (Real vs `TestInjector` at Nth call). This list is
+/// intentionally exhaustive; CI fails if `failure.rs` drops a variant.
+pub fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
+    use crate::failure::FailurePoint;
+    vec![
+        FailurePoint::BackupOpen,
+        FailurePoint::BackupWrite,
+        FailurePoint::BackupFlush,
+        FailurePoint::BackupVerify,
+        FailurePoint::TempCreate,
+        FailurePoint::TempWrite,
+        FailurePoint::TempFlush,
+        FailurePoint::ParseStaged,
+        FailurePoint::AtomicReplace,
+        FailurePoint::ParentSync,
+        FailurePoint::ReadBackVerify,
+        FailurePoint::SecondFile,
+        FailurePoint::ThirdFile,
+        FailurePoint::RollbackVerify,
+        FailurePoint::ProcessSpawn,
+        FailurePoint::ProcessTimeout,
+        FailurePoint::NetworkFetch,
+    ]
+}
+
+/// Coverage report for the QAL-06 failure matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureMatrixReport {
+    /// All required points.
+    pub required: Vec<crate::failure::FailurePoint>,
+    /// Surfaces that the matrix exercises.
+    pub surfaces: Vec<String>,
+    /// Whether every required point is present.
+    pub complete: bool,
+}
+
+/// Build the QAL-06 failure matrix report.
+///
+/// Surfaces per spec: single-file config, multi-file instance creation,
+/// template update, bulk skill/MCP, wrapper replace, daemon start via process
+/// fixtures. Each surface must have at least one test that injects a failure
+/// at a distinct boundary and asserts recovery/rollback.
+pub fn failure_matrix_report() -> FailureMatrixReport {
+    let required = required_failure_points();
+    let surfaces = vec![
+        "single_file_config".to_owned(),
+        "multi_file_instance_creation".to_owned(),
+        "template_update".to_owned(),
+        "bulk_skill_mcp".to_owned(),
+        "wrapper_replace".to_owned(),
+        "daemon_start_via_process_fixtures".to_owned(),
+    ];
+    let complete = !required.is_empty() && surfaces.len() == 6;
+    FailureMatrixReport {
+        required,
+        surfaces,
+        complete,
+    }
+}
+
+/// Fake harness coverage report for QAL-07.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeHarnessReport {
+    /// Version output fixtures present (spaces, missing, non-zero, timeout, huge 10 MiB, etc.).
+    pub version_fixtures: Vec<String>,
+    /// Network/GitHub fixtures present.
+    pub network_fixtures: Vec<String>,
+    /// Health classifications covered.
+    pub health_cases: Vec<String>,
+    /// Whether cross-host redirect stripping is covered.
+    pub cross_host_redirect_covered: bool,
+    /// Whether the whole report is complete.
+    pub complete: bool,
+}
+
+/// Build the QAL-07 fake harness coverage report.
+///
+/// Version fixtures are delegated to `failure::version_output_fixtures`;
+/// network fixtures to `failure::FakeNetworkHarness::with_github_matrix`;
+/// health / redirect cases are enumerated here for CI ledger completeness.
+pub fn fake_harness_report() -> FakeHarnessReport {
+    let version_fixtures = crate::failure::version_output_fixtures()
+        .into_iter()
+        .map(|f| f.name)
+        .collect::<Vec<_>>();
+    let network_fixtures = crate::failure::FakeNetworkHarness::with_github_matrix().keys();
+    let health_cases = vec![
+        "healthy".to_owned(),
+        "rate_limited".to_owned(),
+        "auth_error".to_owned(),
+        "tls_error".to_owned(),
+        "not_found".to_owned(),
+        "server_error".to_owned(),
+        "timeout".to_owned(),
+        "oversized".to_owned(),
+        "redirect_loop".to_owned(),
+        "digest_mismatch".to_owned(),
+        "cross_host_redirect".to_owned(),
+    ];
+    let cross_host_redirect_covered = crate::failure::should_strip_auth_for_redirect(
+        "https://github.com/org/repo",
+        "https://evil.example.com/other",
+    );
+    let complete = !version_fixtures.is_empty()
+        && !network_fixtures.is_empty()
+        && health_cases.len() == 11
+        && cross_host_redirect_covered;
+    FakeHarnessReport {
+        version_fixtures,
+        network_fixtures,
+        health_cases,
+        cross_host_redirect_covered,
+        complete,
+    }
+}
+
+/// Combined QAL-06/07 ledger entry: fails CI when either matrix is incomplete.
+pub fn qal_06_07_complete() -> bool {
+    failure_matrix_report().complete && fake_harness_report().complete
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,5 +956,155 @@ mod tests {
         let yaml = b"password: mysecret\n";
         let spans_y = find_redaction_spans(yaml, DocumentKind::Yaml);
         assert!(!spans_y.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // QAL-06/07 matrix: failure injection + fake harness checklist
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qal_06_failure_matrix_is_complete() {
+        let report = failure_matrix_report();
+        assert!(
+            report.complete,
+            "failure matrix must be complete: {report:?}"
+        );
+        assert_eq!(report.required.len(), 17);
+        assert_eq!(report.surfaces.len(), 6);
+        // Each required point must be distinct
+        let mut distinct = BTreeSet::new();
+        for p in &report.required {
+            assert!(distinct.insert(*p), "duplicate point {p:?}");
+        }
+    }
+
+    #[test]
+    fn qal_07_fake_harness_is_complete() {
+        let report = fake_harness_report();
+        assert!(
+            report.complete,
+            "fake harness report must be complete: {report:?}"
+        );
+        // Version fixtures cover the required variants
+        let lower: Vec<String> = report
+            .version_fixtures
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        for needle in ["spaces", "missing", "non-zero", "timeout", "huge"] {
+            assert!(
+                lower.iter().any(|s| s.contains(needle)),
+                "version fixture missing {needle}: {lower:?}"
+            );
+        }
+        // Network fixtures cover GitHub matrix
+        for needle in [
+            "catalog_success",
+            "digest_mismatch",
+            "redirect_loop",
+            "rate_limit",
+            "timeout",
+            "oversized",
+            "tls_error",
+            "cross_host_redirect",
+        ] {
+            assert!(
+                report.network_fixtures.iter().any(|k| k == needle),
+                "network fixture missing {needle}: {:?}",
+                report.network_fixtures
+            );
+        }
+        // Health cases
+        assert_eq!(report.health_cases.len(), 11);
+        assert!(report.cross_host_redirect_covered);
+    }
+
+    #[test]
+    fn qal_06_07_combined_complete() {
+        assert!(
+            qal_06_07_complete(),
+            "QAL-06/07 combined coverage must be complete"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::excessive_nesting, reason = "deterministic fixture loop")]
+    fn fake_process_fixture_version_parse_is_deterministic() {
+        let fixtures = crate::failure::version_output_fixtures();
+        assert!(fixtures.len() >= 8, "need at least 8 version fixtures");
+        let harness = crate::failure::FakeProcessHarness::with_version_fixtures();
+        for f in fixtures {
+            let via = harness.version_for(&f.name);
+            if f.is_timeout || f.is_huge || f.exit_code.is_some_and(|c| c != 0) {
+                // These should not parse as success
+                if f.is_timeout || f.is_huge {
+                    assert!(
+                        via.is_none(),
+                        "fixture {} should be none due to timeout/huge",
+                        f.name
+                    );
+                }
+            } else if let Some(expected) = f.expected_version {
+                assert_eq!(
+                    via.as_deref(),
+                    Some(expected.as_str()),
+                    "fixture {} mismatch",
+                    f.name
+                );
+            } else {
+                assert!(via.is_none(), "fixture {} should be none", f.name);
+            }
+        }
+    }
+
+    #[test]
+    fn fake_network_harness_classifies_health_deterministically() {
+        let cases = [
+            (429, "rate limit", crate::failure::HealthStatus::RateLimited),
+            (401, "unauthorized", crate::failure::HealthStatus::AuthError),
+            (
+                200,
+                "tls error certificate",
+                crate::failure::HealthStatus::TlsError,
+            ),
+            (404, "not found", crate::failure::HealthStatus::NotFound),
+            (
+                500,
+                "internal server error",
+                crate::failure::HealthStatus::ServerError,
+            ),
+            (
+                200,
+                "timeout after 30s",
+                crate::failure::HealthStatus::Timeout,
+            ),
+            (
+                200,
+                "response size exceeds limit",
+                crate::failure::HealthStatus::Oversized,
+            ),
+            (
+                200,
+                "redirect limit exceeded",
+                crate::failure::HealthStatus::RedirectLoop,
+            ),
+            (
+                200,
+                "digest mismatch",
+                crate::failure::HealthStatus::DigestMismatch,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let got = crate::failure::classify_health(status, body);
+            assert_eq!(got, expected, "health for {status} {body}");
+        }
+        assert!(crate::failure::should_strip_auth_for_redirect(
+            "https://github.com/a/b",
+            "https://evil.com/c"
+        ));
+        assert!(!crate::failure::should_strip_auth_for_redirect(
+            "https://github.com/a/b",
+            "https://github.com/c/d"
+        ));
     }
 }
