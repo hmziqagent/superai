@@ -10,6 +10,8 @@ mod instance;
 /// Validated path and executable reference types.
 pub mod paths;
 mod registry;
+/// Lifecycle and ownership states.
+pub mod state;
 
 pub use capability::{Capability, Support};
 pub use error::{CoreError, Result};
