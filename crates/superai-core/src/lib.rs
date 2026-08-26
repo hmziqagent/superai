@@ -73,3 +73,6 @@ pub mod plugin;
 
 #[cfg(test)]
 mod test_util;
+
+#[cfg(test)]
+mod property_tests;
