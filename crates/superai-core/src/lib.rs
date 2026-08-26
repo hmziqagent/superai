@@ -13,6 +13,8 @@ pub mod harness_catalog;
 /// Validated identifiers and names.
 pub mod ids;
 mod instance;
+/// Instance lifecycle orchestration.
+pub mod lifecycle;
 /// Operation preview and result contracts.
 pub mod operation;
 /// Validated path and executable reference types.
@@ -20,6 +22,8 @@ pub mod paths;
 mod registry;
 /// Lifecycle and ownership states.
 pub mod state;
+/// Wrapper generation.
+pub mod wrapper;
 
 pub use capability::{Capability, Support};
 pub use error::{CoreError, Result};
