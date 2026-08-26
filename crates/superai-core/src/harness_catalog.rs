@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, GenericAdapter, ProductStatus};
+use crate::adapters::aider::AiderAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
+use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
 
@@ -616,9 +618,20 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
     let mut out = Vec::with_capacity(ENTRIES.len());
     for entry in ENTRIES {
-        // Use concrete adapter for Claude Code; generic for the rest.
         if entry.id == crate::adapters::claude_code::HARNESS_ID_STR
             && let Ok(adapter) = ClaudeCodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::codex_cli::HARNESS_ID_STR
+            && let Ok(adapter) = CodexCliAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::aider::HARNESS_ID_STR
+            && let Ok(adapter) = AiderAdapter::new()
         {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;

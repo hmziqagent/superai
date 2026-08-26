@@ -136,6 +136,7 @@ dependencies = [
  "serde_json",
  "superai-config",
  "thiserror",
+ "toml_edit",
 ]
 
 [[package]]

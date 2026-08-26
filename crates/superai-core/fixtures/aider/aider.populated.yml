@@ -1,0 +1,6 @@
+model: openrouter/anthropic/claude-sonnet-4
+dark-mode: true
+auto-commits: false
+map-tokens: 2048
+edit-format: diff
+weak-model: gpt-4o-mini

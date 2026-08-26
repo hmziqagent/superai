@@ -1,0 +1,11 @@
+model: gpt-4
+unknownTopLevel: preserve-me
+foreignKey:
+  nested: keep
+  value: 123
+customField: custom-value
+dark-mode: true
+extraUnknown:
+  - 1
+  - 2
+  - 3
