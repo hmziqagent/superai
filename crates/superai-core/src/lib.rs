@@ -2,8 +2,12 @@
 //!
 //! Exposes capabilities upward; harness identity stays below this line.
 
+/// Harness adapter trait and supporting types.
+pub mod adapter;
 mod capability;
 mod error;
+/// Registered harness catalog — the 48 planned product surfaces.
+pub mod harness_catalog;
 /// Validated identifiers and names.
 pub mod ids;
 mod instance;
