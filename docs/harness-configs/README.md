@@ -20,6 +20,7 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 | Amp (Sourcegraph) | [amp.md](amp.md) | `AMP_API_KEY` + `AMP_SETTINGS_FILE` per instance |
 | Qwen Code (Alibaba) | [qwen-code.md](qwen-code.md) | settings-path relocation vars (`QWEN_CODE_*_PATH`) |
 | Kimi Code CLI (Moonshot) | [kimi-cli.md](kimi-cli.md) | `KIMI_CODE_HOME` |
+| DeepSeek Harness (`dsh`) | [deepseek-harness.md](deepseek-harness.md) | `DSH_HOME`. ⚠️ dev preview, breaking changes expected |
 | Grok Build (xAI) | [grok-build.md](grok-build.md) | `GROK_HOME` (+ `GROK_CONFIG` JSON overlay!) |
 | Mistral Vibe | [mistral-vibe.md](mistral-vibe.md) | `VIBE_HOME` |
 | iFlow CLI | [iflow-cli.md](iflow-cli.md) | Gemini-fork lineage — see file |
@@ -45,6 +46,7 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 | Kilo Code | [kilo-code.md](kilo-code.md) | kilo.jsonc global+project; CLI shares OpenCode lineage config |
 | Continue.dev (now Cursor's) | [continue-dev.md](continue-dev.md) | global vs workspace `.continue/` layers; `cn` headless CLI |
 | Zed + external agents via ACP | [zed-acp.md](zed-acp.md) | register wrapper scripts as separate `agent_servers` entries |
+| ZCode (Z.ai) | [zcode.md](zcode.md) | No env override — GUI, fixed `~/.zcode/v2/config.json`. Anthropic + OpenAI custom endpoints |
 | Windsurf | [windsurf.md](windsurf.md) | no env override — `--user-data-dir` IDE isolation; managed-backend limits documented |
 | Auggie (Augment) | [auggie.md](auggie.md) | proprietary context engine; headless `--print` |
 | Hermes Agent (Nous) | [hermes-agent.md](hermes-agent.md) | `HERMES_HOME` + `--profile`; local-install-verified `[L]` tags |
@@ -61,10 +63,11 @@ Compiled 2026-08-25 by parallel research agents against live official docs/repos
 
 ## Universal patterns (the cheat-sheet)
 
-1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`. Relocate → run its auth flow once → you have an independent instance.
+1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`. Relocate → run its auth flow once → you have an independent instance.
 2. **Env beats config for providers** almost everywhere: every harness that speaks OpenAI-compatible takes `<PROVIDER>_API_KEY` + some base-URL override (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `COPILOT_PROVIDER_BASE_URL`, `OPENROUTER_API_KEY`…). Wrappers just export different values before `exec`.
 3. **Anthropic-compatible endpoints are a de-facto standard too** — Claude Code (`ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN`), Kimi Code (`anthropic` provider with custom `base_url`), Crush/Kilo/Cline ("anthropic" provider type) all repoint at GLM/OpenRouter-style Anthropic-format gateways.
 4. **Inline config injection** where supported: Codex `CODEX_CONFIG`, Grok `GROK_CONFIG` (JSON deep-merge), OpenCode `OPENCODE_CONFIG_CONTENT`, Amp `AMP_SETTINGS_FILE`, Nanocoder `NANOCODER_PROVIDERS_FILE`.
+4b. **GUI desktop apps have no relocation knob at all** — Claude Desktop, ZCode (`~/.zcode/v2/config.json`), Windsurf. Config must be written in place; "instances" mean swapping files, not isolating them.
 5. **IDE extensions can't be env-isolated** — wrap VS Code itself: `code --user-data-dir <dir>` gives fully separate extension state (Cline/Roo/Kilo pattern).
 6. **Orchestrators are prebuilt wrappers**: Vibe Kanban injects per-profile `ANTHROPIC_BASE_URL`/`AUTH_TOKEN`; Conductor overrides executable paths + Bedrock/Vertex; Sculptor passes env through to containerized Claude Code sessions — see orchestrators.md before rolling your own.
 
