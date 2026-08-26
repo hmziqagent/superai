@@ -1107,4 +1107,463 @@ mod tests {
             "https://github.com/c/d"
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // QAL-05: mutant-killing guards — each test would fail if its guard were
+    // flipped (true→false or false→true).  They assert observable recovery,
+    // abort, or redaction behavior, not constants.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mutant_backup_guard_aborts_on_failure_and_allows_success() {
+        let dir = crate::test_util::temp_dir_unique("mutant-backup");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // happy: regular file backup succeeds and verifies
+        let file = dir.join("config.json");
+        std::fs::write(&file, br#"{"a":1}"#).unwrap();
+        let entry = superai_config::backup::backup(&file)
+            .unwrap()
+            .expect("backup should succeed for regular file");
+        let ok = superai_config::backup::verify_backup(&entry).unwrap();
+        assert!(ok, "fresh backup must verify");
+
+        // failure: backing up a directory must error (mutant that ignores Err would allow commit without backup)
+        let subdir = dir.join("adir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let err = superai_config::backup::backup(&subdir).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("is a directory") || msg.contains("directory"),
+            "backup dir should error with directory reason: {msg}"
+        );
+
+        // transaction prepare should succeed when backup succeeds (mutant always-abort would fail here)
+        let target_ok = dir.join("ok.json");
+        std::fs::write(&target_ok, br#"{"x":1}"#).unwrap();
+        let op_ok = superai_config::transaction::OperationId::new("op-mutant-ok").unwrap();
+        let steps_ok = vec![superai_config::transaction::FileAction::Write {
+            path: target_ok,
+            content: br#"{"x":2}"#.to_vec(),
+            kind: DocumentKind::StrictJson,
+        }];
+        let mut txn_ok = superai_config::transaction::Transaction::new(op_ok, steps_ok);
+        let prep_ok = txn_ok.prepare();
+        assert!(
+            prep_ok.is_ok(),
+            "prepare should succeed when backup succeeds: {prep_ok:?}"
+        );
+
+        // injected backup failure must be treated as abort (mutant never-abort would ignore this)
+        let file2 = dir.join("inject.json");
+        std::fs::write(&file2, br#"{"z":1}"#).unwrap();
+        let real = crate::failure::RealInjector;
+        let ok_injected = crate::failure::injected_backup(&file2, &real).unwrap();
+        assert!(ok_injected.is_some(), "real injector should allow backup");
+        let inj = crate::failure::TestInjector::new();
+        inj.fail_at(crate::failure::FailurePoint::BackupWrite, 1);
+        let err_injected = crate::failure::injected_backup(&file2, &inj).unwrap_err();
+        let msg2 = format!("{err_injected:?}");
+        assert!(
+            msg2.to_ascii_lowercase().contains("backup") || msg2.contains("injected"),
+            "injected backup failure should be reported: {msg2}"
+        );
+        // flipping guard `if backup.is_err() { abort }` to `if false` would make err_injected appear as Ok
+    }
+
+    #[test]
+    fn mutant_is_modified_guard_blocks_stale_and_allows_fresh() {
+        let dir = crate::test_util::temp_dir_unique("mutant-modified");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, br#"{"a":1}"#).unwrap();
+        let snap_fresh = superai_config::snapshot::snapshot(&path);
+        // same snapshot must not be considered modified (mutant always-true would fail here)
+        assert!(
+            !superai_config::snapshot::is_modified(&snap_fresh, &snap_fresh),
+            "identical snapshots must not be modified"
+        );
+        // modify file -> must be detected as modified (mutant always-false would fail here)
+        std::fs::write(&path, br#"{"a":2}"#).unwrap();
+        let snap_stale = snap_fresh;
+        let snap_current = superai_config::snapshot::snapshot(&path);
+        assert!(
+            superai_config::snapshot::is_modified(&snap_stale, &snap_current),
+            "changed content must be detected"
+        );
+        // creation/deletion
+        let missing = dir.join("missing.json");
+        drop(std::fs::remove_file(&missing));
+        let snap_missing = superai_config::snapshot::snapshot(&missing);
+        assert!(
+            superai_config::snapshot::is_modified(&snap_missing, &snap_current),
+            "missing vs exists must be modified"
+        );
+        assert!(
+            !superai_config::snapshot::is_modified(&snap_missing, &snap_missing),
+            "missing vs missing must not be modified"
+        );
+
+        // guard via raw_editor commit_with_snapshot: stale must error, fresh must succeed
+        let dir2 = crate::test_util::temp_dir_unique("mutant-commit");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let p2 = dir2.join("file.json");
+        std::fs::write(&p2, br#"{"v":1}"#).unwrap();
+        let snap_before = superai_config::snapshot::snapshot(&p2);
+        // external concurrent modification
+        std::fs::write(&p2, br#"{"v":2}"#).unwrap();
+        let res_stale = superai_config::raw_editor::commit_with_snapshot(
+            &p2,
+            br#"{"v":3}"#,
+            Some(&snap_before),
+        );
+        assert!(
+            res_stale.is_err(),
+            "stale snapshot must be rejected with ConcurrentModification"
+        );
+        let msg = format!("{:?}", res_stale.unwrap_err());
+        assert!(
+            msg.to_ascii_lowercase().contains("concurrent")
+                || msg.to_ascii_lowercase().contains("modification")
+                || msg.contains("digest"),
+            "error should mention concurrent modification: {msg}"
+        );
+        // fresh snapshot must allow commit (mutant always-true would block this)
+        let snap_fresh2 = superai_config::snapshot::snapshot(&p2);
+        let res_fresh = superai_config::raw_editor::commit_with_snapshot(
+            &p2,
+            br#"{"v":3}"#,
+            Some(&snap_fresh2),
+        );
+        assert!(
+            res_fresh.is_ok(),
+            "fresh snapshot must allow commit: {res_fresh:?}"
+        );
+        let back = std::fs::read(&p2).unwrap();
+        assert_eq!(back, br#"{"v":3}"#);
+    }
+
+    #[test]
+    #[expect(
+        clippy::redundant_clone,
+        reason = "paths retained for rollback verification"
+    )]
+    fn mutant_rollback_reports_residual_on_corrupted_backup() {
+        let dir = crate::test_util::temp_dir_unique("mutant-rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::fs::write(&a, br#"{"a":1}"#).unwrap();
+        std::fs::write(&b, br#"{"b":1}"#).unwrap();
+
+        // happy rollback: intact backups yield no residuals (mutant always-residual would fail here)
+        let op1 = superai_config::transaction::OperationId::new("op-rollback-ok").unwrap();
+        let steps1 = vec![
+            superai_config::transaction::FileAction::Write {
+                path: a.clone(),
+                content: br#"{"a":2}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            },
+            superai_config::transaction::FileAction::Write {
+                path: b.clone(),
+                content: br#"{"b":2}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            },
+        ];
+        let mut txn1 = superai_config::transaction::Transaction::new(op1, steps1);
+        txn1.prepare().unwrap();
+        assert_eq!(txn1.backups.len(), 2, "both files existed so two backups");
+        txn1.commit().unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), br#"{"a":2}"#);
+        let rb1 = txn1.rollback().unwrap();
+        assert!(
+            rb1.residuals.is_empty(),
+            "intact backups should yield no residuals: {rb1:?}"
+        );
+        assert_eq!(rb1.rolled_back.len(), 2);
+        assert!(
+            rb1.verification_ok,
+            "verification should pass when restored"
+        );
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            br#"{"a":1}"#,
+            "rollback must restore original content"
+        );
+
+        // corrupt path: one backup corrupted -> residual reported (mutant never-residual would fail here)
+        std::fs::write(&a, br#"{"a":1}"#).unwrap();
+        std::fs::write(&b, br#"{"b":1}"#).unwrap();
+        let op2 = superai_config::transaction::OperationId::new("op-rollback-corrupt").unwrap();
+        let steps2 = vec![
+            superai_config::transaction::FileAction::Write {
+                path: a.clone(),
+                content: br#"{"a":3}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            },
+            superai_config::transaction::FileAction::Write {
+                path: b.clone(),
+                content: br#"{"b":3}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            },
+        ];
+        let mut txn2 = superai_config::transaction::Transaction::new(op2, steps2);
+        txn2.prepare().unwrap();
+        txn2.commit().unwrap();
+        // corrupt backup for a
+        let backup_a = txn2
+            .backups
+            .iter()
+            .find(|e| e.original_path == a)
+            .expect("backup for a must exist")
+            .clone();
+        std::fs::write(&backup_a.backup_path, b"corrupted").unwrap();
+        let rb2 = txn2.rollback().unwrap();
+        assert!(
+            rb2.residuals.contains(&a),
+            "corrupted backup must be reported as residual: {rb2:?}"
+        );
+        assert!(
+            !rb2.verification_ok || !rb2.residuals.is_empty(),
+            "corrupted rollback should not be fully verified"
+        );
+    }
+
+    #[test]
+    fn mutant_validate_quarantine_target_rejects_broad_roots_and_accepts_valid() {
+        use std::path::Path;
+        // broad roots must be rejected (mutant that returns Ok would allow disastrous delete)
+        for p in ["/", "/home", "/tmp", "/usr", "/etc", "/var"] {
+            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
+            assert!(r.is_err(), "broad root {p} should be rejected");
+        }
+        // home dir must be rejected
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+            && home.is_absolute()
+        {
+            // only test if path exists or not, validate checks equality before existence for home
+            let r = superai_config::quarantine::validate_quarantine_target(&home);
+            // home may not exist in temp HOME override, but still should be rejected as broad root/home
+            assert!(r.is_err(), "home {} should be rejected", home.display());
+        }
+        // globs must be rejected before existence check
+        for p in ["/tmp/*.json", "/var/*.log", "/tmp/foo?bar", "/tmp/[abc]"] {
+            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
+            assert!(r.is_err(), "glob {p} should be rejected");
+        }
+        // unresolved variables must be rejected
+        for p in ["/tmp/$HOME/foo", "/tmp/%USERPROFILE%/bar", "/tmp/${HOME}/x"] {
+            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
+            assert!(r.is_err(), "var {p} should be rejected");
+        }
+        // relative and traversal must be rejected
+        assert!(
+            superai_config::quarantine::validate_quarantine_target(Path::new("relative/path"))
+                .is_err(),
+            "relative should be rejected"
+        );
+        assert!(
+            superai_config::quarantine::validate_quarantine_target(Path::new("/tmp/../etc"))
+                .is_err(),
+            "traversal should be rejected"
+        );
+        // valid file must be accepted (mutant that always Err would fail here)
+        let dir = crate::test_util::temp_dir_unique("mutant-quarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid = dir.join("valid.json");
+        std::fs::write(&valid, b"{}").unwrap();
+        let ok = superai_config::quarantine::validate_quarantine_target(&valid);
+        assert!(ok.is_ok(), "valid file should be accepted: {ok:?}");
+    }
+
+    #[test]
+    fn mutant_redacted_string_hides_secret_in_all_channels() {
+        let secret = "sk-live-super-secret-12345";
+        // core RedactedString
+        let r1 = crate::error::RedactedString::new(secret);
+        for out in [
+            format!("{r1:?}"),
+            format!("{r1}"),
+            serde_json::to_string(&r1).unwrap(),
+        ] {
+            assert!(
+                !out.contains(secret),
+                "core redacted must not contain secret: {out}"
+            );
+            assert!(
+                out.contains("[REDACTED]"),
+                "core redacted must contain placeholder: {out}"
+            );
+        }
+        assert_eq!(
+            r1.expose_secret(),
+            secret,
+            "expose_secret should return original"
+        );
+
+        // operation RedactedString
+        let r2 = crate::operation::RedactedString::new(secret);
+        for out in [
+            format!("{r2:?}"),
+            format!("{r2}"),
+            serde_json::to_string(&r2).unwrap(),
+        ] {
+            assert!(
+                !out.contains(secret),
+                "op redacted must not contain secret: {out}"
+            );
+            assert!(
+                out.contains("[REDACTED]"),
+                "op redacted must contain placeholder: {out}"
+            );
+        }
+        assert_eq!(r2.expose_secret(), secret);
+
+        // error containing redacted must not leak via Debug/Display
+        let err = crate::error::CoreError::SecretValidation {
+            field: "apiKey".to_owned(),
+            reason: "test".to_owned(),
+            redacted: crate::error::RedactedString::new(secret),
+        };
+        for out in [format!("{err:?}"), format!("{err}")] {
+            assert!(!out.contains(secret), "error must not leak secret: {out}");
+        }
+        // flipped mutant that implements Debug as `f.write_str(&self.0)` would leak and be caught above
+    }
+
+    #[test]
+    fn mutant_template_three_way_detects_conflict_and_allows_clean() {
+        use crate::ids::{HarnessId, ProviderId, TemplateId};
+        use crate::template::{OwnedPatch, TEMPLATE_SCHEMA_VERSION, Template, TemplateStatus};
+        use serde_json::{Map, Value, json};
+        fn tmpl(version: &str, patches: Vec<OwnedPatch>) -> Template {
+            Template {
+                schema_version: TEMPLATE_SCHEMA_VERSION,
+                id: TemplateId::new("claude-glm").unwrap(),
+                version: version.to_owned(),
+                harness: HarnessId::new("claude-code").unwrap(),
+                provider: ProviderId::new("glm").unwrap(),
+                label: "Claude Code on GLM".to_owned(),
+                status: TemplateStatus::Active,
+                inputs: vec![],
+                patches,
+                wrapper_env: std::collections::BTreeMap::new(),
+                wrapper_args: vec![],
+                assets: vec![],
+                capability_map: std::collections::BTreeMap::new(),
+                migration_notes: vec![],
+                digest: "a".repeat(64),
+                harness_version_req: None,
+                provider_protocol: None,
+            }
+        }
+        fn patch(sel: &str, v: Value) -> OwnedPatch {
+            OwnedPatch {
+                selector: sel.to_owned(),
+                value: v,
+            }
+        }
+
+        // BothModified conflict: base, new, local all differ -> must be conflict (mutant that always Ok would miss this)
+        let base = tmpl("1.0.0", vec![patch("key:model", json!("glm-4"))]);
+        let new = tmpl("1.1.0", vec![patch("key:model", json!("glm-4.5"))]);
+        let mut local: Map<String, Value> = Map::new();
+        local.insert("model".to_owned(), json!("my-custom"));
+        let preview = crate::template_update::preview_three_way(&base, &new, &local);
+        assert_eq!(
+            preview.conflicts.len(),
+            1,
+            "both_modified should be single conflict"
+        );
+        assert_eq!(
+            preview.conflicts[0].kind,
+            crate::template_update::ConflictKind::BothModified,
+            "kind should be BothModified"
+        );
+        assert!(
+            preview.auto_applicable.is_empty(),
+            "conflicted selector must not be auto applicable"
+        );
+        assert!(!preview.can_auto_apply());
+
+        // clean: local == base -> should auto-apply new (mutant always-conflict would fail here)
+        let mut local2: Map<String, Value> = Map::new();
+        local2.insert("model".to_owned(), json!("glm-4"));
+        let preview2 = crate::template_update::preview_three_way(&base, &new, &local2);
+        assert!(
+            preview2.conflicts.is_empty(),
+            "local == base should have no conflict"
+        );
+        assert_eq!(preview2.auto_applicable.len(), 1);
+        assert!(preview2.can_auto_apply());
+        assert_eq!(preview2.auto_applicable[0].to, Some(json!("glm-4.5")));
+
+        // new == base -> keep local, no conflict
+        let base3 = tmpl("1.0.0", vec![patch("key:model", json!("glm-4"))]);
+        let new3 = tmpl("1.0.0", vec![patch("key:model", json!("glm-4"))]);
+        let mut local3: Map<String, Value> = Map::new();
+        local3.insert("model".to_owned(), json!("my-custom-keep"));
+        let preview3 = crate::template_update::preview_three_way(&base3, &new3, &local3);
+        assert!(preview3.conflicts.is_empty());
+        assert!(preview3.auto_applicable.is_empty());
+
+        // local == new -> already applied, no conflict
+        let mut local4: Map<String, Value> = Map::new();
+        local4.insert("model".to_owned(), json!("glm-4.5"));
+        let preview4 = crate::template_update::preview_three_way(&base, &new, &local4);
+        assert!(preview4.conflicts.is_empty());
+        assert!(preview4.auto_applicable.is_empty());
+    }
+
+    #[test]
+    fn mutant_capability_resolver_absent_for_unknown_and_native_for_known() {
+        use crate::capability::{Capability, Support};
+        use crate::capability_resolver::{CapabilitySource, resolve};
+        use crate::ids::{HarnessId, ProviderId};
+
+        // unknown harness/provider must be Absent + Unknown (mutant that returns Native would fail)
+        let unk_h = HarnessId::new("unknown-harness-xyz").unwrap();
+        let unk_p = ProviderId::new("unknown-provider-xyz").unwrap();
+        for cap in [
+            Capability::WebSearch,
+            Capability::Vision,
+            Capability::Mcp,
+            Capability::ComputerUse,
+        ] {
+            let r = resolve(&unk_h, &unk_p, cap);
+            assert_eq!(
+                r.support,
+                Support::Absent,
+                "unknown should be absent for {cap:?}"
+            );
+            assert_eq!(
+                r.source,
+                CapabilitySource::Unknown,
+                "unknown source for {cap:?}"
+            );
+            assert!(
+                r.explanation.contains("no matrix entry"),
+                "explanation should mention missing entry: {r:?}"
+            );
+        }
+
+        // known pair claude-code + anthropic should be Native for web_search (mutant that returns Absent would fail)
+        let known_h = HarnessId::new("claude-code").unwrap();
+        let known_p = ProviderId::new("anthropic").unwrap();
+        let r2 = resolve(&known_h, &known_p, Capability::WebSearch);
+        assert_eq!(r2.support, Support::Native);
+        assert_eq!(r2.source, CapabilitySource::Harness);
+
+        // case insensitivity: Claude-Code + ANTHROPIC should also be native
+        let ci_h = HarnessId::new("Claude-Code").unwrap();
+        let ci_p = ProviderId::new("ANTHROPIC").unwrap();
+        let r3 = resolve(&ci_h, &ci_p, Capability::WebSearch);
+        assert_eq!(r3.support, Support::Native, "case-fold should be native");
+
+        // known pair claude-code + glm web_search should be Substituted via provider
+        let glm_p = ProviderId::new("glm").unwrap();
+        let r4 = resolve(&known_h, &glm_p, Capability::WebSearch);
+        assert_eq!(r4.support, Support::Substituted);
+        assert_eq!(r4.source, CapabilitySource::Provider);
+    }
 }
