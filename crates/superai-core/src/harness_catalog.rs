@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, GenericAdapter, ProductStatus, SkillMode};
 use crate::adapters::aider::AiderAdapter;
+use crate::adapters::amazon_q::AmazonQAdapter;
 use crate::adapters::amp::AmpAdapter;
+use crate::adapters::antigravity::AntigravityAdapter;
 use crate::adapters::auggie::AuggieAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
@@ -18,6 +20,7 @@ use crate::adapters::copilot_cli::CopilotCliAdapter;
 use crate::adapters::cursor::CursorAdapter;
 use crate::adapters::factory_droid::FactoryDroidAdapter;
 use crate::adapters::forge::ForgeAdapter;
+use crate::adapters::gemini_cli::GeminiCliAdapter;
 use crate::adapters::goose::GooseAdapter;
 use crate::adapters::gptme::GptmeAdapter;
 use crate::adapters::grok_build::GrokBuildAdapter;
@@ -25,16 +28,21 @@ use crate::adapters::hermes::HermesAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::kilo::KiloAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
+use crate::adapters::kiro::KiroAdapter;
 use crate::adapters::kode::KodeAdapter;
+use crate::adapters::legacy_kimi::LegacyKimiAdapter;
 use crate::adapters::mimo::MimoAdapter;
 use crate::adapters::mistral_vibe::MistralVibeAdapter;
 use crate::adapters::nanocoder::NanocoderAdapter;
+use crate::adapters::openclaw::OpenClawAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
 use crate::adapters::pi::PiAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
+use crate::adapters::roo_code::RooCodeAdapter;
 use crate::adapters::swe_agent::SweAgentAdapter;
 use crate::adapters::trae_agent::TraeAgentAdapter;
 use crate::adapters::windsurf::WindsurfAdapter;
+use crate::adapters::zcode::ZcodeAdapter;
 use crate::adapters::zed_acp::ZedAcpAdapter;
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -823,6 +831,54 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;
         }
+        if entry.id == crate::adapters::gemini_cli::HARNESS_ID_STR
+            && let Ok(adapter) = GeminiCliAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::amazon_q::HARNESS_ID_STR
+            && let Ok(adapter) = AmazonQAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::roo_code::HARNESS_ID_STR
+            && let Ok(adapter) = RooCodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::legacy_kimi::HARNESS_ID_STR
+            && let Ok(adapter) = LegacyKimiAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::antigravity::HARNESS_ID_STR
+            && let Ok(adapter) = AntigravityAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::kiro::HARNESS_ID_STR
+            && let Ok(adapter) = KiroAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::openclaw::HARNESS_ID_STR
+            && let Ok(adapter) = OpenClawAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::zcode::HARNESS_ID_STR
+            && let Ok(adapter) = ZcodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
         // Ledger alias: catalog uses kimi-code-cli but adapter is kimi-code
         if entry.id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
             && KimiCodeAdapter::new().is_ok()
@@ -1151,6 +1207,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "test branching for support states"
+    )]
     fn adapters_are_object_safe_and_usable_as_trait_objects() {
         let adapters = all_adapters();
         for adapter in adapters {
@@ -1185,14 +1245,63 @@ mod tests {
                 adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
             };
             let res = adapter.validate_instance(&inst);
-            assert!(
-                res.is_ok(),
-                "validate_instance should succeed for matching harness `{}`: {:?}",
-                harness_id,
-                res.err()
+            let entry = find_by_id(harness_id.as_str());
+            let is_research_blocked =
+                entry.is_some_and(|e| e.support == AdapterSupport::ResearchBlocked);
+            // Only strictly enforce ResearchBlocked for concrete adapters (antigravity, openclaw);
+            // generic ResearchBlocked adapters (crush, deepseek) currently return Ok and are allowed.
+            let is_concrete_research_blocked = matches!(
+                harness_id.as_str(),
+                crate::adapters::antigravity::HARNESS_ID_STR
+                    | crate::adapters::openclaw::HARNESS_ID_STR
             );
-            let plan = adapter.plan_wrapper(&inst).unwrap();
-            assert!(!plan.description.is_empty());
+            if is_research_blocked && is_concrete_research_blocked {
+                assert!(
+                    res.is_err(),
+                    "validate_instance should be ResearchBlocked for `{harness_id}`"
+                );
+                if let Err(err) = &res {
+                    let dbg = format!("{err:?}");
+                    assert!(
+                        dbg.contains("ResearchBlocked") || dbg.contains("research"),
+                        "expected ResearchBlocked error for `{harness_id}`: {dbg}"
+                    );
+                }
+            } else {
+                // For generic ResearchBlocked (crush, deepseek) allow Ok; for others require Ok.
+                assert!(
+                    res.is_ok(),
+                    "validate_instance should succeed for matching harness `{harness_id}`: {:?}",
+                    res.err()
+                );
+            }
+            let plan_res = adapter.plan_wrapper(&inst);
+            let is_migration_only =
+                entry.is_some_and(|e| e.support == AdapterSupport::MigrationOnly);
+            // Only strictly enforce blocking for concrete migration/research adapters;
+            // generic adapters still return Ok and are allowed until they get concrete impls.
+            let is_concrete_blocked = matches!(
+                harness_id.as_str(),
+                crate::adapters::gemini_cli::HARNESS_ID_STR
+                    | crate::adapters::amazon_q::HARNESS_ID_STR
+                    | crate::adapters::roo_code::HARNESS_ID_STR
+                    | crate::adapters::legacy_kimi::HARNESS_ID_STR
+                    | crate::adapters::antigravity::HARNESS_ID_STR
+                    | crate::adapters::openclaw::HARNESS_ID_STR
+            );
+            if (is_research_blocked || is_migration_only) && is_concrete_blocked {
+                assert!(
+                    plan_res.is_err(),
+                    "plan_wrapper should be blocked for `{harness_id}` (support {support:?})",
+                    support = entry.map(|e| e.support)
+                );
+            } else {
+                let plan = match plan_res {
+                    Ok(p) => p,
+                    Err(err) => panic!("plan_wrapper should succeed for `{harness_id}`: {err:?}"),
+                };
+                assert!(!plan.description.is_empty());
+            }
         }
     }
 
