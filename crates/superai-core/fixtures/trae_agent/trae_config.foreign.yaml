@@ -1,0 +1,16 @@
+agents:
+  trae_agent:
+    enable_lakeview: false
+    model: trae_agent_model
+foreignKey: preserve-me
+unknownTopLevel:
+  nested: 123
+customField: custom-value
+model_providers:
+  openai:
+    api_key: sk-fake-123
+    provider: openai
+models:
+  trae_agent_model:
+    model_provider: openai
+    model: gpt-4o

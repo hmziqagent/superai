@@ -1,0 +1,28 @@
+name: My Config
+version: 1.0.0
+schema: v1
+models:
+  - name: GPT-4o
+    provider: openai
+    model: gpt-4o
+    roles: [chat, edit]
+  - name: Local Embed
+    provider: openai
+    model: nomic-embed-text
+    apiBase: http://localhost:8000/v1
+    roles: [embed]
+rules:
+  - Be concise
+mcpServers:
+  - name: sqlite
+    command: uvx
+    args: [mcp-server-sqlite, --db-path, ./test.db]
+context:
+  - provider: file
+prompts:
+  - name: test
+    description: Unit test
+    prompt: Write tests
+docs:
+  - name: Continue
+    startUrl: https://docs.continue.dev/intro

@@ -1,0 +1,9 @@
+{
+  "default_provider": "anthropic",
+  "max_steps": 20,
+  "enable_lakeview": false,
+  "model_providers": {
+    "anthropic": {"api_key": "sk-fake-anthropic-123", "provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    "openai": {"api_key": "sk-fake-openai-123", "provider": "openai", "model": "gpt-4o"}
+  }
+}

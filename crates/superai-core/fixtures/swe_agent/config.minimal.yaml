@@ -1,0 +1,8 @@
+agent:
+  name: test
+  model:
+    name: gpt-4o
+    temperature: 0.0
+tools:
+  bundles:
+    - path: tools/windowed

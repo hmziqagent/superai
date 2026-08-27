@@ -1,0 +1,20 @@
+[user]
+name = "Test"
+about = "Test user"
+
+[prompt]
+files = ["~/notes/llm-tips.md"]
+
+[env]
+OPENAI_API_KEY = "sk-fake-openai-123"
+ANTHROPIC_API_KEY = "sk-fake-anthropic-123"
+MODEL = "openai/gpt-4o"
+
+[models]
+default = "anthropic/claude-sonnet-4-6"
+
+[settings]
+gear = 2
+
+[mcp]
+# example mcp server

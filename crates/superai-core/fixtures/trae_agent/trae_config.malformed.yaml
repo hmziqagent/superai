@@ -1,0 +1,5 @@
+agents:
+  trae_agent:
+    enable_lakeview: true
+  bad-indent: 123
+  - broken: [

@@ -1,0 +1,14 @@
+files = ["README.md", "Makefile"]
+prompt = "This is gptme."
+
+[settings]
+gear = 3
+
+[agent]
+name = "Bob"
+
+[env]
+OPENAI_API_KEY = "sk-fake-123"
+
+[mcp]
+# project mcp

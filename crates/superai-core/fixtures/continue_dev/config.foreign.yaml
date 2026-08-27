@@ -1,0 +1,11 @@
+name: My Config
+version: 1.0.0
+schema: v1
+foreignKey: preserve-me
+unknownTopLevel:
+  nested: 123
+customField: custom-value
+models:
+  - name: GPT-4o
+    provider: openai
+    model: gpt-4o

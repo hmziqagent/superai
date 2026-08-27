@@ -1,0 +1,4 @@
+agent:
+  name: test
+  bad-indent: 123
+  - broken: [

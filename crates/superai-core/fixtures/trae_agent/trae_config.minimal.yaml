@@ -1,0 +1,15 @@
+agents:
+  trae_agent:
+    enable_lakeview: false
+    model: trae_agent_model
+    max_steps: 20
+model_providers:
+  openai:
+    api_key: sk-fake-openai-123
+    provider: openai
+models:
+  trae_agent_model:
+    model_provider: openai
+    model: gpt-4o
+    max_tokens: 4096
+    temperature: 0.5

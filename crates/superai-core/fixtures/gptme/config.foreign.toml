@@ -1,0 +1,11 @@
+[user]
+name = "Test"
+
+foreignKey = "preserve-me"
+customField = "custom-value"
+
+[unknownTopLevel]
+nested = 123
+
+[settings]
+gear = 2

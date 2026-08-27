@@ -1,0 +1,5 @@
+agent:
+  name: overlay-test
+  model:
+    name: openai/gpt-4o
+    per_instance_cost_limit: 3.00

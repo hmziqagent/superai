@@ -1,0 +1,7 @@
+{
+  "model": "test",
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {"nested": 123},
+  "customField": "custom-value",
+  "customModels": []
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "https://ampcode.com/settings.json",
+  "amp.mcpServers": {},
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {"nested": 123},
+  "customField": "custom-value"
+}

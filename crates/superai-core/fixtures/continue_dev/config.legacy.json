@@ -1,0 +1,6 @@
+{
+  "models": [{"title": "GPT-4o", "provider": "openai", "model": "gpt-4o"}],
+  "tabAutocompleteModel": {"title": "Codestral", "provider": "mistral", "model": "codestral-latest"},
+  "contextProviders": [{"name": "code", "params": {}}],
+  "systemMessage": "Be helpful"
+}

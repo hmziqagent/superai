@@ -1,12 +1,16 @@
 //! Harness adapters — concrete implementations.
 
 pub mod aider;
+pub mod amp;
 pub mod claude_code;
 pub mod cline;
 pub mod codex_cli;
+pub mod continue_dev;
 pub mod copilot_cli;
+pub mod factory_droid;
 pub mod forge;
 pub mod goose;
+pub mod gptme;
 pub mod grok_build;
 pub mod hermes;
 pub mod junie;
@@ -18,3 +22,5 @@ pub mod nanocoder;
 pub mod opencode;
 pub mod pi;
 pub mod qwen_code;
+pub mod swe_agent;
+pub mod trae_agent;

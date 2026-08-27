@@ -1,0 +1,17 @@
+{
+  "model": "claude-sonnet-4-5",
+  "customModels": [
+    {
+      "model": "openai/gpt-oss-20b",
+      "displayName": "GPT-OSS 20B (OpenRouter)",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKey": "sk-fake-openrouter-123",
+      "provider": "generic-chat-completion-api"
+    }
+  ],
+  "commandAllowlist": ["ls", "pwd"],
+  "mcpServers": {
+    "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}
+  },
+  "disabledSkills": []
+}

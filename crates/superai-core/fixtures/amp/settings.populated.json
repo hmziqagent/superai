@@ -1,0 +1,12 @@
+{
+  "$schema": "https://ampcode.com/settings.json",
+  "amp.mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  },
+  "amp.tools.disable": ["web-search"],
+  "amp.permissions": {"allow": ["read"]},
+  "amp.notifications.enabled": true
+}

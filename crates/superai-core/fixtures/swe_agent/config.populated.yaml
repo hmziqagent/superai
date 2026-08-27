@@ -1,0 +1,27 @@
+agent:
+  name: claude-sonnet-4-20250514
+  model:
+    name: anthropic/claude-sonnet-4-20250514
+    temperature: 0.0
+    per_instance_cost_limit: 2.00
+    completion_kwargs:
+      reasoning_effort: high
+  templates:
+    disable_image_processing: false
+  history_processors:
+    - type: cache_control
+      last_n_messages: 2
+  tools:
+    bundles:
+      - path: tools/windowed
+      - path: tools/image_tools
+tools:
+  bundles:
+    - path: tools/windowed
+environment:
+  deployment:
+    type: docker
+    image: python:3.11
+  repo:
+    type: github
+    github_url: https://github.com/test/repo

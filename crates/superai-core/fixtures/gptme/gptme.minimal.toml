@@ -1,0 +1,4 @@
+files = ["README.md"]
+
+[settings]
+gear = 2

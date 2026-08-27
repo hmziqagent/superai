@@ -1,0 +1,11 @@
+agent:
+  name: test
+  model:
+    name: gpt-4o
+foreignKey: preserve-me
+unknownTopLevel:
+  nested: 123
+customField: custom-value
+tools:
+  bundles:
+    - path: tools/windowed
