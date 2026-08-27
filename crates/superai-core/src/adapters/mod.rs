@@ -2,11 +2,13 @@
 
 pub mod aider;
 pub mod amp;
+pub mod auggie;
 pub mod claude_code;
 pub mod cline;
 pub mod codex_cli;
 pub mod continue_dev;
 pub mod copilot_cli;
+pub mod cursor;
 pub mod factory_droid;
 pub mod forge;
 pub mod goose;
@@ -14,6 +16,7 @@ pub mod gptme;
 pub mod grok_build;
 pub mod hermes;
 pub mod junie;
+pub mod kilo;
 pub mod kimi_code;
 pub mod kode;
 pub mod mimo;
@@ -24,3 +27,5 @@ pub mod pi;
 pub mod qwen_code;
 pub mod swe_agent;
 pub mod trae_agent;
+pub mod windsurf;
+pub mod zed_acp;

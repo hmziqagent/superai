@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{Adapter, GenericAdapter, ProductStatus, SkillMode};
 use crate::adapters::aider::AiderAdapter;
 use crate::adapters::amp::AmpAdapter;
+use crate::adapters::auggie::AuggieAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::adapters::continue_dev::ContinueDevAdapter;
 use crate::adapters::copilot_cli::CopilotCliAdapter;
+use crate::adapters::cursor::CursorAdapter;
 use crate::adapters::factory_droid::FactoryDroidAdapter;
 use crate::adapters::forge::ForgeAdapter;
 use crate::adapters::goose::GooseAdapter;
@@ -21,6 +23,7 @@ use crate::adapters::gptme::GptmeAdapter;
 use crate::adapters::grok_build::GrokBuildAdapter;
 use crate::adapters::hermes::HermesAdapter;
 use crate::adapters::junie::JunieAdapter;
+use crate::adapters::kilo::KiloAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
 use crate::adapters::kode::KodeAdapter;
 use crate::adapters::mimo::MimoAdapter;
@@ -31,6 +34,8 @@ use crate::adapters::pi::PiAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
 use crate::adapters::swe_agent::SweAgentAdapter;
 use crate::adapters::trae_agent::TraeAgentAdapter;
+use crate::adapters::windsurf::WindsurfAdapter;
+use crate::adapters::zed_acp::ZedAcpAdapter;
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
@@ -772,6 +777,36 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
         }
         if entry.id == crate::adapters::gptme::HARNESS_ID_STR
             && let Ok(adapter) = GptmeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::cursor::HARNESS_ID_STR
+            && let Ok(adapter) = CursorAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::kilo::HARNESS_ID_STR
+            && let Ok(adapter) = KiloAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::windsurf::HARNESS_ID_STR
+            && let Ok(adapter) = WindsurfAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::zed_acp::HARNESS_ID_STR
+            && let Ok(adapter) = ZedAcpAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::auggie::HARNESS_ID_STR
+            && let Ok(adapter) = AuggieAdapter::new()
         {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;
