@@ -1,0 +1,4 @@
+GOOSE_PROVIDER: [ unbalanced
+GOOSE_MODEL: "missing quote
+extensions:
+  - : invalid

@@ -584,6 +584,18 @@ fn candidate_patterns() -> Vec<String> {
     if let Ok(adapter) = crate::adapters::cline::ClineAdapter::new() {
         out.extend(adapter.scan_candidates());
     }
+    if let Ok(adapter) = crate::adapters::copilot_cli::CopilotCliAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::goose::GooseAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::qwen_code::QwenCodeAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::kimi_code::KimiCodeAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
     // Generic entries from catalog for remaining harnesses
     for entry in crate::harness_catalog::ENTRIES {
         let candidate = format!("~/.{}", entry.id);

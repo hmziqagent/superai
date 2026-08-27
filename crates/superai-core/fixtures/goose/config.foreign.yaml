@@ -1,0 +1,11 @@
+GOOSE_PROVIDER: openai
+GOOSE_MODEL: gpt-4o
+foreignKey: preserve-me
+unknownTopLevel:
+  nested: keep
+  value: 123
+customField: custom-value
+extraUnknown:
+  - 1
+  - 2
+  - 3

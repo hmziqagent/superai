@@ -1,0 +1,14 @@
+default_model = "k3"
+unknownTopLevel = "preserve-me"
+foreignKey = { nested = "keep", value = 123 }
+customField = "custom-value"
+
+[providers.kimi]
+type = "kimi"
+base_url = "https://api.moonshot.ai/v1"
+api_key = "sk-fake-key-1234"
+
+[models.k3]
+provider = "kimi"
+model = "kimi-k2.5"
+max_context_size = 262144

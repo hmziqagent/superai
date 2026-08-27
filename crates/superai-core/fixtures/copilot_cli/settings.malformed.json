@@ -1,0 +1,9 @@
+{
+  "model": "opus",
+  "provider": "openai",
+  // trailing comment and missing value
+  "permissions": {
+    "allow": ["shell"],
+    "deny":
+  }
+}

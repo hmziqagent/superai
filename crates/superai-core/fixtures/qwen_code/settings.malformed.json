@@ -1,0 +1,10 @@
+{
+  "model": {
+    "name": "qwen3-coder-plus",
+  },
+  // trailing comment and missing value
+  "permissions": {
+    "allow": ["Bash"],
+    "deny":
+  }
+}

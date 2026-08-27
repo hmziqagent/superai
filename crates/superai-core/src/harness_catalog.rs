@@ -11,7 +11,11 @@ use crate::adapters::aider::AiderAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
+use crate::adapters::copilot_cli::CopilotCliAdapter;
+use crate::adapters::goose::GooseAdapter;
+use crate::adapters::kimi_code::KimiCodeAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
+use crate::adapters::qwen_code::QwenCodeAdapter;
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
@@ -649,6 +653,40 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
             && let Ok(adapter) = ClineAdapter::new()
         {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::copilot_cli::HARNESS_ID_STR
+            && let Ok(adapter) = CopilotCliAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::goose::HARNESS_ID_STR
+            && let Ok(adapter) = GooseAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::qwen_code::HARNESS_ID_STR
+            && let Ok(adapter) = QwenCodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::kimi_code::HARNESS_ID_STR
+            && let Ok(adapter) = KimiCodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        // Ledger alias: catalog uses kimi-code-cli but adapter is kimi-code
+        if entry.id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
+            && KimiCodeAdapter::new().is_ok()
+        {
+            #[expect(clippy::unwrap_used, reason = "catalog ids are static valid")]
+            let ledger_id = HarnessId::new(entry.id).unwrap();
+            let aliased = KimiCodeAdapter::from_ledger_id(ledger_id);
+            out.push(Box::new(aliased) as Box<dyn Adapter>);
             continue;
         }
         if let Ok(harness_id) = HarnessId::new(entry.id) {

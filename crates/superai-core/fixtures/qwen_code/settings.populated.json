@@ -1,0 +1,32 @@
+{
+  "model": {
+    "name": "qwen3-coder-plus",
+    "maxSessionTurns": 10
+  },
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen3-coder-plus",
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "envKey": "DASHSCOPE_API_KEY"
+      }
+    ]
+  },
+  "mcpServers": {
+    "pythonTools": {
+      "command": "python",
+      "args": ["-m", "my_mcp_server"],
+      "env": {
+        "DATABASE_URL": "sk-fake-db-url-1234"
+      }
+    }
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "permissions": {
+    "allow": ["Bash(git *)"]
+  }
+}

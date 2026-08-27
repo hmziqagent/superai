@@ -1,0 +1,4 @@
+default_model = "
+[providers
+type = "invalid
+[[permission.rules

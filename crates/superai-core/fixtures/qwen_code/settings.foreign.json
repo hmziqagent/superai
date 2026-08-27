@@ -1,0 +1,13 @@
+{
+  "model": {
+    "name": "qwen3-coder-plus"
+  },
+  "unknownTopLevel": "preserve-me",
+  "foreignKey": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3],
+  "mcpServers": {}
+}

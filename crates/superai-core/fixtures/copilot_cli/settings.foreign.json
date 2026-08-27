@@ -1,0 +1,17 @@
+{
+  "model": "opus",
+  "unknownTopLevel": "preserve-me",
+  "foreignKey": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "provider": "anthropic",
+  "mcpServers": {
+    "test": {
+      "command": "npx",
+      "args": ["test-mcp"]
+    }
+  },
+  "extraUnknown": [1, 2, 3]
+}

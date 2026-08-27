@@ -1,0 +1,13 @@
+GOOSE_PROVIDER: anthropic
+GOOSE_MODEL: claude-sonnet-4-5
+GOOSE_MODE: auto
+GOOSE_TEMPERATURE: 0.7
+GOOSE_MAX_TOKENS: 8192
+enabled_extensions:
+  - developer
+extensions:
+  filesystem-tools:
+    enabled: true
+    type: stdio
+    cmd: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
