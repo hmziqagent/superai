@@ -18,6 +18,8 @@ mod error;
 pub mod failure;
 /// Registered harness catalog — the 48 planned product surfaces.
 pub mod harness_catalog;
+/// Health probe — bounded, redacted, protocol-aware.
+pub mod health;
 /// Validated identifiers and names.
 pub mod ids;
 mod instance;

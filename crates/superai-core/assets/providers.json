@@ -1,0 +1,49 @@
+[
+  {
+    "id": "anthropic",
+    "display_name": "Anthropic",
+    "base_url": "https://api.anthropic.com",
+    "auth_style": "x_api_key",
+    "protocol": "anthropic",
+    "model_list": [
+      {"id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4", "status": "active", "health_eligible": true},
+      {"id": "claude-opus-4-20250514", "display_name": "Claude Opus 4", "status": "active", "health_eligible": true},
+      {"id": "claude-haiku-3-5-20241022", "display_name": "Claude Haiku 3.5", "status": "active", "health_eligible": true},
+      {"id": "claude-3-5-sonnet-20241022", "display_name": "Claude 3.5 Sonnet", "status": "deprecated", "health_eligible": false}
+    ],
+    "defaults": {"default_model": "claude-sonnet-4-20250514"},
+    "status": "active",
+    "documentation_url": "https://docs.anthropic.com/en/docs/about-claude/models"
+  },
+  {
+    "id": "glm",
+    "display_name": "Zhipu GLM",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "auth_style": "bearer",
+    "protocol": "openai_chat",
+    "model_list": [
+      {"id": "glm-4.5", "display_name": "GLM-4.5", "status": "active", "health_eligible": true},
+      {"id": "glm-4.5-air", "display_name": "GLM-4.5 Air", "status": "active", "health_eligible": true},
+      {"id": "glm-4", "display_name": "GLM-4", "status": "active", "health_eligible": true},
+      {"id": "glm-4v", "display_name": "GLM-4V", "status": "preview", "health_eligible": false}
+    ],
+    "defaults": {"default_model": "glm-4.5"},
+    "status": "active",
+    "documentation_url": "https://open.bigmodel.cn/dev/howuse/model"
+  },
+  {
+    "id": "minimax",
+    "display_name": "MiniMax",
+    "base_url": "https://api.minimax.chat/v1",
+    "auth_style": "bearer",
+    "protocol": "openai_chat",
+    "model_list": [
+      {"id": "MiniMax-M2", "display_name": "MiniMax M2", "status": "active", "health_eligible": true},
+      {"id": "minimax-text-01", "display_name": "MiniMax Text 01", "status": "active", "health_eligible": true},
+      {"id": "abab6.5-chat", "display_name": "abab 6.5", "status": "deprecated", "health_eligible": false}
+    ],
+    "defaults": {"default_model": "MiniMax-M2"},
+    "status": "active",
+    "documentation_url": "https://api.minimax.chat/document/introduction"
+  }
+]
