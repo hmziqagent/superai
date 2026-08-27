@@ -1,0 +1,5 @@
+{
+  "id": "custom-model",
+  "baseUrl": "https://api.example.com/v1",
+  "apiType": "OpenAICompletion"
+}

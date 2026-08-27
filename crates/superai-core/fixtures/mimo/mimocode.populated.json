@@ -1,0 +1,20 @@
+{
+  "$schema": "https://mimo.xiaomi.com/mimocode/config.json",
+  "model": "xiaomi/mimo-v2.5",
+  "provider": {
+    "openai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenAI",
+      "options": {
+        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "sk-fake-openai-123"
+      }
+    }
+  },
+  "mcp": {
+    "filesystem": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}

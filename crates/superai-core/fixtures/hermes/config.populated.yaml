@@ -1,0 +1,19 @@
+model:
+  default: stealth/ox-alpha
+  provider: nous
+providers:
+  local-vllm:
+    api: http://localhost:8080/v1
+fallback_providers:
+  - provider: openrouter
+    model: stealth/ox-alpha
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+skills:
+  external_dirs: ["/home/user/.agents/skills"]
+cron:
+  wrap_response: true
+memory:
+  memory_enabled: true

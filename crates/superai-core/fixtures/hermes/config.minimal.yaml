@@ -1,0 +1,3 @@
+model:
+  default: stealth/ox-alpha
+  provider: nous

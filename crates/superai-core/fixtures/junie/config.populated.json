@@ -1,0 +1,19 @@
+{
+  "model": "sonnet",
+  "provider": "anthropic",
+  "byok": {
+    "anthropic": "sk-fake-anthropic-123"
+  },
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  },
+  "proxies": {
+    "custom": {
+      "api-url": "https://proxy.example.com/v1",
+      "kind": "openai"
+    }
+  }
+}

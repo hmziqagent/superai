@@ -1,0 +1,11 @@
+// Foreign keys must round-trip
+{
+  "$schema": "https://mimo.xiaomi.com/mimocode/config.json",
+  "model": "xiaomi/mimo-v2.5",
+  "foreignKey": "preserve-me", // keep
+  "unknownTopLevel": {
+    "nested": "keep"
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3],
+}

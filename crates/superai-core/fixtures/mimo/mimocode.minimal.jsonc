@@ -1,0 +1,5 @@
+// Minimal MiMo config with comments
+{
+  // Schema enables editor autocomplete
+  "$schema": "https://mimo.xiaomi.com/mimocode/config.json"
+}

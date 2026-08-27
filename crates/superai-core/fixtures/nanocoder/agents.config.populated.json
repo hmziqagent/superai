@@ -1,0 +1,20 @@
+{
+  "nanocoder": {
+    "providers": [
+      {
+        "name": "openrouter",
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-fake-openrouter-123",
+        "models": ["anthropic/claude-3.5-sonnet"]
+      }
+    ],
+    "alwaysAllow": ["read_file"],
+    "disabledTools": []
+  },
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}

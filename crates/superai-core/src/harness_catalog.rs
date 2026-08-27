@@ -15,9 +15,13 @@ use crate::adapters::copilot_cli::CopilotCliAdapter;
 use crate::adapters::forge::ForgeAdapter;
 use crate::adapters::goose::GooseAdapter;
 use crate::adapters::grok_build::GrokBuildAdapter;
+use crate::adapters::hermes::HermesAdapter;
+use crate::adapters::junie::JunieAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
 use crate::adapters::kode::KodeAdapter;
+use crate::adapters::mimo::MimoAdapter;
 use crate::adapters::mistral_vibe::MistralVibeAdapter;
+use crate::adapters::nanocoder::NanocoderAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
 use crate::adapters::pi::PiAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
@@ -714,6 +718,30 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
         }
         if entry.id == crate::adapters::pi::HARNESS_ID_STR
             && let Ok(adapter) = PiAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::nanocoder::HARNESS_ID_STR
+            && let Ok(adapter) = NanocoderAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::hermes::HARNESS_ID_STR
+            && let Ok(adapter) = HermesAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::mimo::HARNESS_ID_STR
+            && let Ok(adapter) = MimoAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::junie::HARNESS_ID_STR
+            && let Ok(adapter) = JunieAdapter::new()
         {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;

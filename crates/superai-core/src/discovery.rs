@@ -596,6 +596,33 @@ fn candidate_patterns() -> Vec<String> {
     if let Ok(adapter) = crate::adapters::kimi_code::KimiCodeAdapter::new() {
         out.extend(adapter.scan_candidates());
     }
+    if let Ok(adapter) = crate::adapters::grok_build::GrokBuildAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::mistral_vibe::MistralVibeAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::forge::ForgeAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::kode::KodeAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::pi::PiAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::nanocoder::NanocoderAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::hermes::HermesAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::mimo::MimoAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
+    if let Ok(adapter) = crate::adapters::junie::JunieAdapter::new() {
+        out.extend(adapter.scan_candidates());
+    }
     // Generic entries from catalog for remaining harnesses
     for entry in crate::harness_catalog::ENTRIES {
         let candidate = format!("~/.{}", entry.id);

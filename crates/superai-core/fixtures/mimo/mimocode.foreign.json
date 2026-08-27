@@ -1,0 +1,8 @@
+{
+  "$schema": "https://mimo.xiaomi.com/mimocode/config.json",
+  "model": "xiaomi/mimo-v2.5",
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": "preserve-me",
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}

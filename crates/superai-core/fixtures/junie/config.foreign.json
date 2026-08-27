@@ -1,0 +1,10 @@
+{
+  "model": "sonnet",
+  "foreignKey": {
+    "nested": "keep",
+    "value": 123
+  },
+  "unknownTopLevel": "preserve-me",
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}
