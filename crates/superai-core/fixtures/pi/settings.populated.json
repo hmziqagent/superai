@@ -1,0 +1,13 @@
+{
+  "theme": "dark",
+  "defaultProjectTrust": "ask",
+  "thinkingLevel": "medium",
+  "skills": ["~/.pi/agent/skills"],
+  "extensions": [],
+  "providers": {
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "api": "openai-completions"
+    }
+  }
+}

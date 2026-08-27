@@ -1,0 +1,13 @@
+# foreign keys for preservation
+unknownTopLevel = "preserve-me"
+foreignKey = { nested = "keep", value = 123 }
+customField = "custom-value"
+
+[[providers]]
+id = "custom"
+url = "https://example.com/v1"
+api_key_vars = "CUSTOM_API_KEY"
+
+[model.keep]
+model = "keep-model"
+base_url = "https://example.com/v1"

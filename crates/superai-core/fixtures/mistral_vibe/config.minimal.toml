@@ -1,0 +1,2 @@
+# minimal mistral-vibe config
+active_model = "mistral-medium-latest"

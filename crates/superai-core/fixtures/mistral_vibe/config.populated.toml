@@ -1,0 +1,30 @@
+active_model = "mistral-medium-latest"
+default_agent = "plan"
+theme = "dracula"
+enable_update_checks = false
+enable_telemetry = false
+log_level = "INFO"
+
+[[providers]]
+name = "openrouter"
+api_base = "https://openrouter.ai/api/v1"
+api_key_env_var = "OPENROUTER_API_KEY"
+api_style = "openai"
+backend = "generic"
+
+[[models]]
+name = "mistralai/devstral-2512:free"
+provider = "openrouter"
+alias = "devstral-openrouter"
+temperature = 0.2
+
+[[mcp_servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+enabled_skills = ["code-review"]
+disabled_skills = ["experimental-*"]
+enabled_tools = ["read_file", "grep"]
+disabled_tools = ["bash"]

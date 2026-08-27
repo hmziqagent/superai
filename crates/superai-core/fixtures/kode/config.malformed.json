@@ -1,0 +1,10 @@
+{
+  "modelProfiles": [
+    {
+      "name": "o3",
+  // trailing comment and missing value
+  "modelPointers": {
+    "main": "o3",
+    "task":
+  }
+}

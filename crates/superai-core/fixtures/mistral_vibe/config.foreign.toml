@@ -1,0 +1,18 @@
+# foreign keys for preservation
+unknownTopLevel = "preserve-me"
+foreignKey = { nested = "keep", value = 123 }
+customField = "custom-value"
+
+active_model = "mistral-medium-latest"
+
+[[providers]]
+name = "custom"
+api_base = "https://example.com/v1"
+api_key_env_var = "CUSTOM_KEY"
+api_style = "openai"
+backend = "generic"
+
+[[models]]
+name = "custom/model"
+provider = "custom"
+alias = "custom-alias"

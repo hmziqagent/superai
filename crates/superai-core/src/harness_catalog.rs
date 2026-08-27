@@ -12,9 +12,14 @@ use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::adapters::copilot_cli::CopilotCliAdapter;
+use crate::adapters::forge::ForgeAdapter;
 use crate::adapters::goose::GooseAdapter;
+use crate::adapters::grok_build::GrokBuildAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
+use crate::adapters::kode::KodeAdapter;
+use crate::adapters::mistral_vibe::MistralVibeAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
+use crate::adapters::pi::PiAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -622,6 +627,10 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 ///
 /// Invalid ids are skipped; with the current ledger all ids are valid so the
 /// returned count equals `ENTRIES.len()`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "catalog has 48 entries with per-adapter branching"
+)]
 pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
     let mut out = Vec::with_capacity(ENTRIES.len());
     for entry in ENTRIES {
@@ -675,6 +684,36 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
         }
         if entry.id == crate::adapters::kimi_code::HARNESS_ID_STR
             && let Ok(adapter) = KimiCodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::grok_build::HARNESS_ID_STR
+            && let Ok(adapter) = GrokBuildAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::mistral_vibe::HARNESS_ID_STR
+            && let Ok(adapter) = MistralVibeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::forge::HARNESS_ID_STR
+            && let Ok(adapter) = ForgeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::kode::HARNESS_ID_STR
+            && let Ok(adapter) = KodeAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::pi::HARNESS_ID_STR
+            && let Ok(adapter) = PiAdapter::new()
         {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;

@@ -1,0 +1,21 @@
+{
+  "modelProfiles": [
+    {
+      "name": "o3",
+      "provider": "openai",
+      "modelName": "o3",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "sk-fake-key-123"
+    }
+  ],
+  "modelPointers": {
+    "main": "o3"
+  },
+  "foreignKey": {
+    "nested": "keep",
+    "value": 123
+  },
+  "unknownTopLevel": "preserve-me",
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}

@@ -1,0 +1,28 @@
+{
+  "modelProfiles": [
+    {
+      "name": "o3",
+      "provider": "openai",
+      "modelName": "o3",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "sk-fake-openai-key-123",
+      "maxTokens": 8192,
+      "contextLength": 200000,
+      "isActive": true,
+      "createdAt": 1710000000000
+    }
+  ],
+  "modelPointers": {
+    "main": "o3",
+    "task": "o3",
+    "compact": "o3",
+    "quick": "o3"
+  },
+  "theme": "dark",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}

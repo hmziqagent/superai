@@ -1,0 +1,9 @@
+{
+  "theme": "dark",
+  // trailing comment and missing value
+  "defaultProjectTrust": "ask",
+  "providers": {
+    "openai": {
+      "baseUrl":
+  }
+}

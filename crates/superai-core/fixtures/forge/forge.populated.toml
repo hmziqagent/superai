@@ -1,0 +1,24 @@
+# populated forge config
+restricted = false
+max_conversations = 100
+max_tokens = 20480
+
+[session]
+provider_id = "openai"
+model_id = "gpt-4o"
+
+[[providers]]
+id = "openai"
+url = "https://api.openai.com/v1/chat/completions"
+api_key_vars = "OPENAI_API_KEY"
+response_type = "OpenAI"
+auth_methods = ["api_key"]
+
+[retry]
+initial_backoff_ms = 200
+backoff_factor = 2
+max_attempts = 8
+
+[compact]
+max_tokens = 2000
+message_threshold = 200
