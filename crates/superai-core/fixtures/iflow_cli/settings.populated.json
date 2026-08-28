@@ -1,0 +1,22 @@
+{
+  "$schema": "https://iflow.example/settings.json",
+  "theme": "Default",
+  "selectedAuthType": "iflow",
+  "apiKey": "$MY_API_TOKEN",
+  "baseUrl": "https://apis.iflow.cn/v1",
+  "modelName": "Qwen3-Coder",
+  "searchApiKey": "$MY_API_TOKEN",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  },
+  "coreTools": ["ReadFileTool", "GlobTool"],
+  "fileFiltering": {
+    "respectGitIgnore": true,
+    "enableRecursiveFileSearch": true
+  },
+  "contextFileName": "IFLOW.md",
+  "sandbox": false
+}

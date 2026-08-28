@@ -1,0 +1,15 @@
+{
+  "model": "claude-sonnet-4",
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3],
+  "providers": {
+    "anthropic": {
+      "apiKeyEnv": "ANTHROPIC_API_KEY"
+    }
+  }
+}

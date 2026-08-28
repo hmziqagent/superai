@@ -1,0 +1,16 @@
+{
+  "$schema": "https://deepseek.example/catalog.json",
+  "providers": {
+    "openai": {
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "baseURL": "https://api.openai.com/v1"
+    }
+  },
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}

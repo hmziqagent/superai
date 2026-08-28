@@ -1,0 +1,17 @@
+{
+  "$schema": "https://charm.land/crush.json",
+  "providers": {
+    "custom": {
+      "type": "openai-compat",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "$CUSTOM_API_KEY"
+    }
+  },
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}

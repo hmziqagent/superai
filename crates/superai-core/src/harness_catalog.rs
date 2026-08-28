@@ -17,7 +17,9 @@ use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::adapters::continue_dev::ContinueDevAdapter;
 use crate::adapters::copilot_cli::CopilotCliAdapter;
+use crate::adapters::crush::CrushAdapter;
 use crate::adapters::cursor::CursorAdapter;
+use crate::adapters::deepseek::DeepSeekAdapter;
 use crate::adapters::factory_droid::FactoryDroidAdapter;
 use crate::adapters::forge::ForgeAdapter;
 use crate::adapters::gemini_cli::GeminiCliAdapter;
@@ -25,12 +27,14 @@ use crate::adapters::goose::GooseAdapter;
 use crate::adapters::gptme::GptmeAdapter;
 use crate::adapters::grok_build::GrokBuildAdapter;
 use crate::adapters::hermes::HermesAdapter;
+use crate::adapters::iflow::IflowAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::kilo::KiloAdapter;
 use crate::adapters::kimi_code::KimiCodeAdapter;
 use crate::adapters::kiro::KiroAdapter;
 use crate::adapters::kode::KodeAdapter;
 use crate::adapters::legacy_kimi::LegacyKimiAdapter;
+use crate::adapters::letta::LettaAdapter;
 use crate::adapters::mimo::MimoAdapter;
 use crate::adapters::mistral_vibe::MistralVibeAdapter;
 use crate::adapters::nanocoder::NanocoderAdapter;
@@ -879,6 +883,30 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;
         }
+        if entry.id == crate::adapters::crush::HARNESS_ID_STR
+            && let Ok(adapter) = CrushAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::deepseek::HARNESS_ID_STR
+            && let Ok(adapter) = DeepSeekAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::iflow::HARNESS_ID_STR
+            && let Ok(adapter) = IflowAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::letta::HARNESS_ID_STR
+            && let Ok(adapter) = LettaAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
         // Ledger alias: catalog uses kimi-code-cli but adapter is kimi-code
         if entry.id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
             && KimiCodeAdapter::new().is_ok()
@@ -1254,6 +1282,8 @@ mod tests {
                 harness_id.as_str(),
                 crate::adapters::antigravity::HARNESS_ID_STR
                     | crate::adapters::openclaw::HARNESS_ID_STR
+                    | crate::adapters::crush::HARNESS_ID_STR
+                    | crate::adapters::deepseek::HARNESS_ID_STR
             );
             if is_research_blocked && is_concrete_research_blocked {
                 assert!(
@@ -1288,6 +1318,9 @@ mod tests {
                     | crate::adapters::legacy_kimi::HARNESS_ID_STR
                     | crate::adapters::antigravity::HARNESS_ID_STR
                     | crate::adapters::openclaw::HARNESS_ID_STR
+                    | crate::adapters::crush::HARNESS_ID_STR
+                    | crate::adapters::deepseek::HARNESS_ID_STR
+                    | crate::adapters::iflow::HARNESS_ID_STR
             );
             if (is_research_blocked || is_migration_only) && is_concrete_blocked {
                 assert!(

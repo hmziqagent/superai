@@ -1,0 +1,6 @@
+{
+  "selectedAuthType": "iflow",
+  "apiKey": "$MY_API_TOKEN",
+  "mcpServers": {
+    "broken": [
+}

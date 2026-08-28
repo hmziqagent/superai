@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# populated crushrc — sanitized fake
+provider add openai-compat --type openai-compat --base-url "https://api.example.com/v1" --api-key "$OPENAI_API_KEY"
+model add openai-compat/gpt-4o-mini --name "GPT-4o Mini" --context-window 128000 --default-max-tokens 4096 --price-input 0.15 --price-output 0.6 --price-cache-create 0.075 --price-cache-hit 0.3
+model large openai-compat/gpt-4o-mini
+mcp add github --command npx --args "-y @modelcontextprotocol/server-github"
+option debug false
+permissions allow view ls

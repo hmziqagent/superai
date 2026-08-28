@@ -1,0 +1,12 @@
+{
+  "$schema": "https://iflow.example/settings.json",
+  "selectedAuthType": "iflow",
+  "apiKey": "$MY_API_TOKEN",
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}

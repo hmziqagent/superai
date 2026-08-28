@@ -1,0 +1,25 @@
+{
+  "model": "claude-sonnet-4",
+  "embedding": "openai-small",
+  "toolset": "default",
+  "providers": {
+    "anthropic": {
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "baseURL": "https://api.anthropic.com"
+    },
+    "ollama": {
+      "baseURL": "http://localhost:11434/v1"
+    }
+  },
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  },
+  "memory": {
+    "memfs": true,
+    "context_limit": 200000
+  },
+  "skills": ["memory", "search"]
+}
