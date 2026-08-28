@@ -1,0 +1,9 @@
+claude_code_executable_path = "/opt/homebrew/bin/claude"
+foreign_key = "preserve-me"
+customField = 123
+
+[unknown_section]
+nested = "keep"
+
+[models]
+default = "sonnet"

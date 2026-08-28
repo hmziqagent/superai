@@ -1,0 +1,22 @@
+{
+  "llm": {
+    "model": "openai/gpt-4o",
+    "api_key": "sk-fake-openhands-123456",
+    "base_url": "https://api.openai.com/v1",
+    "temperature": 0.0
+  },
+  "sandbox": {
+    "base_container_image": "nikolaik/python-nodejs:python3.12-nodejs22",
+    "timeout": 120
+  },
+  "agent": {
+    "enable_browsing": true,
+    "enable_jupyter": true
+  },
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}

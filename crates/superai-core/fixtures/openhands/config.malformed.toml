@@ -1,0 +1,4 @@
+[core
+workspace_base = "./workspace"
+[llm
+model = "openai/gpt-4o"

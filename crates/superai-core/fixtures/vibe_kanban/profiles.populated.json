@@ -1,0 +1,22 @@
+{
+  "profiles": [
+    {
+      "name": "claude-glm",
+      "harness": "claude-code",
+      "model": "glm-4.5",
+      "environmentVariables": {
+        "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "sk-fake-glm-123456"
+      },
+      "permissions": {
+        "sandbox": "workspace-write"
+      },
+      "mcpServers": {
+        "filesystem": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        }
+      }
+    }
+  ]
+}

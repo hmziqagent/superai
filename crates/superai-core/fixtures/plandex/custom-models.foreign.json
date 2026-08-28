@@ -1,0 +1,10 @@
+{
+  "$schema": "https://plandex.ai/schemas/models-input.schema.json",
+  "providers": [
+    { "name": "togetherai", "baseUrl": "https://api.together.xyz/v1", "apiKeyEnvVar": "TOGETHER_API_KEY" }
+  ],
+  "models": [],
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": { "nested": "keep" },
+  "customField": "custom-value"
+}

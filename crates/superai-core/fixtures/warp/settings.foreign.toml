@@ -1,0 +1,10 @@
+[appearance]
+theme = "dark"
+foreign_key = "preserve-me"
+
+[unknown_section]
+nested = "keep"
+
+[general]
+autoupdate_enabled = false
+custom = 123

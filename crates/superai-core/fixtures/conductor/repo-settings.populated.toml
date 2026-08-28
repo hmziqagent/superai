@@ -1,0 +1,16 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+[scripts]
+setup = "pnpm install"
+run = "pnpm dev --port $CONDUCTOR_PORT"
+archive = "./script/workspace-archive.sh"
+run_mode = "concurrent"
+
+[scripts.run.web]
+command = "pnpm dev --port $CONDUCTOR_PORT"
+available_in = ["local", "cloud"]
+default = true
+
+[environment_variables]
+API_BASE_URL = "http://localhost:3000"
+
+file_include_globs = [".env.example"]

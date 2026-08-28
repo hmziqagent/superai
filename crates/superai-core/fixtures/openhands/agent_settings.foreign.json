@@ -1,0 +1,13 @@
+{
+  "llm": {
+    "model": "openai/gpt-4o",
+    "api_key": "sk-fake-openhands-123456"
+  },
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": {
+    "nested": "keep",
+    "value": 123
+  },
+  "customField": "custom-value",
+  "extraUnknown": [1, 2, 3]
+}

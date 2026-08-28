@@ -15,8 +15,10 @@ use crate::adapters::auggie::AuggieAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
+use crate::adapters::conductor::ConductorAdapter;
 use crate::adapters::continue_dev::ContinueDevAdapter;
 use crate::adapters::copilot_cli::CopilotCliAdapter;
+use crate::adapters::copilot_coding_agent::CopilotCodingAgentAdapter;
 use crate::adapters::crush::CrushAdapter;
 use crate::adapters::cursor::CursorAdapter;
 use crate::adapters::deepseek::DeepSeekAdapter;
@@ -40,11 +42,16 @@ use crate::adapters::mistral_vibe::MistralVibeAdapter;
 use crate::adapters::nanocoder::NanocoderAdapter;
 use crate::adapters::openclaw::OpenClawAdapter;
 use crate::adapters::opencode::OpenCodeAdapter;
+use crate::adapters::openhands::OpenHandsAdapter;
 use crate::adapters::pi::PiAdapter;
+use crate::adapters::plandex::PlandexAdapter;
 use crate::adapters::qwen_code::QwenCodeAdapter;
 use crate::adapters::roo_code::RooCodeAdapter;
+use crate::adapters::sculptor::SculptorAdapter;
 use crate::adapters::swe_agent::SweAgentAdapter;
 use crate::adapters::trae_agent::TraeAgentAdapter;
+use crate::adapters::vibe_kanban::VibeKanbanAdapter;
+use crate::adapters::warp::WarpAdapter;
 use crate::adapters::windsurf::WindsurfAdapter;
 use crate::adapters::zcode::ZcodeAdapter;
 use crate::adapters::zed_acp::ZedAcpAdapter;
@@ -907,6 +914,48 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
             out.push(Box::new(adapter) as Box<dyn Adapter>);
             continue;
         }
+        if entry.id == crate::adapters::openhands::HARNESS_ID_STR
+            && let Ok(adapter) = OpenHandsAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::plandex::HARNESS_ID_STR
+            && let Ok(adapter) = PlandexAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::warp::HARNESS_ID_STR
+            && let Ok(adapter) = WarpAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::vibe_kanban::HARNESS_ID_STR
+            && let Ok(adapter) = VibeKanbanAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::conductor::HARNESS_ID_STR
+            && let Ok(adapter) = ConductorAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::sculptor::HARNESS_ID_STR
+            && let Ok(adapter) = SculptorAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
+        if entry.id == crate::adapters::copilot_coding_agent::HARNESS_ID_STR
+            && let Ok(adapter) = CopilotCodingAgentAdapter::new()
+        {
+            out.push(Box::new(adapter) as Box<dyn Adapter>);
+            continue;
+        }
         // Ledger alias: catalog uses kimi-code-cli but adapter is kimi-code
         if entry.id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
             && KimiCodeAdapter::new().is_ok()
@@ -1239,6 +1288,10 @@ mod tests {
         clippy::excessive_nesting,
         reason = "test branching for support states"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test exercises every trait method for 48 adapters"
+    )]
     fn adapters_are_object_safe_and_usable_as_trait_objects() {
         let adapters = all_adapters();
         for adapter in adapters {
@@ -1276,6 +1329,7 @@ mod tests {
             let entry = find_by_id(harness_id.as_str());
             let is_research_blocked =
                 entry.is_some_and(|e| e.support == AdapterSupport::ResearchBlocked);
+            let is_unsupported = entry.is_some_and(|e| e.support == AdapterSupport::Unsupported);
             // Only strictly enforce ResearchBlocked for concrete adapters (antigravity, openclaw);
             // generic ResearchBlocked adapters (crush, deepseek) currently return Ok and are allowed.
             let is_concrete_research_blocked = matches!(
@@ -1285,16 +1339,26 @@ mod tests {
                     | crate::adapters::crush::HARNESS_ID_STR
                     | crate::adapters::deepseek::HARNESS_ID_STR
             );
-            if is_research_blocked && is_concrete_research_blocked {
+            let is_concrete_unsupported = matches!(
+                harness_id.as_str(),
+                crate::adapters::copilot_coding_agent::HARNESS_ID_STR
+            );
+            if (is_research_blocked && is_concrete_research_blocked)
+                || (is_unsupported && is_concrete_unsupported)
+            {
                 assert!(
                     res.is_err(),
-                    "validate_instance should be ResearchBlocked for `{harness_id}`"
+                    "validate_instance should be blocked for `{harness_id}` (research/unsupported)"
                 );
                 if let Err(err) = &res {
                     let dbg = format!("{err:?}");
                     assert!(
-                        dbg.contains("ResearchBlocked") || dbg.contains("research"),
-                        "expected ResearchBlocked error for `{harness_id}`: {dbg}"
+                        dbg.contains("ResearchBlocked")
+                            || dbg.contains("research")
+                            || dbg.contains("Unsupported")
+                            || dbg.contains("unsupported")
+                            || dbg.contains("cloud-owned"),
+                        "expected blocked error for `{harness_id}`: {dbg}"
                     );
                 }
             } else {
@@ -1308,7 +1372,7 @@ mod tests {
             let plan_res = adapter.plan_wrapper(&inst);
             let is_migration_only =
                 entry.is_some_and(|e| e.support == AdapterSupport::MigrationOnly);
-            // Only strictly enforce blocking for concrete migration/research adapters;
+            // Only strictly enforce blocking for concrete migration/research/unsupported adapters;
             // generic adapters still return Ok and are allowed until they get concrete impls.
             let is_concrete_blocked = matches!(
                 harness_id.as_str(),
@@ -1321,8 +1385,10 @@ mod tests {
                     | crate::adapters::crush::HARNESS_ID_STR
                     | crate::adapters::deepseek::HARNESS_ID_STR
                     | crate::adapters::iflow::HARNESS_ID_STR
+                    | crate::adapters::copilot_coding_agent::HARNESS_ID_STR
+                    | crate::adapters::vibe_kanban::HARNESS_ID_STR
             );
-            if (is_research_blocked || is_migration_only) && is_concrete_blocked {
+            if (is_research_blocked || is_migration_only || is_unsupported) && is_concrete_blocked {
                 assert!(
                     plan_res.is_err(),
                     "plan_wrapper should be blocked for `{harness_id}` (support {support:?})",

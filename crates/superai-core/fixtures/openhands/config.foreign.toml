@@ -1,0 +1,14 @@
+[core]
+workspace_base = "./workspace"
+foreign_key = "preserve-me"
+
+[llm]
+model = "openai/gpt-4o"
+custom_foreign = 123
+
+[unknown_section]
+nested = "keep"
+value = 42
+
+[agent]
+enable_browsing = true

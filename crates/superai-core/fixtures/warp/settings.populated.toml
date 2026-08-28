@@ -1,0 +1,17 @@
+[appearance]
+theme = "dark"
+
+[general]
+autoupdate_enabled = false
+
+[agents]
+default_model = "auto"
+planning_model = "auto-genius"
+
+[mcpServers]
+filesystem = { command = "npx", args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] }
+
+[profiles.default]
+base_model = "auto"
+planning_model = "auto-genius"
+autonomy = "agent-decides"

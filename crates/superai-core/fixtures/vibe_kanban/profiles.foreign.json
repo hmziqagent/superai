@@ -1,0 +1,11 @@
+{
+  "profiles": [
+    {
+      "name": "test",
+      "harness": "claude-code",
+      "model": "sonnet"
+    }
+  ],
+  "foreignKey": "preserve-me",
+  "unknownTopLevel": { "nested": "keep" }
+}

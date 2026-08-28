@@ -1,0 +1,30 @@
+[core]
+workspace_base = "./workspace"
+max_iterations = 250
+runtime = "docker"
+default_agent = "CodeActAgent"
+debug = false
+
+[llm]
+model = "openai/gpt-4o"
+api_key = "sk-fake-openhands-123456"
+base_url = "https://api.openai.com/v1"
+temperature = 0.0
+num_retries = 8
+
+[sandbox]
+timeout = 120
+user_id = 1000
+base_container_image = "nikolaik/python-nodejs:python3.12-nodejs22"
+use_host_network = false
+
+[agent]
+enable_browsing = true
+enable_jupyter = true
+enable_prompt_extensions = true
+
+[security]
+confirmation_mode = false
+
+[condenser]
+type = "noop"

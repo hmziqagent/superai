@@ -1,0 +1,9 @@
+name: Git fixup push
+command: git commit --fixup={{ref}} && git push
+tags: ["git", "GitHub"]
+description: Fixup against ref and push
+shells: [zsh, bash, fish]
+arguments:
+  - name: ref
+    description: Commit to fixup against
+    default_value: HEAD

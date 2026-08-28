@@ -1,0 +1,18 @@
+{
+  "claude_code": {
+    "model": "sonnet",
+    "effort": "medium",
+    "fastMode": false,
+    "binary": "managed"
+  },
+  "pi": {
+    "provider": "anthropic",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "model": "claude-sonnet-4"
+  },
+  "dependencies": {
+    "claude_code_binary": "managed",
+    "git": "system",
+    "gh": "system"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "llm": {
+    "model": "openai/gpt-4o",
+    "api_key": "sk-fake-openhands-123456",
+    "base_url": "https://api.openai.com/v1",

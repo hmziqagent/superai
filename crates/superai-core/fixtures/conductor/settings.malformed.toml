@@ -1,0 +1,4 @@
+[models
+default = "sonnet"
+[scripts
+setup = "pnpm install"

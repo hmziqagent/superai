@@ -1,0 +1,4 @@
+{
+  "$schema": "https://plandex.ai/schemas/models-input.schema.json",
+  "providers": [
+    { "name": "togetherai",

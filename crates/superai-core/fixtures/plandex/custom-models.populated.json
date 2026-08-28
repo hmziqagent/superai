@@ -1,0 +1,39 @@
+{
+  "$schema": "https://plandex.ai/schemas/models-input.schema.json",
+  "providers": [
+    {
+      "name": "togetherai",
+      "baseUrl": "https://api.together.xyz/v1",
+      "apiKeyEnvVar": "TOGETHER_API_KEY"
+    },
+    {
+      "name": "local-llm",
+      "baseUrl": "http://localhost:8080/v1",
+      "skipAuth": true
+    }
+  ],
+  "models": [
+    {
+      "modelId": "my-model",
+      "publisher": "test-publisher",
+      "maxTokens": 128000,
+      "maxOutputTokens": 8192,
+      "reservedOutputTokens": 8192,
+      "defaultMaxConvoTokens": 50000,
+      "preferredOutputFormat": "xml",
+      "providers": [
+        { "provider": "custom", "customProvider": "togetherai", "modelName": "exact-id-on-provider" },
+        { "provider": "openrouter", "modelName": "vendor/model" }
+      ]
+    }
+  ],
+  "modelPacks": [
+    {
+      "name": "custom-pack",
+      "planner": "anthropic/claude-sonnet-4",
+      "coder": "openai/gpt-4o",
+      "architect": "openai/o3-medium",
+      "summarizer": "openai/gpt-4o-mini"
+    }
+  ]
+}

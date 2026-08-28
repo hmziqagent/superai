@@ -1,0 +1,4 @@
+name: [unclosed
+command: |
+  echo hello
+  bad: [unclosed
