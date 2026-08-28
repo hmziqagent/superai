@@ -3,8 +3,10 @@
 //! Support is not a boolean: a capability can be native, substituted, or absent,
 //! and it depends on the harness *and* provider together. This module resolves
 //! a capability for a given harness/provider pair using a data-driven matrix.
-//! The matrix lives as a static map; a file-based override can also be loaded.
-//! No interface consumer branches on harness identity — they ask this resolver.
+//! Every active harness/provider pair has native/substituted/absent with
+//! explanation for all capabilities. The matrix lives as a static map; a
+//! file-based override can also be loaded. No interface consumer branches on
+//! harness identity — they ask this resolver.
 
 use std::path::Path;
 
@@ -913,5 +915,164 @@ mod tests {
         // Delta would be absent -> native.
         assert_eq!(before.support, Support::Absent);
         assert_eq!(after.support, Support::Native);
+    }
+
+    #[test]
+    fn matrix_has_native_substituted_absent_with_explanations() {
+        // Every active pair has a row for every capability, with non-empty explanation,
+        // and the static matrix contains at least one of each support variant.
+        validate_matrix_completeness().unwrap();
+        let mut seen_native = false;
+        let mut seen_substituted = false;
+        let mut seen_absent = false;
+        for entry in MATRIX {
+            assert!(
+                !entry.explanation.trim().is_empty(),
+                "matrix entry harness `{}` provider `{}` cap `{:?}` has empty explanation",
+                entry.harness,
+                entry.provider,
+                entry.capability
+            );
+            match entry.support {
+                Support::Native => seen_native = true,
+                Support::Substituted => seen_substituted = true,
+                Support::Absent => seen_absent = true,
+            }
+            if entry.support == Support::Substituted {
+                assert!(
+                    matches!(
+                        entry.source,
+                        CapabilitySource::Provider
+                            | CapabilitySource::Template
+                            | CapabilitySource::Plugin
+                            | CapabilitySource::Policy
+                    ),
+                    "substituted must have provider/template/plugin/policy source, got {}",
+                    entry.source
+                );
+            }
+        }
+        assert!(seen_native, "matrix must contain at least one native");
+        assert!(
+            seen_substituted,
+            "matrix must contain at least one substituted"
+        );
+        assert!(seen_absent, "matrix must contain at least one absent");
+        // Verify every active pair covers all capabilities.
+        for (harness, provider) in ACTIVE_PAIRS {
+            let hid = HarnessId::new(harness).unwrap();
+            let pid = ProviderId::new(provider).unwrap();
+            let all = resolve_all(&hid, &pid);
+            assert_eq!(
+                all.len(),
+                ALL_CAPABILITIES.len(),
+                "pair {harness}/{provider} missing capabilities"
+            );
+            for (cap, resolved) in all {
+                assert!(
+                    !resolved.explanation.trim().is_empty(),
+                    "pair {harness}/{provider} cap {cap:?} has empty explanation"
+                );
+                // Support must be one of the three variants — always true by enum, but ensure resolvable.
+                assert!(matches!(
+                    resolved.support,
+                    Support::Native | Support::Substituted | Support::Absent
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn add_provider_without_code_change_and_matrix_completeness() {
+        // Provider side: adding a provider via file requires no Rust edit.
+        let dir = crate::test_util::temp_dir_unique("matrix-provider-polish");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Simulate provider file for a synthetic provider.
+        let provider_json = r#"{
+  "id": "synthetic-matrix-provider",
+  "display_name": "Synthetic",
+  "base_url": "https://synthetic.example.com",
+  "auth_style": "bearer",
+  "protocol": "openai_chat",
+  "model_list": [{"id": "m1", "status": "active"}],
+  "defaults": {"default_model": "m1"},
+  "status": "active"
+}"#;
+        let path = dir.join("synthetic-matrix-provider.json");
+        std::fs::write(&path, provider_json).unwrap();
+        let loaded = crate::provider::load_provider_defs(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id.as_str(), "synthetic-matrix-provider");
+        // Health on that synthetic provider still works (data-driven health).
+        let cfg = crate::health::HealthConfig::default();
+        let health = crate::health::health_probe(&loaded[0], &cfg);
+        assert!(
+            health.valid,
+            "synthetic provider health should be valid: {}",
+            health.reason
+        );
+        assert!(!health.base_url_redacted.contains("sk-"));
+
+        // Capability side: matrix completeness is validated for known pairs; synthetic pair
+        // is absent Unknown until rows are added, demonstrating that matrix is also data-driven
+        // but completeness requires rows per pair.
+        let synthetic_h = HarnessId::new("synthetic-harness").unwrap();
+        let synthetic_p = ProviderId::new("synthetic-matrix-provider").unwrap();
+        let unknown = resolve(&synthetic_h, &synthetic_p, Capability::WebSearch);
+        assert_eq!(unknown.support, Support::Absent);
+        assert_eq!(unknown.source, CapabilitySource::Unknown);
+
+        // If we add rows for the synthetic pair, resolve becomes deterministic.
+        let synthetic_matrix = [
+            MatrixEntry {
+                harness: "synthetic-harness",
+                provider: "synthetic-matrix-provider",
+                capability: Capability::WebSearch,
+                support: Support::Substituted,
+                source: CapabilitySource::Provider,
+                explanation: "synthetic substituted via provider",
+            },
+            MatrixEntry {
+                harness: "synthetic-harness",
+                provider: "synthetic-matrix-provider",
+                capability: Capability::Vision,
+                support: Support::Native,
+                source: CapabilitySource::Harness,
+                explanation: "synthetic vision native",
+            },
+            MatrixEntry {
+                harness: "synthetic-harness",
+                provider: "synthetic-matrix-provider",
+                capability: Capability::ComputerUse,
+                support: Support::Absent,
+                source: CapabilitySource::Harness,
+                explanation: "synthetic computer_use absent",
+            },
+            MatrixEntry {
+                harness: "synthetic-harness",
+                provider: "synthetic-matrix-provider",
+                capability: Capability::Mcp,
+                support: Support::Native,
+                source: CapabilitySource::Harness,
+                explanation: "synthetic mcp native",
+            },
+        ];
+        validate_matrix_completeness_with(
+            &synthetic_matrix,
+            &[("synthetic-harness", "synthetic-matrix-provider")],
+            ALL_CAPABILITIES,
+        )
+        .unwrap();
+        let substituted = resolve_with_matrix(
+            &synthetic_h,
+            &synthetic_p,
+            Capability::WebSearch,
+            &synthetic_matrix,
+        );
+        assert_eq!(substituted.support, Support::Substituted);
+        assert_eq!(substituted.source, CapabilitySource::Provider);
+        assert!(!substituted.explanation.is_empty());
+
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

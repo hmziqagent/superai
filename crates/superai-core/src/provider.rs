@@ -3,9 +3,10 @@
 //! A provider is versioned data, not a Rust branch. Adding a provider is a
 //! data-only change: add a JSON/YAML file and no Rust source edit is required.
 //! Definitions are read fresh from disk on every load; nothing is cached.
-//! Health probing validates URL format, bounds timeout, redacts secrets, and
-//! classifies auth/rate-limit/TLS via the fake harness (no live network).
-//! API keys are ephemeral and only written to harness-declared sinks.
+//! Health probing validates URL format, bounds timeout, redacts secrets,
+//! classifies auth/rate-limit/TLS via the fake harness (no live network),
+//! and strips auth on cross-host redirects. API keys are ephemeral and only
+//! written to harness-declared sinks.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1750,5 +1751,139 @@ status: active
             redacted_h.get("Content-Type").map(String::as_str),
             Some("application/json")
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "comprehensive health polish covers data-driven, bounded, redacted, classify, redirect in one test"
+    )]
+    fn health_polish_comprehensive_data_driven_bounded_redacted_classified_and_redirect_stripping()
+    {
+        // Data-driven: synthetic provider loaded from file, no Rust edit.
+        let dir = tmp_dir("health-polish");
+        let json = single_provider_json("synthetic-health-polish", "https://api.example.com");
+        let path = dir.join("synthetic-health-polish.json");
+        std::fs::write(&path, &json).unwrap();
+        let loaded = load_provider_defs(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let prov = &loaded[0];
+        assert_eq!(prov.id.as_str(), "synthetic-health-polish");
+
+        // Bounded timeout: valid bounds succeed, out-of-bounds fail.
+        assert!(
+            crate::health::HealthConfig::new(
+                crate::health::HealthProbeKind::HttpStatus,
+                Duration::from_secs(5),
+                1024,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::health::HealthConfig::new(
+                crate::health::HealthProbeKind::HttpStatus,
+                Duration::from_millis(500),
+                1024,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            crate::health::HealthConfig::new(
+                crate::health::HealthProbeKind::HttpStatus,
+                Duration::from_secs(31),
+                1024,
+                false
+            )
+            .is_err()
+        );
+        let cfg = crate::health::HealthConfig::default();
+        let res = crate::health::health_probe(prov, &cfg);
+        assert!(
+            res.valid,
+            "synthetic provider should be valid: {}",
+            res.reason
+        );
+        assert_eq!(res.timeout_ms, 5000);
+
+        // Redacted: query secret never appears in result.
+        let secret_url =
+            "https://api.example.com?api_key=sk-superai-test-sentinel-12345-fake&model=foo";
+        let secret_prov = ProviderDefinition {
+            id: ProviderId::new("synthetic-redacted").unwrap(),
+            display_name: "redacted".to_owned(),
+            base_url: secret_url.to_owned(),
+            auth_style: AuthStyle::Bearer,
+            protocol: Protocol::OpenAiChat,
+            model_list: vec![],
+            defaults: ProviderDefaults::default(),
+            status: ProviderStatus::Active,
+            documentation_url: None,
+        };
+        let redacted_res = crate::health::health_probe(&secret_prov, &cfg);
+        assert!(
+            !redacted_res
+                .base_url_redacted
+                .contains("sk-superai-test-sentinel-12345-fake")
+        );
+        assert!(redacted_res.base_url_redacted.contains("[REDACTED]"));
+        assert!(redacted_res.base_url_redacted.contains("model=foo"));
+
+        // Classify auth / rate-limit / TLS via mock harness.
+        let ok = crate::health::health_probe_with_mock(prov, &cfg, 200, "all good", None);
+        assert_eq!(ok.status, crate::failure::HealthStatus::Healthy);
+        assert!(ok.valid);
+        let rate =
+            crate::health::health_probe_with_mock(prov, &cfg, 429, "rate limit exceeded", None);
+        assert_eq!(rate.status, crate::failure::HealthStatus::RateLimited);
+        assert!(!rate.valid);
+        let auth = crate::health::health_probe_with_mock(prov, &cfg, 401, "unauthorized", None);
+        assert_eq!(auth.status, crate::failure::HealthStatus::AuthError);
+        assert!(!auth.valid);
+        let tls = crate::health::health_probe_with_mock(
+            prov,
+            &cfg,
+            200,
+            "tls certificate verify failed",
+            None,
+        );
+        assert_eq!(tls.status, crate::failure::HealthStatus::TlsError);
+        assert!(!tls.valid);
+
+        // Cross-host redirect stripping.
+        let cross = crate::health::health_probe_with_mock(
+            prov,
+            &cfg,
+            302,
+            "redirect",
+            Some("https://evil.example.com/other"),
+        );
+        assert!(cross.stripped_auth_on_redirect);
+        let same = crate::health::health_probe_with_mock(
+            prov,
+            &cfg,
+            302,
+            "redirect",
+            Some("https://api.example.com/other"),
+        );
+        assert!(!same.stripped_auth_on_redirect);
+        assert!(crate::failure::should_strip_auth_for_redirect(
+            "https://a.example.com/x",
+            "https://b.example.com/y"
+        ));
+        assert!(!crate::failure::should_strip_auth_for_redirect(
+            "https://a.example.com/x",
+            "https://a.example.com/y"
+        ));
+
+        // Sentinel never leaks in reason.
+        let sentinel = crate::abuse::SENTINEL;
+        let body_with_sentinel = format!("rate limit {sentinel}");
+        let leaked =
+            crate::health::health_probe_with_mock(prov, &cfg, 429, &body_with_sentinel, None);
+        assert!(!leaked.reason.contains(sentinel));
+
+        drop(std::fs::remove_dir_all(&dir));
     }
 }
