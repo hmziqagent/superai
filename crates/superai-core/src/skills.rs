@@ -1258,7 +1258,9 @@ impl SkillRegistry {
                     // For GitHub/Marketplace, fetch to staging.
                     // Support file:// for tests and https:// via ureq.
                     // If locator is file://, copy from that file path's directory.
-                    // Otherwise, we simulate fetch by creating a minimal skill.
+                    // Otherwise the https fetch must succeed: a failure returns
+                    // CoreError::SourceFetch, nothing is staged, and the
+                    // registry/disk are left unchanged.
                     if source.locator.starts_with("file://") {
                         let path_str = source.locator.trim_start_matches("file://");
                         let src = Path::new(path_str);
