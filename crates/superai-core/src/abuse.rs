@@ -840,7 +840,7 @@ description: test skill
         {
             // On non-unix, just test that directory validation doesn't panic
             let res = crate::skills::validate_skill_tree(&skill_dir);
-            assert!(res.is_ok());
+            res.expect("skill tree validation should succeed on non-unix");
         }
 
         drop(std::fs::remove_dir_all(&dir));

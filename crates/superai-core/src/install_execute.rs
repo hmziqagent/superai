@@ -2115,7 +2115,17 @@ mod tests {
                 .referencing_instances
                 .contains(&"work".to_owned())
         );
-        assert!(plan.preflight.preserved.iter().any(|p| p == &config_root));
+        // macOS temp dirs live under /var, a symlink to /private/var: compare
+        // canonicalized forms so the preserve-list match is filesystem-truth.
+        let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        assert!(
+            plan.preflight
+                .preserved
+                .iter()
+                .any(|p| canon(p) == canon(&config_root)),
+            "config root must be preserved: {:?} vs {config_root:?}",
+            plan.preflight.preserved
+        );
         assert!(
             plan.preflight
                 .preserved

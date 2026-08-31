@@ -722,51 +722,63 @@ pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<Path
 ///
 /// On Unix, two paths that point to the same inode/device are considered one.
 /// Otherwise, lexical dedup is used. The first occurrence's display path is kept.
-#[expect(clippy::excessive_nesting, reason = "dedup branches are explicit")]
 pub fn deduplicate_by_identity(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
-        let mut seen_lexical: HashSet<String> = HashSet::new();
-        let mut out: Vec<PathBuf> = Vec::new();
-        for path in candidates {
-            let normalized_key = normalize_path(&path).to_string_lossy().into_owned();
-            // Lexical dedup first
-            if !seen_lexical.insert(normalized_key.clone()) {
-                continue;
-            }
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let id = (meta.dev(), meta.ino());
-                if !seen_ids.insert(id) {
-                    // Duplicate inode; keep first display path, skip this one
-                    // Need to remove the lexical we just inserted? No, we want to keep lexical set
-                    // but this inode dup means we should remove the duplicate path from out
-                    // Since we haven't pushed yet, just skip.
-                    // But we already inserted lexical; keep it to prevent re-adding same normalized path via symlink.
-                    // The inode dup should be skipped.
-                    continue;
-                }
-            }
-            out.push(path);
-        }
-        out
+        dedup_by_identity_unix(candidates)
     }
     #[cfg(not(unix))]
     {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out: Vec<PathBuf> = Vec::new();
-        for path in candidates {
-            let key = normalize_path(&path)
-                .to_string_lossy()
-                .into_owned()
-                .to_lowercase();
-            if seen.insert(key) {
-                out.push(path);
+        dedup_by_identity_lexical(candidates)
+    }
+}
+
+/// Unix: same inode/device is one entry; the first display path is kept.
+#[cfg(unix)]
+fn dedup_by_identity_unix(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen_lexical: HashSet<String> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        let normalized_key = normalize_path(&path).to_string_lossy().into_owned();
+        // Lexical dedup first
+        if !seen_lexical.insert(normalized_key.clone()) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let id = (meta.dev(), meta.ino());
+            if !seen_ids.insert(id) {
+                // Duplicate inode; keep first display path, skip this one
+                // Need to remove the lexical we just inserted? No, we want to keep lexical set
+                // but this inode dup means we should remove the duplicate path from out
+                // Since we haven't pushed yet, just skip.
+                // But we already inserted lexical; keep it to prevent re-adding same normalized path via symlink.
+                // The inode dup should be skipped.
+                continue;
             }
         }
-        out
+        out.push(path);
     }
+    out
+}
+
+/// Non-unix: no inode identity; case-folded lexical dedup (Windows filesystems
+/// are case-insensitive by default).
+#[cfg(not(unix))]
+fn dedup_by_identity_lexical(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        let key = normalize_path(&path)
+            .to_string_lossy()
+            .into_owned()
+            .to_lowercase();
+        if seen.insert(key) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Find unmanaged candidates by scanning `home` and filtering against the registry.
@@ -1181,7 +1193,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let candidates = vec![real.clone(), real.clone()];
+            let candidates = vec![real.clone(), real];
             let deduped = deduplicate_by_identity(candidates);
             assert_eq!(deduped.len(), 1);
         }

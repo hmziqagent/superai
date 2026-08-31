@@ -722,19 +722,25 @@ pub fn commit_api_key(
     Ok(preview)
 }
 
+/// Unix: tighten the sink file to owner-only (0o600). Windows has no mode
+/// bits; the atomic write already creates the file with user-only defaults.
+#[cfg(unix)]
 fn harden_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let perm = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perm).map_err(|e| CoreError::InvalidPath {
-            kind: "permissions".to_owned(),
-            value: path.display().to_string(),
-            reason: format!("cannot set 0o600: {e}"),
-        })?;
-    }
-    // On non-unix, no special handling; file is still not world-readable via default.
-    let _ = path;
+    use std::os::unix::fs::PermissionsExt as _;
+    let perm = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perm).map_err(|e| CoreError::InvalidPath {
+        kind: "permissions".to_owned(),
+        value: path.display().to_string(),
+        reason: format!("cannot set 0o600: {e}"),
+    })
+}
+
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "no-op off unix; callers keep the Result contract"
+)]
+fn harden_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
