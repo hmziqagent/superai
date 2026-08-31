@@ -1492,7 +1492,8 @@ fn isolate_and_configure(
         if entry.target == target_settings_path && request.template.is_some() {
             let src_bytes = std::fs::read(&entry.source).ok();
             let template_ref = request.template.as_ref().expect("template is some");
-            let mutated = mutate_settings_with_template(src_bytes.as_deref(), template_ref)?;
+            let mutated =
+                mutate_settings_with_template(&entry.target, src_bytes.as_deref(), template_ref)?;
             steps.push(FileAction::Write {
                 path: entry.target.clone(),
                 content: mutated,
@@ -1518,7 +1519,7 @@ fn isolate_and_configure(
     // Apply template/provider mutations to target only if not already handled
     if let Some(template) = &request.template {
         if !has_settings_write {
-            let mutated = mutate_settings_with_template(None, template)?;
+            let mutated = mutate_settings_with_template(&target_settings_path, None, template)?;
             steps.push(FileAction::Write {
                 path: target_settings_path,
                 content: mutated,
@@ -1597,14 +1598,29 @@ fn guess_document_kind(path: &Path) -> superai_config::document::DocumentKind {
     }
 }
 
+/// Mutate settings bytes with template markers, or refuse honestly.
+///
+/// codec-honesty (DOC-05): if `existing` bytes are present they must parse as
+/// strict JSON. Comment/trailing-comma bearing content (JSONC — e.g. amp's
+/// declared settings kind) must not be silently swapped for an empty map and
+/// rewritten as normalized JSON: that destroys every foreign key and comment.
+/// Refuse with the typed lossy-write error instead.
 fn mutate_settings_with_template(
+    target: &Path,
     existing: Option<&[u8]>,
     template: &TemplateRef,
 ) -> Result<Vec<u8>> {
-    let mut value: serde_json::Value = if let Some(bytes) = existing {
-        serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
+    let mut value: serde_json::Value = match existing {
+        Some(bytes) if !bytes.is_empty() => match serde_json::from_slice(bytes) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Err(CoreError::Config(ConfigError::LossyWrite {
+                    path: target.to_path_buf(),
+                    format: "jsonc",
+                }));
+            }
+        },
+        _ => serde_json::Value::Object(serde_json::Map::new()),
     };
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
@@ -3582,6 +3598,67 @@ mod tests {
         assert_eq!(inst.config_root.as_path(), target_root);
         assert_eq!(inst.template.as_ref().unwrap().name.as_str(), "claude-glm");
 
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn mirror_with_jsonc_settings_refuses_instead_of_stripping_comments() {
+        // codec-honesty (DOC-05): harnesses whose settings files carry JSONC
+        // (comments/trailing commas — e.g. amp's declared settings surface)
+        // must fail with the typed lossy-write error rather than being
+        // re-serialized as normalized JSON, which would drop every comment
+        // and every foreign key.
+        let tmp = unique_temp("mirror_jsonc_refusal");
+        let registry_path = tmp.join("registry.json");
+        let adapter = make_adapter("claude-code");
+
+        let source_root = tmp.join("source_claude");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source_settings = source_root.join("settings.json");
+        let jsonc =
+            "{\n  // user comment\n  \"model\": \"sonnet\",\n  \"foreignKey\": \"keep\",\n}\n";
+        std::fs::write(&source_settings, jsonc).unwrap();
+        let source_bytes_before = std::fs::read(&source_settings).unwrap();
+
+        let target_root = tmp.join("target_work");
+        let request = CreateRequest {
+            name: InstanceName::new("work").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source_root).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: Some(TemplateRef {
+                name: TemplateId::new("claude-glm").unwrap(),
+                version: TemplateVersion::new("1.2.0").unwrap(),
+            }),
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
+        };
+
+        let result = create_mirrored(request, &registry_path, &adapter);
+        match result {
+            Err(CoreError::Config(ConfigError::LossyWrite { format, .. })) => {
+                assert_eq!(format, "jsonc");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+
+        // Nothing was corrupted: source bytes untouched, no target settings
+        // written, no registry record invented.
+        assert_eq!(
+            std::fs::read(&source_settings).unwrap(),
+            source_bytes_before,
+            "source must be unchanged after refusal"
+        );
+        let target_settings = target_root.join("settings.json");
+        assert!(
+            !target_settings.exists(),
+            "refused create must not write normalized settings"
+        );
+        let loaded = Registry::load(&registry_path).unwrap();
+        assert!(
+            loaded.instances().is_empty(),
+            "refused create must not commit a registry record"
+        );
         drop(std::fs::remove_dir_all(&tmp));
     }
 

@@ -26,14 +26,15 @@
 //!   lexical material is refused with
 //!   [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite). A
 //!   write proceeds only when it is provably lossless: the target file is
-//!   missing (creation) or its bytes carry none of those lexical features
-//!   (see `has_unpreservable_lexical_material`), in which case normalized
-//!   output preserves every lexical feature the file has. Flow collections
-//!   and scalar quoting are layout, not lexical material under this policy:
-//!   their values round-trip exactly and only layout is normalized. No-op
-//!   edits never write and keep byte identity. A future lossless codec (e.g.
-//!   `yaml-edit`) can replace this gate while keeping the same
-//!   parse/validation surface.
+//!   missing (creation) or its bytes carry none of that material (see
+//!   `has_unpreservable_lexical_material`). Quoted scalars count as lexical
+//!   material: their style is normalized away, and parser-free quote
+//!   detection cannot be made reliable, so any quote character refuses the
+//!   write. What remains writable is plain block-style YAML — flow-vs-block
+//!   layout and indentation are the only things normalized there, and values
+//!   round-trip exactly. No-op edits never write and keep byte identity. A
+//!   future lossless codec (e.g. `yaml-edit`) can replace this gate while
+//!   keeping the same parse/validation surface.
 //! - Policy: do not mutate through an alias if ownership/effect is ambiguous,
 //!   and do not expand anchors into duplicated values. The `serde` layer
 //!   resolves aliases to duplicated values on parse (anchor names are lost),
@@ -181,59 +182,37 @@ fn strip_bom(text: &str) -> &str {
 
 /// Whether `text` carries YAML lexical material the normalized writer cannot
 /// reproduce: comments, anchors, aliases, tags, directives, document markers,
-/// block scalar indicators, or explicit complex keys.
+/// block scalar indicators, explicit complex keys, or quoted scalars.
 ///
-/// The scan is string-aware: indicators inside single- or double-quoted
-/// scalars are ignored. Flow collections (`{`, `[`) and scalar quoting are not
-/// lexical material under this policy — their values round-trip exactly and
-/// only layout is normalized on write (see the module preservation contract).
-#[expect(clippy::excessive_nesting, reason = "string-aware indicator scan")]
+/// Detection is deliberately conservative and stateless: a false positive
+/// only refuses a write (honest), while a false negative silently corrupts a
+/// file. There is therefore **no quote-state tracking** — determining whether
+/// a `'` or `"` opens a quoted scalar requires a full YAML parser (plain
+/// scalars may contain apostrophes, quoted scalars span lines, flow context
+/// changes the rules), so any quote character anywhere is treated as lexical
+/// material. Other indicators are recognized at node-start positions (line
+/// start, after whitespace, and after flow separators `[`, `{`, `,`, `:`),
+/// which is where YAML gives them their special meaning.
 fn has_unpreservable_lexical_material(text: &str) -> bool {
     let text = strip_bom(text);
     let chars: Vec<char> = text.chars().collect();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
     // Treat start of input as start of line so column-0 indicators are seen.
     let mut prev = '\n';
 
     let mut idx = 0usize;
     while let Some(&ch) = chars.get(idx) {
-        if in_double {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_double = false;
-            }
-            prev = ch;
-            idx += 1;
-            continue;
-        }
-        if in_single {
-            if ch == '\'' {
-                if chars.get(idx + 1) == Some(&'\'') {
-                    // `''` inside a single-quoted scalar is an escaped quote.
-                    idx += 2;
-                    prev = '\'';
-                    continue;
-                }
-                in_single = false;
-            }
-            prev = ch;
-            idx += 1;
-            continue;
-        }
-
         let at_line_start = prev == '\n';
         let after_space = prev == ' ' || prev == '\t';
+        let after_flow_sep = prev == '[' || prev == '{' || prev == ',' || prev == ':';
+        let node_start = at_line_start || after_space || after_flow_sep;
         match ch {
-            '"' => in_double = true,
-            '\'' => in_single = true,
-            '#' | '&' | '*' | '!' | '|' | '>' if at_line_start || after_space => return true,
+            // Quoted scalars: style is lexical material, and parser-free
+            // quote detection is not reliable — refuse unconditionally.
+            '\'' | '"' => return true,
+            '#' if at_line_start || after_space => return true,
+            '&' | '*' | '!' | '|' | '>' if node_start => return true,
             '%' if at_line_start => return true,
-            '?' if (at_line_start || after_space)
+            '?' if node_start
                 && matches!(chars.get(idx + 1), None | Some(' ' | '\t' | '\n' | '\r')) =>
             {
                 return true;
@@ -525,19 +504,121 @@ mod tests {
     }
 
     #[test]
-    fn quoted_indicators_are_not_lexical_material() {
-        // Comment/anchor/tag indicators inside quoted scalars must not trip
-        // the gate: the file round-trips losslessly.
-        let clean = "a: \"x # y & z * w\"\nb: 2\n";
-        let path = scratch("quoted_clean.yaml");
-        std::fs::write(&path, clean).unwrap();
-        edit(&path, |m| {
+    fn plain_scalar_quotes_do_not_hide_comments() {
+        // Judge round-1 finding: apostrophes inside plain scalars used to open
+        // phantom quote state and swallow a following real comment. Exercised
+        // through `store` so every case reaches the gate regardless of
+        // whether the bytes also parse.
+        let cases = [
+            "title: it's fine\n# real comment\nb: 2\n",
+            "x: don't\n# between\ny: can't\n",
+            "a: she said \"hi\"\n# real comment\nb: 2\n",
+            "a: \"unclosed\n# real comment\nb: 2\n",
+        ];
+        for yaml in cases {
+            let path = scratch("plain_quote.yaml");
+            std::fs::write(&path, yaml).unwrap();
+            let mut map = Map::new();
+            map.insert("new".into(), Value::Number(1.into()));
+            match store(&path, &map) {
+                Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+                other => panic!("expected LossyWrite for {yaml:?}, got {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                yaml,
+                "refused store must leave the file byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_scalar_apostrophe_edit_refuses_and_keeps_comments() {
+        // The primary judge case, end to end through `edit`: the file parses
+        // (apostrophes are legal in plain scalars), so only the write gate
+        // stands between the comments and destruction.
+        let yaml = "title: it's fine\n# real comment\nb: 2\n";
+        let path = scratch("apostrophe.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let result = edit(&path, |m| {
+            m.insert("new".into(), Value::Number(1.into()));
+        });
+        match result {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("# real comment")
+        );
+    }
+
+    #[test]
+    fn quoted_scalars_refuse_changing_writes() {
+        // Quoted scalars are lexical material: their style is normalized away
+        // and parser-free quote detection is unreliable, so any quote refuses.
+        let yaml = "a: \"quoted\"\nb: 2\n";
+        let path = scratch("quoted.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let result = edit(&path, |m| {
             m.insert("c".into(), Value::Number(3.into()));
-        })
-        .unwrap();
-        let after = load(&path).unwrap();
-        assert_eq!(after["a"], Value::String("x # y & z * w".into()));
-        assert_eq!(after["c"], Value::Number(3.into()));
+        });
+        assert!(matches!(
+            result,
+            Err(ConfigError::LossyWrite { format: "yaml", .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn flow_context_indicators_refuse_changing_writes() {
+        // Anchors/aliases inside flow collections (no space after `[`/`,`)
+        // must be recognized at flow node-start positions.
+        let yaml = "a: [&one 1, &two 2]\nb: 2\n";
+        let path = scratch("flow_anchor.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let mut map = Map::new();
+        map.insert("c".into(), Value::Number(3.into()));
+        match store(&path, &map) {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn store_refused_when_target_carries_lexical_material() {
+        let path = scratch("store.yaml");
+        let original = "# top comment\na: 1\n";
+        std::fs::write(&path, original).unwrap();
+        let mut map = Map::new();
+        map.insert("a".into(), Value::Number(2.into()));
+        match store(&path, &map) {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        // Refusal is total: no file changes, no backup.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let dir_entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(dir_entries, 1, "refused store must not create files");
+    }
+
+    #[test]
+    fn edit_value_refused_when_target_carries_lexical_material() {
+        let yaml = "a: 1 # keep\n";
+        let path = scratch("edit_value.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let result = edit_value(&path, |v| {
+            if let Value::Object(m) = v {
+                m.insert("b".into(), Value::Number(2.into()));
+            }
+        });
+        assert!(matches!(
+            result,
+            Err(ConfigError::LossyWrite { format: "yaml", .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
     }
 
     #[test]

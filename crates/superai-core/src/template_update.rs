@@ -220,7 +220,15 @@ fn resolve_config_path(instance: &Instance, adapter: &dyn Adapter) -> PathBuf {
     instance.config_root.as_path().join("settings.json")
 }
 
-fn load_local_map(path: &Path) -> Map<String, Value> {
+/// Load the local config map for a three-way merge, or refuse honestly.
+///
+/// codec-honesty (DOC-05): a missing or empty file legitimately yields an
+/// empty base map, but bytes that fail strict-JSON parsing (JSONC content —
+/// comments/trailing commas, e.g. amp's declared settings kind) must not be
+/// silently swapped for an empty map: the merge would then drop every local
+/// key and write normalized JSON over the file. Refuse with the typed
+/// lossy-write error instead.
+fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
     match std::fs::read(path) {
         Ok(bytes) => {
             #[expect(
@@ -228,21 +236,19 @@ fn load_local_map(path: &Path) -> Map<String, Value> {
                 reason = "explicit closure for &u8"
             )]
             if bytes.is_empty() || bytes.iter().all(|b| b.is_ascii_whitespace()) {
-                return Map::new();
+                return Ok(Map::new());
             }
             match serde_json::from_slice::<Value>(&bytes) {
-                Ok(Value::Object(m)) => m,
-                Ok(other) => {
-                    // If root not object, wrap? But preserve as empty for diff
-                    // For non-object roots we treat as empty map to trigger schema conflict per selector
-                    let _ = other;
-                    Map::new()
-                }
-                Err(_) => Map::new(),
+                Ok(Value::Object(m)) => Ok(m),
+                Ok(_) => Ok(Map::new()),
+                Err(_) => Err(CoreError::Config(superai_config::ConfigError::LossyWrite {
+                    path: path.to_path_buf(),
+                    format: "jsonc",
+                })),
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
-        Err(_) => Map::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(_) => Ok(Map::new()),
     }
 }
 
@@ -869,7 +875,7 @@ pub fn apply_update_with_catalog_digests(
     let config_path = resolve_config_path(fresh_instance, adapter);
     let snap_before = snapshot(&config_path);
     let conflict_token = snap_before.digest.clone();
-    let local_map = load_local_map(&config_path);
+    let local_map = load_local_map(&config_path)?;
 
     // 3. recompute three-way + conflict token
     let preview = preview_three_way(base, new, &local_map);
@@ -1600,6 +1606,83 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
         // Avoid unused warning for preview
         drop(preview);
+    }
+
+    #[test]
+    fn apply_update_refuses_jsonc_settings_instead_of_normalizing() {
+        // codec-honesty (DOC-05): a settings file carrying JSONC content
+        // (comments/trailing commas — e.g. amp's declared settings surface at
+        // a settings.json path) must make apply_update fail with the typed
+        // lossy-write error. Previously the unparseable bytes were swapped
+        // for an empty map and overwritten with normalized JSON, destroying
+        // every comment and every local (foreign) key.
+        let tmp = crate::test_util::temp_dir_unique("tpl-update-jsonc");
+        let registry_path = tmp.join("instances.json");
+        let config_root = tmp.join(".claude-jsonc");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join("settings.json");
+        let jsonc =
+            "{\n  // user comment\n  \"model\": \"glm-4\",\n  \"foreignKey\": \"keep\",\n}\n";
+        std::fs::write(&config_path, jsonc).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let base_patches = vec![patch("key:model", json!("glm-4"))];
+        let new_patches = vec![patch("key:model", json!("glm-4.5"))];
+        let mut base_tmpl = minimal_template("1.1.0", base_patches);
+        let mut new_tmpl = minimal_template("1.2.0", new_patches);
+        base_tmpl.digest = "a".repeat(64);
+        new_tmpl.digest = "b".repeat(64);
+        let base_bytes = serde_json::to_vec(&base_tmpl).unwrap();
+        let new_bytes = serde_json::to_vec(&new_tmpl).unwrap();
+
+        let instance = Instance {
+            id: crate::ids::InstanceId::new("test-instance-jsonc").unwrap(),
+            name: crate::ids::InstanceName::new("work").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            config_root: AbsolutePath::from_path(&config_root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: Some(TemplateRef {
+                name: TemplateId::new("claude-glm").unwrap(),
+                version: TemplateVersion::new("1.1.0").unwrap(),
+            }),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+        };
+        let mut registry = Registry::default();
+        registry.insert(instance.clone()).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let result = apply_update(
+            &instance,
+            &registry_path,
+            &base_tmpl,
+            &new_tmpl,
+            &base_bytes,
+            &new_bytes,
+            &adapter,
+        );
+        match result {
+            Err(CoreError::Config(superai_config::ConfigError::LossyWrite { format, .. })) => {
+                assert_eq!(format, "jsonc");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+
+        // Nothing corrupted: file byte-identical, registry version unchanged.
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before,
+            "refused apply must leave the settings file byte-identical"
+        );
+        let registry_after = Registry::load(&registry_path).unwrap();
+        let inst = registry_after.get_by_id("test-instance-jsonc").unwrap();
+        assert_eq!(inst.template.as_ref().unwrap().version.as_str(), "1.1.0");
+        drop(std::fs::remove_dir_all(&tmp));
     }
 
     #[test]
