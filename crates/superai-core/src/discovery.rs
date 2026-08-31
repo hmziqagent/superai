@@ -990,6 +990,40 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
     Ok(fingerprint)
 }
 
+/// Canonical config file names adoption uses as its conflict token.
+///
+/// These are the readable harness files [`fingerprint_candidate`] proves
+/// identity from — never a secret store — so a digest over exactly this set
+/// is the minimal token that says "the proof still stands".
+const ADOPTION_TOKEN_FILES: &[&str] = &[
+    "settings.json",
+    "config.toml",
+    "opencode.json",
+    "opencode.jsonc",
+    ".aider.conf.yml",
+    "aider.conf.yml",
+    ".aider.model.metadata.json",
+];
+
+/// Fresh digests of a candidate's canonical config files.
+///
+/// Returns one `(file name, digest)` pair per canonical file that is present
+/// and readable, in [`ADOPTION_TOKEN_FILES`] order. Never reads a secret
+/// store. Adoption compares this set between preview and commit: the same
+/// names with the same digests mean the fingerprint proof still holds for the
+/// bytes it was proven on. A canonical file that exists but cannot be read
+/// contributes no pair (its content was never part of the proof either).
+pub fn canonical_config_digests(candidate: &Path) -> Vec<(String, String)> {
+    let mut tokens: Vec<(String, String)> = Vec::new();
+    for name in ADOPTION_TOKEN_FILES {
+        let snap = superai_config::snapshot::snapshot(&candidate.join(name));
+        if let Some(digest) = snap.digest {
+            tokens.push(((*name).to_owned(), digest));
+        }
+    }
+    tokens
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

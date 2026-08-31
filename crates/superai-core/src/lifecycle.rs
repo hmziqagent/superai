@@ -25,14 +25,17 @@ use superai_config::snapshot::{Snapshot, snapshot};
 use superai_config::transaction::{FileAction, Transaction};
 
 use crate::adapter::{Adapter, ConfigScope, SurfaceOwnership, WrapperPlan};
+use crate::discovery::{
+    Fingerprint, ForeignCheck, can_adopt, canonical_config_digests, is_foreign_managed,
+};
 use crate::error::{CoreError, Result};
 use crate::ids::{HarnessId, InstanceId, InstanceName, OperationId};
 use crate::instance::{Instance, TemplateRef, WrapperRef};
 use crate::operation::{
-    ActionKind, AuthStep, BackupPlan, CompletedAction, Conflict, OperationKind, OperationPreview,
-    OperationResult, PlannedAction, Precondition, PreconditionKind, RedactedDiff, RequestedTarget,
-    ResolvedResource, RollbackPlan, RollbackStatus, RollbackStep, VerificationKind,
-    VerificationResult, Warning,
+    ActionKind, AuthStep, BackupPlan, CompletedAction, Conflict, Limitation, OperationKind,
+    OperationPreview, OperationResult, PlannedAction, Precondition, PreconditionKind, RedactedDiff,
+    RequestedTarget, ResolvedResource, RollbackPlan, RollbackStatus, RollbackStep,
+    VerificationKind, VerificationResult, Warning,
 };
 use crate::paths::{AbsolutePath, WrapperPath};
 use crate::registry::Registry;
@@ -932,34 +935,7 @@ fn build_default_instance(
     config_root: AbsolutePath,
     version_resolution: &crate::adapter::VersionResolution,
 ) -> Result<Instance> {
-    let id = InstanceId::new(&format!(
-        "default-{}-{}",
-        harness.as_str(),
-        compute_digest_bytes(config_root.to_string().as_bytes())
-    ))
-    .map_err(|e| CoreError::Validation {
-        field: "id".to_owned(),
-        reason: format!("default id invalid: {e}"),
-    })?;
-    // Use a stable id derived from harness+root; ensure it passes validation
-    // If the generated id is too long or contains '/', fallback to hash-based
-    let id = if id.as_str().len() > 64 {
-        let full = format!("{harness}{config_root}");
-        let bytes = full.as_bytes();
-        let slice_len = if bytes.len() > 16 { 16 } else { bytes.len() };
-        let Some(slice) = bytes.get(0..slice_len) else {
-            return Err(CoreError::Validation {
-                field: "id".to_owned(),
-                reason: "slice out of bounds".to_owned(),
-            });
-        };
-        InstanceId::new(&compute_digest_bytes(slice)).map_err(|e| CoreError::Validation {
-            field: "id".to_owned(),
-            reason: format!("fallback id invalid: {e}"),
-        })?
-    } else {
-        id
-    };
+    let id = stable_instance_id("default", &harness, &config_root)?;
     let created_at = now_iso8601();
     let adapter_revision = version_resolution
         .schema_version
@@ -978,6 +954,453 @@ fn build_default_instance(
         template: None,
         created_at,
         adapter_revision,
+    })
+}
+
+/// Stable instance id derived from a prefix, the harness, and the config root.
+///
+/// Same inputs always yield the same id, so a preview can show the id the
+/// commit will record without the two ever diverging. Falls back to a bare
+/// digest when the prefixed form would exceed the id length limit.
+fn stable_instance_id(
+    prefix: &str,
+    harness: &HarnessId,
+    config_root: &AbsolutePath,
+) -> Result<InstanceId> {
+    let id = InstanceId::new(&format!(
+        "{prefix}-{}-{}",
+        harness.as_str(),
+        compute_digest_bytes(config_root.to_string().as_bytes())
+    ))
+    .map_err(|e| CoreError::Validation {
+        field: "id".to_owned(),
+        reason: format!("{prefix} id invalid: {e}"),
+    })?;
+    // Use a stable id derived from harness+root; ensure it passes validation
+    // If the generated id is too long or contains '/', fallback to hash-based
+    if id.as_str().len() > 64 {
+        let full = format!("{harness}{config_root}");
+        let bytes = full.as_bytes();
+        let slice_len = if bytes.len() > 16 { 16 } else { bytes.len() };
+        let Some(slice) = bytes.get(0..slice_len) else {
+            return Err(CoreError::Validation {
+                field: "id".to_owned(),
+                reason: "slice out of bounds".to_owned(),
+            });
+        };
+        InstanceId::new(&compute_digest_bytes(slice)).map_err(|e| CoreError::Validation {
+            field: "id".to_owned(),
+            reason: format!("fallback id invalid: {e}"),
+        })
+    } else {
+        Ok(id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adoption (DRF-06): record-first, config-preserving
+// ---------------------------------------------------------------------------
+
+/// Preview of adopting an unmanaged candidate config root.
+///
+/// Adoption records what is already on disk. It never copies, migrates,
+/// normalizes, or reformats harness config, and it never invents a wrapper:
+/// the only write [`adopt`] performs is the superai-owned registry record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptPreview {
+    /// Candidate config root being adopted, as observed (absolute, normalized).
+    pub candidate_root: AbsolutePath,
+    /// Home scope the foreign-ownership check ran under at preview time.
+    ///
+    /// Commit re-runs that check fresh under the same scope.
+    pub home: Option<PathBuf>,
+    /// Harness proven by the fingerprint at preview time.
+    pub harness: HarnessId,
+    /// Fingerprint evidence captured at preview time.
+    pub fingerprint: Fingerprint,
+    /// Foreign-manager check evidence captured at preview time.
+    pub foreign: ForeignCheck,
+    /// Isolation class for the harness from the registry catalog.
+    ///
+    /// [`Isolation::Unknown`] when the proven harness has no catalog entry.
+    pub isolation: Isolation,
+    /// Digests of the candidate's canonical config files at preview time.
+    ///
+    /// Conflict token: commit requires the same set with the same digests.
+    pub config_digests: Vec<(String, String)>,
+    /// Name the adopted record will carry (caller-chosen, validated).
+    pub name: InstanceName,
+    /// Stable id the adopted record will carry (derived from harness + root).
+    pub id: InstanceId,
+    /// Whether the candidate root is already recorded in the registry.
+    pub already_recorded: bool,
+    /// Operation preview for the adoption.
+    pub preview: OperationPreview,
+}
+
+/// Isolation class recorded for an adopted harness.
+///
+/// Adoption observes a config root that already exists wherever the harness
+/// put it, so the recorded isolation is the harness's declared class from the
+/// catalog — never a claim that superai relocated anything. Uncataloged
+/// harnesses record [`Isolation::Unknown`] rather than a guess.
+fn adopted_isolation(harness: &HarnessId) -> Isolation {
+    crate::harness_catalog::find_by_id(harness.as_str())
+        .map_or(Isolation::Unknown, |entry| entry.isolation)
+}
+
+/// Render a digest token set for an error message (names and digests only).
+fn format_config_tokens(tokens: &[(String, String)]) -> String {
+    if tokens.is_empty() {
+        "<no readable canonical config file>".to_owned()
+    } else {
+        tokens
+            .iter()
+            .map(|(name, digest)| format!("{name}:{digest}"))
+            .collect::<Vec<String>>()
+            .join(", ")
+    }
+}
+
+/// Preview adopting an unmanaged candidate config directory as instance `name`.
+///
+/// Proves the harness fingerprint fresh, blocks foreign ownership, requires a
+/// fresh readable candidate, and surfaces registry collisions (name, id,
+/// already-recorded root) as conflicts that block commit. Read-only: no file
+/// is created, written, or modified.
+pub fn preview_adopt(
+    candidate: &Path,
+    name: &InstanceName,
+    registry: &Registry,
+    home: Option<&Path>,
+) -> Result<AdoptPreview> {
+    let candidate_root =
+        AbsolutePath::from_path(candidate).map_err(|e| CoreError::InvalidPath {
+            kind: "config_root".to_owned(),
+            value: candidate.display().to_string(),
+            reason: format!("candidate must be an absolute path: {e}"),
+        })?;
+    // can_adopt proves the fingerprint, blocks foreign ownership and requires
+    // a fresh readable candidate; failure is a typed error, not a conflict.
+    let fingerprint = can_adopt(candidate, home)?;
+    let harness = fingerprint
+        .harness
+        .clone()
+        .ok_or_else(|| CoreError::Validation {
+            field: "candidate".to_owned(),
+            reason: format!(
+                "fingerprint carried no harness id for {}: {}",
+                candidate.display(),
+                fingerprint.evidence.join("; ")
+            ),
+        })?;
+    let foreign = is_foreign_managed(candidate, home);
+    let isolation = adopted_isolation(&harness);
+    let config_digests = canonical_config_digests(candidate);
+    let id = stable_instance_id("adopted", &harness, &candidate_root)?;
+
+    let already_recorded = registry
+        .instances()
+        .iter()
+        .any(|i| i.config_root.as_path() == candidate_root.as_path());
+    let name_taken = registry.get_case_fold(name.as_str()).is_some();
+    let id_taken = registry.get_by_id(id.as_str()).is_some();
+
+    let mut conflicts: Vec<Conflict> = Vec::new();
+    if already_recorded {
+        conflicts.push(Conflict {
+            code: "already_recorded".to_owned(),
+            message: format!(
+                "candidate {} is already recorded as an instance",
+                candidate_root
+            ),
+            paths: vec![candidate_root.clone()],
+        });
+    }
+    if name_taken {
+        conflicts.push(Conflict {
+            code: "name_collision".to_owned(),
+            message: format!("instance name {name} collides (case-fold) with existing"),
+            paths: Vec::new(),
+        });
+    }
+    if id_taken {
+        conflicts.push(Conflict {
+            code: "id_collision".to_owned(),
+            message: format!("derived id {id} collides with an existing instance"),
+            paths: Vec::new(),
+        });
+    }
+
+    let mut warnings: Vec<Warning> = Vec::new();
+    if isolation == Isolation::Unknown {
+        warnings.push(Warning {
+            code: "isolation_unknown".to_owned(),
+            message: format!(
+                "harness {} has no cataloged isolation class; recording unknown",
+                harness.as_str()
+            ),
+            path: None,
+        });
+    }
+
+    let recordable = conflicts.is_empty();
+    let requested_target = RequestedTarget {
+        display: format!("adopt {name}"),
+        harness: Some(harness.clone()),
+        instance: Some(name.clone()),
+    };
+    let resolved_resources = vec![ResolvedResource {
+        kind: "config_root".to_owned(),
+        path: candidate_root.clone(),
+        description: "observed harness config root, left byte-for-byte as found".to_owned(),
+        owned_by_superai: false,
+    }];
+    let preconditions = vec![
+        Precondition {
+            kind: PreconditionKind::Exists,
+            description: format!("candidate {candidate_root} exists and is readable"),
+            path: Some(candidate_root.clone()),
+            satisfied: true,
+        },
+        Precondition {
+            kind: PreconditionKind::NoForeignOwner,
+            description: "no foreign manager owns the candidate".to_owned(),
+            path: Some(candidate_root.clone()),
+            satisfied: !foreign.is_foreign,
+        },
+        Precondition {
+            kind: PreconditionKind::Unchanged,
+            description: format!(
+                "canonical config files unchanged until commit ({})",
+                config_digests.len()
+            ),
+            path: Some(candidate_root.clone()),
+            satisfied: true,
+        },
+    ];
+    let actions = if recordable {
+        vec![PlannedAction {
+            order: 0,
+            kind: ActionKind::UpdateRegistry,
+            target: candidate_root.clone(),
+            description: format!("record adopted instance {name} for {}", harness.as_str()),
+            requires_backup: true,
+        }]
+    } else {
+        Vec::new()
+    };
+    let diffs = vec![RedactedDiff {
+        path: candidate_root.clone(),
+        surface: "instance-record".to_owned(),
+        lexical_redacted: format!(
+            "record instance name={name} harness={} root={candidate_root} origin=adopted",
+            harness.as_str()
+        ),
+        semantic_redacted: "record the observed config root and provenance; no harness file \
+            is copied, migrated, normalized, or reformatted"
+            .to_owned(),
+        redacted_fields: Vec::new(),
+    }];
+    let rollback_plan = RollbackPlan {
+        steps: if recordable {
+            vec![RollbackStep {
+                order: 0,
+                description: "remove the registry record".to_owned(),
+                target: candidate_root.clone(),
+                backup_id: None,
+            }]
+        } else {
+            Vec::new()
+        },
+        will_restore_backups: false,
+        estimated_steps: usize::from(recordable),
+    };
+    let preview = OperationPreview {
+        id: new_operation_id()?,
+        kind: OperationKind::AdoptInstance,
+        requested_target,
+        resolved_resources,
+        preconditions,
+        actions,
+        diffs,
+        backups: Vec::new(),
+        warnings,
+        conflicts,
+        limitations: vec![Limitation {
+            code: "record_only".to_owned(),
+            description: "adoption records the candidate and generates no wrapper; create one \
+                with the wrapper flow after adoption if isolation needs a launcher"
+                .to_owned(),
+        }],
+        auth_steps: Vec::new(),
+        restart_requirements: Vec::new(),
+        rollback_plan,
+    };
+
+    Ok(AdoptPreview {
+        candidate_root,
+        home: home.map(Path::to_path_buf),
+        harness,
+        fingerprint,
+        foreign,
+        isolation,
+        config_digests,
+        name: name.clone(),
+        id,
+        already_recorded,
+        preview,
+    })
+}
+
+/// Commit an adoption preview: write the registry record and nothing else.
+///
+/// Every adoption check is re-proven fresh at commit time (disk is truth):
+/// the fingerprint, the foreign-ownership block, and the readability of the
+/// candidate via [`can_adopt`]; the canonical config digests against the
+/// preview's token; and the registry, re-read from disk, for name, id, and
+/// config-root collisions. The candidate's config files are never modified —
+/// the only write is the superai-owned registry record, committed last.
+pub fn adopt(preview: &AdoptPreview, registry_path: &Path) -> Result<OperationResult> {
+    if !preview.preview.conflicts.is_empty() {
+        return Err(CoreError::Validation {
+            field: "preview".to_owned(),
+            reason: format!(
+                "cannot adopt: conflicts present: {:?}",
+                preview.preview.conflicts
+            ),
+        });
+    }
+    let candidate = preview.candidate_root.as_path();
+
+    // Fresh re-proof: fingerprint, foreign ownership, readable candidate.
+    let fingerprint = can_adopt(candidate, preview.home.as_deref())?;
+    let commit_harness = fingerprint
+        .harness
+        .clone()
+        .ok_or_else(|| CoreError::Validation {
+            field: "candidate".to_owned(),
+            reason: format!(
+                "fingerprint carried no harness id for {}: {}",
+                candidate.display(),
+                fingerprint.evidence.join("; ")
+            ),
+        })?;
+    if commit_harness != preview.harness {
+        return Err(CoreError::ConcurrentModification {
+            path: candidate.to_path_buf(),
+            expected: format!("harness {}", preview.harness),
+            actual: format!("harness {commit_harness}"),
+        });
+    }
+
+    // Fresh conflict token: the proof must still stand on the previewed bytes.
+    let config_digests = canonical_config_digests(candidate);
+    if config_digests != preview.config_digests {
+        return Err(CoreError::ConcurrentModification {
+            path: candidate.to_path_buf(),
+            expected: format_config_tokens(&preview.config_digests),
+            actual: format_config_tokens(&config_digests),
+        });
+    }
+
+    // Fresh registry read; re-check every collision kind before writing.
+    let mut registry = Registry::load(registry_path)?;
+    if registry
+        .instances()
+        .iter()
+        .any(|i| i.config_root.as_path() == candidate)
+    {
+        return Err(CoreError::NameCollision {
+            kind: "config_root".to_owned(),
+            name: candidate.display().to_string(),
+            reason: "candidate already recorded after fresh read".to_owned(),
+        });
+    }
+    if registry.get_case_fold(preview.name.as_str()).is_some() {
+        return Err(CoreError::NameCollision {
+            kind: "InstanceName".to_owned(),
+            name: preview.name.to_string(),
+            reason: "instance name collides after fresh read".to_owned(),
+        });
+    }
+    if registry.get_by_id(preview.id.as_str()).is_some() {
+        return Err(CoreError::NameCollision {
+            kind: "InstanceId".to_owned(),
+            name: preview.id.to_string(),
+            reason: "instance id collides after fresh read".to_owned(),
+        });
+    }
+
+    let instance = Instance {
+        id: preview.id.clone(),
+        name: preview.name.clone(),
+        harness: preview.harness.clone(),
+        config_root: preview.candidate_root.clone(),
+        binary: None,
+        wrapper: None,
+        isolation: preview.isolation,
+        origin: InstanceOrigin::Adopted,
+        ownership: Ownership::ExplicitlyAdopted,
+        template: None,
+        created_at: now_iso8601(),
+        adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+    };
+    instance.validate()?;
+    // Safety net for every collision kind (including wrapper paths, which
+    // adoption never writes but must still not shadow).
+    registry.insert(instance)?;
+    // The only write of the whole operation, committed last.
+    registry.store(registry_path)?;
+
+    // Read back: the record must exist with the adopted provenance, and the
+    // candidate's config must still be exactly the bytes we proved.
+    let reloaded = Registry::load(registry_path)?;
+    let recorded =
+        reloaded
+            .get_by_id(preview.id.as_str())
+            .ok_or_else(|| CoreError::Verification {
+                path: registry_path.to_path_buf(),
+                kind: "registry".to_owned(),
+                reason: "adopted record missing after store".to_owned(),
+            })?;
+    if recorded.origin != InstanceOrigin::Adopted || recorded.config_root != preview.candidate_root
+    {
+        return Err(CoreError::Verification {
+            path: registry_path.to_path_buf(),
+            kind: "registry".to_owned(),
+            reason: format!(
+                "adopted record provenance mismatch: origin {}, root {}",
+                recorded.origin, recorded.config_root
+            ),
+        });
+    }
+    let digests_after = canonical_config_digests(candidate);
+    let candidate_untouched = digests_after == preview.config_digests;
+
+    Ok(OperationResult {
+        id: preview.preview.id.clone(),
+        kind: OperationKind::AdoptInstance,
+        actions_completed: vec![CompletedAction {
+            order: 0,
+            kind: ActionKind::UpdateRegistry,
+            target: preview.candidate_root.clone(),
+            success: true,
+            elapsed_ms: None,
+        }],
+        backups: Vec::new(),
+        verification: vec![VerificationResult {
+            path: preview.candidate_root.clone(),
+            kind: VerificationKind::Digest,
+            passed: candidate_untouched,
+            message: "candidate config bytes unchanged; registry record verified".to_owned(),
+        }],
+        rollback_status: RollbackStatus::NotNeeded,
+        diagnostics_redacted: vec![format!(
+            "adopted {} instance {} at {} (record-only, config untouched)",
+            preview.harness, preview.name, preview.candidate_root
+        )],
+        success: candidate_untouched,
     })
 }
 
@@ -4566,6 +4989,295 @@ mod tests {
                 .iter()
                 .any(|r| r.kind == RepairKind::MissingWrapper)
         );
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -----------------------------------------------------------------------
+    // Adoption (DRF-06)
+    // -----------------------------------------------------------------------
+
+    /// Digest of every regular file under `root`, sorted by path, so tests can
+    /// prove a candidate tree is byte-for-byte untouched.
+    fn tree_digests(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut out: Vec<(PathBuf, String)> = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    stack.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    out.push((path, compute_digest_bytes(&bytes)));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn adopt_candidate(home: &Path, label: &str) -> PathBuf {
+        let candidate = home.join(format!(".claude-{label}"));
+        std::fs::create_dir_all(&candidate).unwrap();
+        // JSONC-shaped settings: comments and a trailing comma must survive
+        // adoption exactly as found (adoption never reformats).
+        std::fs::write(
+            candidate.join("settings.json"),
+            "{\n  // team default\n  \"model\": \"opus\",\n  \"custom\": \"keep\",\n}\n",
+        )
+        .unwrap();
+        std::fs::write(candidate.join("history.jsonl"), "one\ntwo\n").unwrap();
+        std::fs::write(candidate.join(".credentials.json"), "secret-token-material").unwrap();
+        candidate
+    }
+
+    #[test]
+    fn adopt_records_instance_and_leaves_candidate_bytes_identical() {
+        let tmp = unique_temp("adopt_success");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "adoptme");
+        let before = tree_digests(&candidate);
+
+        let name = InstanceName::new("adopted-work").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let preview = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap();
+        assert!(
+            preview.preview.conflicts.is_empty(),
+            "{:?}",
+            preview.preview.conflicts
+        );
+        assert!(!preview.already_recorded);
+        assert_eq!(preview.harness.as_str(), "claude-code");
+        assert_eq!(preview.isolation, Isolation::RelocatedRoot);
+        assert!(
+            preview
+                .config_digests
+                .iter()
+                .any(|(file, _)| file == "settings.json"),
+            "token must cover the proven canonical file: {:?}",
+            preview.config_digests
+        );
+
+        let result = adopt(&preview, &registry_path).unwrap();
+        assert!(result.success);
+
+        assert_eq!(
+            before,
+            tree_digests(&candidate),
+            "adoption must not touch any candidate file"
+        );
+
+        let loaded = Registry::load(&registry_path).unwrap();
+        assert_eq!(loaded.instances().len(), 1);
+        let inst = loaded.get("adopted-work").unwrap();
+        assert_eq!(inst.origin, InstanceOrigin::Adopted);
+        assert_eq!(inst.ownership, Ownership::ExplicitlyAdopted);
+        assert_eq!(inst.harness.as_str(), "claude-code");
+        assert_eq!(
+            inst.config_root,
+            AbsolutePath::from_path(&candidate).unwrap()
+        );
+        assert_eq!(inst.isolation, Isolation::RelocatedRoot);
+        assert_eq!(inst.id, preview.id);
+        assert!(inst.wrapper.is_none(), "adoption must not invent a wrapper");
+        assert!(inst.template.is_none());
+
+        // The record carries provenance only, never harness-owned values.
+        let registry_text = std::fs::read_to_string(&registry_path).unwrap();
+        for forbidden in ["\"model\"", "\"baseUrl\"", "\"apiKey\"", "\"endpoint\""] {
+            assert!(
+                !registry_text.contains(forbidden),
+                "adopted record must not carry {forbidden}: {registry_text}"
+            );
+        }
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_is_blocked_by_foreign_manager() {
+        let tmp = unique_temp("adopt_foreign");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "foreign");
+        // claude-multi referencing the candidate, as the discovery suite does.
+        let multi_dir = home.join(".claude-multi");
+        std::fs::create_dir_all(&multi_dir).unwrap();
+        std::fs::write(
+            multi_dir.join("config.json"),
+            format!(
+                r#"{{"instances":[{{"configDir":"{}"}}]}}"#,
+                candidate.display()
+            ),
+        )
+        .unwrap();
+        let before = tree_digests(&candidate);
+
+        let name = InstanceName::new("foreign-adopt").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let err = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap_err();
+        match err {
+            CoreError::ForeignOwnership { path, owner } => {
+                assert_eq!(path, candidate);
+                assert_eq!(owner, "claude-multi");
+            }
+            other => panic!("expected ForeignOwnership, got {other:?}"),
+        }
+        assert!(
+            !registry_path.exists(),
+            "a refused adoption must not create the registry file"
+        );
+        assert_eq!(before, tree_digests(&candidate));
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_of_already_recorded_root_is_refused_and_registry_unchanged() {
+        let tmp = unique_temp("adopt_recorded");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "taken");
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry
+            .insert(make_instance("taken", &candidate, "claude-code"))
+            .unwrap();
+        registry.store(&registry_path).unwrap();
+        let bytes_before = std::fs::read(&registry_path).unwrap();
+
+        let name = InstanceName::new("second-name").unwrap();
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview = preview_adopt(&candidate, &name, &loaded, Some(&home)).unwrap();
+        assert!(preview.already_recorded);
+        assert!(
+            preview
+                .preview
+                .conflicts
+                .iter()
+                .any(|c| c.code == "already_recorded"),
+            "{:?}",
+            preview.preview.conflicts
+        );
+        assert!(preview.preview.actions.is_empty());
+
+        let err = adopt(&preview, &registry_path).unwrap_err();
+        assert!(matches!(err, CoreError::Validation { .. }), "got {err:?}");
+        assert_eq!(
+            std::fs::read(&registry_path).unwrap(),
+            bytes_before,
+            "registry must be unchanged by a refused adoption"
+        );
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_rechecks_registry_fresh_between_preview_and_commit() {
+        let tmp = unique_temp("adopt_fresh_read");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "freshread");
+
+        // Preview against an empty registry: no conflicts.
+        let name = InstanceName::new("late-adopt").unwrap();
+        let preview = preview_adopt(&candidate, &name, &Registry::default(), Some(&home)).unwrap();
+        assert!(
+            preview.preview.conflicts.is_empty(),
+            "{:?}",
+            preview.preview.conflicts
+        );
+
+        // Another actor records the same root between preview and commit.
+        let mut other = Registry::default();
+        other
+            .insert(make_instance("sneaky", &candidate, "claude-code"))
+            .unwrap();
+        other.store(&registry_path).unwrap();
+        let bytes_before = std::fs::read(&registry_path).unwrap();
+        let candidate_before = tree_digests(&candidate);
+
+        let err = adopt(&preview, &registry_path).unwrap_err();
+        match err {
+            CoreError::NameCollision { kind, name, .. } => {
+                assert_eq!(kind, "config_root");
+                assert_eq!(name, candidate.display().to_string());
+            }
+            other_err => panic!("expected NameCollision, got {other_err:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&registry_path).unwrap(),
+            bytes_before,
+            "registry must be unchanged by a refused adoption"
+        );
+        assert_eq!(candidate_before, tree_digests(&candidate));
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_refused_when_candidate_changes_between_preview_and_commit() {
+        let tmp = unique_temp("adopt_mid_change");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "midchange");
+
+        let name = InstanceName::new("mid-adopt").unwrap();
+        let preview = preview_adopt(&candidate, &name, &Registry::default(), Some(&home)).unwrap();
+        assert!(preview.preview.conflicts.is_empty());
+
+        // External edit of the exact file the fingerprint was proven on.
+        std::fs::write(
+            candidate.join("settings.json"),
+            "{\n  // rewritten externally\n  \"model\": \"haiku\"\n}\n",
+        )
+        .unwrap();
+
+        let err = adopt(&preview, &registry_path).unwrap_err();
+        match &err {
+            CoreError::ConcurrentModification {
+                path,
+                expected,
+                actual,
+            } => {
+                assert_eq!(path, &candidate);
+                assert!(expected.contains("settings.json"));
+                assert_ne!(expected, actual);
+            }
+            other => panic!("expected ConcurrentModification, got {other:?}"),
+        }
+        assert!(
+            !registry_path.exists(),
+            "a refused adoption must not create the registry file"
+        );
+        // The external actor's bytes are left exactly as they were written.
+        assert!(
+            std::fs::read_to_string(candidate.join("settings.json"))
+                .unwrap()
+                .contains("haiku")
+        );
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_requires_a_provable_harness() {
+        let tmp = unique_temp("adopt_unprovable");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        // A directory whose name carries no known pattern and which holds no
+        // canonical config file cannot be adopted: nothing proves the harness.
+        let candidate = home.join("mystery-dir");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("notes.txt"), "not a harness config").unwrap();
+
+        let name = InstanceName::new("mystery").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let err = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap_err();
+        assert!(matches!(err, CoreError::Validation { .. }), "got {err:?}");
+        assert!(!registry_path.exists());
 
         drop(std::fs::remove_dir_all(&tmp));
     }
