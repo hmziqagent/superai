@@ -364,6 +364,16 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Returns true when a relative mirror path names OAuth/keychain credential
+/// material (`.credentials.json`, `credentials`, `*.keychain`, or any file
+/// stored under such a directory). Credential entries are classified
+/// [`MirrorKind::ExternalAuth`] and must never enter the copy set: instances
+/// re-establish credentials through the documented external-auth path instead.
+fn is_credential_path(relative: &Path) -> bool {
+    let rel = relative.to_string_lossy();
+    rel.contains("credentials") || rel.contains(".keychain")
+}
+
 fn build_mirror_plan(
     source_root: &Path,
     target_root: &Path,
@@ -427,19 +437,17 @@ fn build_mirror_plan(
                 kind: MirrorKind::Skipped,
                 reason,
             });
+        } else if is_credential_path(&relative) {
+            // Credential material is never copied, even when no adapter
+            // exclusion covers it: instances re-establish credentials through
+            // the documented external-auth path instead.
+            skipped.push(MirrorEntry {
+                source: src,
+                target,
+                kind: MirrorKind::ExternalAuth,
+                reason: "OAuth/keychain credentials stay external (default needs-auth)".to_owned(),
+            });
         } else {
-            // Check for auth files that remain external
-            if relative.to_string_lossy().contains("credentials")
-                || relative.to_string_lossy().contains(".keychain")
-            {
-                skipped.push(MirrorEntry {
-                    source: src.clone(),
-                    target: target.clone(),
-                    kind: MirrorKind::ExternalAuth,
-                    reason: "OAuth/keychain credentials stay external (default needs-auth)"
-                        .to_owned(),
-                });
-            }
             copied.push(MirrorEntry {
                 source: src,
                 target,
@@ -3669,6 +3677,163 @@ mod tests {
         assert!(
             loaded.instances().is_empty(),
             "refused create must not commit a registry record"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn mirror_plan_never_copies_credential_named_files() {
+        // INS-03: credential/keychain entries must land ONLY in `skipped`
+        // (ExternalAuth), never in `copied` — even when no adapter exclusion
+        // covers them, because credentials are re-established per instance
+        // through the external-auth path, never mirrored.
+        let tmp = unique_temp("mirror_plan_creds");
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(source_root.join(".keychain")).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        std::fs::write(source_root.join(".credentials.json"), "oauth").unwrap();
+        std::fs::write(source_root.join("credentials"), "keychain blob").unwrap();
+        std::fs::write(source_root.join("auth.keychain"), "keychain blob").unwrap();
+        std::fs::write(source_root.join(".keychain/store.json"), "secret").unwrap();
+        let target_root = tmp.join("target");
+
+        // Worst case: an adapter contributing zero exclusions of its own.
+        let plan = build_mirror_plan(&source_root, &target_root, &[]).unwrap();
+
+        let credential_sources = [
+            source_root.join(".credentials.json"),
+            source_root.join("credentials"),
+            source_root.join("auth.keychain"),
+            source_root.join(".keychain"),
+            source_root.join(".keychain/store.json"),
+        ];
+        for cred in &credential_sources {
+            let entry = plan
+                .skipped
+                .iter()
+                .find(|e| &e.source == cred)
+                .unwrap_or_else(|| panic!("{} must be classified in the plan", cred.display()));
+            assert_eq!(
+                entry.kind,
+                MirrorKind::ExternalAuth,
+                "{} must be skipped as external-auth",
+                cred.display()
+            );
+            assert!(
+                !plan.copied.iter().any(|e| &e.source == cred),
+                "{} must never appear in the copy set",
+                cred.display()
+            );
+        }
+
+        // The copy set is exactly the ordinary settings file: nothing else in
+        // the source root survives the credential gate.
+        let expected = vec![source_root.join("settings.json")];
+        let copied_sources: Vec<PathBuf> = plan.copied.iter().map(|e| e.source.clone()).collect();
+        assert_eq!(copied_sources, expected);
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn mirror_plan_adapter_exclusions_and_credential_gate_never_copy() {
+        // Adapter-excluded files appear only in `skipped` (no
+        // double-classification into `copied`), and the credential gate still
+        // catches credential names the adapter exclusions do not list (bare
+        // `credentials` and `auth.keychain` here).
+        let tmp = unique_temp("mirror_plan_exclusions");
+        let adapter = make_adapter("claude-code");
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(source_root.join("debug")).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        std::fs::write(source_root.join("history.jsonl"), "history").unwrap();
+        std::fs::write(source_root.join("debug/log.txt"), "log").unwrap();
+        std::fs::write(source_root.join("credentials"), "keychain blob").unwrap();
+        std::fs::write(source_root.join("auth.keychain"), "keychain blob").unwrap();
+        let target_root = tmp.join("target");
+
+        let plan = plan_mirror(&source_root, &target_root, &adapter).unwrap();
+
+        for excluded_rel in ["history.jsonl", "debug", "debug/log.txt"] {
+            let src = source_root.join(excluded_rel);
+            let entry = plan
+                .skipped
+                .iter()
+                .find(|e| e.source == src)
+                .unwrap_or_else(|| panic!("{excluded_rel} must be classified in the plan"));
+            assert_eq!(
+                entry.kind,
+                MirrorKind::Skipped,
+                "{excluded_rel} is adapter-excluded"
+            );
+            assert!(
+                !plan.copied.iter().any(|e| e.source == src),
+                "adapter-excluded {excluded_rel} must not appear in the copy set"
+            );
+        }
+        for cred_rel in ["credentials", "auth.keychain"] {
+            let src = source_root.join(cred_rel);
+            let entry = plan
+                .skipped
+                .iter()
+                .find(|e| e.source == src)
+                .unwrap_or_else(|| panic!("{cred_rel} must be classified in the plan"));
+            assert_eq!(
+                entry.kind,
+                MirrorKind::ExternalAuth,
+                "{cred_rel} is credential material the adapter does not exclude"
+            );
+            assert!(
+                !plan.copied.iter().any(|e| e.source == src),
+                "{cred_rel} must not appear in the copy set"
+            );
+        }
+
+        let expected = vec![source_root.join("settings.json")];
+        let copied_sources: Vec<PathBuf> = plan.copied.iter().map(|e| e.source.clone()).collect();
+        assert_eq!(copied_sources, expected);
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn create_mirrored_target_lacks_credential_files_without_adapter_exclusions() {
+        // End-to-end INS-03: bare `credentials` and `auth.keychain` are NOT
+        // covered by the generic adapter exclusions, so only the plan's
+        // credential gate can keep them out of the mirrored target root.
+        let tmp = unique_temp("mirror_e2e_creds");
+        let registry_path = tmp.join("registry.json");
+        let adapter = make_adapter("claude-code");
+
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        std::fs::write(source_root.join("credentials"), "oauth secret").unwrap();
+        std::fs::write(source_root.join("auth.keychain"), "keychain blob").unwrap();
+
+        let target_root = tmp.join("target");
+        let request = CreateRequest {
+            name: InstanceName::new("work").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source_root).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
+        };
+        let result = create_mirrored(request, &registry_path, &adapter).unwrap();
+        assert!(
+            result.success,
+            "diagnostics: {:?}",
+            result.diagnostics_redacted
+        );
+
+        assert!(target_root.join("settings.json").exists());
+        assert!(
+            !target_root.join("credentials").exists(),
+            "credentials must never be mirrored into the target"
+        );
+        assert!(
+            !target_root.join("auth.keychain").exists(),
+            "keychain material must never be mirrored into the target"
         );
         drop(std::fs::remove_dir_all(&tmp));
     }
