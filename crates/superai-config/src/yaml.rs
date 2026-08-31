@@ -277,26 +277,28 @@ pub fn load_value(path: &Path) -> Result<Value> {
     parse_strict(&text, path)
 }
 
-/// Back up, then write `config` to `path`, creating parent directories as needed.
+/// Write `config` to `path` as normalized YAML, creating parent directories
+/// as needed.
 ///
-/// Changing writes are refused with [`ConfigError::LossyWrite`] when `path`
-/// already exists and carries YAML lexical material (comments, anchors,
-/// aliases, tags, directives, document markers, block scalars): normalized
-/// YAML cannot preserve it (DOC-06). Missing files are created, and existing
-/// files free of that material are rewritten losslessly, since they carry no
-/// lexical feature the writer cannot reproduce. Key order and unknown values
-/// are preserved (via `preserve_order`). For a no-op (semantic value
-/// unchanged) callers should prefer [`edit`], which skips the write entirely
-/// and leaves the original bytes untouched.
+/// DOC-06 write policy (unconditional): **every changing write to an existing
+/// YAML file is refused** with [`ConfigError::LossyWrite`] — the normalized
+/// writer cannot preserve comments, anchors, aliases, tags, scalar style, or
+/// document markers, and lexical detection of that material cannot be made
+/// hole-free (see module docs). Only creating a missing file is allowed,
+/// because there is no prior content to destroy; the gate runs before
+/// `backup()`, so a refusal leaves zero disk mutation. Reads and validation
+/// are unaffected. For a no-op (semantic value unchanged) callers should
+/// prefer [`edit`], which skips the write entirely and leaves the original
+/// bytes untouched.
 pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     store_value(path, &Value::Object(config.clone()))
 }
 
-/// Back up, then write an arbitrary YAML `value` to `path`.
+/// Write an arbitrary YAML `value` to `path` as normalized YAML.
 ///
-/// See [`store`] for the lossless-write gate (DOC-06). This entry point
-/// preserves a non-object root (array, string, number, bool, null) for
-/// raw-editor use.
+/// See [`store`] for the unconditional write gate (DOC-06): an existing
+/// target refuses, a missing target is created. This entry point preserves a
+/// non-object root (array, string, number, bool, null) for raw-editor use.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     ensure_lossless_write(path)?;
     backup(path)?;
@@ -323,10 +325,10 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
 /// This is the only supported way to mutate a config. Disk is the truth:
 /// nothing is cached between calls. For no-op edits (the closure leaves the
 /// map equal to the on-disk value) no write and no backup are performed, so
-/// the file's byte identity is preserved. Changing edits are refused with
-/// [`ConfigError::LossyWrite`] when the on-disk file carries lexical material
-/// the normalized writer cannot reproduce (comments, anchors, tags, block
-/// scalars — see module docs); otherwise the write is lossless.
+/// the file's byte identity is preserved. Every changing edit on an existing
+/// file is refused with [`ConfigError::LossyWrite`] (see [`store`] and the
+/// module preservation contract) — a missing file is created. Reads and
+/// validation are unaffected.
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Map<String, Value>),
@@ -343,8 +345,9 @@ where
 /// Read fresh as [`Value`], apply `edit`, write back only if changed.
 ///
 /// Preserves an arbitrary root type. Duplicate keys in the original file are
-/// still rejected on load. No-op edits leave the file byte-identical. See
-/// [`edit`] for the lossless-write gate (DOC-06).
+/// still rejected on load. No-op edits leave the file byte-identical. Every
+/// changing edit on an existing file is refused with [`ConfigError::LossyWrite`]
+/// (see [`edit`], DOC-06); a missing file is created.
 pub fn edit_value<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Value),
