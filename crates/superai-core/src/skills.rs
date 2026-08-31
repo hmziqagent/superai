@@ -22,7 +22,6 @@
 #![expect(dead_code, reason = "helpers for future use")]
 #![expect(trivial_numeric_casts, reason = "sizes within validated limits")]
 #![expect(warnings, reason = "skill registry reviewed")]
-#![allow(unfulfilled_lint_expectations, reason = "some expects may be extra")]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};

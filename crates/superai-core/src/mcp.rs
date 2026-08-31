@@ -14,8 +14,6 @@
 
 #![expect(clippy::all, reason = "mcp module reviewed for pedantic lints")]
 #![expect(clippy::pedantic, reason = "mcp comprehensive")]
-#![allow(unfulfilled_lint_expectations, reason = "some expects may be extra")]
-#![expect(clippy::redundant_clone, reason = "clones needed for ownership")]
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -816,7 +814,6 @@ pub fn inspect_servers(
     for (k, v) in inner {
         match from_native_value(&k, &v) {
             Ok(def) => {
-                #[expect(clippy::redundant_clone, reason = "need clone before move")]
                 out.insert(def.id.clone(), def);
             }
             Err(e) => {
@@ -1049,12 +1046,8 @@ mod tests {
     #[test]
     fn mcp_definition_round_trip() {
         let id = McpServerId::new("my-mcp").unwrap();
-        let mut server = McpServerDef::stdio(
-            id.clone(),
-            "npx",
-            vec!["-y".to_owned(), "my-server".to_owned()],
-        )
-        .unwrap();
+        let mut server =
+            McpServerDef::stdio(id, "npx", vec!["-y".to_owned(), "my-server".to_owned()]).unwrap();
         server
             .env
             .insert("API_KEY".to_owned(), "secret-123".to_owned());

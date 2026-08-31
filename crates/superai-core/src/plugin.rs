@@ -13,7 +13,6 @@
 
 #![expect(clippy::all, reason = "plugin module reviewed")]
 #![expect(clippy::pedantic, reason = "plugin comprehensive")]
-#![allow(unfulfilled_lint_expectations, reason = "some expects may be extra")]
 #![expect(clippy::redundant_clone, reason = "clones needed")]
 
 use std::collections::BTreeMap;
