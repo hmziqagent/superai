@@ -50,24 +50,47 @@ fn generate_temp_path(target: &Path) -> Result<PathBuf> {
     Ok(parent.join(tmp_name))
 }
 
+/// Resolve the permission bits the replacement file must carry.
+///
+/// An explicit `mode` (used by backup restore to reinstate the permissions
+/// recorded in the catalog entry) wins; otherwise the bits are derived from
+/// the current target, falling back to owner-only `0o600` for a target that
+/// does not exist or cannot be read.
 #[cfg(unix)]
-fn set_safe_permissions(path: &Path, original_path: &Path) -> Result<()> {
+fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    let mode = if original_path.exists() {
-        match std::fs::metadata(original_path) {
+    if let Some(mode) = mode {
+        return mode;
+    }
+    let derived = if target.exists() {
+        match std::fs::metadata(target) {
             Ok(m) => m.permissions().mode() & 0o777,
             Err(_) => 0o600,
         }
     } else {
         0o600
     };
-    let safe_mode = if mode == 0 { 0o600 } else { mode };
+    if derived == 0 { 0o600 } else { derived }
+}
+
+#[cfg(not(unix))]
+fn resolve_final_mode(_target: &Path, mode: Option<u32>) -> u32 {
+    mode.unwrap_or(0o600)
+}
+
+/// Apply `mode` to `path`, masking to the permission bits and never leaving
+/// the file with no access at all.
+#[cfg(unix)]
+fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let masked = mode & 0o777;
+    let safe_mode = if masked == 0 { 0o600 } else { masked };
     let perm = std::fs::Permissions::from_mode(safe_mode);
     std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
 }
 
 #[cfg(not(unix))]
-fn set_safe_permissions(path: &Path, _original_path: &Path) -> Result<()> {
+fn apply_mode(path: &Path, _mode: u32) -> Result<()> {
     let _ = path;
     Ok(())
 }
@@ -111,137 +134,19 @@ fn is_directory(path: &Path) -> bool {
 ///
 /// Steps:
 /// 1. Create same-directory temp with exclusive name.
-/// 2. Apply safe permissions before writing secret-bearing bytes.
+/// 2. Hold the temp owner-only while it carries bytes.
 /// 3. Write bytes and flush.
-/// 4. (Callers validate parse/semantics of temp before calling, or after).
-/// 5. Recheck original conflict token (detect change since entry).
+/// 4. Apply the final permission bits (derived from the current target, or
+///    owner-only for a new file) before the rename.
+/// 5. Recheck the original state (detect change since the temp was started).
 /// 6. Atomically rename via `std::fs::rename`.
 /// 7. Sync parent directory where supported.
-/// 8. Read back and verify digest.
+/// 8. Read back and verify digest and size.
 ///
 /// Never truncates the original in place; the original is only replaced via
 /// atomic rename.
-#[expect(
-    clippy::too_many_lines,
-    reason = "atomic write steps are sequential and clearer together"
-)]
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if is_directory(path) {
-        return Err(ConfigError::io(
-            path,
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "is a directory"),
-        ));
-    }
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-
-    let original_digest = read_digest_if_exists(path)?;
-
-    let mut temp_path: PathBuf = generate_temp_path(path)?;
-    let mut attempts = 0;
-    while temp_path.exists() && attempts < 5 {
-        temp_path = generate_temp_path(path)?;
-        attempts += 1;
-    }
-
-    let create_result: Result<std::fs::File> = (|| {
-        for _ in 0..3 {
-            let p = generate_temp_path(path)?;
-            let open = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&p);
-            match open {
-                Ok(f) => {
-                    temp_path = p;
-                    return Ok(f);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(ConfigError::io(&p, e)),
-            }
-        }
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|e| ConfigError::io(&temp_path, e))?;
-        Ok(f)
-    })();
-
-    let mut file = create_result?;
-
-    drop(file);
-    if let Err(e) = set_safe_permissions(&temp_path, path) {
-        drop(std::fs::remove_file(&temp_path));
-        return Err(e);
-    }
-    file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&temp_path)
-        .map_err(|e| ConfigError::io(&temp_path, e))?;
-
-    {
-        use std::io::Write;
-        file.write_all(bytes)
-            .map_err(|e| ConfigError::io(&temp_path, e))?;
-        file.flush().map_err(|e| ConfigError::io(&temp_path, e))?;
-        file.sync_all()
-            .map_err(|e| ConfigError::io(&temp_path, e))?;
-    }
-    drop(file);
-
-    let current_digest = read_digest_if_exists(path)?;
-    if original_digest != current_digest {
-        drop(std::fs::remove_file(&temp_path));
-        let expected = original_digest.unwrap_or_default();
-        let actual = current_digest.unwrap_or_default();
-        return Err(ConfigError::concurrent_modification(path, expected, actual));
-    }
-
-    let mut rename_attempts: u64 = 0;
-    loop {
-        match std::fs::rename(&temp_path, path) {
-            Ok(()) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && rename_attempts < 3 => {
-                rename_attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10 * rename_attempts));
-            }
-            Err(e) => {
-                drop(std::fs::remove_file(&temp_path));
-                return Err(ConfigError::io(path, e));
-            }
-        }
-    }
-
-    sync_parent(path)?;
-
-    let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
-    let expected = compute_digest(bytes);
-    let actual = compute_digest(&read_back);
-    if expected != actual {
-        return Err(ConfigError::verification(
-            path,
-            format!("digest mismatch after atomic write: expected {expected}, got {actual}"),
-        ));
-    }
-    if read_back.len() != bytes.len() {
-        return Err(ConfigError::verification(
-            path,
-            format!(
-                "size mismatch after atomic write: expected {}, got {}",
-                bytes.len(),
-                read_back.len()
-            ),
-        ));
-    }
-
-    Ok(())
+    atomic_write_expecting(path, bytes, WriteExpectation::Any, None)
 }
 
 /// Atomically write `bytes` to `path`, failing if the current file digest
@@ -255,14 +160,79 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// The function also rechecks for concurrent modification between temp
 /// creation and rename even when `expected_digest` is `None` (detecting any
 /// change during the preparation window).
-#[expect(
-    clippy::too_many_lines,
-    reason = "atomic write steps are sequential and clearer together"
-)]
 pub fn atomic_write_with_expected_digest(
     path: &Path,
     bytes: &[u8],
     expected_digest: Option<&str>,
+) -> Result<()> {
+    let expectation = match expected_digest {
+        Some(digest) => WriteExpectation::Digest(digest),
+        None => WriteExpectation::Missing,
+    };
+    atomic_write_expecting(path, bytes, expectation, None)
+}
+
+/// How the current on-disk state of the target must relate to the write.
+///
+/// The expectation is checked before the temporary file is created and again
+/// once its bytes are flushed, so a target that changes anywhere inside the
+/// preparation window aborts the write with `ConcurrentModification` and
+/// leaves the target untouched.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WriteExpectation<'a> {
+    /// No prior-state requirement; only mid-write change detection applies.
+    Any,
+    /// The target must be absent.
+    Missing,
+    /// The target must currently carry exactly this digest.
+    Digest(&'a str),
+}
+
+impl WriteExpectation<'_> {
+    fn check(self, path: &Path, observed: Option<&str>) -> Result<()> {
+        match self {
+            Self::Any => Ok(()),
+            Self::Missing => match observed {
+                None => Ok(()),
+                Some(actual) => Err(ConfigError::concurrent_modification(
+                    path,
+                    String::new(),
+                    actual.to_owned(),
+                )),
+            },
+            Self::Digest(expected) => {
+                let actual = observed.unwrap_or_default();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(ConfigError::concurrent_modification(
+                        path,
+                        expected.to_owned(),
+                        actual.to_owned(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Shared body of the atomic write family (MUT-04).
+///
+/// `mode` selects the permission bits the replacement carries: `None`
+/// derives them from the current target (owner-only `0o600` for a new file);
+/// `Some(mode)` applies the recorded bits verbatim, which is how backup
+/// restore reinstates the original permissions. The temporary file is held
+/// owner-only while it carries bytes, and the final mode is applied before
+/// the rename so the replacement never appears with the interim mode.
+#[expect(
+    clippy::too_many_lines,
+    reason = "atomic write steps are sequential and clearer together"
+)]
+pub(crate) fn atomic_write_expecting(
+    path: &Path,
+    bytes: &[u8],
+    expectation: WriteExpectation<'_>,
+    mode: Option<u32>,
 ) -> Result<()> {
     if is_directory(path) {
         return Err(ConfigError::io(
@@ -278,28 +248,7 @@ pub fn atomic_write_with_expected_digest(
     }
 
     let original_digest = read_digest_if_exists(path)?;
-
-    match expected_digest {
-        Some(expected) => {
-            let actual = original_digest.as_deref().unwrap_or_default();
-            if actual != expected {
-                return Err(ConfigError::concurrent_modification(
-                    path,
-                    expected.to_owned(),
-                    actual.to_owned(),
-                ));
-            }
-        }
-        None => {
-            if original_digest.is_some() {
-                return Err(ConfigError::concurrent_modification(
-                    path,
-                    String::new(),
-                    original_digest.as_deref().unwrap_or_default().to_owned(),
-                ));
-            }
-        }
-    }
+    expectation.check(path, original_digest.as_deref())?;
 
     let mut temp_path: PathBuf = generate_temp_path(path)?;
     let mut attempts = 0;
@@ -336,7 +285,10 @@ pub fn atomic_write_with_expected_digest(
     let mut file = create_result?;
 
     drop(file);
-    if let Err(e) = set_safe_permissions(&temp_path, path) {
+    // The temp is held owner-only from creation until the final mode is
+    // known, so payload bytes are never group/world readable regardless of
+    // the process umask.
+    if let Err(e) = apply_mode(&temp_path, 0o600) {
         drop(std::fs::remove_file(&temp_path));
         return Err(e);
     }
@@ -356,6 +308,14 @@ pub fn atomic_write_with_expected_digest(
     }
     drop(file);
 
+    // The final mode lands after the bytes are durable but before the
+    // rename, so the replacement never appears with the interim owner-only
+    // mode and a read-only recorded mode cannot block the write itself.
+    if let Err(e) = apply_mode(&temp_path, resolve_final_mode(path, mode)) {
+        drop(std::fs::remove_file(&temp_path));
+        return Err(e);
+    }
+
     let current_digest = read_digest_if_exists(path)?;
     if original_digest != current_digest {
         drop(std::fs::remove_file(&temp_path));
@@ -363,28 +323,9 @@ pub fn atomic_write_with_expected_digest(
         let actual = current_digest.unwrap_or_default();
         return Err(ConfigError::concurrent_modification(path, expected, actual));
     }
-    match expected_digest {
-        Some(expected) => {
-            let actual = current_digest.as_deref().unwrap_or_default();
-            if actual != expected {
-                drop(std::fs::remove_file(&temp_path));
-                return Err(ConfigError::concurrent_modification(
-                    path,
-                    expected.to_owned(),
-                    actual.to_owned(),
-                ));
-            }
-        }
-        None => {
-            if current_digest.is_some() {
-                drop(std::fs::remove_file(&temp_path));
-                return Err(ConfigError::concurrent_modification(
-                    path,
-                    String::new(),
-                    current_digest.as_deref().unwrap_or_default().to_owned(),
-                ));
-            }
-        }
+    if let Err(e) = expectation.check(path, current_digest.as_deref()) {
+        drop(std::fs::remove_file(&temp_path));
+        return Err(e);
     }
 
     let mut rename_attempts: u64 = 0;
