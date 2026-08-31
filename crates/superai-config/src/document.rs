@@ -14,6 +14,10 @@
 //!
 //! Selectors and operations are typed (no ad-hoc dotted strings) so
 //! codecs and adapters can reason about stability and redaction.
+//!
+//! DOC-09 vocabulary also lives here: diagnostic severities (including
+//! deprecation), deprecated owned keys, the adapter-supplied semantic
+//! validator hook, and the path/value type-check primitive.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -154,24 +158,95 @@ impl FromStr for DocumentKind {
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-/// A diagnostic with a line/column span and a message.
+/// Severity of a [`Diagnostic`] (DOC-09).
+///
+/// Syntax problems are [`DiagnosticSeverity::Error`]; adapter-supplied
+/// semantic validators may downgrade to warnings, hints, or deprecations so
+/// deprecated owned keys surface without blocking reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DiagnosticSeverity {
+    /// Blocking problem (the default for syntax diagnostics).
+    #[default]
+    Error,
+    /// Non-blocking warning.
+    Warning,
+    /// Use of a deprecated key or feature (DOC-09 deprecation diagnostics).
+    Deprecation,
+    /// Informational hint.
+    Hint,
+}
+
+impl DiagnosticSeverity {
+    /// Stable wire label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Deprecation => "deprecation",
+            Self::Hint => "hint",
+        }
+    }
+}
+
+/// A diagnostic with a line/column span, a severity, and a message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Diagnostic {
     /// One-based line number.
     pub line: usize,
     /// One-based column number.
     pub col: usize,
+    /// Severity (DOC-09); syntax diagnostics default to `Error`.
+    pub severity: DiagnosticSeverity,
     /// Human-readable message.
     pub message: String,
 }
 
 impl Diagnostic {
-    /// Create a new diagnostic.
+    /// Create a new error-severity diagnostic.
     pub fn new(line: usize, col: usize, message: impl Into<String>) -> Self {
         Self {
             line: usize::max(line, 1),
             col: usize::max(col, 1),
+            severity: DiagnosticSeverity::Error,
             message: message.into(),
+        }
+    }
+
+    /// Create a warning-severity diagnostic (DOC-09).
+    pub fn warning(line: usize, col: usize, message: impl Into<String>) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Warning,
+            ..Self::new(line, col, message)
+        }
+    }
+
+    /// Create a deprecation diagnostic for a deprecated owned key (DOC-09).
+    ///
+    /// `replacement` is the recommended substitute (e.g. a replacement
+    /// selector pointer), when one exists.
+    pub fn deprecation(
+        line: usize,
+        col: usize,
+        deprecated: &str,
+        replacement: Option<&str>,
+    ) -> Self {
+        let message = match replacement {
+            Some(replacement) => {
+                format!("owned key `{deprecated}` is deprecated; use `{replacement}` instead")
+            }
+            None => format!("owned key `{deprecated}` is deprecated"),
+        };
+        Self {
+            severity: DiagnosticSeverity::Deprecation,
+            ..Self::new(line, col, message)
+        }
+    }
+
+    /// Create a hint-severity diagnostic (DOC-09).
+    pub fn hint(line: usize, col: usize, message: impl Into<String>) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Hint,
+            ..Self::new(line, col, message)
         }
     }
 }
@@ -592,6 +667,9 @@ pub enum EditOperation {
         selector: Selector,
         /// Item to append.
         value: Value,
+        /// Field inside `value` that carries the item's identity (e.g.
+        /// `"name"` or `"id"`); duplicate handling compares this field.
+        identity_key: String,
     },
     /// Ensure a directory or list entry exists (e.g. skills, plugins).
     EnsureDirEntry {
@@ -606,7 +684,7 @@ pub enum EditOperation {
 ///
 /// Each operation declares:
 /// - `owned_keys` – which keys the adapter claims ownership of
-/// - `expected_old` – expected previous value or `None` for absence (conflict detection)
+/// - `expected_old` – expected previous value or absence (conflict detection)
 /// - `duplicate_handling` – how to treat duplicates
 /// - `create_parent` – whether missing parents should be created
 /// - `redaction_policy` – what to redact in diffs/diagnostics
@@ -615,9 +693,18 @@ pub struct Operation {
     /// The typed edit to perform.
     pub kind: EditOperation,
     /// Keys owned by the adapter at the target (for merge/ownership checks).
+    ///
+    /// The executor rejects any operation whose addressed key falls outside
+    /// this set (DOC-02). An empty set owns nothing, so every selector is
+    /// rejected — ownership must be declared, never assumed.
     pub owned_keys: Vec<String>,
-    /// Expected previous value, or `None` if the entry should be absent.
-    pub expected_old: Option<Value>,
+    /// Expected previous state (DOC-02 conflict detection):
+    /// - `None` — no expectation declared (any current state accepted)
+    /// - `Some(None)` — the entry must be absent
+    /// - `Some(Some(v))` — the entry must exist and equal `v`
+    ///
+    /// A mismatch is a typed conflict error and nothing is written.
+    pub expected_old: Option<Option<Value>>,
     /// Duplicate-key policy.
     pub duplicate_handling: DuplicateHandling,
     /// Whether to create parent tables/objects if they are missing.
@@ -646,10 +733,12 @@ impl Operation {
         self
     }
 
-    /// Declare the expected old value (or absence).
+    /// Declare the expected previous state: `Some(v)` expects the current
+    /// value to equal `v`, `None` expects the entry to be absent. Not calling
+    /// this builder leaves no expectation (conflict detection disabled).
     #[must_use]
     pub fn with_expected_old(mut self, expected: Option<Value>) -> Self {
-        self.expected_old = expected;
+        self.expected_old = Some(expected);
         self
     }
 
@@ -686,6 +775,199 @@ impl Operation {
             | EditOperation::EnsureDirEntry { selector, .. } => selector,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DOC-09 — semantic validation vocabulary
+// ---------------------------------------------------------------------------
+
+/// Adapter-supplied semantic validator over a parsed document (DOC-09).
+///
+/// Receives the semantic value tree and the document kind; returns
+/// diagnostics (empty = semantically valid). Pure: no I/O, no mutation.
+/// This is the engine-side hook the adapter trait consumes to validate a
+/// document's root shape and semantics at validate-time, not only at
+/// commit-time version gates.
+pub type SemanticValidator =
+    std::sync::Arc<dyn Fn(&Value, DocumentKind) -> Vec<Diagnostic> + Send + Sync>;
+
+/// An owned key the adapter has deprecated (DOC-09 deprecation diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeprecatedKey {
+    /// Dotted key path (or typed selector string) that is deprecated.
+    pub key: String,
+    /// Replacement pointer (e.g. `"key:newModel"`), if one exists.
+    pub replacement: Option<String>,
+}
+
+impl DeprecatedKey {
+    /// Create a deprecation marker for `key` with an optional replacement.
+    pub fn new(key: impl Into<String>, replacement: Option<String>) -> Self {
+        Self {
+            key: key.into(),
+            replacement,
+        }
+    }
+}
+
+/// Adapter-supplied semantic schema consumed at validate-time (DOC-09).
+///
+/// Bundles the semantic validator hook with the adapter's deprecated owned
+/// keys so one object can be handed to
+/// [`crate::raw_editor::validate_with_schema`].
+#[derive(Default, Clone)]
+pub struct SemanticSchema {
+    /// Validator over the parsed semantic value, if the adapter supplies one.
+    pub validator: Option<SemanticValidator>,
+    /// Owned keys the adapter has deprecated.
+    pub deprecated_keys: Vec<DeprecatedKey>,
+}
+
+impl std::fmt::Debug for SemanticSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SemanticSchema")
+            .field("validator", &self.validator.as_ref().map_or(0, |_| 1))
+            .field("deprecated_keys", &self.deprecated_keys)
+            .finish()
+    }
+}
+
+impl SemanticSchema {
+    /// Attach a semantic validator.
+    #[must_use]
+    pub fn with_validator(mut self, validator: SemanticValidator) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
+    /// Declare deprecated owned keys.
+    #[must_use]
+    pub fn with_deprecated(mut self, keys: Vec<DeprecatedKey>) -> Self {
+        self.deprecated_keys = keys;
+        self
+    }
+}
+
+/// Expected value type at a key path (DOC-09 path/value type checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueType {
+    /// A JSON-family object (`{ … }`).
+    Object,
+    /// An array.
+    Array,
+    /// A string.
+    String,
+    /// A number (integer or float; `1` and `1.0` are both numbers).
+    Number,
+    /// A boolean.
+    Boolean,
+    /// The null value.
+    Null,
+}
+
+impl ValueType {
+    /// Name shown in diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Null => "null",
+        }
+    }
+
+    /// The type `value` currently holds.
+    pub fn of(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Bool(_) => Self::Boolean,
+            Value::Number(_) => Self::Number,
+            Value::String(_) => Self::String,
+            Value::Array(_) => Self::Array,
+            Value::Object(_) => Self::Object,
+        }
+    }
+}
+
+/// Check that the dotted `path` exists in `value` and holds `expected`
+/// (DOC-09 path/value type-check primitive).
+///
+/// Path segments are separated by `.` and walk objects only. The error
+/// message names the failing segment, never any value content, so it is
+/// safe to surface in diagnostics.
+pub fn check_path_type(
+    value: &Value,
+    path: &str,
+    expected: ValueType,
+) -> std::result::Result<(), String> {
+    let mut current = value;
+    let segments: Vec<&str> = path.split('.').map(str::trim).collect();
+    for (idx, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            return Err(format!("path `{path}` has an empty segment"));
+        }
+        let Value::Object(map) = current else {
+            return Err(format!(
+                "path `{path}`: segment {} of `{}` is not an object",
+                idx.saturating_add(1),
+                segments.first().unwrap_or(&"")
+            ));
+        };
+        match map.get(*segment) {
+            Some(next) => current = next,
+            None => {
+                return Err(format!("path `{path}`: segment `{segment}` is missing"));
+            }
+        }
+    }
+    let actual = ValueType::of(current);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "path `{path}` holds a {}, expected a {}",
+            actual.as_str(),
+            expected.as_str()
+        ))
+    }
+}
+
+/// Produce deprecation diagnostics for deprecated owned keys present in
+/// `value` (DOC-09).
+///
+/// Keys are resolved as dotted paths; only keys actually present produce
+/// diagnostics. Positions are approximate (`1:1`) because the semantic
+/// value tree carries no spans — the message names the key and replacement.
+pub fn deprecation_diagnostics(value: &Value, deprecated: &[DeprecatedKey]) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for entry in deprecated {
+        if resolve_dotted(value, &entry.key).is_some() {
+            diagnostics.push(Diagnostic::deprecation(
+                1,
+                1,
+                &entry.key,
+                entry.replacement.as_deref(),
+            ));
+        }
+    }
+    diagnostics
+}
+
+/// Resolve a dotted key path in `value`, walking objects only.
+pub(crate) fn resolve_dotted<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.').map(str::trim) {
+        if segment.is_empty() {
+            return None;
+        }
+        let Value::Object(map) = current else {
+            return None;
+        };
+        current = map.get(segment)?;
+    }
+    Some(current)
 }
 
 // ---------------------------------------------------------------------------
@@ -999,11 +1281,28 @@ mod tests {
         .with_redaction_policy(RedactionPolicy::RedactValue);
 
         assert_eq!(op.owned_keys, vec!["model"]);
-        assert_eq!(op.expected_old, Some(Value::String("opus".to_owned())));
+        assert_eq!(
+            op.expected_old,
+            Some(Some(Value::String("opus".to_owned())))
+        );
         assert_eq!(op.duplicate_handling, DuplicateHandling::Error);
         assert!(op.create_parent);
         assert_eq!(op.redaction_policy, RedactionPolicy::RedactValue);
         assert_eq!(op.selector(), &Selector::Key("model".to_owned()));
+    }
+
+    #[test]
+    fn operation_expected_old_absent_vs_no_expectation() {
+        let no_expectation = Operation::new(EditOperation::Remove {
+            selector: Selector::Key("a".to_owned()),
+        });
+        assert_eq!(no_expectation.expected_old, None);
+
+        let expect_absent = no_expectation.clone().with_expected_old(None);
+        assert_eq!(expect_absent.expected_old, Some(None));
+
+        let expect_value = no_expectation.with_expected_old(Some(Value::Bool(true)));
+        assert_eq!(expect_value.expected_old, Some(Some(Value::Bool(true))));
     }
 
     #[test]
@@ -1037,10 +1336,80 @@ mod tests {
         let _ = Operation::new(EditOperation::AppendIdentityItem {
             selector: Selector::Key("servers".to_owned()),
             value: Value::String("x".to_owned()),
+            identity_key: "name".to_owned(),
         });
         let _ = Operation::new(EditOperation::EnsureDirEntry {
             selector: Selector::Key("plugins".to_owned()),
             path: "/tmp/foo".to_owned(),
         });
+    }
+
+    // ---- DOC-09 vocabulary ----
+
+    #[test]
+    fn diagnostic_severity_defaults_to_error_and_has_constructors() {
+        let error = Diagnostic::new(1, 1, "syntax");
+        assert_eq!(error.severity, DiagnosticSeverity::Error);
+
+        let warning = Diagnostic::warning(2, 3, "careful");
+        assert_eq!(warning.severity, DiagnosticSeverity::Warning);
+        assert_eq!((warning.line, warning.col), (2, 3));
+
+        let hint = Diagnostic::hint(4, 1, "fyi");
+        assert_eq!(hint.severity, DiagnosticSeverity::Hint);
+
+        let severities = [
+            DiagnosticSeverity::Error,
+            DiagnosticSeverity::Warning,
+            DiagnosticSeverity::Deprecation,
+            DiagnosticSeverity::Hint,
+        ];
+        let labels: Vec<&str> = severities.iter().map(DiagnosticSeverity::as_str).collect();
+        assert_eq!(labels, ["error", "warning", "deprecation", "hint"]);
+    }
+
+    #[test]
+    fn deprecation_diagnostic_names_key_and_replacement() {
+        let with_replacement = Diagnostic::deprecation(1, 1, "key:oldModel", Some("key:model"));
+        assert_eq!(with_replacement.severity, DiagnosticSeverity::Deprecation);
+        assert!(with_replacement.message.contains("key:oldModel"));
+        assert!(with_replacement.message.contains("key:model"));
+
+        let without = Diagnostic::deprecation(1, 1, "legacyKey", None);
+        assert!(without.message.contains("legacyKey"));
+        assert!(!without.message.contains("use `"));
+    }
+
+    #[test]
+    fn check_path_type_passes_and_fails_on_type_mismatch() {
+        let value: Value = serde_json::from_str(r#"{"model":{"name":"opus"},"list":[1]}"#).unwrap();
+        check_path_type(&value, "model", ValueType::Object).unwrap();
+        check_path_type(&value, "model.name", ValueType::String).unwrap();
+        check_path_type(&value, "list", ValueType::Array).unwrap();
+
+        let mismatch = check_path_type(&value, "model.name", ValueType::Number).unwrap_err();
+        assert!(mismatch.contains("model.name"));
+        assert!(mismatch.contains("string"));
+
+        let missing = check_path_type(&value, "model.absent", ValueType::String).unwrap_err();
+        assert!(missing.contains("absent"));
+
+        let not_object =
+            check_path_type(&value, "model.name.deeper", ValueType::String).unwrap_err();
+        assert!(not_object.contains("not an object"));
+    }
+
+    #[test]
+    fn deprecation_diagnostics_fire_only_for_present_keys() {
+        let value: Value = serde_json::from_str(r#"{"oldModel":"x","other":1}"#).unwrap();
+        let deprecated = vec![
+            DeprecatedKey::new("oldModel", Some("model".to_owned())),
+            DeprecatedKey::new("notPresent", None),
+        ];
+        let diagnostics = deprecation_diagnostics(&value, &deprecated);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Deprecation);
+        assert!(diagnostics[0].message.contains("oldModel"));
+        assert!(diagnostics[0].message.contains("model"));
     }
 }

@@ -421,6 +421,24 @@ where
     store_value(path, &value)
 }
 
+/// DOC-10: disclosure when a changing write must reformat surrounding
+/// layout.
+///
+/// Files carrying JSONC lexical material (comments/trailing commas) have
+/// their changing writes refused with `LossyWrite`, so no reformatting
+/// happens for them. Extension-free files are written as normalized pretty
+/// JSON: when such a file is not already in that form, a changing write
+/// reformats surrounding layout even where semantics do not change.
+pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
+    if text.trim().is_empty() || strip_jsonc(text) != text {
+        return None;
+    }
+    crate::json::formatting_change_warning(text).map(|_| {
+        "jsonc codec normalizes whitespace and indentation on changing writes for \
+             extension-free files; surrounding formatting will change even where semantics do not"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

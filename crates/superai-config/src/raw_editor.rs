@@ -225,6 +225,18 @@ impl RawEditor {
         validate(content, kind)
     }
 
+    /// Validate `content` for `kind` with an adapter-supplied semantic
+    /// schema (DOC-09): syntax + semantic validator + deprecation
+    /// diagnostics at validate-time. Never touches disk.
+    pub fn validate_with_schema(
+        &self,
+        content: &[u8],
+        kind: DocumentKind,
+        schema: Option<&crate::document::SemanticSchema>,
+    ) -> Vec<Diagnostic> {
+        validate_with_schema(content, kind, schema)
+    }
+
     /// Diff `old` vs `new` for `kind`, producing redacted lexical diff and semantic ops.
     pub fn diff(&self, old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
         diff(old, new, kind)
@@ -299,10 +311,89 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
         DocumentKind::Toml => diagnostics.extend(validate_toml(text)),
         DocumentKind::Yaml => diagnostics.extend(validate_yaml(text)),
         DocumentKind::Env => diagnostics.extend(validate_env(text)),
-        DocumentKind::TextFragment | DocumentKind::Opaque => {}
+        DocumentKind::TextFragment => diagnostics.extend(validate_text_fragment(text)),
+        DocumentKind::Opaque => {}
     }
 
     diagnostics
+}
+
+/// Validate managed-span sentinels in a text fragment (DOC-08): duplicate,
+/// partial, mis-ordered, or nested sentinels are diagnostics so the
+/// fragment fails closed instead of being guessed at.
+fn validate_text_fragment(text: &str) -> Vec<Diagnostic> {
+    match crate::span_codec::SpanCodec::default().validate(text) {
+        Ok(_) => Vec::new(),
+        Err(err) => vec![Diagnostic::new(
+            err.line,
+            1,
+            format!("invalid managed spans: {}", err.reason),
+        )],
+    }
+}
+
+/// Validate `content` for `kind` with an adapter-supplied semantic schema
+/// (DOC-09): syntax diagnostics plus semantic-validator diagnostics plus
+/// deprecation diagnostics for deprecated owned keys, all at validate-time
+/// rather than only at commit-time version gates. Never touches disk.
+///
+/// The document is parsed per `kind` into its semantic value tree first;
+/// when it does not parse, only syntax diagnostics are returned (semantic
+/// validation of unparsable content is meaningless).
+pub fn validate_with_schema(
+    content: &[u8],
+    kind: DocumentKind,
+    schema: Option<&crate::document::SemanticSchema>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = validate(content, kind);
+    let Some(schema) = schema else {
+        return diagnostics;
+    };
+    let Some(value) = parse_semantic_value(content, kind) else {
+        return diagnostics;
+    };
+    if let Some(validator) = &schema.validator {
+        diagnostics.extend(validator(&value, kind));
+    }
+    diagnostics.extend(crate::document::deprecation_diagnostics(
+        &value,
+        &schema.deprecated_keys,
+    ));
+    diagnostics
+}
+
+/// Parse `content` per `kind` into the semantic value tree, when possible.
+fn parse_semantic_value(content: &[u8], kind: DocumentKind) -> Option<Value> {
+    let text = std::str::from_utf8(bytes_without_bom(content)).ok()?;
+    if text.trim().is_empty() {
+        return Some(Value::Object(Map::new()));
+    }
+    match kind {
+        DocumentKind::StrictJson => parse_strict_json_value(text).ok(),
+        DocumentKind::JsonC => {
+            let stripped = strip_jsonc(text);
+            if stripped.trim().is_empty() {
+                Some(Value::Object(Map::new()))
+            } else {
+                parse_strict_json_value(&stripped).ok()
+            }
+        }
+        DocumentKind::Yaml => yaml_serde::from_str::<StrictYamlValue>(text)
+            .ok()
+            .map(|v| v.0),
+        DocumentKind::Toml => text
+            .parse::<DocumentMut>()
+            .ok()
+            .map(|doc| crate::executor::toml_document_to_value(&doc)),
+        DocumentKind::Env => {
+            let mut map = Map::new();
+            for (key, value) in parse_env_map(text) {
+                map.insert(key, Value::String(value));
+            }
+            Some(Value::Object(map))
+        }
+        DocumentKind::TextFragment | DocumentKind::Opaque => None,
+    }
 }
 
 fn validate_json(text: &str) -> Vec<Diagnostic> {
@@ -806,6 +897,18 @@ pub struct RedactionSpan {
     pub reason: String,
 }
 
+/// A formatting-change warning in a diff (DOC-10).
+///
+/// Emitted when surrounding formatting must change even though the
+/// semantics elsewhere do not: the codec that owns the document rewrites
+/// layout (whitespace, indentation, newlines) on changing writes, so the
+/// lexical change extends beyond the edited values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffWarning {
+    /// Human-readable explanation naming the codec and the reformatting.
+    pub message: String,
+}
+
 /// Result of diffing two file versions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffResult {
@@ -817,6 +920,9 @@ pub struct DiffResult {
     pub redaction_spans: Vec<RedactionSpan>,
     /// Whether the two contents are byte-identical.
     pub is_noop: bool,
+    /// Formatting-change warnings (DOC-10): surrounding formatting must
+    /// change though semantics elsewhere do not.
+    pub formatting_warnings: Vec<DiffWarning>,
 }
 
 // ---------------------------------------------------------------------------
@@ -834,13 +940,56 @@ pub fn diff(old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
     let lexical_unified_diff = lexical_diff(old, new);
     let semantic_ops = semantic_diff(old, new, kind);
     let redaction_spans = find_redaction_spans(new, kind);
+    let formatting_warnings = formatting_change_warnings(old, new, kind, &semantic_ops);
 
     DiffResult {
         semantic_ops,
         lexical_unified_diff,
         redaction_spans,
         is_noop,
+        formatting_warnings,
     }
+}
+
+/// DOC-10 formatting-change warnings: produced from the codec that owns the
+/// document, surfaced when a semantic edit is accompanied by unavoidable
+/// surrounding-layout rewrites.
+///
+/// Fires only when both hold:
+/// - the buffers differ (an edit is happening), and
+/// - semantic operations exist (the edit changes values, not just layout).
+///
+/// The codec layer decides whether its layout-normalizing write would
+/// rewrite anything beyond the edited values.
+fn formatting_change_warnings(
+    old: &[u8],
+    new: &[u8],
+    kind: DocumentKind,
+    semantic_ops: &[SemanticOp],
+) -> Vec<DiffWarning> {
+    if old == new || semantic_ops.is_empty() {
+        return Vec::new();
+    }
+    let Ok(old_text) = std::str::from_utf8(bytes_without_bom(old)) else {
+        return Vec::new();
+    };
+    let note = match kind {
+        DocumentKind::StrictJson => crate::json::formatting_change_warning(old_text),
+        DocumentKind::JsonC => crate::jsonc::formatting_change_warning(old_text),
+        DocumentKind::Toml => crate::toml_file::formatting_change_warning(old_text),
+        // env rewrites only edited lines (lexical-preserving edit path);
+        // yaml changing writes are refused outright; text fragments change
+        // only inside managed spans; opaque never reaches a codec write.
+        DocumentKind::Yaml
+        | DocumentKind::Env
+        | DocumentKind::TextFragment
+        | DocumentKind::Opaque => None,
+    };
+    note.map(|message| DiffWarning {
+        message: message.to_owned(),
+    })
+    .into_iter()
+    .collect()
 }
 
 fn lexical_diff(old: &[u8], new: &[u8]) -> String {
@@ -1478,6 +1627,54 @@ pub fn commit_with_snapshot(
     commit_inner(path, new_content, digest_opt, expected)
 }
 
+/// DOC-08 commit gate for text fragments: the change between the current
+/// file and `new_content` must be confined to managed spans.
+///
+/// Both sides must carry well-formed, non-overlapping sentinels (fail
+/// closed with [`ConfigError::InvalidSpans`] otherwise) and their bytes
+/// outside all spans must be identical, else the write is refused with
+/// [`ConfigError::UnmanagedSpanWrite`]. A missing file compares against
+/// empty content, so creating a fragment is only possible with span-only
+/// content. No disk mutation happens here.
+fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
+    let old_bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(ConfigError::io(path, e)),
+    };
+    let to_text = |bytes: &[u8], label: &str| -> Result<String> {
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|err| {
+                ConfigError::io(
+                    path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{label} content is not valid utf-8: {err}"),
+                    ),
+                )
+            })
+    };
+    let old_text = to_text(&old_bytes, "current")?;
+    let new_text = to_text(new_content, "new")?;
+    let codec = crate::span_codec::SpanCodec::default();
+    let old_outside = codec
+        .outside_span_bytes(&old_text)
+        .map_err(|e| e.into_config_error(path))?;
+    let new_outside = codec
+        .outside_span_bytes(&new_text)
+        .map_err(|e| e.into_config_error(path))?;
+    if old_outside == new_outside {
+        return Ok(());
+    }
+    Err(ConfigError::unmanaged_span_write(
+        path,
+        "bytes outside managed spans would change; whole-file rewrites are \
+         opaque/read-only (DOC-08)"
+            .to_owned(),
+    ))
+}
+
 fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Result<()> {
     let diagnostics = validate(content, kind);
     if diagnostics.is_empty() {
@@ -1565,6 +1762,13 @@ fn commit_inner(
 
     // Validate before any disk mutation.
     validate_for_commit(path, new_content, kind)?;
+
+    // DOC-08: text fragments accept managed-span edits only — bytes outside
+    // managed spans must be identical between the current file and the new
+    // content; whole-file rewrites stay opaque/read-only.
+    if kind == DocumentKind::TextFragment {
+        enforce_span_only_change(path, new_content)?;
+    }
 
     // Fresh snapshot and conflict check.
     let current_snapshot = snapshot(path);
@@ -2342,17 +2546,195 @@ mod tests {
             drop(std::fs::remove_file(b.backup_path));
         }
 
-        // Text fragment
+        // Text fragment: DOC-08 — span-managed writes only.
         let path_txt = unique_scratch("svc-txt", ".txt");
         drop(std::fs::remove_file(&path_txt));
+        // Plain whole-file creation is opaque and refused.
         let txt_content = b"hello text fragment\nsecond line\n";
-        let report2 = editor.commit(&path_txt, txt_content, None).unwrap();
+        match editor.commit(&path_txt, txt_content, None) {
+            Err(ConfigError::UnmanagedSpanWrite { .. }) => {}
+            other => panic!("expected UnmanagedSpanWrite, got {other:?}"),
+        }
+        assert!(
+            !path_txt.exists(),
+            "refused fragment creation must not touch disk"
+        );
+        // Span-only creation is accepted.
+        let span_only = b"# superai:begin:managed\nowned body\n# superai:end:managed\n";
+        let report2 = editor.commit(&path_txt, span_only, None).unwrap();
         assert!(!report2.is_noop);
-        assert_eq!(std::fs::read(&path_txt).unwrap(), txt_content);
+        assert_eq!(std::fs::read(&path_txt).unwrap(), span_only);
+        // Whole-file rewrite that changes unmanaged bytes is refused.
+        let rewrite =
+            b"different prelude\n# superai:begin:managed\nowned body\n# superai:end:managed\n";
+        match editor.commit(&path_txt, rewrite, None) {
+            Err(ConfigError::UnmanagedSpanWrite { .. }) => {}
+            other => panic!("expected UnmanagedSpanWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path_txt).unwrap(), span_only);
         drop(std::fs::remove_file(&path_txt));
         if let Some(b) = report2.backup {
             drop(std::fs::remove_file(b.backup_path));
         }
+    }
+
+    #[test]
+    fn text_fragment_malformed_sentinels_are_diagnostics() {
+        let duplicate = "prelude\n# superai:begin:x\na\n# superai:begin:x\nb\n# superai:end:x\n";
+        let diags = validate(duplicate.as_bytes(), DocumentKind::TextFragment);
+        assert!(!diags.is_empty(), "duplicate sentinels must be diagnostics");
+        assert!(diags[0].message.contains("duplicate"));
+
+        let unbalanced = "prelude\n# superai:begin:x\nbody\n";
+        let diags = validate(unbalanced.as_bytes(), DocumentKind::TextFragment);
+        assert!(!diags.is_empty(), "partial sentinels must be diagnostics");
+        assert!(diags[0].message.contains("unbalanced"));
+
+        let clean = "prelude\n# superai:begin:x\nbody\n# superai:end:x\n";
+        assert!(validate(clean.as_bytes(), DocumentKind::TextFragment).is_empty());
+        assert!(
+            validate(b"no sentinels at all\n", DocumentKind::TextFragment).is_empty(),
+            "plain text without sentinels is valid to read"
+        );
+    }
+
+    #[test]
+    fn diff_text_fragment_outside_span_change_is_not_semantic() {
+        let old = b"prelude\n# superai:begin:x\nbody\n# superai:end:x\n";
+        let new = b"prelude\n# superai:begin:x\nchanged\n# superai:end:x\n";
+        let res = diff(old, new, DocumentKind::TextFragment);
+        assert!(res.semantic_ops.is_empty());
+        assert!(!res.lexical_unified_diff.is_empty());
+        assert!(res.formatting_warnings.is_empty());
+    }
+
+    #[test]
+    fn diff_json_semantic_change_on_minified_file_warns_formatting() {
+        // Minified input: a changing write must reformat surrounding layout.
+        let old = br#"{"a":1,"b":2}"#;
+        let new = br#"{"a":2,"b":2}"#;
+        let res = diff(old, new, DocumentKind::StrictJson);
+        assert!(!res.semantic_ops.is_empty());
+        assert_eq!(res.formatting_warnings.len(), 1);
+        assert!(
+            res.formatting_warnings[0]
+                .message
+                .contains("surrounding formatting")
+        );
+    }
+
+    #[test]
+    fn diff_json_semantic_change_on_normalized_file_has_no_warning() {
+        let old = b"{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+        let new = b"{\n  \"a\": 2,\n  \"b\": 2\n}\n";
+        let res = diff(old, new, DocumentKind::StrictJson);
+        assert!(!res.semantic_ops.is_empty());
+        assert!(
+            res.formatting_warnings.is_empty(),
+            "already-normalized layout must not warn"
+        );
+    }
+
+    #[test]
+    fn diff_formatting_only_change_has_no_formatting_warning() {
+        let old = br#"{"a":1,"b":2}"#;
+        let new = b"{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+        let res = diff(old, new, DocumentKind::StrictJson);
+        assert!(res.semantic_ops.is_empty());
+        assert!(
+            res.formatting_warnings.is_empty(),
+            "formatting-only diffs are not codec reformatting warnings"
+        );
+    }
+
+    #[test]
+    fn diff_toml_crlf_semantic_change_warns_formatting() {
+        let old = b"a = 1\r\nb = 2\r\n";
+        let new = b"a = 2\r\nb = 2\r\n";
+        let res = diff(old, new, DocumentKind::Toml);
+        assert!(!res.semantic_ops.is_empty());
+        assert_eq!(res.formatting_warnings.len(), 1);
+        assert!(res.formatting_warnings[0].message.contains("CRLF"));
+    }
+
+    #[test]
+    fn validate_with_schema_runs_semantic_and_deprecation_checks() {
+        let editor = RawEditor::new();
+        let schema = crate::document::SemanticSchema::default()
+            .with_validator(std::sync::Arc::new(|value: &Value, _kind| {
+                let mut diags = Vec::new();
+                if let Some(model) = value.get("model")
+                    && !model.is_string()
+                {
+                    diags.push(Diagnostic::warning(1, 1, "model must be a string"));
+                }
+                diags
+            }))
+            .with_deprecated(vec![crate::document::DeprecatedKey::new(
+                "oldModel",
+                Some("model".to_owned()),
+            )]);
+
+        // Semantic violation + deprecated key in use.
+        let diags = editor.validate_with_schema(
+            br#"{"model":1,"oldModel":"x"}"#,
+            DocumentKind::StrictJson,
+            Some(&schema),
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("model must be a string"))
+        );
+        assert!(diags.iter().any(|d| d.severity
+            == crate::document::DiagnosticSeverity::Deprecation
+            && d.message.contains("oldModel")));
+
+        // Clean document: only syntax check applies.
+        let clean = editor.validate_with_schema(
+            br#"{"model":"opus"}"#,
+            DocumentKind::StrictJson,
+            Some(&schema),
+        );
+        assert!(clean.is_empty(), "{clean:?}");
+
+        // Unparsable content: syntax diagnostics only, validator skipped.
+        let broken =
+            editor.validate_with_schema(b"{ nope", DocumentKind::StrictJson, Some(&schema));
+        assert!(!broken.is_empty());
+        assert!(broken.iter().all(|d| d.message.contains("invalid")
+            || d.severity == crate::document::DiagnosticSeverity::Error));
+
+        // No schema supplied: behaves like plain validate.
+        assert!(
+            editor
+                .validate_with_schema(br#"{"a":1}"#, DocumentKind::StrictJson, None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn validate_with_schema_covers_toml_and_env_kinds() {
+        let schema = crate::document::SemanticSchema::default()
+            .with_deprecated(vec![crate::document::DeprecatedKey::new("legacy", None)]);
+        let toml_diags = validate_with_schema(
+            b"legacy = true\nmodel = \"opus\"\n",
+            DocumentKind::Toml,
+            Some(&schema),
+        );
+        assert!(
+            toml_diags
+                .iter()
+                .any(|d| d.severity == crate::document::DiagnosticSeverity::Deprecation)
+        );
+
+        let env_diags =
+            validate_with_schema(b"legacy=1\nMODEL=opus\n", DocumentKind::Env, Some(&schema));
+        assert!(
+            env_diags
+                .iter()
+                .any(|d| d.severity == crate::document::DiagnosticSeverity::Deprecation)
+        );
     }
 
     #[test]

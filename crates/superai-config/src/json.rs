@@ -277,6 +277,32 @@ where
     store_value(path, &value)
 }
 
+/// DOC-10: disclosure when a changing write must reformat surrounding
+/// layout.
+///
+/// This codec serializes the whole document on changing writes, so a file
+/// that is not already in normalized pretty form gets its surrounding
+/// formatting rewritten even where semantics do not change. Returns the
+/// warning message when `text` (the pre-edit content) would be reformatted,
+/// or `None` when the layout already matches the codec's output form (or
+/// `text` does not parse — syntax diagnostics cover that case).
+pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let mut normalized = serde_json::to_string_pretty(&value).ok()?;
+    normalized.push('\n');
+    if normalized == text {
+        None
+    } else {
+        Some(
+            "strict json codec normalizes whitespace and indentation on changing writes; \
+             surrounding formatting will change even where semantics do not",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

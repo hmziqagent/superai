@@ -33,7 +33,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
-use superai_config::document::{DocumentKind, Selector};
+use superai_config::document::{
+    DocumentKind, EditOperation, Operation as EngineOperation, Selector,
+};
+use superai_config::executor;
 use superai_config::snapshot::{is_modified, snapshot};
 use superai_config::transaction::{FileAction, Transaction};
 
@@ -99,86 +102,26 @@ fn get_local_value(local: &Map<String, Value>, selector: &str) -> Option<Value> 
     Some(current)
 }
 
-fn set_nested_value(map: &mut Map<String, Value>, selector: &str, value: Option<Value>) {
-    let Some(path) = selector_to_path(selector) else {
-        return;
+/// Build the engine operation for one auto-applicable edit (DOC-02 caller
+/// migration: three-way edits route through the executor so
+/// `owned_keys`/`expected_old`/`create_parent` are enforced instead of
+/// hand-rolled JSON path editing).
+fn edit_to_engine_operation(edit: &Edit, owned_keys: &[String]) -> Result<EngineOperation> {
+    let selector = Selector::parse(&edit.selector).map_err(|e| CoreError::Validation {
+        field: "patches.selector".to_owned(),
+        reason: format!("selector `{}` invalid: {e}", edit.selector),
+    })?;
+    let kind = match &edit.to {
+        Some(value) => EditOperation::Set {
+            selector,
+            value: value.clone(),
+        },
+        None => EditOperation::Remove { selector },
     };
-    if path.is_empty() {
-        return;
-    }
-    if path.len() == 1 {
-        let Some(key) = path.first().cloned() else {
-            return;
-        };
-        match value {
-            Some(v) => {
-                map.insert(key, v);
-            }
-            None => {
-                map.remove(&key);
-            }
-        }
-        return;
-    }
-    // Nested: walk to parent
-    let Some(leaf) = path.last().cloned() else {
-        return;
-    };
-    let Some(prefix) = path.get(0..path.len() - 1) else {
-        return;
-    };
-    let mut current: &mut Map<String, Value> = map;
-    for (idx, segment) in prefix.iter().enumerate() {
-        let is_last_prefix = idx + 1 == prefix.len();
-        if is_last_prefix {
-            // Parent map: ensure it is object
-            let entry = current
-                .entry(segment.clone())
-                .or_insert_with(|| Value::Object(Map::new()));
-            match entry {
-                Value::Object(inner) => {
-                    match value.clone() {
-                        Some(v) => {
-                            inner.insert(leaf.clone(), v);
-                        }
-                        None => {
-                            inner.remove(&leaf);
-                            // Optional: clean up empty parent? Keep empty object for determinism.
-                        }
-                    }
-                }
-                _ => {
-                    // Type mismatch at intermediate: replace with object if setting, or remove if deleting
-                    if let Some(v) = value.clone() {
-                        let mut new_inner = Map::new();
-                        new_inner.insert(leaf.clone(), v);
-                        *entry = Value::Object(new_inner);
-                    }
-                }
-            }
-            return;
-        }
-        // Intermediate not last
-        let entry = current
-            .entry(segment.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        #[expect(clippy::single_match_else, reason = "explicit match clearer")]
-        match entry {
-            Value::Object(inner) => {
-                current = inner;
-            }
-            _ => {
-                // Overwrite non-object intermediate with object map to allow nesting
-                let new_map = Map::new();
-                *entry = Value::Object(new_map);
-                if let Value::Object(inner) = entry {
-                    current = inner;
-                } else {
-                    return;
-                }
-            }
-        }
-    }
+    Ok(EngineOperation::new(kind)
+        .with_owned_keys(owned_keys.to_vec())
+        .with_expected_old(edit.from.clone())
+        .with_create_parent(true))
 }
 
 fn operation_id_string() -> String {
@@ -904,18 +847,36 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // Build new config map by applying auto_applicable edits
-    let mut new_local_map = local_map.clone();
+    // Build new config map by applying auto_applicable edits through the
+    // document engine (DOC-02 executor): owned keys are the template's own
+    // patch selectors, expected_old is each edit's observed `from` value,
+    // and parents may be created to mirror nested patch paths.
+    let owned_keys: Vec<String> = base
+        .patches
+        .iter()
+        .chain(new.patches.iter())
+        .map(|p| p.selector.clone())
+        .collect();
+    let mut new_value = Value::Object(local_map.clone());
     for edit in &preview.auto_applicable {
-        set_nested_value(&mut new_local_map, &edit.selector, edit.to.clone());
+        let op = edit_to_engine_operation(edit, &owned_keys)?;
+        executor::apply_to_value(&config_path, &mut new_value, &op).map_err(CoreError::Config)?;
     }
+    let Value::Object(new_local_map) = new_value else {
+        return Err(CoreError::Validation {
+            field: "config".to_owned(),
+            reason: "config root ceased to be an object during edit application".to_owned(),
+        });
+    };
 
     // Serialize new config
-    let new_value = Value::Object(new_local_map.clone());
+    let serialized_value = Value::Object(new_local_map.clone());
     let mut new_bytes_serialized =
-        serde_json::to_string_pretty(&new_value).map_err(|e| CoreError::SchemaValidation {
-            path: config_path.clone(),
-            details: format!("serialize new config failed: {e}"),
+        serde_json::to_string_pretty(&serialized_value).map_err(|e| {
+            CoreError::SchemaValidation {
+                path: config_path.clone(),
+                details: format!("serialize new config failed: {e}"),
+            }
         })?;
     new_bytes_serialized.push('\n');
     let new_content = new_bytes_serialized.into_bytes();
@@ -1310,6 +1271,80 @@ mod tests {
             "should keep local, no auto: {:?}",
             preview.auto_applicable
         );
+    }
+
+    #[test]
+    fn apply_nested_selector_creates_parent_and_preserves_foreign() {
+        // DOC-02 caller migration: nested patch selectors route through the
+        // engine executor, creating intermediate objects while foreign keys
+        // and untouched siblings survive the apply.
+        let tmp = crate::test_util::temp_dir_unique("tpl-update-nested");
+        let registry_path = tmp.join("instances.json");
+        let config_root = tmp.join(".claude-nested");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join("settings.json");
+
+        let mut base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
+        base.digest = "a".repeat(64);
+        let mut new = minimal_template(
+            "1.2.0",
+            vec![
+                patch("key:model", json!("glm-4.5")),
+                patch("key:env.MAX_THINKING", json!("high")),
+            ],
+        );
+        new.digest = "b".repeat(64);
+        let base_bytes = serde_json::to_vec(&base).unwrap();
+        let new_bytes = serde_json::to_vec(&new).unwrap();
+
+        let instance = Instance {
+            id: crate::ids::InstanceId::new("test-nested-001").unwrap(),
+            name: crate::ids::InstanceName::new("nested").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            config_root: AbsolutePath::from_path(&config_root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: Some(TemplateRef {
+                name: TemplateId::new("claude-glm").unwrap(),
+                version: TemplateVersion::new("1.1.0").unwrap(),
+            }),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+        };
+        let mut registry = Registry::default();
+        registry.insert(instance.clone()).unwrap();
+        registry.store(&registry_path).unwrap();
+        // Local has the base model plus a foreign sibling at the root.
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({"model":"glm-4","foreignRoot":"keep"})).unwrap()
+                + "\n",
+        )
+        .unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let outcome = apply_update(
+            &instance,
+            &registry_path,
+            &base,
+            &new,
+            &base_bytes,
+            &new_bytes,
+            &adapter,
+        )
+        .unwrap();
+        assert!(outcome.registry_updated);
+        assert_eq!(outcome.applied.len(), 2, "{:?}", outcome.applied);
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(after["model"], json!("glm-4.5"));
+        assert_eq!(after["env"]["MAX_THINKING"], json!("high"));
+        assert_eq!(after["foreignRoot"], json!("keep"));
+        drop(std::fs::remove_dir_all(&tmp));
     }
 
     #[test]

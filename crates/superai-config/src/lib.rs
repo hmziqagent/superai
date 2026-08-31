@@ -15,6 +15,8 @@ pub mod document;
 /// Env file configs, comments and duplicate handling preserved.
 pub mod env_file;
 mod error;
+/// Operation executor enforcing DOC-02 policies through the codecs.
+pub mod executor;
 /// Strict JSON configs, key order preserved.
 pub mod json;
 /// JSONC configs (comments + trailing commas); lossy changing writes refused.
@@ -25,6 +27,8 @@ pub mod quarantine;
 pub mod raw_editor;
 /// Filesystem snapshot and conflict token.
 pub mod snapshot;
+/// Managed-span codec for text fragments (DOC-08).
+pub mod span_codec;
 /// TOML configs, comments and formatting preserved.
 pub mod toml_file;
 /// Multi-file compensated transaction.

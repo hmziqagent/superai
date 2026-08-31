@@ -70,6 +70,35 @@ where
     store(path, &doc)
 }
 
+/// DOC-10: disclosure when a changing write must reformat surrounding
+/// layout.
+///
+/// `toml_edit` preserves comments and decor for untouched regions, but the
+/// documented narrower guarantee normalizes CRLF to LF on a changing write.
+/// Returns the warning when `text` (the pre-edit content) carries CRLF or
+/// cannot round-trip through the codec's serializer unchanged; `None` when
+/// the layout already matches the codec's output form (or `text` does not
+/// parse — syntax diagnostics cover that case).
+pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    if text.contains("\r\n") {
+        return Some(
+            "toml codec normalizes CRLF to LF on changing writes; \
+             surrounding formatting will change even where semantics do not",
+        );
+    }
+    match text.parse::<DocumentMut>() {
+        Ok(doc) if doc.to_string() == text => None,
+        Ok(_) => Some(
+            "toml codec cannot round-trip this document's decor byte-identically; \
+             surrounding formatting will change even where semantics do not",
+        ),
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
