@@ -2416,11 +2416,22 @@ pub fn reconfigure(
     let snap_before = snapshot(&settings_path);
 
     // Build mutations: for demo, ensure file contains a marker "reconfigured": true
+    // codec-honesty (DOC-05): bytes that fail strict-JSON parsing (JSONC
+    // content — comments/trailing commas) must not be swapped for a fabricated
+    // empty map and rewritten as normalized JSON; refuse before any disk
+    // mutation, same gate as `mutate_settings_with_template`.
     let current_bytes = std::fs::read(&settings_path).ok();
-    let mut value: serde_json::Value = if let Some(bytes) = current_bytes {
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
+    let mut value: serde_json::Value = match current_bytes {
+        Some(bytes) if !bytes.is_empty() => match serde_json::from_slice(&bytes) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Err(CoreError::Config(ConfigError::LossyWrite {
+                    path: settings_path,
+                    format: "jsonc",
+                }));
+            }
+        },
+        _ => serde_json::Value::Object(serde_json::Map::new()),
     };
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
@@ -3953,6 +3964,71 @@ mod tests {
         );
         assert!(after.contains("superai_reconfigured"));
 
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn reconfigure_refuses_jsonc_settings_instead_of_stripping() {
+        // codec-honesty (DOC-05): JSONC settings (comments/trailing commas)
+        // must make reconfigure fail with the typed lossy-write error before
+        // any disk mutation. Previously the unparseable bytes became a
+        // fabricated empty map, so the rewrite destroyed every comment and
+        // foreign key and the post-commit digest check blessed the result.
+        let tmp = unique_temp("reconfigure_jsonc");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = root.join("settings.json");
+        let jsonc =
+            "{\n  // user comment\n  \"model\": \"sonnet\",\n  \"foreignKey\": \"keep\",\n}\n";
+        std::fs::write(&settings, jsonc).unwrap();
+        let before = std::fs::read(&settings).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        let inst = Instance {
+            id: InstanceId::new("id-reconf-jsonc").unwrap(),
+            name: InstanceName::new("work").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            config_root: AbsolutePath::from_path(&root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: now_iso8601(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = make_adapter("claude-code");
+        let result = reconfigure(&registry_path, "work", &adapter);
+        match result {
+            Err(CoreError::Config(ConfigError::LossyWrite { format, .. })) => {
+                assert_eq!(format, "jsonc");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+
+        // Refusal is total: bytes untouched, no backup, no marker written.
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            before,
+            "refused reconfigure must leave settings byte-identical"
+        );
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("superai_reconfigured"),
+            "refused reconfigure must not write its marker"
+        );
+        let backups: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "refused reconfigure must not create backups"
+        );
         drop(std::fs::remove_dir_all(&tmp));
     }
 

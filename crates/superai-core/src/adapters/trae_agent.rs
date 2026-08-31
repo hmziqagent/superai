@@ -842,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_foreign_preserves_unknown_keys_on_edit() {
+    fn fixture_foreign_survive_because_changing_edit_refuses() {
         let path = fixture_path("trae_config.foreign.yaml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::yaml::load(&path).unwrap();
@@ -851,14 +851,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("trae.foreign.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        superai_config::yaml::edit(&tmp, |map| {
+        // codec-honesty (DOC-06): changing YAML writes on existing files are
+        // refused outright, so foreign keys survive because nothing is written.
+        let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert(
                 "allow_mcp_servers".to_owned(),
                 serde_json::Value::Array(vec![]),
             );
             assert!(map.contains_key("foreignKey") || map.contains_key("unknownTopLevel"));
-        })
-        .unwrap();
+        });
+        assert!(matches!(
+            result,
+            Err(superai_config::ConfigError::LossyWrite { format: "yaml", .. })
+        ));
         let after = superai_config::yaml::load(&tmp).unwrap();
         assert!(after.contains_key("foreignKey") || after.contains_key("unknownTopLevel"));
         drop(std::fs::remove_file(&tmp));

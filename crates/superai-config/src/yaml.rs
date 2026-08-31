@@ -22,19 +22,18 @@
 //! Preservation contract (DOC-06):
 //! - Write policy: a `serde`-based writer normalizes comments, anchor names,
 //!   alias structure, tag information, scalar style, and document markers, so
-//!   it cannot perform changing writes. A write that would destroy such
-//!   lexical material is refused with
-//!   [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite). A
-//!   write proceeds only when it is provably lossless: the target file is
-//!   missing (creation) or its bytes carry none of that material (see
-//!   `has_unpreservable_lexical_material`). Quoted scalars count as lexical
-//!   material: their style is normalized away, and parser-free quote
-//!   detection cannot be made reliable, so any quote character refuses the
-//!   write. What remains writable is plain block-style YAML — flow-vs-block
-//!   layout and indentation are the only things normalized there, and values
-//!   round-trip exactly. No-op edits never write and keep byte identity. A
-//!   future lossless codec (e.g. `yaml-edit`) can replace this gate while
-//!   keeping the same parse/validation surface.
+//!   it cannot perform changing writes — and lexical detection of that
+//!   material cannot be made hole-free without a real preserving parser (two
+//!   audit rounds each found a scanner blind spot). The policy is therefore
+//!   unconditional: every changing write to an existing YAML file is refused
+//!   with
+//!   [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite);
+//!   existing YAML files are read-only until a lexically preserving codec
+//!   exists. Only creating a missing file is allowed (no prior content to
+//!   destroy). Reads and validation always work, and no-op edits never write,
+//!   so byte identity is preserved. A future lossless codec (e.g.
+//!   `yaml-edit`) can replace this gate while keeping the same
+//!   parse/validation surface.
 //! - Policy: do not mutate through an alias if ownership/effect is ambiguous,
 //!   and do not expand anchors into duplicated values. The `serde` layer
 //!   resolves aliases to duplicated values on parse (anchor names are lost),
@@ -180,76 +179,21 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{FEFF}').unwrap_or(text)
 }
 
-/// Whether `text` carries YAML lexical material the normalized writer cannot
-/// reproduce: comments, anchors, aliases, tags, directives, document markers,
-/// block scalar indicators, explicit complex keys, or quoted scalars.
+/// Refuse every changing write to an existing YAML file (DOC-06).
 ///
-/// Detection is deliberately conservative and stateless: a false positive
-/// only refuses a write (honest), while a false negative silently corrupts a
-/// file. There is therefore **no quote-state tracking** — determining whether
-/// a `'` or `"` opens a quoted scalar requires a full YAML parser (plain
-/// scalars may contain apostrophes, quoted scalars span lines, flow context
-/// changes the rules), so any quote character anywhere is treated as lexical
-/// material. Other indicators are recognized at node-start positions (line
-/// start, after whitespace, and after flow separators `[`, `{`, `,`, `:`),
-/// which is where YAML gives them their special meaning.
-fn has_unpreservable_lexical_material(text: &str) -> bool {
-    let text = strip_bom(text);
-    let chars: Vec<char> = text.chars().collect();
-    // Treat start of input as start of line so column-0 indicators are seen.
-    let mut prev = '\n';
-
-    let mut idx = 0usize;
-    while let Some(&ch) = chars.get(idx) {
-        let at_line_start = prev == '\n';
-        let after_space = prev == ' ' || prev == '\t';
-        let after_flow_sep = prev == '[' || prev == '{' || prev == ',' || prev == ':';
-        let node_start = at_line_start || after_space || after_flow_sep;
-        match ch {
-            // Quoted scalars: style is lexical material, and parser-free
-            // quote detection is not reliable — refuse unconditionally.
-            '\'' | '"' => return true,
-            '#' if at_line_start || after_space => return true,
-            '&' | '*' | '!' | '|' | '>' if node_start => return true,
-            '%' if at_line_start => return true,
-            '?' if node_start
-                && matches!(chars.get(idx + 1), None | Some(' ' | '\t' | '\n' | '\r')) =>
-            {
-                return true;
-            }
-            '-' if at_line_start
-                && chars.get(idx + 1) == Some(&'-')
-                && chars.get(idx + 2) == Some(&'-') =>
-            {
-                return true;
-            }
-            '.' if at_line_start
-                && chars.get(idx + 1) == Some(&'.')
-                && chars.get(idx + 2) == Some(&'.') =>
-            {
-                return true;
-            }
-            _ => {}
-        }
-        prev = ch;
-        idx += 1;
-    }
-    false
-}
-
-/// Refuse writes that would destroy YAML lexical material already on disk
-/// (see [`has_unpreservable_lexical_material`]).
-///
-/// A file carrying none of those features is rewritten losslessly: normalized
-/// output preserves every lexical feature it has. Missing files are writable
-/// (creation); files that cannot be read as UTF-8 are refused because
-/// preservation cannot be proven.
+/// The normalized writer cannot preserve comments, anchors, aliases, tags,
+/// scalar style, or document markers, and no parser-free detection of that
+/// material is hole-free: two audit rounds each found a blind spot in lexical
+/// scanning (plain-scalar quotes opening phantom quote state; then non-`\n`
+/// line breaks — CR, NEL, LS, PS — that libyaml honors but a `\n`-anchored
+/// scan does not). Rather than iterate on detection, the policy is now
+/// unconditional: an existing YAML file is read-only for changing writes
+/// until a lexically preserving codec exists. Only creating a missing file
+/// is allowed, because there is no prior content to destroy. No-op edits
+/// never reach this gate and keep byte identity.
 fn ensure_lossless_write(path: &Path) -> Result<()> {
     match std::fs::read_to_string(path) {
-        Ok(text) if has_unpreservable_lexical_material(&text) => {
-            Err(ConfigError::lossy_write(path, "yaml"))
-        }
-        Ok(_) => Ok(()),
+        Ok(_) => Err(ConfigError::lossy_write(path, "yaml")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(path, e)),
     }
@@ -556,8 +500,8 @@ mod tests {
 
     #[test]
     fn quoted_scalars_refuse_changing_writes() {
-        // Quoted scalars are lexical material: their style is normalized away
-        // and parser-free quote detection is unreliable, so any quote refuses.
+        // Quoted scalar style is normalized away by the writer, so quoted
+        // files refuse like every other existing YAML target.
         let yaml = "a: \"quoted\"\nb: 2\n";
         let path = scratch("quoted.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -572,9 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_context_indicators_refuse_changing_writes() {
-        // Anchors/aliases inside flow collections (no space after `[`/`,`)
-        // must be recognized at flow node-start positions.
+    fn flow_style_file_refuses_changing_write() {
         let yaml = "a: [&one 1, &two 2]\nb: 2\n";
         let path = scratch("flow_anchor.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -588,24 +530,66 @@ mod tests {
     }
 
     #[test]
-    fn store_refused_when_target_carries_lexical_material() {
-        let path = scratch("store.yaml");
-        let original = "# top comment\na: 1\n";
-        std::fs::write(&path, original).unwrap();
-        let mut map = Map::new();
-        map.insert("a".into(), Value::Number(2.into()));
-        match store(&path, &map) {
-            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
-            other => panic!("expected LossyWrite, got {other:?}"),
+    fn store_refuses_any_existing_target() {
+        // The gate is unconditional: comment-bearing, plain, and
+        // line-break-variant files alike refuse. Line breaks CR, NEL (U+0085),
+        // LS (U+2028), and PS (U+2029) are valid YAML breaks for libyaml and
+        // defeated the round-2 scanner — under the unconditional policy they
+        // are covered by construction.
+        let cases = [
+            "# top comment\na: 1\n",
+            "a: 1\nb: 2\n",
+            "a: 1\r# real user comment\rb: 2\r",
+            "a: 1\u{85}# comment\u{85}b: 2\u{85}",
+            "a: 1\u{2028}# comment\u{2028}b: 2\u{2028}",
+            "a: 1\u{2029}# comment\u{2029}b: 2\u{2029}",
+        ];
+        for original in cases {
+            let path = scratch("store.yaml");
+            std::fs::write(&path, original).unwrap();
+            let mut map = Map::new();
+            map.insert("a".into(), Value::Number(2.into()));
+            match store(&path, &map) {
+                Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+                other => panic!("expected LossyWrite for {original:?}, got {other:?}"),
+            }
+            // Refusal is total: no file changes, no backup.
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "refused store must leave the file byte-identical"
+            );
+            let dir_entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+            assert_eq!(dir_entries, 1, "refused store must not create files");
         }
-        // Refusal is total: no file changes, no backup.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        let dir_entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
-        assert_eq!(dir_entries, 1, "refused store must not create files");
     }
 
     #[test]
-    fn edit_value_refused_when_target_carries_lexical_material() {
+    fn lone_cr_comment_file_refuses_changing_edit() {
+        // Judge round-2 repro, end to end through `edit`: libyaml accepts lone
+        // CR as a line break, so this file loads fine — and the changing edit
+        // must still refuse rather than destroy the CR-delimited comment.
+        let yaml = "a: 1\r# real user comment\rb: 2\r";
+        let path = scratch("lone_cr.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded["a"], Value::Number(1.into()));
+        let result = edit(&path, |m| {
+            m.insert("new".into(), Value::Number(9.into()));
+        });
+        match result {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            yaml,
+            "refused edit must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn edit_value_refused_on_existing_target() {
         let yaml = "a: 1 # keep\n";
         let path = scratch("edit_value.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -623,7 +607,7 @@ mod tests {
 
     #[test]
     fn store_allows_missing_target() {
-        // Creation: there is no lexical material to destroy.
+        // Creation: there is no prior content to destroy.
         let path = scratch("created.yaml");
         let mut map = Map::new();
         map.insert("a".into(), Value::Number(1.into()));
@@ -733,22 +717,26 @@ mod tests {
     }
 
     #[test]
-    fn edit_preserves_unmodelled_keys_and_order() {
+    fn changing_edit_refused_but_unmodelled_keys_still_readable() {
+        // Under the read-only policy the edit refuses, so preservation of
+        // unmodelled keys is expressed the only honest way: nothing is lost,
+        // because nothing is written.
         let path = scratch("roundtrip.yaml");
-        std::fs::write(&path, "zzz: 1\nmodel: opus\naaa:\n  nested: true\n").unwrap();
+        let original = "zzz: 1\nmodel: opus\naaa:\n  nested: true\n";
+        std::fs::write(&path, original).unwrap();
 
-        edit(&path, |c| {
+        let result = edit(&path, |c| {
             c.insert("model".into(), Value::String("sonnet".into()));
-        })
-        .unwrap();
+        });
+        assert!(matches!(result, Err(ConfigError::LossyWrite { .. })));
 
         let after = load(&path).unwrap();
         let keys: Vec<&str> = after.keys().map(String::as_str).collect();
-        // Order: yaml_serde preserves insertion order via Map; after edit, new order may be normalized but original keys before model remain
         assert!(keys.contains(&"zzz"));
         assert!(keys.contains(&"aaa"));
-        assert_eq!(after["model"], Value::String("sonnet".into()));
+        assert_eq!(after["model"], Value::String("opus".into()));
         assert_eq!(after["aaa"]["nested"], Value::Bool(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -806,13 +794,17 @@ mod tests {
     }
 
     #[test]
-    fn writing_leaves_backup() {
+    fn refused_write_leaves_no_backup() {
+        // With changing writes refused, no backup may appear either: the gate
+        // runs before any disk mutation.
         let path = scratch("backed.yaml");
-        std::fs::write(&path, "model: opus\n").unwrap();
-        edit(&path, |c| {
+        let original = "model: opus\n";
+        std::fs::write(&path, original).unwrap();
+        let result = edit(&path, |c| {
             c.insert("model".into(), Value::String("sonnet".into()));
-        })
-        .unwrap();
+        });
+        assert!(matches!(result, Err(ConfigError::LossyWrite { .. })));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(std::result::Result::ok)
@@ -822,12 +814,7 @@ mod tests {
                     .starts_with("backed.yaml.bak.")
             })
             .collect();
-        assert!(!backups.is_empty(), "no backup written");
-        let restored = std::fs::read_to_string(backups[0].path()).unwrap();
-        assert!(restored.contains("opus"));
-        for b in backups {
-            drop(std::fs::remove_file(b.path()));
-        }
+        assert!(backups.is_empty(), "refused write must not create backup");
     }
 
     #[test]

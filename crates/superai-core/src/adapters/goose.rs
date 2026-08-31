@@ -1001,30 +1001,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_preservation_via_yaml_edit() {
+    fn unknown_keys_survive_because_changing_yaml_edit_refuses() {
         let dir = crate::test_util::temp_dir_unique("goose");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.yaml");
         let original = "GOOSE_PROVIDER: openai\nforeignKey: keep-me\ncustomField: 123\n";
         std::fs::write(&path, original).unwrap();
 
-        superai_config::yaml::edit(&path, |map| {
+        // codec-honesty (DOC-06): changing YAML writes on existing files are
+        // refused outright; preservation is expressed by refusing.
+        let result = superai_config::yaml::edit(&path, |map| {
             map.insert(
                 "GOOSE_PROVIDER".to_owned(),
                 serde_json::Value::String("anthropic".to_owned()),
             );
-        })
-        .unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         let after = superai_config::yaml::load(&path).unwrap();
         assert_eq!(
             after["foreignKey"],
             serde_json::Value::String("keep-me".to_owned())
         );
         assert_eq!(after["customField"], serde_json::Value::Number(123.into()));
-        assert_eq!(
-            after["GOOSE_PROVIDER"],
-            serde_json::Value::String("anthropic".to_owned())
-        );
         drop(std::fs::remove_file(&path));
     }
 

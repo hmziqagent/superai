@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_foreign_preserves_unknown_keys_on_edit() {
+    fn fixture_foreign_survive_because_changing_edit_refuses() {
         let path = fixture_path("config.foreign.yaml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::yaml::load(&path).unwrap();
@@ -902,11 +902,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("continue.foreign.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        superai_config::yaml::edit(&tmp, |map| {
+        let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert("rules".to_owned(), serde_json::Value::Array(vec![]));
             assert!(map.contains_key("foreignKey") || map.contains_key("unknownTopLevel"));
-        })
-        .unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
         let after = superai_config::yaml::load(&tmp).unwrap();
         assert!(
             after.contains_key("foreignKey")
@@ -933,15 +938,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_preservation_via_yaml_edit() {
+    fn unknown_keys_survive_because_changing_yaml_edit_refuses() {
         let dir = crate::test_util::temp_dir_unique("continue");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("preserve.yaml");
         std::fs::write(&path, "name: test\nforeignKey: keep-me\n").unwrap();
-        superai_config::yaml::edit(&path, |map| {
+        // codec-honesty (DOC-06): changing YAML writes on existing files are
+        // refused outright; preservation is expressed by refusing, not by
+        // rewriting.
+        let result = superai_config::yaml::edit(&path, |map| {
             map.insert("models".to_owned(), serde_json::Value::Array(vec![]));
-        })
-        .unwrap();
+        });
+        assert!(matches!(
+            result,
+            Err(superai_config::ConfigError::LossyWrite { format: "yaml", .. })
+        ));
         let after = superai_config::yaml::load(&path).unwrap();
         assert_eq!(
             after["foreignKey"],

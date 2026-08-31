@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_foreign_preserves_unknown_keys_on_edit() {
+    fn fixture_foreign_survive_because_changing_edit_refuses() {
         let path = fixture_path("config.foreign.yaml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::yaml::load(&path).unwrap();
@@ -1049,7 +1049,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("config.foreign.yaml.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        superai_config::yaml::edit(&tmp, |map| {
+        // codec-honesty (DOC-06): changing YAML writes on existing files are
+        // refused outright, so foreign keys survive because nothing is written.
+        let before = std::fs::read(&tmp).unwrap();
+        let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert(
                 "theme".to_owned(),
                 serde_json::Value::String("dark".to_owned()),
@@ -1059,10 +1062,15 @@ mod tests {
                     || map.contains_key("unknownTopLevel")
                     || map.contains_key("extraUnknown")
             );
-        })
-        .unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&tmp).unwrap(), before);
         let after = superai_config::yaml::load(&tmp).unwrap();
-        assert_eq!(after["theme"], serde_json::Value::String("dark".to_owned()));
         let foreign_preserved = after.contains_key("foreignKey")
             || after.contains_key("unknownTopLevel")
             || after.contains_key("customField")
