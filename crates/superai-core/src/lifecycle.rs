@@ -5281,4 +5281,101 @@ mod tests {
 
         drop(std::fs::remove_dir_all(&tmp));
     }
+
+    #[test]
+    fn adopt_name_fold_collision_surfaces_in_preview_and_blocks_commit() {
+        let tmp = unique_temp("adopt_name_taken");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "namedup");
+        // An unrelated config root so only the NAME collides, not the root.
+        let other_root = tmp.join("other_claude");
+        std::fs::create_dir_all(&other_root).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry
+            .insert(make_instance("Work", &other_root, "claude-code"))
+            .unwrap();
+        registry.store(&registry_path).unwrap();
+        let bytes_before = std::fs::read(&registry_path).unwrap();
+
+        let loaded = Registry::load(&registry_path).unwrap();
+        for requested in ["work", "WORK"] {
+            let name = InstanceName::new(requested).unwrap();
+            let preview = preview_adopt(&candidate, &name, &loaded, Some(&home)).unwrap();
+            assert!(!preview.already_recorded);
+            assert!(
+                preview
+                    .preview
+                    .conflicts
+                    .iter()
+                    .any(|c| c.code == "name_collision"),
+                "{requested}: {:?}",
+                preview.preview.conflicts
+            );
+            assert!(
+                preview.preview.actions.is_empty(),
+                "{requested}: a conflicted preview must plan no action"
+            );
+
+            let err = adopt(&preview, &registry_path).unwrap_err();
+            assert!(
+                matches!(err, CoreError::Validation { .. }),
+                "{requested}: got {err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&registry_path).unwrap(),
+            bytes_before,
+            "registry must be unchanged by a refused adoption"
+        );
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_rechecks_name_fresh_between_preview_and_commit() {
+        let tmp = unique_temp("adopt_name_fresh");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "namefresh");
+
+        // Preview against an empty registry: no conflicts.
+        let name = InstanceName::new("late-name").unwrap();
+        let preview = preview_adopt(&candidate, &name, &Registry::default(), Some(&home)).unwrap();
+        assert!(
+            preview.preview.conflicts.is_empty(),
+            "{:?}",
+            preview.preview.conflicts
+        );
+
+        // Another actor registers the same name with different casing (and a
+        // different config root) between preview and commit.
+        let other_root = tmp.join("other_claude");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let mut other = Registry::default();
+        other
+            .insert(make_instance("LATE-NAME", &other_root, "claude-code"))
+            .unwrap();
+        other.store(&registry_path).unwrap();
+        let bytes_before = std::fs::read(&registry_path).unwrap();
+        let candidate_before = tree_digests(&candidate);
+
+        let err = adopt(&preview, &registry_path).unwrap_err();
+        match err {
+            CoreError::NameCollision { kind, name, .. } => {
+                assert_eq!(kind, "InstanceName");
+                assert_eq!(name, "late-name");
+            }
+            other_err => panic!("expected NameCollision, got {other_err:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&registry_path).unwrap(),
+            bytes_before,
+            "registry must be unchanged by a refused adoption"
+        );
+        assert_eq!(candidate_before, tree_digests(&candidate));
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
 }
