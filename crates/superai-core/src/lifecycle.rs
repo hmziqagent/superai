@@ -1014,7 +1014,8 @@ pub struct AdoptPreview {
     ///
     /// Commit re-runs that check fresh under the same scope.
     pub home: Option<PathBuf>,
-    /// Harness proven by the fingerprint at preview time.
+    /// Harness proven by the fingerprint at preview time (Medium confidence
+    /// or better — a canonical config file carried the proof).
     pub harness: HarnessId,
     /// Fingerprint evidence captured at preview time.
     pub fingerprint: Fingerprint,
@@ -1064,7 +1065,10 @@ fn format_config_tokens(tokens: &[(String, String)]) -> String {
 
 /// Preview adopting an unmanaged candidate config directory as instance `name`.
 ///
-/// Proves the harness fingerprint fresh, blocks foreign ownership, requires a
+/// Proves the harness fingerprint fresh at
+/// [`ADOPTION_CONFIDENCE_FLOOR`][crate::discovery::ADOPTION_CONFIDENCE_FLOOR]
+/// (Medium or better — a canonical config file must carry the proof, a
+/// directory name alone never does), blocks foreign ownership, requires a
 /// fresh readable candidate, and surfaces registry collisions (name, id,
 /// already-recorded root) as conflicts that block commit. Read-only: no file
 /// is created, written, or modified.
@@ -1256,11 +1260,12 @@ pub fn preview_adopt(
 /// Commit an adoption preview: write the registry record and nothing else.
 ///
 /// Every adoption check is re-proven fresh at commit time (disk is truth):
-/// the fingerprint, the foreign-ownership block, and the readability of the
-/// candidate via [`can_adopt`]; the canonical config digests against the
-/// preview's token; and the registry, re-read from disk, for name, id, and
-/// config-root collisions. The candidate's config files are never modified —
-/// the only write is the superai-owned registry record, committed last.
+/// the fingerprint (still at the Medium confidence floor), the
+/// foreign-ownership block, and the readability of the candidate via
+/// [`can_adopt`]; the canonical config digests against the preview's token;
+/// and the registry, re-read from disk, for name, id, and config-root
+/// collisions. The candidate's config files are never modified — the only
+/// write is the superai-owned registry record, committed last.
 pub fn adopt(preview: &AdoptPreview, registry_path: &Path) -> Result<OperationResult> {
     if !preview.preview.conflicts.is_empty() {
         return Err(CoreError::Validation {
@@ -5276,8 +5281,172 @@ mod tests {
         let name = InstanceName::new("mystery").unwrap();
         let registry = Registry::load(&registry_path).unwrap();
         let err = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap_err();
-        assert!(matches!(err, CoreError::Validation { .. }), "got {err:?}");
+        match &err {
+            CoreError::InsufficientEvidence {
+                path,
+                required,
+                observed,
+                ..
+            } => {
+                assert_eq!(path, &candidate);
+                assert_eq!(required, "medium");
+                assert_eq!(observed, "none");
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
         assert!(!registry_path.exists());
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_refuses_name_only_pattern_candidate() {
+        let tmp = unique_temp("adopt_low_confidence");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        // Name pattern only: the directory name matches `.claude*` but holds
+        // NO canonical config file, so the fingerprint is Confidence::Low and
+        // a directory name alone cannot establish harness identity (DRF-02).
+        let candidate = home.join(".claude-notes");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("notes.txt"), "shopping list").unwrap();
+        let before = tree_digests(&candidate);
+
+        let name = InstanceName::new("notes").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let err = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap_err();
+        match &err {
+            CoreError::InsufficientEvidence {
+                path,
+                required,
+                observed,
+                evidence,
+            } => {
+                assert_eq!(path, &candidate);
+                assert_eq!(required, "medium");
+                assert_eq!(observed, "low");
+                assert!(
+                    evidence.iter().any(|e| e.contains("path pattern")),
+                    "evidence should show the name-only match: {evidence:?}"
+                );
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
+        assert!(
+            !registry_path.exists(),
+            "a refused adoption must not create the registry file"
+        );
+        assert_eq!(before, tree_digests(&candidate));
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_succeeds_at_medium_confidence() {
+        let tmp = unique_temp("adopt_medium");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        // A canonical settings.json with no schema marker proves the harness
+        // at Medium confidence — the floor itself, not above it.
+        let candidate = home.join(".claude-medium");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("settings.json"), "{}").unwrap();
+
+        let name = InstanceName::new("medium-adopt").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let preview = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap();
+        assert!(
+            preview.preview.conflicts.is_empty(),
+            "{:?}",
+            preview.preview.conflicts
+        );
+        assert_eq!(preview.harness.as_str(), "claude-code");
+
+        let result = adopt(&preview, &registry_path).unwrap();
+        assert!(result.success);
+        let loaded = Registry::load(&registry_path).unwrap();
+        let inst = loaded.get("medium-adopt").unwrap();
+        assert_eq!(inst.origin, InstanceOrigin::Adopted);
+        assert_eq!(inst.harness.as_str(), "claude-code");
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn adopt_refused_when_confidence_drops_between_preview_and_commit() {
+        let tmp = unique_temp("adopt_confidence_drop");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "confdrop");
+
+        let name = InstanceName::new("drop-adopt").unwrap();
+        let preview = preview_adopt(&candidate, &name, &Registry::default(), Some(&home)).unwrap();
+        assert!(preview.preview.conflicts.is_empty());
+
+        // The canonical file that carried the proof is removed after preview:
+        // the fresh fingerprint degrades to name-pattern-only, so the floor
+        // re-check at commit must refuse (before any registry write).
+        std::fs::remove_file(candidate.join("settings.json")).unwrap();
+
+        let err = adopt(&preview, &registry_path).unwrap_err();
+        match &err {
+            CoreError::InsufficientEvidence {
+                path,
+                required,
+                observed,
+                ..
+            } => {
+                assert_eq!(path, &candidate);
+                assert_eq!(required, "medium");
+                assert_eq!(observed, "low");
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
+        assert!(
+            !registry_path.exists(),
+            "a refused adoption must not create the registry file"
+        );
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// Platform: Linux/macOS — proof-carrier readability via mode 0o000. The
+    /// aider fingerprint branch proves identity from the canonical file's
+    /// PRESENCE alone, so only an unreadable file can reach the
+    /// "no readable canonical config file" refusal.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_when_no_canonical_config_file_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = unique_temp("adopt_unreadable");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = home.join(".aider-locked");
+        std::fs::create_dir_all(&candidate).unwrap();
+        let conf = candidate.join(".aider.conf.yml");
+        std::fs::write(&conf, "model: gpt-4\n").unwrap();
+        let mut perms = std::fs::metadata(&conf).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&conf, perms).unwrap();
+
+        let name = InstanceName::new("locked").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let err = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap_err();
+        match &err {
+            CoreError::InsufficientEvidence { path, observed, .. } => {
+                assert_eq!(path, &candidate);
+                assert!(
+                    observed.contains("no readable canonical config file"),
+                    "observed should name the unreadable proof carrier: {observed}"
+                );
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
+        assert!(
+            !registry_path.exists(),
+            "a refused adoption must not create the registry file"
+        );
 
         drop(std::fs::remove_dir_all(&tmp));
     }

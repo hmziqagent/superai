@@ -320,6 +320,27 @@ pub enum CoreError {
         owner: String,
     },
 
+    /// The evidence collected for a candidate is too weak to act on it.
+    ///
+    /// Raised when a proof is asked to justify an operation it cannot
+    /// support, e.g. adoption on a name-pattern-only fingerprint where a
+    /// canonical config file is required. Carries what the operation
+    /// required, what was observed, and the evidence lines behind it —
+    /// paths and markers only, never file content or secrets.
+    #[error(
+        "insufficient evidence for {path}: requires {required}, observed {observed}: {evidence:?}"
+    )]
+    InsufficientEvidence {
+        /// Path the evidence was collected for.
+        path: PathBuf,
+        /// What the operation requires, display form.
+        required: String,
+        /// What was actually observed, display form.
+        observed: String,
+        /// Evidence lines that produced the observed result.
+        evidence: Vec<String>,
+    },
+
     /// A port conflict prevents the operation.
     #[error("port conflict on {port}: {reason}")]
     PortConflict {
@@ -533,6 +554,12 @@ mod tests {
             CoreError::ForeignOwnership {
                 path: PathBuf::from("/home/user/.claude"),
                 owner: "claude-multi".to_owned(),
+            },
+            CoreError::InsufficientEvidence {
+                path: PathBuf::from("/home/user/.claude-notes"),
+                required: "medium".to_owned(),
+                observed: "low".to_owned(),
+                evidence: vec!["path pattern matches .claude*".to_owned()],
             },
             CoreError::PortConflict {
                 port: 8080,

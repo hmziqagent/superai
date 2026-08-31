@@ -897,22 +897,54 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 // adoption helper (record-first, config-preserving)
 // ---------------------------------------------------------------------------
 
+/// Minimum fingerprint confidence adoption requires.
+///
+/// [`Confidence::Medium`] is the lowest level that requires a canonical config
+/// file to be present: `fingerprint_candidate` only assigns `Medium` or
+/// `High` inside a canonical-file branch, while [`Confidence::Low`] is
+/// name-pattern only and [`Confidence::None`] is no evidence at all. DRF-02
+/// forbids a directory name alone from establishing harness identity, so
+/// `Low` can never satisfy this floor.
+pub const ADOPTION_CONFIDENCE_FLOOR: Confidence = Confidence::Medium;
+
+/// Whether `confidence` carries more than a name-pattern match.
+fn meets_adoption_floor(confidence: Confidence) -> bool {
+    matches!(confidence, Confidence::High | Confidence::Medium)
+}
+
 /// Validate that a candidate can be adopted.
 ///
-/// Checks: harness fingerprint (prove harness/version), foreign ownership,
-/// fresh config read (at least one canonical file or directory exists),
-/// and isolation class. Returns the fingerprint on success.
+/// Checks: harness fingerprint at or above
+/// [`ADOPTION_CONFIDENCE_FLOOR`] (a canonical config file must prove the
+/// harness — a directory name alone never does), a readable canonical config
+/// file (so the preview→commit conflict token is enforceable rather than
+/// vacuously empty), foreign ownership, and a fresh readable candidate.
+/// Returns the fingerprint on success.
 /// Never copies, migrates, normalizes, or reformats the harness config.
 pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
     let fingerprint = fingerprint_candidate(candidate);
-    if fingerprint.confidence == Confidence::None {
-        return Err(CoreError::Validation {
-            field: "candidate".to_owned(),
-            reason: format!(
-                "cannot prove harness for {}: {}",
-                candidate.display(),
-                fingerprint.evidence.join("; ")
+    if !meets_adoption_floor(fingerprint.confidence) {
+        return Err(CoreError::InsufficientEvidence {
+            path: candidate.to_path_buf(),
+            required: ADOPTION_CONFIDENCE_FLOOR.to_string(),
+            observed: fingerprint.confidence.to_string(),
+            evidence: fingerprint.evidence,
+        });
+    }
+    // A Medium+ fingerprint implies a canonical file exists; it must also be
+    // READABLE, or the digest token adoption compares between preview and
+    // commit would be empty and that check would pass vacuously.
+    if canonical_config_digests(candidate).is_empty() {
+        return Err(CoreError::InsufficientEvidence {
+            path: candidate.to_path_buf(),
+            required: format!(
+                "{ADOPTION_CONFIDENCE_FLOOR} confidence with a readable canonical config file"
             ),
+            observed: format!(
+                "{} confidence with no readable canonical config file",
+                fingerprint.confidence
+            ),
+            evidence: fingerprint.evidence,
         });
     }
     let foreign = is_foreign_managed(candidate, home);
