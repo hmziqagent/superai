@@ -657,313 +657,276 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
     ENTRIES.iter().find(|entry| entry.id == id)
 }
 
-/// Build generic adapters for every catalog entry.
+/// Build the concrete adapter for `id`, if one exists.
 ///
-/// Invalid ids are skipped; with the current ledger all ids are valid so the
-/// returned count equals `ENTRIES.len()`.
+/// Returns `None` when `id` has no concrete adapter implementation; callers
+/// fall back to a [`GenericAdapter`] built from the catalog row. This is the
+/// single registry of concrete adapter constructors — consumers resolve
+/// harness ids through here instead of duplicating per-adapter wiring.
 #[expect(
     clippy::too_many_lines,
     reason = "catalog has 48 entries with per-adapter branching"
 )]
+pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
+    if id == crate::adapters::claude_code::HARNESS_ID_STR
+        && let Ok(adapter) = ClaudeCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::codex_cli::HARNESS_ID_STR
+        && let Ok(adapter) = CodexCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::aider::HARNESS_ID_STR
+        && let Ok(adapter) = AiderAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::opencode::HARNESS_ID_STR
+        && let Ok(adapter) = OpenCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::cline::HARNESS_ID_STR
+        && let Ok(adapter) = ClineAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::copilot_cli::HARNESS_ID_STR
+        && let Ok(adapter) = CopilotCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::goose::HARNESS_ID_STR
+        && let Ok(adapter) = GooseAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::qwen_code::HARNESS_ID_STR
+        && let Ok(adapter) = QwenCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::kimi_code::HARNESS_ID_STR
+        && let Ok(adapter) = KimiCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::grok_build::HARNESS_ID_STR
+        && let Ok(adapter) = GrokBuildAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::mistral_vibe::HARNESS_ID_STR
+        && let Ok(adapter) = MistralVibeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::forge::HARNESS_ID_STR
+        && let Ok(adapter) = ForgeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::kode::HARNESS_ID_STR
+        && let Ok(adapter) = KodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::pi::HARNESS_ID_STR
+        && let Ok(adapter) = PiAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::nanocoder::HARNESS_ID_STR
+        && let Ok(adapter) = NanocoderAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::hermes::HARNESS_ID_STR
+        && let Ok(adapter) = HermesAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::mimo::HARNESS_ID_STR
+        && let Ok(adapter) = MimoAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::junie::HARNESS_ID_STR
+        && let Ok(adapter) = JunieAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::amp::HARNESS_ID_STR
+        && let Ok(adapter) = AmpAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::continue_dev::HARNESS_ID_STR
+        && let Ok(adapter) = ContinueDevAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::factory_droid::HARNESS_ID_STR
+        && let Ok(adapter) = FactoryDroidAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::gptme::HARNESS_ID_STR
+        && let Ok(adapter) = GptmeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::cursor::HARNESS_ID_STR
+        && let Ok(adapter) = CursorAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::kilo::HARNESS_ID_STR
+        && let Ok(adapter) = KiloAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::windsurf::HARNESS_ID_STR
+        && let Ok(adapter) = WindsurfAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::zed_acp::HARNESS_ID_STR
+        && let Ok(adapter) = ZedAcpAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::auggie::HARNESS_ID_STR
+        && let Ok(adapter) = AuggieAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::trae_agent::HARNESS_ID_STR
+        && let Ok(adapter) = TraeAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::swe_agent::HARNESS_ID_STR
+        && let Ok(adapter) = SweAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::gemini_cli::HARNESS_ID_STR
+        && let Ok(adapter) = GeminiCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::amazon_q::HARNESS_ID_STR
+        && let Ok(adapter) = AmazonQAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::roo_code::HARNESS_ID_STR
+        && let Ok(adapter) = RooCodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::legacy_kimi::HARNESS_ID_STR
+        && let Ok(adapter) = LegacyKimiAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::antigravity::HARNESS_ID_STR
+        && let Ok(adapter) = AntigravityAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::kiro::HARNESS_ID_STR
+        && let Ok(adapter) = KiroAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::openclaw::HARNESS_ID_STR
+        && let Ok(adapter) = OpenClawAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::zcode::HARNESS_ID_STR
+        && let Ok(adapter) = ZcodeAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::crush::HARNESS_ID_STR
+        && let Ok(adapter) = CrushAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::deepseek::HARNESS_ID_STR
+        && let Ok(adapter) = DeepSeekAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::iflow::HARNESS_ID_STR
+        && let Ok(adapter) = IflowAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::letta::HARNESS_ID_STR
+        && let Ok(adapter) = LettaAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::openhands::HARNESS_ID_STR
+        && let Ok(adapter) = OpenHandsAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::plandex::HARNESS_ID_STR
+        && let Ok(adapter) = PlandexAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::warp::HARNESS_ID_STR
+        && let Ok(adapter) = WarpAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::vibe_kanban::HARNESS_ID_STR
+        && let Ok(adapter) = VibeKanbanAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::conductor::HARNESS_ID_STR
+        && let Ok(adapter) = ConductorAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::sculptor::HARNESS_ID_STR
+        && let Ok(adapter) = SculptorAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::copilot_coding_agent::HARNESS_ID_STR
+        && let Ok(adapter) = CopilotCodingAgentAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    // Ledger alias: the catalog row is kimi-code-cli; the adapter is kimi-code.
+    if id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
+        && let Ok(ledger_id) = HarnessId::new(id)
+    {
+        return Some(Box::new(KimiCodeAdapter::from_ledger_id(ledger_id)) as Box<dyn Adapter>);
+    }
+    None
+}
+
+/// Build one adapter per catalog entry.
+///
+/// Every entry resolves through [`concrete_adapter_for`]; ids without a
+/// concrete adapter get a [`GenericAdapter`] built from the catalog row, so
+/// the returned count always equals `ENTRIES.len()`.
 pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
     let mut out = Vec::with_capacity(ENTRIES.len());
     for entry in ENTRIES {
-        if entry.id == crate::adapters::claude_code::HARNESS_ID_STR
-            && let Ok(adapter) = ClaudeCodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::codex_cli::HARNESS_ID_STR
-            && let Ok(adapter) = CodexCliAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::aider::HARNESS_ID_STR
-            && let Ok(adapter) = AiderAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::opencode::HARNESS_ID_STR
-            && let Ok(adapter) = OpenCodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::cline::HARNESS_ID_STR
-            && let Ok(adapter) = ClineAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::copilot_cli::HARNESS_ID_STR
-            && let Ok(adapter) = CopilotCliAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::goose::HARNESS_ID_STR
-            && let Ok(adapter) = GooseAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::qwen_code::HARNESS_ID_STR
-            && let Ok(adapter) = QwenCodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::kimi_code::HARNESS_ID_STR
-            && let Ok(adapter) = KimiCodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::grok_build::HARNESS_ID_STR
-            && let Ok(adapter) = GrokBuildAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::mistral_vibe::HARNESS_ID_STR
-            && let Ok(adapter) = MistralVibeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::forge::HARNESS_ID_STR
-            && let Ok(adapter) = ForgeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::kode::HARNESS_ID_STR
-            && let Ok(adapter) = KodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::pi::HARNESS_ID_STR
-            && let Ok(adapter) = PiAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::nanocoder::HARNESS_ID_STR
-            && let Ok(adapter) = NanocoderAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::hermes::HARNESS_ID_STR
-            && let Ok(adapter) = HermesAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::mimo::HARNESS_ID_STR
-            && let Ok(adapter) = MimoAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::junie::HARNESS_ID_STR
-            && let Ok(adapter) = JunieAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::amp::HARNESS_ID_STR
-            && let Ok(adapter) = AmpAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::continue_dev::HARNESS_ID_STR
-            && let Ok(adapter) = ContinueDevAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::factory_droid::HARNESS_ID_STR
-            && let Ok(adapter) = FactoryDroidAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::gptme::HARNESS_ID_STR
-            && let Ok(adapter) = GptmeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::cursor::HARNESS_ID_STR
-            && let Ok(adapter) = CursorAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::kilo::HARNESS_ID_STR
-            && let Ok(adapter) = KiloAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::windsurf::HARNESS_ID_STR
-            && let Ok(adapter) = WindsurfAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::zed_acp::HARNESS_ID_STR
-            && let Ok(adapter) = ZedAcpAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::auggie::HARNESS_ID_STR
-            && let Ok(adapter) = AuggieAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::trae_agent::HARNESS_ID_STR
-            && let Ok(adapter) = TraeAgentAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::swe_agent::HARNESS_ID_STR
-            && let Ok(adapter) = SweAgentAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::gemini_cli::HARNESS_ID_STR
-            && let Ok(adapter) = GeminiCliAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::amazon_q::HARNESS_ID_STR
-            && let Ok(adapter) = AmazonQAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::roo_code::HARNESS_ID_STR
-            && let Ok(adapter) = RooCodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::legacy_kimi::HARNESS_ID_STR
-            && let Ok(adapter) = LegacyKimiAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::antigravity::HARNESS_ID_STR
-            && let Ok(adapter) = AntigravityAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::kiro::HARNESS_ID_STR
-            && let Ok(adapter) = KiroAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::openclaw::HARNESS_ID_STR
-            && let Ok(adapter) = OpenClawAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::zcode::HARNESS_ID_STR
-            && let Ok(adapter) = ZcodeAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::crush::HARNESS_ID_STR
-            && let Ok(adapter) = CrushAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::deepseek::HARNESS_ID_STR
-            && let Ok(adapter) = DeepSeekAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::iflow::HARNESS_ID_STR
-            && let Ok(adapter) = IflowAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::letta::HARNESS_ID_STR
-            && let Ok(adapter) = LettaAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::openhands::HARNESS_ID_STR
-            && let Ok(adapter) = OpenHandsAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::plandex::HARNESS_ID_STR
-            && let Ok(adapter) = PlandexAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::warp::HARNESS_ID_STR
-            && let Ok(adapter) = WarpAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::vibe_kanban::HARNESS_ID_STR
-            && let Ok(adapter) = VibeKanbanAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::conductor::HARNESS_ID_STR
-            && let Ok(adapter) = ConductorAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::sculptor::HARNESS_ID_STR
-            && let Ok(adapter) = SculptorAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        if entry.id == crate::adapters::copilot_coding_agent::HARNESS_ID_STR
-            && let Ok(adapter) = CopilotCodingAgentAdapter::new()
-        {
-            out.push(Box::new(adapter) as Box<dyn Adapter>);
-            continue;
-        }
-        // Ledger alias: catalog uses kimi-code-cli but adapter is kimi-code
-        if entry.id == crate::adapters::kimi_code::HARNESS_ID_LEDGER_ALIAS
-            && KimiCodeAdapter::new().is_ok()
-        {
-            #[expect(clippy::unwrap_used, reason = "catalog ids are static valid")]
-            let ledger_id = HarnessId::new(entry.id).unwrap();
-            let aliased = KimiCodeAdapter::from_ledger_id(ledger_id);
-            out.push(Box::new(aliased) as Box<dyn Adapter>);
+        if let Some(adapter) = concrete_adapter_for(entry.id) {
+            out.push(adapter);
             continue;
         }
         if let Ok(harness_id) = HarnessId::new(entry.id) {

@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::adapter::Adapter;
 use crate::error::{CoreError, Result};
 use crate::ids::HarnessId;
 use crate::registry::Registry;
@@ -565,72 +564,19 @@ fn normalize_path(path: &Path) -> PathBuf {
 const MAX_HOME_ENTRIES: usize = 1024;
 const MAX_XDG_ENTRIES: usize = 256;
 
-/// Expand a list of adapter-derived patterns into existing absolute paths.
+/// Collect adapter-derived candidate patterns for the scan.
+///
+/// Patterns come from every adapter in the harness catalog via
+/// [`crate::harness_catalog::all_adapters`]: concrete adapters contribute
+/// their `scan_candidates`, and a harness without a concrete adapter falls
+/// back to the generic `~/.<id>` hints of [`crate::adapter::GenericAdapter`].
+/// The scanner keeps only patterns that expand to an existing path (see
+/// [`scan_candidate_roots_limited`]).
 fn candidate_patterns() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    // Concrete adapters with accurate scan_candidates
-    if let Ok(adapter) = crate::adapters::claude_code::ClaudeCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::codex_cli::CodexCliAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::aider::AiderAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::opencode::OpenCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::cline::ClineAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::copilot_cli::CopilotCliAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::goose::GooseAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::qwen_code::QwenCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::kimi_code::KimiCodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::grok_build::GrokBuildAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::mistral_vibe::MistralVibeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::forge::ForgeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::kode::KodeAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::pi::PiAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::nanocoder::NanocoderAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::hermes::HermesAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::mimo::MimoAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    if let Ok(adapter) = crate::adapters::junie::JunieAdapter::new() {
-        out.extend(adapter.scan_candidates());
-    }
-    // Generic entries from catalog for remaining harnesses
-    for entry in crate::harness_catalog::ENTRIES {
-        let candidate = format!("~/.{}", entry.id);
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    out
+    crate::harness_catalog::all_adapters()
+        .iter()
+        .flat_map(|adapter| adapter.scan_candidates())
+        .collect()
 }
 
 /// Scan `home` for candidate config roots.
@@ -1347,5 +1293,71 @@ mod tests {
         // Also ensure content unchanged
         let content = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(content, r#"{"model":"sonnet"}"#);
+    }
+
+    /// Platform: all — wiring is pure pattern-string assembly, no FS access.
+    /// Every catalog harness must resolve to its concrete adapter and every
+    /// adapter-specific candidate must be part of the discovery pattern set
+    /// (HAD-09/10/11): a future catalog row without a concrete adapter fails
+    /// here instead of silently falling back to generic `~/.<id>` hints.
+    #[test]
+    fn scan_patterns_cover_every_catalog_concrete_adapter() {
+        let patterns = candidate_patterns();
+        for entry in crate::harness_catalog::all_entries() {
+            let adapter = crate::harness_catalog::concrete_adapter_for(entry.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "catalog id `{}` has no concrete adapter; discovery would silently fall back to generic `~/.{}` candidates",
+                        entry.id, entry.id
+                    )
+                });
+            for candidate in adapter.scan_candidates() {
+                assert!(
+                    patterns.contains(&candidate),
+                    "discovery patterns must include `{candidate}` from adapter `{}`",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    /// Platform: all — `~/.config/warp-terminal/cli/settings.toml` under a temp
+    /// home; tilde expansion via `expand_tilde` is uniform.
+    /// A previously generic-only harness now gets adapter-specific candidates:
+    /// warp's CLI settings file is reachable only through
+    /// `WarpAdapter::scan_candidates` — the generic `~/.<id>` fallback never
+    /// listed it, no known home prefix matches, and the XDG crawl ignores
+    /// `warp-terminal`.
+    #[test]
+    fn scan_finds_adapter_specific_warp_candidate() {
+        let home = tmp_home("scan_warp_cli");
+        let settings = home
+            .join(".config")
+            .join("warp-terminal")
+            .join("cli")
+            .join("settings.toml");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "model = \"sonnet\"\n").unwrap();
+        let candidates = scan_candidate_roots(&home);
+        assert!(
+            candidates.iter().any(|p| p == &settings),
+            "scan must find warp's adapter-specific settings via scan_candidates, got {candidates:?}"
+        );
+    }
+
+    /// swe-agent's project-layout candidate `config/default.yaml` is likewise
+    /// adapter-specific: the generic fallback only ever offered
+    /// `~/.swe-agent`, and no known home prefix matches `config`.
+    #[test]
+    fn scan_finds_adapter_specific_swe_agent_candidate() {
+        let home = tmp_home("scan_swe_agent");
+        let cfg = home.join("config").join("default.yaml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "model:\n  name: sonnet\n").unwrap();
+        let candidates = scan_candidate_roots(&home);
+        assert!(
+            candidates.iter().any(|p| p == &cfg),
+            "scan must find swe-agent's config/default.yaml via scan_candidates, got {candidates:?}"
+        );
     }
 }
