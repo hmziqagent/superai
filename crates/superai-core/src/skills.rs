@@ -1291,7 +1291,6 @@ impl SkillRegistry {
                                     reason: format!("write staging SKILL.md failed: {e}"),
                                 },
                             )?;
-                            // Also create a placeholder file if needed
                         } else {
                             return Err(CoreError::Validation {
                                 field: "skill_source".to_owned(),
@@ -1302,33 +1301,9 @@ impl SkillRegistry {
                             });
                         }
                     } else {
-                        // HTTPS: attempt real fetch via ureq, but for offline tests, create minimal skill from URL
-                        // Try ureq fetch; if fails, fallback to synthetic skill
-                        let fetch_result =
-                            fetch_https_to_staging(&source.locator, &staging_skill_dir);
-                        if fetch_result.is_err() {
-                            // Synthetic fallback: derive skill name from last URL segment
-                            let name = synthetic_name_from_url(&source.locator);
-                            let skill_id =
-                                SkillId::new(&name).map_err(|e| CoreError::Validation {
-                                    field: "skill_name".to_owned(),
-                                    reason: format!("synthetic name `{name}` invalid: {e}"),
-                                })?;
-                            let frontmatter = format!(
-                                "---\nname: {}\ndescription: Synthetic skill fetched from {}\n---\n# {name}\nSynthetic content for testing.\n",
-                                skill_id.as_str(),
-                                source.locator
-                            );
-                            std::fs::write(
-                                staging_skill_dir.join(SKILL_MD_NAME),
-                                frontmatter.as_bytes(),
-                            )
-                            .map_err(|e| CoreError::InvalidPath {
-                                kind: "staging".to_owned(),
-                                value: staging_skill_dir.display().to_string(),
-                                reason: format!("write synthetic SKILL.md failed: {e}"),
-                            })?;
-                        }
+                        // HTTPS: fetch via ureq. A failed fetch is a hard error —
+                        // content is never invented in place of a download.
+                        fetch_https_to_staging(&source.locator, &staging_skill_dir)?;
                     }
                 }
             }
@@ -1337,27 +1312,10 @@ impl SkillRegistry {
             let metadata = if validate {
                 validate_skill_tree(&staging_skill_dir)?
             } else {
-                // Still need to parse metadata for id/name; but skip file count/size? For simplicity, still validate tree boundaries.
-                // If validate is false, we skip frontmatter? No, we still parse but allow missing? For spec, validate flag controls validation; if false, skip checks.
-                // We'll still validate boundaries but not frontmatter when validate false.
-                // However spec says validate boundaries etc always. So we at least check boundaries.
-                // For now, respect validate flag: if false, just try to parse but don't error on frontmatter absence.
-                match parse_skill_metadata(&staging_skill_dir) {
-                    Ok(meta) => meta,
-                    Err(_) => {
-                        // Create synthetic metadata from directory name
-                        let dir_name = staging_skill_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("synthetic-skill");
-                        let fallback_name = dir_name.to_owned();
-                        SkillMetadata {
-                            name: fallback_name.clone(),
-                            description: "synthetic (validation disabled)".to_owned(),
-                            license: source.license.clone(),
-                        }
-                    }
-                }
+                // Even with validation disabled, identity metadata must come from
+                // the staged SKILL.md — an unparseable tree is an explicit error,
+                // never invented metadata in the registry.
+                parse_skill_metadata(&staging_skill_dir)?
             };
             // Additional file count/size already checked in validate_skill_tree if validate true; if false, we still need to check boundaries via collect
             if !validate {
@@ -1717,28 +1675,9 @@ impl SkillRegistry {
                             )?;
                         }
                     } else {
-                        let fetch_res = fetch_https_to_staging(&source.locator, &staging_dir);
-                        if fetch_res.is_err() {
-                            let name = synthetic_name_from_url(&source.locator);
-                            let synthetic_id =
-                                SkillId::new(&name).map_err(|e| CoreError::Validation {
-                                    field: "skill_name".to_owned(),
-                                    reason: format!("synthetic name invalid: {e}"),
-                                })?;
-                            // Use provided skill_id's name if synthetic differs? but keep synthetic name for digest differentiation
-                            // We'll create frontmatter with the existing skill name to keep id stable, but change description to indicate update
-                            let frontmatter = format!(
-                                "---\nname: {}\ndescription: Updated synthetic skill from {}\n---\n# {}\nUpdated content.\n",
-                                existing.name, source.locator, existing.name
-                            );
-                            std::fs::write(staging_dir.join(SKILL_MD_NAME), frontmatter.as_bytes())
-                                .map_err(|e| CoreError::InvalidPath {
-                                    kind: "staging".to_owned(),
-                                    value: staging_dir.display().to_string(),
-                                    reason: format!("write synthetic failed: {e}"),
-                                })?;
-                            drop(synthetic_id);
-                        }
+                        // HTTPS: fetch via ureq. A failed fetch is a hard error —
+                        // content is never invented in place of a download.
+                        fetch_https_to_staging(&source.locator, &staging_dir)?;
                     }
                 }
             }
@@ -1749,22 +1688,14 @@ impl SkillRegistry {
             return Err(e);
         }
 
-        // Validate new staged tree
-        let validate_res = validate_skill_tree(&staging_dir);
-        if let Err(e) = validate_res {
-            drop(std::fs::remove_dir_all(&staging_root));
-            return Err(e);
-        }
-        let new_metadata = validate_res
-            .map_err(|e| {
+        // Validate new staged tree; an unparseable tree is an explicit error.
+        let new_metadata = match validate_skill_tree(&staging_dir) {
+            Ok(meta) => meta,
+            Err(e) => {
                 drop(std::fs::remove_dir_all(&staging_root));
-                e
-            })
-            .unwrap_or_else(|_| SkillMetadata {
-                name: existing.name.clone(),
-                description: String::new(),
-                license: None,
-            });
+                return Err(e);
+            }
+        };
 
         // Compute digests
         let new_digest = compute_skill_digest(&staging_dir).map_err(|e| {
@@ -1977,19 +1908,9 @@ impl SkillRegistry {
                             )?;
                         }
                     } else {
-                        let fetch_res = fetch_https_to_staging(&source.locator, &staging_dir);
-                        if fetch_res.is_err() {
-                            let frontmatter = format!(
-                                "---\nname: {}\ndescription: Updated synthetic skill from {}\n---\n# {}\nUpdated content.\n",
-                                existing.name, source.locator, existing.name
-                            );
-                            std::fs::write(staging_dir.join(SKILL_MD_NAME), frontmatter.as_bytes())
-                                .map_err(|e| CoreError::InvalidPath {
-                                    kind: "staging".to_owned(),
-                                    value: staging_dir.display().to_string(),
-                                    reason: format!("write synthetic failed: {e}"),
-                                })?;
-                        }
+                        // HTTPS: fetch via ureq. A failed fetch is a hard error —
+                        // content is never invented in place of a download.
+                        fetch_https_to_staging(&source.locator, &staging_dir)?;
                     }
                 }
             }
@@ -2938,7 +2859,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 
 /// Fetch HTTPS URL to staging directory (simple GET, handle file:// already covered).
 ///
-/// Returns error if fetch fails; caller may synthesize fallback.
+/// Returns an explicit [`CoreError::SourceFetch`] if the fetch fails; callers
+/// must propagate the error — content is never invented in place of a
+/// successful download.
 fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     validate_fetch_url(url)?;
     if url.starts_with("file://") {
@@ -2948,10 +2871,10 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
         });
     }
     // Use ureq to fetch bytes
-    let bytes = fetch_bytes_ureq(url).map_err(|e| CoreError::NetworkTemplate {
-        template: url.to_owned(),
-        reason: format!("https fetch failed: {e}"),
-        context_redacted: None,
+    let bytes = fetch_bytes_ureq(url).map_err(|e| CoreError::SourceFetch {
+        kind: "skill_source".to_owned(),
+        locator: url.to_owned(),
+        reason: e,
     })?;
     if bytes.len() > MAX_SINGLE_FILE_BYTES as usize {
         return Err(CoreError::Validation {
@@ -2974,8 +2897,6 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
         value: dest.display().to_string(),
         reason: format!("write fetched bytes failed: {e}"),
     })?;
-    // If bytes were not a full skill (only SKILL.md), we still need at least SKILL.md frontmatter
-    // The fetched content may already be SKILL.md with frontmatter; if not, validation will fail and caller will fallback
     Ok(())
 }
 
@@ -3007,43 +2928,6 @@ fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
         return Err(format!("size limit exceeded for `{url}`"));
     }
     Ok(bytes)
-}
-
-fn synthetic_name_from_url(url: &str) -> String {
-    // Take last path segment, strip query, hash, etc., sanitize
-    let without_scheme = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    let path_part = without_scheme.split('?').next().unwrap_or(without_scheme);
-    let segment = path_part.split('/').next_back().unwrap_or("skill");
-    let mut sanitized = String::new();
-    for ch in segment.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            sanitized.push(ch.to_ascii_lowercase());
-        } else if ch == '.' {
-            // stop at extension
-            break;
-        } else {
-            sanitized.push('-');
-        }
-    }
-    if sanitized.is_empty() {
-        sanitized = "synthetic-skill".to_owned();
-    }
-    // Ensure valid SkillId: must not be reserved, not end with '.' etc.
-    sanitized = sanitized.trim_matches('-').to_owned();
-    if sanitized.is_empty() {
-        sanitized = "synthetic-skill".to_owned();
-    }
-    // Truncate to reasonable length, respecting utf8
-    let mut truncated = String::new();
-    for (idx, ch) in sanitized.chars().enumerate() {
-        if idx >= 32 {
-            break;
-        }
-        truncated.push(ch);
-    }
-    truncated
 }
 
 // ---------------------------------------------------------------------------
@@ -3398,6 +3282,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         write_skill_md(&dir, name, &format!("description for {name}"));
         dir
+    }
+
+    /// Deterministic (path, bytes) snapshot of every regular file under `root`,
+    /// for asserting an operation left the tree unchanged.
+    fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut all = Vec::new();
+        collect_files_recursive(root, &mut all).unwrap();
+        let mut snap: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for p in all {
+            if std::fs::symlink_metadata(&p)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                snap.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+        snap.sort_by(|a, b| a.0.cmp(&b.0));
+        snap
     }
 
     fn make_skill_with_license(parent: &Path, name: &str, license: &str) -> PathBuf {
@@ -4202,6 +4104,144 @@ mod tests {
         let bad_source = SkillSource::github("http://example.com/skill", None);
         let err = install_skill(&root, &bad_source).unwrap_err();
         assert!(format!("{err:?}").contains("https"));
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&src_parent));
+    }
+
+    #[test]
+    fn install_https_fetch_failure_returns_typed_error_and_writes_nothing() {
+        // An unreachable HTTPS source must fail with the typed fetch error;
+        // nothing is written to the registry or disk (no invented skill).
+        let root = unique_root("install_https_fail_root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let unreachable = "https://127.0.0.1:1/skills/demo/SKILL.md";
+        let source = SkillSource::github(unreachable, None);
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let err = reg.install_skill(&source, true).unwrap_err();
+        match &err {
+            CoreError::SourceFetch { locator, .. } => {
+                assert_eq!(locator, unreachable);
+            }
+            other => panic!("expected SourceFetch, got {other:?}"),
+        }
+        // Display carries the failing locator so users can see what failed.
+        assert!(err.to_string().contains(unreachable));
+        // Registry and disk stay untouched: no record, no skill dir, no file.
+        let reloaded = SkillRegistry::load(&root).unwrap();
+        assert!(reloaded.records.is_empty());
+        assert!(!root.join("demo").exists());
+        assert!(!root.join(REGISTRY_FILE_NAME).exists());
+
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn preview_update_https_fetch_failure_returns_typed_error_and_changes_nothing() {
+        let root = unique_root("preview_https_fail_root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let src_parent = unique_root("preview_https_fail_src");
+        std::fs::create_dir_all(&src_parent).unwrap();
+        let src = make_skill_dir(&src_parent, "preview-https-skill");
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let rec = reg
+            .install_skill(&SkillSource::local_dir(src.to_str().unwrap()), true)
+            .unwrap();
+        let before = snapshot_tree(&root);
+        assert!(!before.is_empty());
+
+        let unreachable = "https://127.0.0.1:1/skills/demo/SKILL.md";
+        let new_source = SkillSource::github(unreachable, None);
+        let err = reg.preview_update(&rec.id, Some(&new_source)).unwrap_err();
+        assert!(
+            matches!(err, CoreError::SourceFetch { .. }),
+            "expected SourceFetch, got {err:?}"
+        );
+        // Registry record kept in memory and every file on disk unchanged.
+        assert_eq!(reg.records.len(), 1);
+        assert_eq!(snapshot_tree(&root), before);
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&src_parent));
+    }
+
+    #[test]
+    fn commit_update_https_fetch_failure_returns_typed_error_and_changes_nothing() {
+        let root = unique_root("commit_https_fail_root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let src_parent = unique_root("commit_https_fail_src");
+        std::fs::create_dir_all(&src_parent).unwrap();
+        let src = make_skill_dir(&src_parent, "commit-https-skill");
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let rec = reg
+            .install_skill(&SkillSource::local_dir(src.to_str().unwrap()), true)
+            .unwrap();
+        let before = snapshot_tree(&root);
+        assert!(!before.is_empty());
+
+        let unreachable = "https://127.0.0.1:1/skills/demo/SKILL.md";
+        let new_source = SkillSource::github(unreachable, None);
+        let preview = SkillUpdatePreview {
+            skill_id: rec.id.clone(),
+            from_digest: rec.digest.clone(),
+            to_digest: "0".repeat(64),
+            has_local_edits: false,
+            diff: Vec::new(),
+            conflicts: Vec::new(),
+            drift: None,
+            can_auto_apply: true,
+        };
+        let err = reg
+            .commit_update(&rec.id, Some(&new_source), &preview)
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::SourceFetch { .. }),
+            "expected SourceFetch, got {err:?}"
+        );
+        assert_eq!(reg.records.len(), 1);
+        assert_eq!(snapshot_tree(&root), before);
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&src_parent));
+    }
+
+    #[test]
+    fn install_validation_disabled_still_requires_real_frontmatter() {
+        // validate=false skips tree checks, but the identity metadata must
+        // still come from the staged SKILL.md — never invented.
+        let root = unique_root("no_fabricate_meta_root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let src_parent = unique_root("no_fabricate_meta_src");
+        std::fs::create_dir_all(&src_parent).unwrap();
+        let src = src_parent.join("src-no-frontmatter");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(SKILL_MD_NAME), "# just markdown, no frontmatter\n").unwrap();
+
+        let source = SkillSource::local_dir(src.to_str().unwrap());
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let err = reg.install_skill(&source, false).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Validation { ref field, .. } if field == "skill_frontmatter"),
+            "expected frontmatter validation error, got {err:?}"
+        );
+        let reloaded = SkillRegistry::load(&root).unwrap();
+        assert!(reloaded.records.is_empty());
+        assert!(!root.join(REGISTRY_FILE_NAME).exists());
+
+        // A parseable SKILL.md still installs with validation disabled, and the
+        // installed bytes are the real source bytes (nothing invented).
+        let good = make_skill_dir(&src_parent, "real-frontmatter-skill");
+        let rec = reg
+            .install_skill(&SkillSource::local_dir(good.to_str().unwrap()), false)
+            .unwrap();
+        assert_eq!(rec.name, "real-frontmatter-skill");
+        let installed = std::fs::read(root.join(rec.id.as_str()).join(SKILL_MD_NAME)).unwrap();
+        let source_bytes = std::fs::read(good.join(SKILL_MD_NAME)).unwrap();
+        assert_eq!(installed, source_bytes);
 
         drop(std::fs::remove_dir_all(&root));
         drop(std::fs::remove_dir_all(&src_parent));

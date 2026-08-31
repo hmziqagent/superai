@@ -285,6 +285,21 @@ pub enum CoreError {
         context_redacted: Option<RedactedString>,
     },
 
+    /// Fetching a remote source (e.g., a skill over HTTPS) failed.
+    ///
+    /// Content is never fabricated in place of a successful fetch: the
+    /// operation fails with the failing locator so the caller can retry or
+    /// report honestly.
+    #[error("source fetch failed for {kind} `{locator}`: {reason}")]
+    SourceFetch {
+        /// Kind of source that failed, e.g., `skill_source`.
+        kind: String,
+        /// Locator (URL) the fetch was attempted from.
+        locator: String,
+        /// Reason the fetch failed; transport/HTTP detail, never secret-bearing.
+        reason: String,
+    },
+
     /// Authentication is required but owned externally.
     #[error("auth required for harness `{harness}` instance `{instance:?}`: {reason}")]
     AuthRequired {
@@ -504,6 +519,11 @@ mod tests {
                 template: "claude-glm".to_owned(),
                 reason: "network failure".to_owned(),
                 context_redacted: None,
+            },
+            CoreError::SourceFetch {
+                kind: "skill_source".to_owned(),
+                locator: "https://example.com/skills/demo/SKILL.md".to_owned(),
+                reason: "connection refused".to_owned(),
             },
             CoreError::AuthRequired {
                 harness: "claude-code".to_owned(),
