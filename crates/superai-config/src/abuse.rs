@@ -58,7 +58,9 @@ mod tests {
     use crate::backup::{backup, list_backups};
     use crate::document::DocumentKind;
     use crate::quarantine::validate_quarantine_target;
-    use crate::snapshot::{is_modified, snapshot};
+    #[cfg(unix)]
+    use crate::snapshot::is_modified;
+    use crate::snapshot::snapshot;
     use crate::transaction::{FileAction, OperationId, Transaction};
     use std::path::PathBuf;
 
@@ -566,18 +568,31 @@ mod tests {
         }
         // Cleanup long file if created
         drop(std::fs::remove_file(&long_path));
-        // Case-insensitive collision: two files differing only in case should be detectable via snapshot/digest
+        // Case-variant names: on a case-sensitive filesystem these are two
+        // distinct files and their snapshot digests must differ; on a
+        // case-insensitive filesystem (default APFS) the second write lands on
+        // the SAME physical file, so both names observe one installation and
+        // the digests must agree. Probe which filesystem kind we are on by
+        // reading back through the first name after the second write.
         let lower = dir.join("case.json");
         let upper = dir.join("CASE.json");
         std::fs::write(&lower, br#"{"a":1}"#).unwrap();
         std::fs::write(&upper, br#"{"a":2}"#).unwrap();
+        let lower_readback = std::fs::read(&lower).unwrap_or_default();
+        let case_sensitive = lower_readback == *br#"{"a":1}"#;
         let snap_lower = snapshot(&lower);
         let snap_upper = snapshot(&upper);
-        // On case-sensitive fs they are distinct; on case-insensitive they collide – either way snapshot must not panic and digests differ
-        assert!(
-            snap_lower.digest != snap_upper.digest,
-            "case variant digests should differ"
-        );
+        if case_sensitive {
+            assert_ne!(
+                snap_lower.digest, snap_upper.digest,
+                "case variant files must keep distinct digests"
+            );
+        } else {
+            assert_eq!(
+                snap_lower.digest, snap_upper.digest,
+                "case-insensitive filesystem: one physical file seen through two names must have one digest"
+            );
+        }
         assert!(!format!("{snap_lower:?}").contains(SENTINEL));
         // CRLF handling: env/json with CRLF must not panic and must round-trip
         let crlf_path = dir.join("crlf.json");

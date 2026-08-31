@@ -1054,6 +1054,40 @@ mod tests {
         crate::test_util::temp_dir_unique(&format!("provider-{name}"))
     }
 
+    /// Write a fake `claude` binary that answers `--version` with a parseable
+    /// version. Keeps the adapter's version gate hermetic: no real `claude`
+    /// install is probed on the host.
+    fn write_fake_claude(dir: &Path) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let path = dir.join("claude");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"1.2.3 (Claude Code)\"; exit 0; fi\necho \"Usage: claude\"\n",
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+            path
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows cannot exec a `#!/bin/sh` script; a batch stub answers
+            // the same probe through cmd.exe.
+            let path = dir.join("claude.bat");
+            std::fs::write(
+                &path,
+                "@echo off\r\nif \"%1\"==\"--version\" (echo 1.2.3) else (echo Usage: claude)\r\n",
+            )
+            .unwrap();
+            path
+        }
+    }
+
     fn single_provider_json(id: &str, base_url: &str) -> String {
         format!(
             r#"{{
@@ -1600,7 +1634,16 @@ status: active
     fn api_key_placement_only_to_declared_sink_and_redacted() {
         let dir = tmp_dir("api-key-sink");
         let inst = sample_instance(&dir, "work-sink");
-        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::default();
+        // Hermetic version gate: `commit_api_key` enforces the adapter's
+        // version resolution, which otherwise probes whatever `claude` happens
+        // to be on PATH (none on CI). Pin a fake binary that answers
+        // `--version` so the gate sees a compatible harness deterministically.
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_claude = write_fake_claude(&bin_dir);
+        let adapter =
+            crate::adapters::claude_code::ClaudeCodeAdapter::with_configured_binary(fake_claude)
+                .unwrap();
         let provider = ProviderDefinition {
             id: ProviderId::new("test-prov-key").unwrap(),
             display_name: "Test".to_owned(),

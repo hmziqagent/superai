@@ -1094,12 +1094,16 @@ fn probe_bundle_id(bundle_id: &str, opts: &DetectOptions) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         crate::test_util::temp_dir_unique(prefix)
     }
 
+    /// Write a fake harness executable answering `--version`. The script is a
+    /// `#!/bin/sh` file, so this (and the tests that probe it) run on unix only.
+    #[cfg(unix)]
     fn write_fake_exe(dir: &Path, name: &str, version_output: &str) {
         let path = dir.join(name);
         let script = format!("#!/bin/sh\necho \"{version_output}\"\n");
@@ -1109,6 +1113,7 @@ mod tests {
         fs::set_permissions(&path, perms).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn detect_with_temp_path_finds_executables_in_order() {
         let tmp1 = make_temp_dir("a");
@@ -1158,6 +1163,7 @@ mod tests {
         drop(fs::remove_dir_all(&home));
     }
 
+    #[cfg(unix)]
     #[test]
     fn detect_reports_mise_shim_when_present() {
         let tmp_path = make_temp_dir("path3");
@@ -1197,9 +1203,14 @@ mod tests {
         // Create a shim that exits non-zero
         let shim_path = shim_dir.join("claude");
         fs::write(&shim_path, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&shim_path, perms).unwrap();
+        // The exec bit only exists on unix; off unix the spawn itself fails,
+        // which exercises the same "probe produced no version" path.
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&shim_path, perms).unwrap();
+        }
 
         let catalog = InstallCatalog::embedded().unwrap();
         let entry = catalog.get_str("claude-code").unwrap().clone();
@@ -1223,6 +1234,7 @@ mod tests {
         drop(fs::remove_dir_all(&home));
     }
 
+    #[cfg(unix)]
     #[test]
     fn detect_does_not_pick_silently_when_multiple() {
         let tmp1 = make_temp_dir("multi1");
@@ -1281,6 +1293,7 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_fake_wrapper_never_shell_interpolates() {
         // Directly test that run_command with duct never spawns shell by checking

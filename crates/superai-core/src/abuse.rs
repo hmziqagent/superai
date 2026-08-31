@@ -616,19 +616,25 @@ mod tests {
             }
         }
 
-        // Test process run_command does not interpret shell metachars
-        let token = "$(whoami) && echo pwned | cat".to_owned();
-        let opts = crate::process::ExecuteOpts {
-            timeout: Some(std::time::Duration::from_secs(2)),
-            ..Default::default()
-        };
-        let out = crate::process::run_command("echo", std::slice::from_ref(&token), &opts).unwrap();
-        assert_eq!(
-            out.stdout_trimmed(),
-            token,
-            "shell metachars must be passed literally, not executed"
-        );
-        assert_no_sentinel_in_debug(&out, "process output");
+        // Test process run_command does not interpret shell metachars. The
+        // unix-shell metachar guarantee is exercised with a real `echo`
+        // binary, which windows does not ship.
+        #[cfg(unix)]
+        {
+            let token = "$(whoami) && echo pwned | cat".to_owned();
+            let opts = crate::process::ExecuteOpts {
+                timeout: Some(std::time::Duration::from_secs(2)),
+                ..Default::default()
+            };
+            let out =
+                crate::process::run_command("echo", std::slice::from_ref(&token), &opts).unwrap();
+            assert_eq!(
+                out.stdout_trimmed(),
+                token,
+                "shell metachars must be passed literally, not executed"
+            );
+            assert_no_sentinel_in_debug(&out, "process output");
+        }
     }
 
     #[test]

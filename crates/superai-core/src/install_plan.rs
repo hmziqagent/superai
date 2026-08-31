@@ -595,7 +595,9 @@ mod tests {
     use crate::install_catalog::{
         DetectHints, InstallCatalogEntry, InstallMethod, PlatformConstraints,
     };
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn minimal_entry(harness: &str, os: &[&str], arch: &[&str]) -> InstallCatalogEntry {
@@ -709,6 +711,9 @@ mod tests {
         }
     }
 
+    /// Writability is proven through POSIX permission bits (0o500 read-only
+    /// directory), so this runs on unix only.
+    #[cfg(unix)]
     #[test]
     fn plan_checks_writable_destination() {
         let tmp = crate::test_util::temp_dir_unique("plan");

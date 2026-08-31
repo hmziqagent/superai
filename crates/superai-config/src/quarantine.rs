@@ -358,9 +358,10 @@ pub fn move_to_quarantine_with_dest(
                 copy_dir_recursively(path, &final_dest)?;
                 std::fs::remove_dir_all(path).map_err(|e2| ConfigError::io(path, e2))?;
             } else if meta.file_type().is_symlink() {
-                let target = std::fs::read_link(path).map_err(|e2| ConfigError::io(path, e2))?;
                 #[cfg(unix)]
                 {
+                    let target =
+                        std::fs::read_link(path).map_err(|e2| ConfigError::io(path, e2))?;
                     std::os::unix::fs::symlink(&target, &final_dest)
                         .map_err(|e2| ConfigError::io(&final_dest, e2))?;
                 }
@@ -419,9 +420,9 @@ fn copy_dir_recursively(from: &Path, to: &Path) -> Result<()> {
         if meta.is_dir() {
             copy_dir_recursively(&src, &dest)?;
         } else if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&src).map_err(|e| ConfigError::io(&src, e))?;
             #[cfg(unix)]
             {
+                let target = std::fs::read_link(&src).map_err(|e| ConfigError::io(&src, e))?;
                 std::os::unix::fs::symlink(&target, &dest)
                     .map_err(|e| ConfigError::io(&dest, e))?;
             }

@@ -90,6 +90,10 @@ fn apply_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
+)]
 fn apply_mode(path: &Path, _mode: u32) -> Result<()> {
     let _ = path;
     Ok(())

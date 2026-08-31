@@ -76,13 +76,33 @@ pub const OWNED_SELECTORS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeAdapter {
     id: HarnessId,
+    /// Explicit binary location that wins over the `PATH` scan, mirroring
+    /// the `SUPERAI_CONFIGURED_BINARY_CLAUDE_CODE` detection source.
+    configured_binary: Option<PathBuf>,
 }
 
 impl ClaudeCodeAdapter {
     /// Create a new adapter instance, validating the static harness id.
     pub fn new() -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
-        Ok(Self { id })
+        Ok(Self {
+            id,
+            configured_binary: None,
+        })
+    }
+
+    /// Create an adapter pinned to an explicit `claude` binary location.
+    ///
+    /// The pinned path is probed before the `PATH` scan, matching the
+    /// `SUPERAI_CONFIGURED_BINARY_CLAUDE_CODE` detection source used by
+    /// [`crate::detect`]. Callers that already know where the harness binary
+    /// lives (install receipts, tests) use this instead of ambient `PATH`.
+    pub fn with_configured_binary(path: PathBuf) -> Result<Self, CoreError> {
+        let id = HarnessId::new(HARNESS_ID_STR)?;
+        Ok(Self {
+            id,
+            configured_binary: Some(path),
+        })
     }
 
     /// Borrow the harness id.
@@ -100,10 +120,15 @@ impl ClaudeCodeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `claude` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
+    /// Try to locate the `claude` binary: a pinned configured binary wins,
+    /// otherwise scan `PATH`.
     #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
     fn find_binary_in_path(&self) -> Option<PathBuf> {
+        if let Some(pinned) = &self.configured_binary
+            && pinned.is_file()
+        {
+            return Some(pinned.clone());
+        }
         let path_var = std::env::var("PATH").ok()?;
         let separator = if cfg!(windows) { ';' } else { ':' };
         for dir in path_var.split(separator) {
@@ -277,7 +302,10 @@ impl Default for ClaudeCodeAdapter {
         // Static id is known valid; use expect with reason for the lint.
         #[expect(clippy::unwrap_used, reason = "claude-code is static valid HarnessId")]
         let id = HarnessId::new(HARNESS_ID_STR).unwrap();
-        Self { id }
+        Self {
+            id,
+            configured_binary: None,
+        }
     }
 }
 

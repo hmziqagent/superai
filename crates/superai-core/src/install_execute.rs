@@ -490,7 +490,12 @@ pub fn verify_install(
         reason: format!("post-install detection found no executable for `{harness}`"),
     })?;
 
-    // If pre-existing detection already contained this exact path+version, do not claim
+    // If the pre-install detection already covered this exact installation, do
+    // not claim it. The same canonical path means the same physical binary:
+    // an unknown version on either side is "unknown, not new" and is never
+    // grounds for a fresh-install receipt (PKG-06). A genuine version change
+    // (both versions known and different) falls through to the explicit
+    // upgrade logic below instead.
     let pre_has_same = pre_detections.iter().any(|pre| {
         // Compare canonical paths when possible, else direct path equality
         let same_path = pre.path == best.path
@@ -498,13 +503,15 @@ pub fn verify_install(
                 .ok()
                 .zip(std::fs::canonicalize(&best.path).ok())
                 .is_some_and(|(a, b)| a == b);
-        let same_version = match (&pre.version, &best.version) {
+        if !same_path {
+            return false;
+        }
+        match (&pre.version, &best.version) {
             (Some(a), Some(b)) => a == b,
-            (None, None) => true,
-            _ => false,
-        };
-        // Also consider same executable name and method-like source
-        same_path && same_version
+            // Same physical path with an unprobed version on either side:
+            // we cannot prove the binary is new, so we must not claim it.
+            _ => true,
+        }
     });
     if pre_has_same {
         return Ok(None);
@@ -1542,13 +1549,17 @@ mod tests {
     use crate::install_catalog::{
         DetectHints, InstallCatalogEntry, InstallMethod, PlatformConstraints,
     };
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     fn make_temp_dir(prefix: &str) -> PathBuf {
         crate::test_util::temp_dir_unique(prefix)
     }
 
+    #[cfg(unix)]
     #[expect(dead_code, reason = "helper for future tests")]
     fn write_fake_exe(dir: &Path, name: &str, version_line: &str) {
         let path = dir.join(name);
@@ -1559,6 +1570,10 @@ mod tests {
         fs::set_permissions(&path, perms).unwrap();
     }
 
+    /// Write a fake harness executable answering `--help` and `--version`.
+    /// The script is a `#!/bin/sh` file, so this (and the tests that probe it)
+    /// run on unix only.
+    #[cfg(unix)]
     fn write_help_exe(dir: &Path, name: &str) {
         let path = dir.join(name);
         let script = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: my-harness --help\"; exit 0; fi\necho \"my-harness 1.2.3\"\n";
@@ -1620,6 +1635,19 @@ mod tests {
 
     // ---- PKG-05 ----
 
+    /// (`echo`-equivalent program, prefix args): unix ships a real `echo`
+    /// binary; windows has none in PATH, so route through `cmd /C echo`.
+    fn echo_program() -> (&'static str, Vec<String>) {
+        #[cfg(unix)]
+        {
+            ("echo", Vec::new())
+        }
+        #[cfg(windows)]
+        {
+            ("cmd", vec!["/C".to_owned(), "echo".to_owned()])
+        }
+    }
+
     #[test]
     fn structured_opts_has_timeout_and_bound_and_minimal_env() {
         let opts = structured_opts(false);
@@ -1636,6 +1664,7 @@ mod tests {
         assert!(redacted_opts.redact);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_structured_no_shell_interpolation() {
         let token = "$(whoami) && echo pwned | cat".to_owned();
@@ -1646,15 +1675,18 @@ mod tests {
 
     #[test]
     fn run_structured_redacts_secrets() {
-        let args = vec![
+        let args = [
             "--token".to_owned(),
             "mysecret123".to_owned(),
             "other".to_owned(),
         ];
+        let (prog, prefix) = echo_program();
+        let mut full_args = prefix;
+        full_args.extend(args.iter().cloned());
         // run with redact=true, verify output still succeeds but display would redact
-        let out = run_structured_command("echo", &args, true).unwrap();
+        let out = run_structured_command(prog, &full_args, true).unwrap();
         assert!(out.success);
-        let display = display_command("echo", &args, true);
+        let display = display_command(prog, &full_args, true);
         assert!(display.contains("***"));
         assert!(!display.contains("mysecret123"));
     }
@@ -1675,19 +1707,29 @@ mod tests {
             clear_env: false,
             ..Default::default()
         };
-        let err = run_command("echo", &[large], &opts).unwrap_err();
+        let (prog, prefix) = echo_program();
+        let mut args = prefix;
+        args.push(large);
+        let err = run_command(prog, &args, &opts).unwrap_err();
         assert!(format!("{err}").contains("output limit exceeded"));
     }
 
     #[test]
     fn run_structured_minimal_env_still_resolves_echo() {
-        // Even with clear_env, minimal_env preserves PATH so `echo` resolves
-        let out = run_structured_command("echo", &["hello".to_owned()], false).unwrap();
+        // Even with clear_env, minimal_env preserves PATH so the echo program
+        // (`echo` on unix, `cmd` in System32 on windows) resolves
+        let (prog, prefix) = echo_program();
+        let mut args = prefix;
+        args.push("hello".to_owned());
+        let out = run_structured_command(prog, &args, false).unwrap();
         assert_eq!(out.stdout.trim(), "hello");
     }
 
     // ---- PKG-06 ----
+    // The receipt/update/uninstall tests below execute `#!/bin/sh` fake
+    // harness binaries, so they run on unix only.
 
+    #[cfg(unix)]
     #[test]
     fn verify_receipt_not_claiming_pre_existing() {
         // Setup: fake exe already present before install, with version 1.2.3
@@ -1765,6 +1807,97 @@ mod tests {
         drop(fs::remove_dir_all(home));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_receipt_same_path_with_unprobed_version_is_not_claimed() {
+        // PKG-06: the same canonical path IS the same installation. A version
+        // probe that transiently fails on either side of the install is
+        // "unknown, not new" and must never produce a fresh-install receipt.
+        let tmp = make_temp_dir("unknown-ver");
+        let home = make_temp_dir("home-unknown-ver");
+        let harness = HarnessId::new("claude-code").unwrap();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+
+        // Post-detection cannot parse a version (probe failed), while the
+        // caller's pre snapshot recorded 1.2.3 for the same physical binary.
+        write_help_exe(&tmp, "claude");
+        fs::write(
+            tmp.join("claude"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: claude --help\"; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        {
+            let mut perms = fs::metadata(tmp.join("claude")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.join("claude"), perms).unwrap();
+        }
+        let mut pre = Detection::new(
+            "claude-code",
+            "claude",
+            tmp.join("claude"),
+            DetectionSource::Path,
+            crate::detect::DetectionConfidence::Medium,
+        );
+        pre.version = Some("1.2.3".to_owned());
+        let receipt = verify_install(
+            &harness,
+            Some("1.2.3"),
+            &InstallMethodKind::Npm,
+            std::slice::from_ref(&pre),
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            receipt.is_none(),
+            "same path with unprobed post version must not be claimed: {receipt:?}"
+        );
+
+        // Mirror case: the binary answers 1.2.3 now, but the pre snapshot for
+        // the same path never got a version.
+        fs::write(
+            tmp.join("claude"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: claude --help\"; exit 0; fi\necho \"1.2.3\"\n",
+        )
+        .unwrap();
+        {
+            let mut perms = fs::metadata(tmp.join("claude")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.join("claude"), perms).unwrap();
+        }
+        let pre_unknown = Detection::new(
+            "claude-code",
+            "claude",
+            tmp.join("claude"),
+            DetectionSource::Path,
+            crate::detect::DetectionConfidence::Medium,
+        );
+        let receipt2 = verify_install(
+            &harness,
+            Some("1.2.3"),
+            &InstallMethodKind::Npm,
+            std::slice::from_ref(&pre_unknown),
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            receipt2.is_none(),
+            "same path with unprobed pre version must not be claimed: {receipt2:?}"
+        );
+
+        drop(fs::remove_dir_all(tmp));
+        drop(fs::remove_dir_all(home));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn verify_receipt_fails_on_wrong_version() {
         let tmp = make_temp_dir("wrongver");
@@ -1836,6 +1969,7 @@ mod tests {
 
     // ---- PKG-07 ----
 
+    #[cfg(unix)]
     #[test]
     fn update_plan_detects_current_and_shows_compat_and_blocks() {
         let tmp = make_temp_dir("update-cur");
@@ -1884,6 +2018,7 @@ mod tests {
         drop(fs::remove_dir_all(home));
     }
 
+    #[cfg(unix)]
     #[test]
     fn update_execute_respects_block() {
         let tmp = make_temp_dir("update-exec");
@@ -1926,6 +2061,7 @@ mod tests {
 
     // ---- PKG-08 ----
 
+    #[cfg(unix)]
     #[test]
     fn uninstall_preflight_lists_instances_and_preserves_config() {
         let tmp = make_temp_dir("uninstall-preserve");
@@ -2014,6 +2150,7 @@ mod tests {
         drop(fs::remove_dir_all(home));
     }
 
+    #[cfg(unix)]
     #[test]
     fn uninstall_blocks_foreign_manual_file_without_explicit() {
         let tmp = make_temp_dir("foreign");

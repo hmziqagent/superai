@@ -404,9 +404,23 @@ fn set_safe_permissions(path: &Path, original_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_safe_permissions(path: &Path, _original_path: &Path) -> Result<()> {
-    let _ = path;
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
+)]
+fn set_safe_permissions(_path: &Path, _original_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Best-effort probe that a planned path's unix file identity (device+inode)
+/// is observable; duplicate identities across steps are surfaced by
+/// verification after commit.
+#[cfg(unix)]
+fn note_inode_identity(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        let _ = (meta.dev(), meta.ino());
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -741,10 +755,6 @@ impl Transaction {
     ///
     /// Checks path safety, symlink loops, duplicate inode/file identity
     /// surrogates (same path or case-fold collision), and traversal.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "plan validation requires nested checks"
-    )]
     pub fn validate_plan(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_folded: HashSet<String> = HashSet::new();
@@ -783,14 +793,7 @@ impl Transaction {
             // Detect multiple planned paths resolving to same inode where file exists
             // (best-effort via symlink_metadata device+inode on unix).
             #[cfg(unix)]
-            {
-                if let Ok(meta) = std::fs::symlink_metadata(path) {
-                    use std::os::unix::fs::MetadataExt;
-                    let dev = meta.dev();
-                    let ino = meta.ino();
-                    let _ = (dev, ino);
-                }
-            }
+            note_inode_identity(path);
         }
         // Check sorted order will be deterministic: ensure no hard-link surprise
         // is silently ignored. We warn via verification later.

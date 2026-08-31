@@ -40,8 +40,11 @@ fn set_permissions_u32(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_permissions_u32(path: &Path, _mode: u32) -> Result<()> {
-    let _ = path;
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
+)]
+fn set_permissions_u32(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -234,15 +237,10 @@ pub fn backup_with_operation(
 
     std::fs::copy(path, &target).map_err(|e| ConfigError::io(path, e))?;
 
+    // No POSIX mode exists off unix, so `permissions` is always None there
+    // and this is a windows no-op.
     if let Some(mode) = permissions {
-        #[cfg(unix)]
-        {
-            set_permissions_u32(&target, mode)?;
-        }
-        #[cfg(not(unix))]
-        {
-            let _mode = mode;
-        }
+        set_permissions_u32(&target, mode)?;
     }
 
     {
