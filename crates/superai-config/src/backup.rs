@@ -1177,4 +1177,88 @@ mod tests {
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&entry.backup_path));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_over_symlinked_original_replaces_the_link_not_its_referent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("config-backup-restore-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let referent = dir.join("referent.json");
+        std::fs::write(&referent, b"referent bytes").unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        // The backup is taken through the link, so it records the referent's
+        // bytes under the link's path.
+        let entry = backup(&link)
+            .unwrap()
+            .expect("backup through a file symlink");
+        std::fs::write(&link, b"changed by writing through the link").unwrap();
+        assert_eq!(
+            std::fs::read(&referent).unwrap(),
+            b"changed by writing through the link"
+        );
+
+        restore_entry(&entry).unwrap();
+
+        // The link itself is replaced by a regular file carrying the backup
+        // bytes; the restore never writes through to the old referent.
+        let link_meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            !link_meta.file_type().is_symlink(),
+            "restore must replace the link itself, not follow it"
+        );
+        assert!(link_meta.is_file());
+        assert_eq!(std::fs::read(&link).unwrap(), b"referent bytes");
+        assert_eq!(
+            std::fs::read(&referent).unwrap(),
+            b"changed by writing through the link",
+            "the referent the link pointed at must be untouched"
+        );
+        assert_no_temp_litter(&dir);
+
+        // The restored file may carry the link-derived mode, so relax it
+        // before cleanup.
+        std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_file(&referent));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_succeeds_over_read_only_target_and_lands_recorded_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        fn set_mode(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let path = unique_scratch("restore-readonly");
+        std::fs::write(&path, b"backed up bytes").unwrap();
+        set_mode(&path, 0o400);
+
+        let entry = backup(&path).unwrap().expect("backup of a read-only file");
+        assert_eq!(entry.permissions.map(|m| m & 0o777), Some(0o400));
+
+        // Change the bytes and leave the target read-only: an in-place write
+        // (the old `std::fs::copy` restore) could not open it at all.
+        set_mode(&path, 0o600);
+        std::fs::write(&path, b"newer bytes").unwrap();
+        set_mode(&path, 0o400);
+
+        restore_entry(&entry).unwrap();
+
+        let restored = std::fs::read(&path).unwrap();
+        assert_eq!(restored, b"backed up bytes");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "the recorded read-only mode must be landed");
+        assert_no_temp_litter(path.parent().unwrap());
+
+        set_mode(&path, 0o600);
+        set_mode(&entry.backup_path, 0o600);
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
 }
