@@ -83,6 +83,20 @@ pub enum ConfigError {
         /// Human-readable reason.
         reason: String,
     },
+
+    /// A changing write was refused because the codec cannot preserve the
+    /// file's lexical content (comments, anchors, tags, scalar style,
+    /// trailing commas). The format stays read-only for such writes until a
+    /// lexically preserving codec exists (plans/01 DOC-05/DOC-06).
+    #[error(
+        "lossy write unsupported for {path}: {format} is read-only until a lexically preserving codec exists"
+    )]
+    LossyWrite {
+        /// Path of the file the write was refused for.
+        path: PathBuf,
+        /// Human-readable format label (e.g. `"jsonc"`, `"yaml"`).
+        format: &'static str,
+    },
 }
 
 impl ConfigError {
@@ -116,6 +130,13 @@ impl ConfigError {
         Self::BackupVerification {
             path: path.into(),
             reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn lossy_write(path: impl Into<PathBuf>, format: &'static str) -> Self {
+        Self::LossyWrite {
+            path: path.into(),
+            format,
         }
     }
 }

@@ -1189,7 +1189,10 @@ mod tests {
     }
 
     #[test]
-    fn yaml_comment_handling() {
+    fn yaml_comment_changing_write_refused_and_comments_preserved() {
+        // codec-honesty (DOC-06): comments parse on read, but a changing write
+        // on a comment-bearing YAML file is refused instead of normalizing the
+        // comments away; the on-disk bytes survive verbatim.
         let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("comment.yml");
@@ -1198,17 +1201,22 @@ mod tests {
         let map = superai_config::yaml::load(&path).unwrap();
         assert_eq!(map["model"], serde_json::Value::String("gpt-4".to_owned()));
         assert_eq!(map["dark-mode"], serde_json::Value::Bool(true));
-        superai_config::yaml::edit(&path, |m| {
+        let result = superai_config::yaml::edit(&path, |m| {
             m.insert(
                 "model".to_owned(),
                 serde_json::Value::String("gpt-5".to_owned()),
             );
-        })
-        .unwrap();
-        let after = superai_config::yaml::load(&path).unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "yaml");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
         assert_eq!(
-            after["model"],
-            serde_json::Value::String("gpt-5".to_owned())
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "refused edit must leave the file byte-identical"
         );
         drop(std::fs::remove_file(&path));
     }

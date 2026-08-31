@@ -668,6 +668,22 @@ fn write_outer_with_inner(
     outer: &Map<String, Value>,
     inner: &BTreeMap<String, Value>,
 ) -> Result<()> {
+    // codec-honesty (DOC-05/DOC-06): the only serializer available here is
+    // normalized JSON, which cannot preserve JSONC/YAML lexical material
+    // (comments, anchors, tags, scalar style). Refuse instead of corrupting;
+    // the typed config error propagates to the caller.
+    let lossy_format = match decl.kind {
+        DocumentKind::Jsonc => Some("jsonc"),
+        DocumentKind::Yaml => Some("yaml"),
+        _ => None,
+    };
+    if let Some(format) = lossy_format {
+        return Err(CoreError::Config(superai_config::ConfigError::LossyWrite {
+            path: path.to_path_buf(),
+            format,
+        }));
+    }
+
     // Build new outer preserving foreign keys, replacing dest_key
     let mut new_outer = outer.clone();
     if inner.is_empty() {
@@ -1295,5 +1311,51 @@ mod tests {
         assert!(diff.contains("[REDACTED]"));
         assert!(!diff.contains("super-secret-123"));
         assert!(!diff.contains("secret-token-xyz"));
+    }
+
+    #[test]
+    fn lossy_surfaces_refuse_install_and_leave_file_untouched() {
+        // codec-honesty (DOC-05/DOC-06): JSONC/YAML MCP surfaces must fail
+        // with the typed lossy-write error instead of receiving normalized
+        // JSON bytes.
+        for (kind, file_name, format) in [
+            (DocumentKind::Jsonc, "settings.jsonc", "jsonc"),
+            (DocumentKind::Yaml, "settings.yaml", "yaml"),
+        ] {
+            let dir = crate::test_util::temp_dir_unique("mcp");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(file_name);
+            let d = McpAdapterDecl::new(
+                file_name,
+                "mcpServers",
+                kind,
+                ConfigScope::User,
+                RestartBehavior::None,
+            );
+            let id = McpServerId::new("owned").unwrap();
+            let server = McpServerDef::stdio(id, "node", vec!["server.js".to_owned()]).unwrap();
+
+            // Absent file: even creation is refused — the serialized bytes
+            // would not match the declared surface kind.
+            let err = install_mcp_server(&path, &d, &server).unwrap_err();
+            match err {
+                CoreError::Config(superai_config::ConfigError::LossyWrite {
+                    format: f, ..
+                }) => assert_eq!(f, format),
+                other => panic!("expected LossyWrite, got {other:?}"),
+            }
+            assert!(!path.exists(), "refused install must not create the file");
+
+            // Existing JSON-parseable file: refuses before any write or backup.
+            std::fs::write(&path, b"{\"mcpServers\": {}}").unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let err2 = install_mcp_server(&path, &d, &server).unwrap_err();
+            assert!(matches!(
+                err2,
+                CoreError::Config(superai_config::ConfigError::LossyWrite { .. })
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            drop(std::fs::remove_file(&path));
+        }
     }
 }

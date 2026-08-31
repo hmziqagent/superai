@@ -20,13 +20,20 @@
 //! by `deny.toml`.
 //!
 //! Preservation contract (DOC-06):
-//! - `serde`-based YAML loses comments, anchor names, alias structure, tag
-//!   information, scalar style (literal vs folded vs flow), and document
-//!   markers on write. The file is normalized on write via `yaml_serde::to_string`.
-//!   Therefore this module is suitable for validation and for normalized writes;
-//!   it does **not** provide lexical preservation of comments or styles.
-//!   A future lossless codec (e.g. `yaml-edit`) can replace the serialization
-//!   layer while keeping the same parse/validation surface.
+//! - Write policy: a `serde`-based writer normalizes comments, anchor names,
+//!   alias structure, tag information, scalar style, and document markers, so
+//!   it cannot perform changing writes. A write that would destroy such
+//!   lexical material is refused with
+//!   [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite). A
+//!   write proceeds only when it is provably lossless: the target file is
+//!   missing (creation) or its bytes carry none of those lexical features
+//!   (see `has_unpreservable_lexical_material`), in which case normalized
+//!   output preserves every lexical feature the file has. Flow collections
+//!   and scalar quoting are layout, not lexical material under this policy:
+//!   their values round-trip exactly and only layout is normalized. No-op
+//!   edits never write and keep byte identity. A future lossless codec (e.g.
+//!   `yaml-edit`) can replace this gate while keeping the same
+//!   parse/validation surface.
 //! - Policy: do not mutate through an alias if ownership/effect is ambiguous,
 //!   and do not expand anchors into duplicated values. The `serde` layer
 //!   resolves aliases to duplicated values on parse (anchor names are lost),
@@ -172,6 +179,103 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{FEFF}').unwrap_or(text)
 }
 
+/// Whether `text` carries YAML lexical material the normalized writer cannot
+/// reproduce: comments, anchors, aliases, tags, directives, document markers,
+/// block scalar indicators, or explicit complex keys.
+///
+/// The scan is string-aware: indicators inside single- or double-quoted
+/// scalars are ignored. Flow collections (`{`, `[`) and scalar quoting are not
+/// lexical material under this policy — their values round-trip exactly and
+/// only layout is normalized on write (see the module preservation contract).
+#[expect(clippy::excessive_nesting, reason = "string-aware indicator scan")]
+fn has_unpreservable_lexical_material(text: &str) -> bool {
+    let text = strip_bom(text);
+    let chars: Vec<char> = text.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    // Treat start of input as start of line so column-0 indicators are seen.
+    let mut prev = '\n';
+
+    let mut idx = 0usize;
+    while let Some(&ch) = chars.get(idx) {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+            prev = ch;
+            idx += 1;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                if chars.get(idx + 1) == Some(&'\'') {
+                    // `''` inside a single-quoted scalar is an escaped quote.
+                    idx += 2;
+                    prev = '\'';
+                    continue;
+                }
+                in_single = false;
+            }
+            prev = ch;
+            idx += 1;
+            continue;
+        }
+
+        let at_line_start = prev == '\n';
+        let after_space = prev == ' ' || prev == '\t';
+        match ch {
+            '"' => in_double = true,
+            '\'' => in_single = true,
+            '#' | '&' | '*' | '!' | '|' | '>' if at_line_start || after_space => return true,
+            '%' if at_line_start => return true,
+            '?' if (at_line_start || after_space)
+                && matches!(chars.get(idx + 1), None | Some(' ' | '\t' | '\n' | '\r')) =>
+            {
+                return true;
+            }
+            '-' if at_line_start
+                && chars.get(idx + 1) == Some(&'-')
+                && chars.get(idx + 2) == Some(&'-') =>
+            {
+                return true;
+            }
+            '.' if at_line_start
+                && chars.get(idx + 1) == Some(&'.')
+                && chars.get(idx + 2) == Some(&'.') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        prev = ch;
+        idx += 1;
+    }
+    false
+}
+
+/// Refuse writes that would destroy YAML lexical material already on disk
+/// (see [`has_unpreservable_lexical_material`]).
+///
+/// A file carrying none of those features is rewritten losslessly: normalized
+/// output preserves every lexical feature it has. Missing files are writable
+/// (creation); files that cannot be read as UTF-8 are refused because
+/// preservation cannot be proven.
+fn ensure_lossless_write(path: &Path) -> Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if has_unpreservable_lexical_material(&text) => {
+            Err(ConfigError::lossy_write(path, "yaml"))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConfigError::io(path, e)),
+    }
+}
+
 /// Parse `text` strictly as YAML: reject duplicate keys via `StrictValue`.
 ///
 /// The YAML text is parsed with `yaml_serde`; anchors/aliases are resolved to
@@ -209,8 +313,8 @@ fn parse_strict_raw(text: &str) -> std::result::Result<Value, yaml_serde::Error>
 /// call reads the file fresh (disk is the truth).
 ///
 /// Comments, anchors, aliases, tags, scalar style, and document markers are
-/// not preserved — they are validated on read but lost on write (see module
-/// docs). Multiple documents are rejected.
+/// accepted on read but never written back: a changing write on a file that
+/// carries them is refused (see module docs). Multiple documents are rejected.
 pub fn load(path: &Path) -> Result<Map<String, Value>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -252,21 +356,26 @@ pub fn load_value(path: &Path) -> Result<Value> {
 
 /// Back up, then write `config` to `path`, creating parent directories as needed.
 ///
-/// The file is written as normalized YAML with a trailing newline.
-/// Lexical preservation guarantee: key order and unknown values are preserved
-/// (via `preserve_order`), but comments, anchors, scalar style, flow style,
-/// and document markers are normalized. For a no-op (semantic value unchanged)
-/// callers should prefer [`edit`] which skips the write entirely and leaves the
-/// original bytes untouched.
+/// Changing writes are refused with [`ConfigError::LossyWrite`] when `path`
+/// already exists and carries YAML lexical material (comments, anchors,
+/// aliases, tags, directives, document markers, block scalars): normalized
+/// YAML cannot preserve it (DOC-06). Missing files are created, and existing
+/// files free of that material are rewritten losslessly, since they carry no
+/// lexical feature the writer cannot reproduce. Key order and unknown values
+/// are preserved (via `preserve_order`). For a no-op (semantic value
+/// unchanged) callers should prefer [`edit`], which skips the write entirely
+/// and leaves the original bytes untouched.
 pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     store_value(path, &Value::Object(config.clone()))
 }
 
 /// Back up, then write an arbitrary YAML `value` to `path`.
 ///
-/// See [`store`] for the lexical guarantee. This entry point preserves a
-/// non-object root (array, string, number, bool, null) for raw-editor use.
+/// See [`store`] for the lossless-write gate (DOC-06). This entry point
+/// preserves a non-object root (array, string, number, bool, null) for
+/// raw-editor use.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
+    ensure_lossless_write(path)?;
     backup(path)?;
 
     if let Some(parent) = path.parent()
@@ -291,8 +400,10 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
 /// This is the only supported way to mutate a config. Disk is the truth:
 /// nothing is cached between calls. For no-op edits (the closure leaves the
 /// map equal to the on-disk value) no write and no backup are performed, so
-/// the file's byte identity is preserved (when feasible). Changing edits emit
-/// normalized YAML (comments/anchors lost — see module docs).
+/// the file's byte identity is preserved. Changing edits are refused with
+/// [`ConfigError::LossyWrite`] when the on-disk file carries lexical material
+/// the normalized writer cannot reproduce (comments, anchors, tags, block
+/// scalars — see module docs); otherwise the write is lossless.
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Map<String, Value>),
@@ -309,7 +420,8 @@ where
 /// Read fresh as [`Value`], apply `edit`, write back only if changed.
 ///
 /// Preserves an arbitrary root type. Duplicate keys in the original file are
-/// still rejected on load. No-op edits leave the file byte-identical.
+/// still rejected on load. No-op edits leave the file byte-identical. See
+/// [`edit`] for the lossless-write gate (DOC-06).
 pub fn edit_value<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Value),
@@ -371,18 +483,71 @@ mod tests {
         let yaml = "# top comment\nkey: value # inline comment\n# trailing\n";
         let v = parse_strict_raw(yaml).unwrap();
         assert_eq!(v["key"], Value::String("value".into()));
-        // No error, but ensure round-trip loses comments (normalized)
+        // Comments parse fine on read ...
         let path = scratch("comments.yaml");
         std::fs::write(&path, yaml).unwrap();
         let map = load(&path).unwrap();
         assert_eq!(map["key"], Value::String("value".into()));
-        edit(&path, |m| {
+        // ... but a changing write is refused instead of normalizing them away.
+        let result = edit(&path, |m| {
             m.insert("extra".into(), Value::String("x".into()));
+        });
+        match result {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        // Refusal leaves the file — comments included — byte-identical.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn anchors_and_block_scalars_refuse_changing_writes() {
+        let anchored = "base: &base\n  x: 1\nderived: *base\n";
+        let path = scratch("anchor.yaml");
+        std::fs::write(&path, anchored).unwrap();
+        let result = edit(&path, |m| {
+            m.insert("new".into(), Value::Number(1.into()));
+        });
+        assert!(matches!(
+            result,
+            Err(ConfigError::LossyWrite { format: "yaml", .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), anchored);
+
+        let block = "description: |\n  hello\n  world\n";
+        let path2 = scratch("block.yaml");
+        std::fs::write(&path2, block).unwrap();
+        let result2 = edit(&path2, |m| {
+            m.insert("new".into(), Value::Number(1.into()));
+        });
+        assert!(matches!(result2, Err(ConfigError::LossyWrite { .. })));
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), block);
+    }
+
+    #[test]
+    fn quoted_indicators_are_not_lexical_material() {
+        // Comment/anchor/tag indicators inside quoted scalars must not trip
+        // the gate: the file round-trips losslessly.
+        let clean = "a: \"x # y & z * w\"\nb: 2\n";
+        let path = scratch("quoted_clean.yaml");
+        std::fs::write(&path, clean).unwrap();
+        edit(&path, |m| {
+            m.insert("c".into(), Value::Number(3.into()));
         })
         .unwrap();
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert!(!after.contains("# top comment"));
-        assert!(after.contains("extra"));
+        let after = load(&path).unwrap();
+        assert_eq!(after["a"], Value::String("x # y & z * w".into()));
+        assert_eq!(after["c"], Value::Number(3.into()));
+    }
+
+    #[test]
+    fn store_allows_missing_target() {
+        // Creation: there is no lexical material to destroy.
+        let path = scratch("created.yaml");
+        let mut map = Map::new();
+        map.insert("a".into(), Value::Number(1.into()));
+        store(&path, &map).unwrap();
+        assert_eq!(load(&path).unwrap()["a"], Value::Number(1.into()));
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub mod env_file;
 mod error;
 /// Strict JSON configs, key order preserved.
 pub mod json;
-/// JSONC configs (comments + trailing commas), normalized on write.
+/// JSONC configs (comments + trailing commas); lossy changing writes refused.
 pub mod jsonc;
 /// Recoverable quarantine for directory removal.
 pub mod quarantine;
@@ -29,7 +29,7 @@ pub mod snapshot;
 pub mod toml_file;
 /// Multi-file compensated transaction.
 pub mod transaction;
-/// YAML configs, validation and normalized write.
+/// YAML configs; reads/validate, lossy changing writes refused.
 pub mod yaml;
 
 #[cfg(test)]

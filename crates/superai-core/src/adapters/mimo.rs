@@ -1041,7 +1041,10 @@ mod tests {
     }
 
     #[test]
-    fn fixture_foreign_preserves_unknown_keys_on_edit() {
+    fn fixture_changing_edit_refused_and_bytes_preserved() {
+        // codec-honesty (DOC-05): the fixture carries comments and trailing
+        // commas, so a changing edit is refused instead of normalizing the
+        // file; the on-disk bytes (foreign keys included) survive verbatim.
         let path = fixture_path("mimocode.foreign.jsonc");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::jsonc::load(&path).unwrap();
@@ -1054,7 +1057,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("mimocode.foreign.jsonc.copy.jsonc");
         std::fs::copy(&path, &tmp).unwrap();
-        superai_config::jsonc::edit(&tmp, |map| {
+        let before = std::fs::read(&tmp).unwrap();
+        let result = superai_config::jsonc::edit(&tmp, |map| {
             map.insert(
                 "theme".to_owned(),
                 serde_json::Value::String("dark".to_owned()),
@@ -1064,10 +1068,19 @@ mod tests {
                     || map.contains_key("unknownTopLevel")
                     || map.contains_key("extraUnknown")
             );
-        })
-        .unwrap();
+        });
+        match result {
+            Err(superai_config::ConfigError::LossyWrite { format, .. }) => {
+                assert_eq!(format, "jsonc");
+            }
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            before,
+            "refused edit must leave the file byte-identical"
+        );
         let after = superai_config::jsonc::load(&tmp).unwrap();
-        assert_eq!(after["theme"], serde_json::Value::String("dark".to_owned()));
         let foreign_preserved = after.contains_key("foreignKey")
             || after.contains_key("unknownTopLevel")
             || after.contains_key("customField")

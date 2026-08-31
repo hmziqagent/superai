@@ -9,11 +9,17 @@
 //! - `comment-json` does not exist on crates.io (verified via `cargo search`).
 //! - `jsonc` 0.1.0 exists but is single-owner, minimal docs, and also normalizes.
 //!
-//! Decision: for now implement read support via comment/trailing-comma stripping
-//! before strict `serde_json` parsing, and write back via normalized pretty JSON.
-//! The file header documents this limitation. Edit preserves key order and unknown
-//! values (via `preserve_order`), but discards comments/trailing commas on write.
-//! A future lexical-preserving JSONC codec can replace the stripping layer.
+//! Decision: implement read/validation support via comment/trailing-comma
+//! stripping before strict `serde_json` parsing. Per DOC-05 a codec that
+//! cannot preserve lexical content must not perform changing writes, so a
+//! write that would destroy JSONC material is refused with
+//! [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite). A write
+//! proceeds only when it is provably lossless: the target file is missing
+//! (creation) or its bytes contain no JSONC extensions
+//! (`strip_jsonc(bytes) == bytes`), in which case normalized pretty JSON
+//! preserves every lexical feature the file has. No-op edits never write and
+//! keep byte identity. A future lexical-preserving JSONC codec can replace
+//! this gate.
 
 use std::path::Path;
 
@@ -331,17 +337,38 @@ pub fn load_value(path: &Path) -> Result<Value> {
     parse_jsonc_strict(&text, path)
 }
 
+/// Refuse writes that would destroy JSONC lexical material already on disk.
+///
+/// A file whose bytes equal their stripped form carries no comments and no
+/// trailing commas, so normalized output preserves its entire lexical content.
+/// Missing files are writable (nothing to destroy); files that cannot be read
+/// as UTF-8 are refused because preservation cannot be proven.
+fn ensure_lossless_write(path: &Path) -> Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if strip_jsonc(&text) != text => Err(ConfigError::lossy_write(path, "jsonc")),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConfigError::io(path, e)),
+    }
+}
+
 /// Back up, then write `config` to `path`.
 ///
-/// The output is normalized pretty-printed JSON (no comments, no trailing commas).
-/// Edit preserves key order and unknown values, but discards JSONC lexical
-/// material — see module docs.
+/// Changing writes are refused with [`ConfigError::LossyWrite`] when `path`
+/// already exists and carries JSONC lexical material (comments or trailing
+/// commas): normalized pretty JSON cannot preserve it (DOC-05). Missing files
+/// are created, and existing files without JSONC extensions are rewritten
+/// losslessly since they carry no lexical material to destroy. Key order and
+/// unknown values are preserved (via `preserve_order`).
 pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     store_value(path, &Value::Object(config.clone()))
 }
 
 /// Back up, then write an arbitrary `value` to `path` as normalized JSON.
+///
+/// See [`store`] for the lossless-write gate (DOC-05).
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
+    ensure_lossless_write(path)?;
     backup(path)?;
 
     if let Some(parent) = path.parent()
@@ -362,7 +389,9 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
 /// Read fresh JSONC, apply `edit`, write back only if changed.
 ///
 /// No-op edits leave the file byte-identical (comments/trailing commas are
-/// preserved because no write occurs). Changing writes emit normalized JSON.
+/// preserved because no write occurs). Changing edits are refused with
+/// [`ConfigError::LossyWrite`] when the on-disk file carries comments or
+/// trailing commas; otherwise the write is lossless (see [`store`]).
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Map<String, Value>),
@@ -377,6 +406,8 @@ where
 }
 
 /// Read fresh JSONC as `Value`, apply `edit`, write back only if changed.
+///
+/// See [`edit`] for the lossless-write gate (DOC-05).
 pub fn edit_value<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Value),
@@ -489,17 +520,71 @@ mod tests {
     }
 
     #[test]
-    fn edit_changes_normalize_output() {
+    fn changing_edit_refused_preserving_comments() {
         let path = scratch("change.jsonc");
-        std::fs::write(&path, "{\"a\":1, // c\n}").unwrap();
-        edit(&path, |m| {
+        let original = "{\"a\":1, // c\n}";
+        std::fs::write(&path, original).unwrap();
+        let result = edit(&path, |m| {
             m.insert("b".into(), Value::Number(2.into()));
-        })
-        .unwrap();
-        let after = std::fs::read_to_string(&path).unwrap();
-        // Normalized: no comments, pretty
-        assert!(!after.contains("//"));
-        assert!(after.contains("\"b\": 2"));
+        });
+        match result {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "jsonc"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        // Refusal must not touch the file: comment and trailing comma survive.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn changing_edit_value_refused_on_comments() {
+        let path = scratch("value.jsonc");
+        let original = "// header\n{\"a\": 1,}\n";
+        std::fs::write(&path, original).unwrap();
+        let result = edit_value(&path, |v| {
+            if let Value::Object(m) = v {
+                m.insert("b".into(), Value::Number(2.into()));
+            }
+        });
+        assert!(matches!(result, Err(ConfigError::LossyWrite { .. })));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn store_refused_when_target_carries_jsonc_extensions() {
+        let path = scratch("store.jsonc");
+        let original = "{\n  // keep me\n  \"a\": 1,\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let mut map = Map::new();
+        map.insert("a".into(), Value::Number(2.into()));
+        match store(&path, &map) {
+            Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "jsonc"),
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // A refused write must not leave a backup either: no disk mutation.
+        let dir_entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(dir_entries, 1, "refused write must not create files");
+    }
+
+    #[test]
+    fn store_allows_missing_target_and_extension_free_target() {
+        // Creation: there is no lexical material to destroy.
+        let path = scratch("new.jsonc");
+        let mut map = Map::new();
+        map.insert("a".into(), Value::Number(1.into()));
+        store(&path, &map).unwrap();
+        assert_eq!(load(&path).unwrap()["a"], Value::Number(1.into()));
+        drop(std::fs::remove_file(&path));
+
+        // A file whose bytes contain no JSONC extensions is rewritten
+        // losslessly: normalized output preserves every lexical feature it has.
+        let clean = scratch("clean.json");
+        std::fs::write(&clean, "{\"a\":1}").unwrap();
+        map.insert("b".into(), Value::Number(2.into()));
+        store(&clean, &map).unwrap();
+        let loaded = load(&clean).unwrap();
+        assert_eq!(loaded["a"], Value::Number(1.into()));
+        assert_eq!(loaded["b"], Value::Number(2.into()));
     }
 
     #[test]

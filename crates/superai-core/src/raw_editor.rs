@@ -465,4 +465,25 @@ mod tests {
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&json_path));
     }
+
+    #[test]
+    fn jsonc_and_yaml_commits_are_byte_verbatim() {
+        // codec-honesty (DOC-05/DOC-06): the raw byte committer never
+        // re-serializes, so JSONC/YAML commits preserve caller bytes exactly;
+        // the lossy-write refusal lives in the value codecs, not here.
+        let jsonc_path = unique_scratch("verbatim", ".jsonc");
+        let new_jsonc: &[u8] = b"{\"a\":1, // keep\n}";
+        let report = commit(&jsonc_path, new_jsonc, None).unwrap();
+        assert!(!report.is_noop);
+        assert_eq!(std::fs::read(&jsonc_path).unwrap(), new_jsonc);
+
+        let yaml_path = unique_scratch("verbatim", ".yaml");
+        let new_yaml: &[u8] = b"a: 1 # keep\n";
+        let report = commit(&yaml_path, new_yaml, None).unwrap();
+        assert!(!report.is_noop);
+        assert_eq!(std::fs::read(&yaml_path).unwrap(), new_yaml);
+
+        drop(std::fs::remove_file(&jsonc_path));
+        drop(std::fs::remove_file(&yaml_path));
+    }
 }
