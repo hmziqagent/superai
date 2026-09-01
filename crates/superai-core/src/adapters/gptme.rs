@@ -579,6 +579,14 @@ impl Adapter for GptmeAdapter {
         ]
     }
 
+    /// INS-03: gptme's `config.toml` embeds absolute config paths in content
+    /// — the documented plugin search path `paths = ["./plugins",
+    /// "~/.config/gptme/plugins"]` (gptme.md §1.1) — so a mirrored copy has
+    /// its config-root references rewritten to the target root.
+    fn mirror_content_rewrite_files(&self) -> Vec<String> {
+        vec!["config.toml".to_owned()]
+    }
+
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         if instance.harness != self.id {
             return Err(CoreError::Validation {

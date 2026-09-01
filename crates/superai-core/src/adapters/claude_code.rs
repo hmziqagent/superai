@@ -554,6 +554,14 @@ impl Adapter for ClaudeCodeAdapter {
         ]
     }
 
+    /// INS-03/04: claude-code's skills directory is link-safe shared state —
+    /// `$CLAUDE_CONFIG_DIR/skills` is where the harness reads skills and
+    /// superai already manages them by symlinking (`LinkAll`, claude-code.md
+    /// "skills" row), so a mirror links it instead of copying.
+    fn mirror_link_paths(&self) -> Vec<String> {
+        vec!["skills".to_owned()]
+    }
+
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         if instance.harness != self.id {
             return Err(CoreError::Validation {
@@ -574,6 +582,27 @@ impl Adapter for ClaudeCodeAdapter {
             " Wrapper sets {}={} and execs `{}`",
             CONFIG_ENV_VAR, instance.config_root, EXECUTABLE
         );
+        // WRP-01 invocation spec (claude-code.md): the `claude` CLI is the
+        // executable; config/state split through CLAUDE_CONFIG_DIR; auth is
+        // OAuth (in-harness `/login`) or an ANTHROPIC_API_KEY env reference —
+        // never embedded; macOS credentials live in the SHARED Keychain.
+        plan.executable = Some(EXECUTABLE.to_owned());
+        plan.state_paths = vec![
+            format!("{CONFIG_ENV_VAR}={}", instance.config_root),
+            "projects/history under the relocated root".to_owned(),
+        ];
+        plan.isolation_guarantees = vec![format!(
+            "config, projects, and history split per {}",
+            CONFIG_ENV_VAR
+        )];
+        plan.shared_state_warnings = vec![
+            "macOS stores Claude Code credentials in the OS Keychain, which is shared across \
+             profiles (claude-code.md credentials row)"
+                .to_owned(),
+        ];
+        plan.auth_prerequisites = vec![crate::adapter::AuthPrerequisite::harness_login(
+            "claude /login (OAuth) — or export ANTHROPIC_API_KEY before launching",
+        )];
         Ok(plan)
     }
 

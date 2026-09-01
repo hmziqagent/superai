@@ -422,6 +422,30 @@ pub enum CoreError {
         /// Why the recorded identity could not be re-verified.
         reason: String,
     },
+
+    /// Evidence about a candidate's owner is ambiguous (DRF-04): more than
+    /// one manager plausibly owns it, or a package-manager shim cannot be
+    /// distinguished from an instance wrapper. Ambiguity BLOCKS adopt and
+    /// remove — it never silently resolves to unmanaged.
+    #[error("ambiguous ownership for {path}: {evidence:?}")]
+    AmbiguousOwnership {
+        /// Path with ambiguous ownership.
+        path: PathBuf,
+        /// The competing evidence lines (paths/markers only, never content).
+        evidence: Vec<String>,
+    },
+
+    /// A fixed-path activation cannot swap profiles because the app may
+    /// still be writing the active path (WRP-06 "never auto-swap back while
+    /// app may still write"). The caller must confirm the app has exited
+    /// before re-activating.
+    #[error("app may still write {path}: {reason}")]
+    AppMayStillWrite {
+        /// Active harness path the app may still be writing.
+        path: PathBuf,
+        /// Why the write window is believed open.
+        reason: String,
+    },
 }
 
 /// Result alias for core operations.
@@ -610,6 +634,17 @@ mod tests {
             CoreError::ProcessIdentityMismatch {
                 pid: 4242,
                 reason: "recorded start time 111 but observed 999 — pid reuse suspected".to_owned(),
+            },
+            CoreError::AmbiguousOwnership {
+                path: PathBuf::from("/home/user/.local/bin/claude"),
+                evidence: vec![
+                    "file matches the mise shim recipe".to_owned(),
+                    "no superai wrapper marker".to_owned(),
+                ],
+            },
+            CoreError::AppMayStillWrite {
+                path: PathBuf::from("/home/user/.zcode/v2/config.json"),
+                reason: "activation marked the app as running; confirm exit first".to_owned(),
             },
         ];
         for err in variants {

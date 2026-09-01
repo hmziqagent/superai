@@ -59,6 +59,94 @@ pub struct ForeignCheck {
     pub owner: Option<String>,
     /// Evidence lines.
     pub evidence: Vec<String>,
+    /// Whether the evidence is AMBIGUOUS (DRF-04): a foreign manager is
+    /// plausibly present but no direct link proves ownership. Ambiguity
+    /// blocks adopt/remove — it never silently resolves to unmanaged.
+    pub ambiguous: bool,
+}
+
+/// Drift category for a finding (DRF drift-category list — never collapse
+/// everything into "unmanaged").
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DriftCategory {
+    /// Recorded instance whose root, wrapper, binary and version all check out.
+    RecordedHealthy,
+    /// Recorded config root missing on disk.
+    RecordedConfigMissing,
+    /// Recorded absolute binary path missing.
+    RecordedBinaryMissing,
+    /// Recorded wrapper file missing.
+    RecordedWrapperMissing,
+    /// Recorded wrapper content no longer matches its recorded digest.
+    WrapperChanged,
+    /// Recorded harness version incompatible for writes.
+    RecordedVersionUnsupported,
+    /// Default config root present but unrecorded.
+    DefaultUnrecorded,
+    /// Candidate on disk, no record, no foreign manager.
+    CandidateUnmanaged,
+    /// Another manager owns the path (evidence present).
+    ForeignManaged,
+    /// Evidence does not decide an owner (DRF-04).
+    AmbiguousOwnership,
+    /// A superai wrapper whose instance id has no registry record.
+    OrphanWrapper,
+    /// Two records share one config root.
+    DuplicateRoot,
+    /// Two records share one wrapper command (case-folded).
+    DuplicateWrapper,
+    /// Fixed-path instance has no active profile identity.
+    FixedPathProfileInactive,
+    /// Daemon-class instance has no live daemon identity.
+    DaemonStopped,
+}
+
+impl std::fmt::Display for DriftCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::RecordedHealthy => "recorded_healthy",
+            Self::RecordedConfigMissing => "recorded_config_missing",
+            Self::RecordedBinaryMissing => "recorded_binary_missing",
+            Self::RecordedWrapperMissing => "recorded_wrapper_missing",
+            Self::WrapperChanged => "wrapper_changed",
+            Self::RecordedVersionUnsupported => "recorded_version_unsupported",
+            Self::DefaultUnrecorded => "default_unrecorded",
+            Self::CandidateUnmanaged => "candidate_unmanaged",
+            Self::ForeignManaged => "foreign_managed",
+            Self::AmbiguousOwnership => "ambiguous_ownership",
+            Self::OrphanWrapper => "orphan_wrapper",
+            Self::DuplicateRoot => "duplicate_root",
+            Self::DuplicateWrapper => "duplicate_wrapper",
+            Self::FixedPathProfileInactive => "fixed_path_profile_inactive",
+            Self::DaemonStopped => "daemon_stopped",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Risk level for a finding or group (DRF-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RiskLevel {
+    /// Nothing wrong; informational only.
+    Info,
+    /// Cosmetic or self-healing; act when convenient.
+    Low,
+    /// Instance degraded (missing/broken piece); act soon.
+    Medium,
+    /// Data-loss or wrong-owner hazard; act before further mutation.
+    High,
+}
+
+impl std::fmt::Display for RiskLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Info => "info",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Drift finding for a single candidate.
@@ -74,6 +162,75 @@ pub struct DriftFinding {
     pub foreign: ForeignCheck,
     /// Whether the candidate is recorded in the registry.
     pub is_recorded: bool,
+    /// Primary drift category for this candidate (DRF-08).
+    pub category: DriftCategory,
+    /// Risk level for this finding.
+    pub risk: RiskLevel,
+    /// Recommended next operations (stable identifiers, no UI formatting).
+    pub next_operations: Vec<String>,
+}
+
+/// One wrapper file found in a configured bin directory (DRF-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrapperFinding {
+    /// Absolute wrapper file path.
+    pub path: PathBuf,
+    /// What the file is.
+    pub kind: WrapperFindingKind,
+    /// For a superai wrapper: whether its instance id has a registry record.
+    pub recorded: bool,
+    /// Risk level.
+    pub risk: RiskLevel,
+    /// Recommended next operations.
+    pub next_operations: Vec<String>,
+}
+
+/// Classification of a file found in a wrapper directory (DRF-03/04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WrapperFindingKind {
+    /// A superai-generated wrapper with a parseable marker.
+    SuperaiWrapper {
+        /// Instance id embedded in the marker.
+        instance_id: String,
+        /// Digest embedded in the marker.
+        digest: String,
+    },
+    /// A user-owned wrapper matching a known isolation recipe.
+    Foreign {
+        /// Why it is foreign.
+        reason: String,
+    },
+    /// A package-manager shim (mise/asdf style) — never an instance wrapper.
+    PackageShim {
+        /// Manager the shim belongs to.
+        manager: String,
+    },
+    /// Unrecognized content; never executed during scan.
+    Opaque {
+        /// Why it is opaque.
+        reason: String,
+    },
+}
+
+/// One group of findings sharing a harness and (when matched) an instance
+/// (DRF-08: findings grouped by harness/instance with support/version,
+/// risk and next operations).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftGroup {
+    /// Harness the group belongs to.
+    pub harness: HarnessId,
+    /// Registry record the group is attached to, when one matched.
+    pub instance: Option<crate::ids::InstanceId>,
+    /// Highest-severity category in the group.
+    pub category: DriftCategory,
+    /// Highest risk across the group's findings.
+    pub risk: RiskLevel,
+    /// Catalog support state for the harness (`None` when uncataloged).
+    pub adapter_support: Option<crate::state::AdapterSupport>,
+    /// Adapter-declared revision / detected version note.
+    pub adapter_version: Option<String>,
+    /// Union of recommended next operations.
+    pub next_operations: Vec<String>,
 }
 
 /// Timestamped drift report over a scan scope.
@@ -87,6 +244,12 @@ pub struct DriftReport {
     pub candidates: Vec<PathBuf>,
     /// Findings grouped by candidate.
     pub findings: Vec<DriftFinding>,
+    /// Wrapper files found in configured bin directories (DRF-03).
+    pub wrapper_findings: Vec<WrapperFinding>,
+    /// Findings grouped by harness/instance (DRF-08).
+    pub groups: Vec<DriftGroup>,
+    /// Permission errors skipped during the scan, surfaced as diagnostics.
+    pub permission_diagnostics: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +534,39 @@ pub fn fingerprint_candidate(path: &Path) -> Fingerprint {
         evidence.push("adjacent history.jsonl present".to_owned());
     }
 
+    // Version marker (DRF-02 signal): a `version.txt` beside the canonical
+    // config is the corpora's install-era marker. It corroborates a
+    // canonical-file identification (Medium -> High, multiple consistent
+    // signals) but can never promote a name-pattern-only match.
+    let version_marker = path.join("version.txt");
+    if version_marker.is_file() {
+        evidence.push(format!(
+            "version marker present at {}",
+            version_marker.display()
+        ));
+        if let Ok(text) = read_bounded(&version_marker, 4096)
+            && !text.trim().is_empty()
+        {
+            evidence.push(format!("version marker reads {}", text.trim()));
+            if confidence == Confidence::Medium && harness_found.is_some() {
+                confidence = Confidence::High;
+            }
+        }
+    }
+
+    // Matching binary/app install (DRF-02 signal): PATH lookup ONLY — the
+    // binary is never executed during fingerprinting. Corroborating
+    // evidence; a directory name alone still cannot establish the harness.
+    if let Some(harness) = harness_found.and_then(|s| HarnessId::new(s).ok()) {
+        let exe = crate::wrapper::executable_for_harness(&harness);
+        if let Some(found) = binary_on_path_from_env(&exe) {
+            evidence.push(format!(
+                "matching binary `{exe}` found on PATH at {} (not executed)",
+                found.display()
+            ));
+        }
+    }
+
     let harness_id = harness_found.and_then(|s| HarnessId::new(s).ok());
 
     Fingerprint {
@@ -414,6 +610,7 @@ fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 )]
 pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
     let mut evidence: Vec<String> = Vec::new();
+    let mut ambiguous = false;
 
     // Generic marker files inside candidate
     for marker in [".foreign-managed", ".superai-foreign", ".owned-by-foreign"] {
@@ -424,6 +621,7 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
                 is_foreign: true,
                 owner: Some("generic-marker".to_owned()),
                 evidence,
+                ambiguous: false,
             };
         }
     }
@@ -439,6 +637,7 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
             is_foreign: true,
             owner: Some("claude-multi".to_owned()),
             evidence,
+            ambiguous: false,
         };
     }
 
@@ -464,6 +663,7 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
                         is_foreign: true,
                         owner: Some("claude-multi".to_owned()),
                         evidence,
+                        ambiguous: false,
                     };
                 }
                 evidence.push(format!(
@@ -482,17 +682,26 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
             let multi_dir = home_path.join(".claude-multi");
             if multi_dir.is_dir() {
                 evidence.push(format!(
-                    "foreign manager directory .claude-multi exists at {}",
-                    multi_dir.display()
+                    "foreign manager directory .claude-multi exists at {} but does not link {}",
+                    multi_dir.display(),
+                    path.display()
                 ));
-                // Do not mark as foreign solely because .claude-multi exists;
-                // need direct evidence linking candidate. Treat as not foreign but ambiguous.
-                // Return not foreign with evidence.
+                // DRF-04: a foreign manager is plausibly present but nothing
+                // links THIS candidate to it — ambiguous evidence, never a
+                // silent unmanaged classification.
+                ambiguous = true;
             }
         }
 
-        // Mise / package-manager shim check: if candidate looks like a shim target
-        // we do not mark here; wrapper discovery handles shims.
+        // Mise / package-manager shim check (DRF-04): a candidate that is
+        // itself a package-manager shim is neither a config root nor ours.
+        if let Some(manager) = detect_shim_manager(path) {
+            evidence.push(format!(
+                "path {} looks like a package-manager shim ({manager})",
+                path.display()
+            ));
+            ambiguous = true;
+        }
     }
 
     // No evidence of foreign ownership
@@ -501,7 +710,68 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
         is_foreign: false,
         owner: None,
         evidence,
+        ambiguous,
     }
+}
+
+// ---------------------------------------------------------------------------
+// PATH adjacency + package-manager shim detection (DRF-02/04)
+// ---------------------------------------------------------------------------
+
+/// Find `name` as an executable file on a `PATH`-shaped string (lookup
+/// only; nothing is executed). Pure over its inputs so tests can pass a
+/// synthetic PATH.
+#[expect(clippy::excessive_nesting, reason = "per-platform exec-bit probe")]
+pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    for dir in path_var.split(separator) {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Ok(meta) = std::fs::metadata(&candidate)
+                    && meta.permissions().mode() & 0o111 == 0
+                {
+                    continue;
+                }
+            }
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// [`binary_on_path`] over the process `PATH`.
+fn binary_on_path_from_env(name: &str) -> Option<PathBuf> {
+    binary_on_path(&std::env::var("PATH").ok()?, name)
+}
+
+/// Detect whether `path` is a package-manager shim rather than an instance
+/// wrapper (DRF-04). mise shims are tiny generated shell scripts that exec
+/// `mise x --` / `mise run`; asdf shims look the same shape. A shim is
+/// NEVER a superai wrapper and NEVER a config root — ownership stays with
+/// the package manager.
+pub fn detect_shim_manager(path: &Path) -> Option<&'static str> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() > 16 * 1024 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&data);
+    if text.contains("mise x --")
+        || text.contains("mise run")
+        || text.contains("exec mise ")
+        || text.contains("mise hook")
+    {
+        return Some("mise");
+    }
+    if text.contains(".asdf/shims") || text.contains("asdf exec") {
+        return Some("asdf");
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -588,9 +858,126 @@ pub fn scan_candidate_roots(home: &Path) -> Vec<PathBuf> {
 }
 
 /// Same as `scan_candidate_roots` but with an explicit entry limit (for tests).
+pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<PathBuf> {
+    scan_with_diagnostics(home, &ScanOptions::with_entry_limit(max_entries)).candidates
+}
+
+/// Scan inputs (DRF-01): adapter defaults and globs, env hints, plus
+/// USER-SPECIFIED roots and the wrapper directories to scan for orphan
+/// launchers. Everything stays bounded.
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    /// User-specified extra scan roots (absolute paths). Included as-is when
+    /// they exist; bounded by `max_entries`.
+    pub extra_roots: Vec<PathBuf>,
+    /// Configured wrapper bin directories to scan one level deep (DRF-03).
+    pub wrapper_dirs: Vec<PathBuf>,
+    /// Entry budget for the home/XDG crawls.
+    pub max_entries: usize,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            extra_roots: Vec::new(),
+            wrapper_dirs: Vec::new(),
+            max_entries: MAX_HOME_ENTRIES,
+        }
+    }
+}
+
+impl ScanOptions {
+    /// Options with only the entry budget changed.
+    pub fn with_entry_limit(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            ..Self::default()
+        }
+    }
+}
+
+/// Default user-owned bin directories wrappers are installed into
+/// (DRF-03 "configured wrapper directories"): `~/.local/bin` (XDG) and
+/// superai's own `~/.superai/bin`. Only these get the bounded one-level
+/// wrapper scan — never a PATH crawl.
+pub fn default_wrapper_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".local").join("bin"),
+        home.join(".superai").join("bin"),
+    ]
+}
+
+/// Result of a bounded scan with surfaced diagnostics (DRF-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Candidate roots found (deduplicated, sorted).
+    pub candidates: Vec<PathBuf>,
+    /// Permission errors skipped during the scan (surfaced, not swallowed).
+    pub permission_diagnostics: Vec<String>,
+}
+
+/// Expand a single-level glob pattern (`prefix/*.ext` or `prefix/*`) under
+/// `home` into at most `MAX_GLOB_ENTRIES` existing paths. Patterns without
+/// `*` are handled by [`expand_pattern`]; a glob in any component other
+/// than the last is not expanded (bounded by design).
+fn expand_glob_candidates(pattern: &str, home: &Path) -> Vec<PathBuf> {
+    const MAX_GLOB_ENTRIES: usize = 256;
+    let Some(star) = pattern.find('*') else {
+        return Vec::new();
+    };
+    // Only a final-component glob is expandable: no further '/' after the '*'.
+    let tail = pattern.get(star + 1..).unwrap_or_default();
+    if tail.contains('/') || tail.contains('\\') {
+        return Vec::new();
+    }
+    let dir_part = pattern.get(..star).unwrap_or_default();
+    let dir = if dir_part.is_empty() {
+        home.to_path_buf()
+    } else {
+        match expand_pattern(dir_part, home) {
+            Some(d) => d,
+            None => return Vec::new(),
+        }
+    };
+    let suffix = tail.trim_start_matches('*');
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    for entry in entries {
+        if out.len() >= MAX_GLOB_ENTRIES {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.starts_with('.') {
+            continue;
+        }
+        if suffix.is_empty() || name_str.ends_with(suffix) {
+            let p = entry.path();
+            if p.is_dir() || p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Bounded scan with user-specified roots, glob expansion, a wall-clock
+/// budget, and permission diagnostics surfaced instead of swallowed
+/// (DRF-01). Never parses known secret stores.
 #[expect(clippy::excessive_nesting, reason = "scan branches are explicit")]
 #[expect(clippy::too_many_lines, reason = "scan is bounded and explicit")]
-pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<PathBuf> {
+pub fn scan_with_diagnostics(home: &Path, options: &ScanOptions) -> ScanReport {
+    const SCAN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + SCAN_TIME_BUDGET;
+    let mut diagnostics: Vec<String> = Vec::new();
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -602,9 +989,30 @@ pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<Path
         }
     };
 
-    // 1) Explicit patterns expanded and checked for existence (skip globs)
+    // 0) User-specified scan roots (DRF-01): honored before everything else.
+    for root in &options.extra_roots {
+        if std::time::Instant::now() >= deadline {
+            diagnostics.push("scan time budget reached before user-specified roots".to_owned());
+            break;
+        }
+        if root.is_dir() || root.is_file() {
+            push_candidate(root.clone());
+        }
+    }
+
+    // 1) Explicit adapter patterns: plain patterns expand directly; glob
+    // patterns (amazon-q `~/.aws/amazonq/cli-agents/*.json`, warp
+    // `~/.warp/workflows/*.yaml`, …) get a bounded single-level expansion
+    // instead of being silently dropped.
     for pattern in candidate_patterns() {
+        if std::time::Instant::now() >= deadline {
+            diagnostics.push("scan time budget reached during pattern expansion".to_owned());
+            break;
+        }
         if pattern.contains('*') {
+            for expanded in expand_glob_candidates(&pattern, home) {
+                push_candidate(expanded);
+            }
             continue;
         }
         if let Some(expanded) = expand_pattern(&pattern, home)
@@ -639,83 +1047,102 @@ pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<Path
     }
 
     // 3) Enumerate top-level home entries matching known prefixes (bounded)
-    if let Ok(entries) = std::fs::read_dir(home) {
-        let mut count: usize = 0;
-        for entry_res in entries {
-            if count >= max_entries {
-                break;
-            }
-            let Ok(entry) = entry_res else {
-                // Skip permission errors with no panic
-                count = count.saturating_add(1);
-                continue;
-            };
-            count = count.saturating_add(1);
-            let path = entry.path();
-            // Use symlink_metadata to avoid following links for the crawl itself
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if !meta.is_dir() {
-                continue;
-            }
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            let lower = name_str.to_lowercase();
-            let mut matches = false;
-            for prefix in known_prefixes() {
-                if lower.starts_with(prefix) {
-                    matches = true;
+    match std::fs::read_dir(home) {
+        Ok(entries) => {
+            let mut count: usize = 0;
+            for entry_res in entries {
+                if count >= options.max_entries || std::time::Instant::now() >= deadline {
                     break;
                 }
-            }
-            if matches {
-                push_candidate(path);
+                match entry_res {
+                    Ok(entry) => {
+                        count = count.saturating_add(1);
+                        let path = entry.path();
+                        // Use symlink_metadata to avoid following links for the crawl itself
+                        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                            continue;
+                        };
+                        if !meta.is_dir() {
+                            continue;
+                        }
+                        let file_name = entry.file_name();
+                        let name_str = file_name.to_string_lossy();
+                        let lower = name_str.to_lowercase();
+                        let mut matches = false;
+                        for prefix in known_prefixes() {
+                            if lower.starts_with(prefix) {
+                                matches = true;
+                                break;
+                            }
+                        }
+                        if matches {
+                            push_candidate(path);
+                        }
+                    }
+                    Err(e) => {
+                        count = count.saturating_add(1);
+                        diagnostics.push(format!(
+                            "skipped unreadable entry under {}: {e}",
+                            home.display()
+                        ));
+                    }
+                }
             }
         }
+        Err(e) => diagnostics.push(format!("cannot read {}: {e}", home.display())),
     }
 
     // 4) XDG / platform application directories: ~/.config/* for relevant harnesses
     let config_dir = home.join(".config");
-    if let Ok(entries) = std::fs::read_dir(&config_dir) {
-        let mut count: usize = 0;
-        for entry_res in entries {
-            if count >= MAX_XDG_ENTRIES {
-                break;
-            }
-            let Ok(entry) = entry_res else {
-                count = count.saturating_add(1);
-                continue;
-            };
-            count = count.saturating_add(1);
-            let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if !meta.is_dir() {
-                continue;
-            }
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy().to_lowercase();
-            // Opencode, cline, codex, etc live under .config
-            if name_str.contains("opencode")
-                || name_str.contains("codex")
-                || name_str.contains("cline")
-                || name_str.contains("goose")
-            {
-                push_candidate(path);
+    match std::fs::read_dir(&config_dir) {
+        Ok(entries) => {
+            let mut count: usize = 0;
+            for entry_res in entries {
+                if count >= MAX_XDG_ENTRIES || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                match entry_res {
+                    Ok(entry) => {
+                        count = count.saturating_add(1);
+                        let path = entry.path();
+                        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                            continue;
+                        };
+                        if !meta.is_dir() {
+                            continue;
+                        }
+                        let file_name = entry.file_name();
+                        let name_str = file_name.to_string_lossy().to_lowercase();
+                        // Opencode, cline, codex, etc live under .config
+                        if name_str.contains("opencode")
+                            || name_str.contains("codex")
+                            || name_str.contains("cline")
+                            || name_str.contains("goose")
+                        {
+                            push_candidate(path);
+                        }
+                    }
+                    Err(e) => {
+                        count = count.saturating_add(1);
+                        diagnostics.push(format!(
+                            "skipped unreadable entry under {}: {e}",
+                            config_dir.display()
+                        ));
+                    }
+                }
             }
         }
+        Err(e) => diagnostics.push(format!("cannot read {}: {e}", config_dir.display())),
     }
-
-    // 5) Also consider wrapper relocation hints: if bin wrappers exist, parse their env assignments
-    // For boundedness, do not crawl bin dirs here; rely on explicit patterns above.
 
     // Deduplicate by file identity (inode) where possible, preserving display path
     let deduped = deduplicate_by_identity(candidates);
     let mut sorted = deduped;
     sorted.sort();
-    sorted
+    ScanReport {
+        candidates: sorted,
+        permission_diagnostics: diagnostics,
+    }
 }
 
 /// Deduplicate candidates by file identity without losing display path.
@@ -799,13 +1226,566 @@ pub fn find_unmanaged_candidates(registry: &Registry, home: &Path) -> Vec<PathBu
         .collect()
 }
 
+/// Scan the CONFIGURED wrapper directories only (DRF-03): a bounded,
+/// one-level-deep listing of each dir (at most 512 entries), classifying
+/// every file without executing it. superai wrappers whose instance id has
+/// no registry record are `OrphanWrapper` findings; package-manager shims are
+/// distinguished from wrappers (DRF-04).
+#[expect(
+    clippy::excessive_nesting,
+    reason = "wrapper-dir classification branches are explicit"
+)]
+pub fn scan_wrapper_dirs(dirs: &[PathBuf], registry: &Registry) -> Vec<WrapperFinding> {
+    const MAX_WRAPPER_DIR_ENTRIES: usize = 512;
+    let mut findings: Vec<WrapperFinding> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut count: usize = 0;
+        for entry in entries {
+            if count >= MAX_WRAPPER_DIR_ENTRIES {
+                break;
+            }
+            count = count.saturating_add(1);
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            if let Some(manager) = detect_shim_manager(&path) {
+                findings.push(WrapperFinding {
+                    path: path.clone(),
+                    kind: WrapperFindingKind::PackageShim {
+                        manager: manager.to_owned(),
+                    },
+                    recorded: false,
+                    risk: RiskLevel::Info,
+                    next_operations: vec![format!(
+                        "none: package-manager `{manager}` shim; manage it with {manager}"
+                    )],
+                });
+                continue;
+            }
+            match crate::wrapper::detect_wrapper_kind(&path) {
+                crate::wrapper::WrapperKind::SuperaiOwned {
+                    digest,
+                    instance_id,
+                } => {
+                    let recorded = instance_id
+                        .as_deref()
+                        .is_some_and(|id| registry.get_by_id(id).is_some());
+                    findings.push(WrapperFinding {
+                        path: path.clone(),
+                        kind: WrapperFindingKind::SuperaiWrapper {
+                            instance_id: instance_id.clone().unwrap_or_default(),
+                            digest,
+                        },
+                        recorded,
+                        risk: if recorded {
+                            RiskLevel::Info
+                        } else {
+                            RiskLevel::Medium
+                        },
+                        next_operations: if recorded {
+                            vec!["none: wrapper matches its instance record".to_owned()]
+                        } else {
+                            vec![
+                                "adopt_orphan_wrapper: record the instance the marker names"
+                                    .to_owned(),
+                                "quarantine_orphan_wrapper: move it aside if target proves safe"
+                                    .to_owned(),
+                            ]
+                        },
+                    });
+                }
+                crate::wrapper::WrapperKind::Foreign { reason } => {
+                    findings.push(WrapperFinding {
+                        path: path.clone(),
+                        kind: WrapperFindingKind::Foreign {
+                            reason: reason.clone(),
+                        },
+                        recorded: false,
+                        risk: RiskLevel::Low,
+                        next_operations: vec![
+                            "none: user-owned wrapper is never adopted or overwritten".to_owned(),
+                        ],
+                    });
+                }
+                crate::wrapper::WrapperKind::Opaque { reason } => {
+                    findings.push(WrapperFinding {
+                        path: path.clone(),
+                        kind: WrapperFindingKind::Opaque {
+                            reason: reason.clone(),
+                        },
+                        recorded: false,
+                        risk: RiskLevel::Info,
+                        next_operations: vec![
+                            "none: opaque launcher; never executed or rewritten by scan".to_owned(),
+                        ],
+                    });
+                }
+                crate::wrapper::WrapperKind::Missing => {}
+            }
+        }
+    }
+    findings.sort_by(|a, b| a.path.cmp(&b.path));
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// registry reconciliation (DRF-05)
+// ---------------------------------------------------------------------------
+
+/// Marker file name superai writes into config roots it creates; carries
+/// the stable `InstanceId` so reconciliation matches identity FIRST, before
+/// any path comparison (DRF-05).
+pub const INSTANCE_MARKER_FILE: &str = ".superai-instance";
+
+/// Read the `InstanceId` marker from a config root, when present.
+pub fn read_instance_marker(root: &Path) -> Option<crate::ids::InstanceId> {
+    let text = std::fs::read_to_string(root.join(INSTANCE_MARKER_FILE)).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    crate::ids::InstanceId::new(trimmed).ok()
+}
+
+/// How a registry record was matched to a discovered candidate (DRF-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchBasis {
+    /// The candidate's `.superai-instance` marker names the record's id.
+    InstanceMarker,
+    /// Exact normalized config-root equality.
+    ExactConfigRoot,
+    /// The record's owned wrapper metadata matches a discovered wrapper.
+    OwnedWrapperMetadata,
+}
+
+/// One reconciliation row: a registry record and the candidate it matches
+/// (or none). Records are NEVER merged on user-facing name alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// Registry record id.
+    pub instance: crate::ids::InstanceId,
+    /// Registry record name (display only — never a match key).
+    pub name: crate::ids::InstanceName,
+    /// Matched candidate root, when one matched.
+    pub candidate: Option<PathBuf>,
+    /// How the match was made.
+    pub basis: Option<MatchBasis>,
+}
+
+/// Match stable `InstanceId` marker first, then exact normalized config root,
+/// then exact owned wrapper metadata (DRF-05). Read-only.
+#[expect(
+    clippy::excessive_nesting,
+    reason = "three-basis reconciliation matches are explicit"
+)]
+pub fn reconcile(
+    registry: &Registry,
+    candidates: &[PathBuf],
+    wrapper_findings: &[WrapperFinding],
+) -> Vec<Reconciliation> {
+    let mut out: Vec<Reconciliation> = Vec::new();
+    for inst in registry.instances() {
+        // 1) marker first: any candidate whose marker names this record
+        let mut matched: Option<(PathBuf, MatchBasis)> = None;
+        for cand in candidates {
+            if read_instance_marker(cand).is_some_and(|id| id == inst.id) {
+                matched = Some((cand.clone(), MatchBasis::InstanceMarker));
+                break;
+            }
+        }
+        // 2) exact normalized config root
+        let norm = normalize_path(inst.config_root.as_path());
+        if matched.is_none() {
+            for cand in candidates {
+                if normalize_path(cand) == norm {
+                    matched = Some((cand.clone(), MatchBasis::ExactConfigRoot));
+                    break;
+                }
+            }
+        }
+        // 3) exact owned wrapper metadata: the record's wrapper path +
+        //    content digest match a discovered superai wrapper
+        if matched.is_none()
+            && let Some(wrapper) = &inst.wrapper
+        {
+            for finding in wrapper_findings {
+                if let WrapperFindingKind::SuperaiWrapper { digest, .. } = &finding.kind
+                    && finding.path == wrapper.path.as_path()
+                    && digest == &wrapper.content_digest
+                {
+                    matched = Some((
+                        inst.config_root.as_path().to_path_buf(),
+                        MatchBasis::OwnedWrapperMetadata,
+                    ));
+                    break;
+                }
+            }
+        }
+        out.push(Reconciliation {
+            instance: inst.id.clone(),
+            name: inst.name.clone(),
+            candidate: matched.as_ref().map(|(path, _)| path.clone()),
+            basis: matched.as_ref().map(|(_, basis)| basis.clone()),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// drift report (DRF-08)
+// ---------------------------------------------------------------------------
+
+/// Classify one candidate into a drift category + risk + next operations
+/// (DRF-08). Pure over its inputs.
+#[expect(
+    clippy::excessive_nesting,
+    reason = "per-state drift classification is explicit"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-state drift classification is explicit"
+)]
+fn classify_finding(
+    is_recorded: bool,
+    path: &Path,
+    foreign: &ForeignCheck,
+    fingerprint: &Fingerprint,
+    registry: &Registry,
+    home: &Path,
+) -> (DriftCategory, RiskLevel, Vec<String>) {
+    if foreign.is_foreign {
+        return (
+            DriftCategory::ForeignManaged,
+            RiskLevel::High,
+            vec![
+                "block: foreign manager owns the path; adoption and removal are refused".to_owned(),
+            ],
+        );
+    }
+    if foreign.ambiguous {
+        return (
+            DriftCategory::AmbiguousOwnership,
+            RiskLevel::Medium,
+            vec![
+                "block: ownership evidence is ambiguous; adopt/remove need explicit resolution"
+                    .to_owned(),
+            ],
+        );
+    }
+    if is_recorded {
+        // Per-record checks: config root exists? wrapper healthy?
+        let inst = registry
+            .instances()
+            .iter()
+            .find(|i| normalize_path(i.config_root.as_path()) == normalize_path(path));
+        if let Some(inst) = inst {
+            if !path.exists() {
+                return (
+                    DriftCategory::RecordedConfigMissing,
+                    RiskLevel::Medium,
+                    vec![
+                        "repair: recreate the config root (INS-09)".to_owned(),
+                        "detach: drop the record if the root is gone for good".to_owned(),
+                    ],
+                );
+            }
+            if let Some(wrapper) = &inst.wrapper {
+                let wpath = wrapper.path.as_path();
+                if !wpath.exists() {
+                    return (
+                        DriftCategory::RecordedWrapperMissing,
+                        RiskLevel::Medium,
+                        vec!["repair: regenerate the wrapper (INS-09)".to_owned()],
+                    );
+                }
+                let content = std::fs::read_to_string(wpath).unwrap_or_default();
+                if !crate::wrapper::is_owned_wrapper(wpath, Some(&wrapper.content_digest))
+                    && !content.contains(&wrapper.content_digest)
+                {
+                    return (
+                        DriftCategory::WrapperChanged,
+                        RiskLevel::Medium,
+                        vec![
+                            "repair: wrapper drift (ownership-aware, INS-09)".to_owned(),
+                            "detach: explicit detach if the edit was deliberate".to_owned(),
+                        ],
+                    );
+                }
+            }
+            if let Some(binary) = &inst.binary
+                && let Some(abs) = binary.as_absolute_path()
+                && !abs.as_path().exists()
+            {
+                return (
+                    DriftCategory::RecordedBinaryMissing,
+                    RiskLevel::Medium,
+                    vec![
+                        "repair: re-detect or clear the pinned binary (INS-09)".to_owned(),
+                        "detach: retain data without superai tracking".to_owned(),
+                    ],
+                );
+            }
+            if fingerprint.harness.is_some() {
+                return (
+                    DriftCategory::RecordedHealthy,
+                    RiskLevel::Info,
+                    vec!["none: healthy".to_owned()],
+                );
+            }
+        }
+        return (
+            DriftCategory::RecordedHealthy,
+            RiskLevel::Info,
+            vec!["none: healthy".to_owned()],
+        );
+    }
+    // Unrecorded: default-root shape or generic candidate.
+    let is_default_root = home.join(format!(
+        ".{}",
+        fingerprint.harness.as_ref().map_or("", |h| h.as_str())
+    )) == normalize_path(path);
+    if is_default_root {
+        return (
+            DriftCategory::DefaultUnrecorded,
+            RiskLevel::Low,
+            vec!["register_default: record the default install without touching it".to_owned()],
+        );
+    }
+    if path.exists() {
+        return (
+            DriftCategory::CandidateUnmanaged,
+            RiskLevel::Low,
+            vec![
+                "adopt: record-first, config-preserving adoption".to_owned(),
+                "ignore: leave the candidate unmanaged".to_owned(),
+            ],
+        );
+    }
+    (
+        DriftCategory::RecordedConfigMissing,
+        RiskLevel::Medium,
+        vec!["repair or detach: recorded root missing".to_owned()],
+    )
+}
+
+/// Highest risk across findings.
+fn max_risk(risks: &[RiskLevel]) -> RiskLevel {
+    risks.iter().copied().max().unwrap_or(RiskLevel::Info)
+}
+
+/// Build the DRF-08 groups: findings grouped by harness/instance with
+/// adapter support, adapter version note, risk, and next operations.
+#[expect(
+    clippy::excessive_nesting,
+    reason = "group assembly walks findings per record"
+)]
+fn build_groups(
+    registry: &Registry,
+    findings: &[DriftFinding],
+    wrapper_findings: &[WrapperFinding],
+    reconciliations: &[Reconciliation],
+) -> Vec<DriftGroup> {
+    let mut groups: Vec<DriftGroup> = Vec::new();
+    for rec in reconciliations {
+        let Some(inst) = registry.get_by_id(rec.instance.as_str()) else {
+            continue;
+        };
+        let mut categories: Vec<DriftCategory> = Vec::new();
+        let mut risks: Vec<RiskLevel> = Vec::new();
+        let mut next_ops: Vec<String> = Vec::new();
+        for finding in findings {
+            if normalize_path(&finding.path) != normalize_path(inst.config_root.as_path()) {
+                continue;
+            }
+            categories.push(finding.category.clone());
+            risks.push(finding.risk);
+            for op in &finding.next_operations {
+                if !next_ops.contains(op) {
+                    next_ops.push(op.clone());
+                }
+            }
+        }
+        for finding in wrapper_findings {
+            if let WrapperFindingKind::SuperaiWrapper { instance_id, .. } = &finding.kind
+                && instance_id == inst.id.as_str()
+            {
+                if !finding.recorded {
+                    categories.push(DriftCategory::OrphanWrapper);
+                }
+                risks.push(finding.risk);
+                for op in &finding.next_operations {
+                    if !next_ops.contains(op) {
+                        next_ops.push(op.clone());
+                    }
+                }
+            }
+        }
+        let entry = crate::harness_catalog::find_by_id(inst.harness.as_str());
+        let adapter_version = crate::harness_catalog::concrete_adapter_for(inst.harness.as_str())
+            .map(|adapter| {
+                let resolution = adapter.version_resolution();
+                resolution
+                    .detected_version
+                    .unwrap_or_else(|| "version unknown".to_owned())
+            });
+        if categories.is_empty() {
+            categories.push(DriftCategory::RecordedHealthy);
+        }
+        groups.push(DriftGroup {
+            harness: inst.harness.clone(),
+            instance: Some(inst.id.clone()),
+            category: pick_primary_category(&categories),
+            risk: max_risk(&risks),
+            adapter_support: entry.map(|e| e.support),
+            adapter_version,
+            next_operations: next_ops,
+        });
+    }
+    // Groups for unmanaged/unrecorded candidates with no record.
+    for finding in findings {
+        if finding.is_recorded {
+            continue;
+        }
+        if groups.iter().any(|g| {
+            g.instance.is_some()
+                && registry
+                    .get_by_id(g.instance.as_ref().map_or("", |i| i.as_str()))
+                    .is_some_and(|inst| {
+                        normalize_path(inst.config_root.as_path()) == normalize_path(&finding.path)
+                    })
+        }) {
+            continue;
+        }
+        let Some(harness) = finding.fingerprint.harness.clone() else {
+            continue;
+        };
+        let entry = crate::harness_catalog::find_by_id(harness.as_str());
+        groups.push(DriftGroup {
+            harness,
+            instance: None,
+            category: finding.category.clone(),
+            risk: finding.risk,
+            adapter_support: entry.map(|e| e.support),
+            adapter_version: crate::harness_catalog::concrete_adapter_for(
+                finding
+                    .fingerprint
+                    .harness
+                    .as_ref()
+                    .map_or(String::new(), |h| h.as_str().to_owned())
+                    .as_str(),
+            )
+            .map(|adapter| {
+                adapter
+                    .version_resolution()
+                    .detected_version
+                    .unwrap_or_else(|| "version unknown".to_owned())
+            }),
+            next_operations: finding.next_operations.clone(),
+        });
+    }
+    groups
+}
+
+/// Pick the category a group is summarized under: the most severe, by a
+/// fixed severity order, so a healthy group with one broken wrapper still
+/// surfaces the break.
+fn pick_primary_category(categories: &[DriftCategory]) -> DriftCategory {
+    let order = [
+        DriftCategory::ForeignManaged,
+        DriftCategory::AmbiguousOwnership,
+        DriftCategory::DuplicateRoot,
+        DriftCategory::DuplicateWrapper,
+        DriftCategory::RecordedConfigMissing,
+        DriftCategory::RecordedBinaryMissing,
+        DriftCategory::RecordedWrapperMissing,
+        DriftCategory::WrapperChanged,
+        DriftCategory::RecordedVersionUnsupported,
+        DriftCategory::FixedPathProfileInactive,
+        DriftCategory::DaemonStopped,
+        DriftCategory::OrphanWrapper,
+        DriftCategory::DefaultUnrecorded,
+        DriftCategory::CandidateUnmanaged,
+        DriftCategory::RecordedHealthy,
+    ];
+    for candidate in order {
+        if categories.contains(&candidate) {
+            return candidate;
+        }
+    }
+    DriftCategory::RecordedHealthy
+}
+
+/// Detect duplicate config roots and duplicate wrapper commands among the
+/// registry records (DRF drift categories).
+fn detect_record_duplicates(registry: &Registry) -> Vec<(DriftCategory, RiskLevel, String)> {
+    let mut out: Vec<(DriftCategory, RiskLevel, String)> = Vec::new();
+    let instances = registry.instances();
+    for (i, a) in instances.iter().enumerate() {
+        for b in instances.iter().skip(i + 1) {
+            if normalize_path(a.config_root.as_path()) == normalize_path(b.config_root.as_path()) {
+                out.push((
+                    DriftCategory::DuplicateRoot,
+                    RiskLevel::High,
+                    format!(
+                        "instances {} and {} share config root {}",
+                        a.name, b.name, a.config_root
+                    ),
+                ));
+            }
+            if let (Some(wa), Some(wb)) = (&a.wrapper, &b.wrapper)
+                && wa.command_name.normalized() == wb.command_name.normalized()
+            {
+                out.push((
+                    DriftCategory::DuplicateWrapper,
+                    RiskLevel::High,
+                    format!(
+                        "instances {} and {} share wrapper command {}",
+                        a.name, b.name, wa.command_name
+                    ),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Produce a drift report for `home` against the current `registry`.
 ///
 /// The report is read-only and contains no UI formatting. It records
 /// the timestamp, scanned scope, fingerprint, ownership, foreign evidence,
-/// and whether each candidate is recorded.
+/// whether each candidate is recorded, the drift category/risk/next
+/// operations per finding, wrapper-directory findings (DRF-03), and
+/// harness/instance groups (DRF-08).
 pub fn drift_report(registry: &Registry, home: &Path) -> DriftReport {
-    let candidates = scan_candidate_roots(home);
+    drift_report_with_options(
+        registry,
+        home,
+        &ScanOptions {
+            wrapper_dirs: default_wrapper_dirs(home),
+            ..ScanOptions::default()
+        },
+    )
+}
+
+/// [`drift_report`] with explicit scan options (user roots, wrapper dirs).
+pub fn drift_report_with_options(
+    registry: &Registry,
+    home: &Path,
+    options: &ScanOptions,
+) -> DriftReport {
+    let scan = scan_with_diagnostics(home, options);
+    let candidates = scan.candidates;
+    let wrapper_findings = scan_wrapper_dirs(&options.wrapper_dirs, registry);
     let mut findings: Vec<DriftFinding> = Vec::new();
     for cand in &candidates {
         let fingerprint = fingerprint_candidate(cand);
@@ -815,12 +1795,17 @@ pub fn drift_report(registry: &Registry, home: &Path) -> DriftReport {
             .instances()
             .iter()
             .any(|i| normalize_path(i.config_root.as_path()) == normalize_path(cand));
+        let (category, risk, next_operations) =
+            classify_finding(is_recorded, cand, &foreign, &fingerprint, registry, home);
         findings.push(DriftFinding {
             path: cand.clone(),
             fingerprint,
             ownership,
             foreign,
             is_recorded,
+            category,
+            risk,
+            next_operations,
         });
     }
     // Include recorded instances whose config root is missing on disk (detached/missing_config)
@@ -842,6 +1827,7 @@ pub fn drift_report(registry: &Registry, home: &Path) -> DriftReport {
                 is_foreign: false,
                 owner: None,
                 evidence: vec!["recorded but missing".to_owned()],
+                ambiguous: false,
             };
             findings.push(DriftFinding {
                 path: root.to_path_buf(),
@@ -849,15 +1835,57 @@ pub fn drift_report(registry: &Registry, home: &Path) -> DriftReport {
                 ownership: inst.ownership,
                 foreign,
                 is_recorded: true,
+                category: DriftCategory::RecordedConfigMissing,
+                risk: RiskLevel::Medium,
+                next_operations: vec![
+                    "repair: recreate the config root (INS-09)".to_owned(),
+                    "detach: drop the record if the root is gone for good".to_owned(),
+                ],
             });
         }
     }
+
+    // Duplicate records (DRF drift categories).
+    let duplicates = detect_record_duplicates(registry);
+    for (category, risk, description) in &duplicates {
+        let target = registry.instances().first().map_or_else(
+            || home.to_path_buf(),
+            |i| i.config_root.as_path().to_path_buf(),
+        );
+        findings.push(DriftFinding {
+            path: target,
+            fingerprint: Fingerprint {
+                harness: None,
+                confidence: Confidence::None,
+                evidence: vec![description.clone()],
+            },
+            ownership: Ownership::Unmanaged,
+            foreign: ForeignCheck {
+                is_foreign: false,
+                owner: None,
+                evidence: Vec::new(),
+                ambiguous: false,
+            },
+            is_recorded: true,
+            category: category.clone(),
+            risk: *risk,
+            next_operations: vec![
+                "resolve: rename or remove one of the colliding records".to_owned(),
+            ],
+        });
+    }
+
+    let reconciliations = reconcile(registry, &candidates, &wrapper_findings);
+    let groups = build_groups(registry, &findings, &wrapper_findings, &reconciliations);
 
     DriftReport {
         scanned_at: now_iso8601(),
         home: home.to_path_buf(),
         candidates,
         findings,
+        wrapper_findings,
+        groups,
+        permission_diagnostics: scan.permission_diagnostics,
     }
 }
 
@@ -964,6 +1992,14 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
         return Err(CoreError::ForeignOwnership {
             path: candidate.to_path_buf(),
             owner: foreign.owner.unwrap_or_else(|| "foreign".to_owned()),
+        });
+    }
+    // DRF-04: ambiguous evidence blocks adopt — it never silently resolves
+    // to unmanaged.
+    if foreign.ambiguous {
+        return Err(CoreError::AmbiguousOwnership {
+            path: candidate.to_path_buf(),
+            evidence: foreign.evidence,
         });
     }
     if !candidate.exists() {
@@ -1402,6 +2438,322 @@ mod tests {
         assert!(
             candidates.iter().any(|p| p == &cfg),
             "scan must find swe-agent's config/default.yaml via scan_candidates, got {candidates:?}"
+        );
+    }
+
+    /// DRF-01: user-specified scan roots are honored and adapter glob
+    /// patterns are EXPANDED (bounded, single level) instead of dropped.
+    #[test]
+    fn user_scan_roots_and_glob_patterns_are_scanned() {
+        let home = tmp_home("scan_user_roots");
+        // A user-specified root outside every known pattern.
+        let custom = home.join("customs").join("harness-config");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        // A glob candidate the adapter corpus really declares (swe-agent
+        // and trae-agent): `trajectories/*` — previously dropped by
+        // `contains('*') { continue }`.
+        let workspace = home.join("trajectories").join("run-1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("traj.json"), "{}\n").unwrap();
+
+        let options = ScanOptions {
+            extra_roots: vec![custom.clone()],
+            ..ScanOptions::default()
+        };
+        let report = scan_with_diagnostics(&home, &options);
+        assert!(
+            report.candidates.contains(&custom),
+            "user-specified root must be scanned: {:?}",
+            report.candidates
+        );
+        assert!(
+            report.candidates.contains(&workspace),
+            "glob pattern trajectories/* must expand to it: {:?}",
+            report.candidates
+        );
+    }
+
+    /// DRF-02: version marker and binary adjacency are fingerprint signals —
+    /// the marker promotes a canonical-file match to High, the PATH lookup
+    /// adds evidence without executing anything, and a name pattern alone
+    /// still never rises above Low.
+    #[test]
+    fn fingerprint_uses_version_marker_and_binary_adjacency() {
+        let home = tmp_home("fp_signals");
+        let root = home.join(".claude-fp");
+        std::fs::create_dir_all(&root).unwrap();
+        // A canonical settings file with no schema marker: Medium alone.
+        std::fs::write(root.join("settings.json"), "{}").unwrap();
+        let medium = fingerprint_candidate(&root);
+        assert_eq!(medium.confidence, Confidence::Medium);
+        // Adding the install-era version marker corroborates: High.
+        std::fs::write(root.join("version.txt"), "2.0.14\n").unwrap();
+        let high = fingerprint_candidate(&root);
+        assert_eq!(high.confidence, Confidence::High);
+        assert!(
+            high.evidence.iter().any(|e| e.contains("version marker")),
+            "evidence: {:?}",
+            high.evidence
+        );
+
+        // PATH adjacency: pure lookup over a synthetic PATH string.
+        let bin_dir = home.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let claude = bin_dir.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&claude).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&claude, perms).unwrap();
+        }
+        let path_var = format!(
+            "{}:{}",
+            bin_dir.display(),
+            Path::new("/nonexistent").display()
+        );
+        assert_eq!(
+            binary_on_path(&path_var, "claude"),
+            Some(claude),
+            "adjacency must find the binary by lookup"
+        );
+        assert_eq!(binary_on_path(&path_var, "codex"), None);
+        // Non-executable files never count.
+        let plain = bin_dir.join("plain-tool");
+        std::fs::write(&plain, "data").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&plain).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&plain, perms).unwrap();
+        }
+        assert_eq!(binary_on_path(&path_var, "plain-tool"), None);
+    }
+
+    /// DRF-03/04: the wrapper-directory scan classifies superai wrappers,
+    /// records, orphans, package-manager shims, and foreign launchers — and
+    /// never executes anything.
+    #[test]
+    fn wrapper_dir_scan_classifies_shims_wrappers_and_orphans() {
+        let home = tmp_home("scan_wrapper_dirs");
+        let bin = home.join(".local").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // A superai wrapper whose instance is recorded.
+        let recorded_inst = sample_instance(
+            "recorded",
+            "/tmp/.claude-recorded",
+            "id-scan-rec",
+            Ownership::SuperaiCreated,
+        );
+        let mut registry = Registry::default();
+        registry.insert(recorded_inst).unwrap();
+        // An orphan superai wrapper for an unrecorded instance.
+        let orphan_inst = sample_instance(
+            "orphaned",
+            "/tmp/.claude-orphaned",
+            "id-scan-orph",
+            Ownership::SuperaiCreated,
+        );
+
+        let make_wrapper = |inst: &Instance, file: &str| {
+            let mut plan = crate::adapter::WrapperPlan::new("test");
+            plan.env_vars
+                .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
+            let (content, _) = crate::wrapper::generate_shell_wrapper(inst, &plan);
+            std::fs::write(bin.join(file), content).unwrap();
+        };
+        make_wrapper(registry.get("recorded").unwrap(), "recorded-tool");
+        make_wrapper(&orphan_inst, "orphan-tool");
+
+        // A mise shim.
+        std::fs::write(
+            bin.join("some-tool"),
+            "#!/bin/sh\nexec mise x -- node \"$@\"\n",
+        )
+        .unwrap();
+
+        // A foreign user wrapper (known recipe, no marker).
+        std::fs::write(
+            bin.join("user-tool"),
+            "#!/bin/sh\nexport CLAUDE_CONFIG_DIR='/tmp/.claude-user'\nexec claude \"$@\"\n",
+        )
+        .unwrap();
+
+        let findings = scan_wrapper_dirs(std::slice::from_ref(&bin), &registry);
+        let by_path = |name: &str| {
+            findings
+                .iter()
+                .find(|f| f.path == bin.join(name))
+                .unwrap_or_else(|| panic!("no finding for {name}: {findings:?}"))
+        };
+
+        let recorded = by_path("recorded-tool");
+        assert!(matches!(
+            recorded.kind,
+            WrapperFindingKind::SuperaiWrapper { .. }
+        ));
+        assert!(recorded.recorded);
+        assert_eq!(recorded.risk, RiskLevel::Info);
+
+        let orphan = by_path("orphan-tool");
+        assert!(matches!(
+            orphan.kind,
+            WrapperFindingKind::SuperaiWrapper { .. }
+        ));
+        assert!(!orphan.recorded, "unrecorded wrapper is an orphan");
+        assert_eq!(orphan.risk, RiskLevel::Medium);
+        assert!(
+            orphan
+                .next_operations
+                .iter()
+                .any(|op| op.contains("adopt_orphan_wrapper")),
+            "{:?}",
+            orphan.next_operations
+        );
+
+        let shim = by_path("some-tool");
+        assert_eq!(
+            shim.kind,
+            WrapperFindingKind::PackageShim {
+                manager: "mise".to_owned()
+            },
+            "mise shims are distinguished from wrappers (DRF-04)"
+        );
+
+        let foreign = by_path("user-tool");
+        assert!(matches!(foreign.kind, WrapperFindingKind::Foreign { .. }));
+    }
+
+    /// DRF-04: ambiguous ownership evidence (a foreign manager is present but
+    /// links nothing) BLOCKS adoption instead of silently resolving to
+    /// unmanaged.
+    #[test]
+    fn ambiguous_ownership_blocks_adoption() {
+        let home = tmp_home("ambiguous_blocks");
+        let candidate = home.join(".claude-amb");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
+        // A claude-multi installation exists but never links this candidate.
+        std::fs::create_dir_all(home.join(".claude-multi")).unwrap();
+
+        let check = is_foreign_managed(&candidate, Some(&home));
+        assert!(!check.is_foreign);
+        assert!(check.ambiguous, "evidence: {:?}", check.evidence);
+
+        match can_adopt(&candidate, Some(&home)) {
+            Err(CoreError::AmbiguousOwnership { path, .. }) => {
+                assert_eq!(path, candidate);
+            }
+            other => panic!("expected AmbiguousOwnership, got {other:?}"),
+        }
+        assert!(
+            !home.join(".superai").exists() || std::fs::read_dir(home.join(".superai")).is_err(),
+            "refused adoption must not write records"
+        );
+    }
+
+    /// DRF-05: reconciliation matches the `InstanceId` marker FIRST — a moved
+    /// root still matches its record before any path comparison — and never
+    /// merges on the display name.
+    #[test]
+    fn reconcile_matches_marker_first() {
+        let home = tmp_home("reconcile_marker");
+        let original = home.join(".claude-work");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::write(original.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+
+        let inst = sample_instance(
+            "work",
+            &original.to_string_lossy(),
+            "id-recon-1",
+            Ownership::SuperaiCreated,
+        );
+        let marker_id = inst.id.clone();
+        let mut registry = Registry::default();
+        registry.insert(inst).unwrap();
+
+        // The root moved on disk but kept the superai marker.
+        let moved = home.join(".claude-moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::write(moved.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        std::fs::write(moved.join(INSTANCE_MARKER_FILE), format!("{marker_id}\n")).unwrap();
+
+        let rows = reconcile(&registry, std::slice::from_ref(&moved), &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].candidate.as_deref(), Some(moved.as_path()));
+        assert_eq!(rows[0].basis, Some(MatchBasis::InstanceMarker));
+
+        // read_instance_marker round-trips the id.
+        assert_eq!(read_instance_marker(&moved), Some(marker_id));
+
+        // Without the marker, the same mismatched paths do NOT match.
+        std::fs::remove_file(moved.join(INSTANCE_MARKER_FILE)).unwrap();
+        let rows2 = reconcile(&registry, std::slice::from_ref(&moved), &[]);
+        assert!(
+            rows2[0].candidate.is_none(),
+            "no marker and no path equality means no match: {:?}",
+            rows2[0]
+        );
+    }
+
+    /// DRF-08: the drift report groups findings by harness/instance with risk
+    /// levels, adapter support/version, and recommended next operations.
+    #[test]
+    fn drift_report_groups_by_harness_with_risk_and_next_ops() {
+        let home = tmp_home("drift_groups");
+        let root = home.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+
+        // A recorded instance whose wrapper file is MISSING.
+        let mut inst = sample_instance(
+            "work",
+            &root.to_string_lossy(),
+            "id-group-1",
+            Ownership::SuperaiCreated,
+        );
+        inst.wrapper = Some(crate::instance::WrapperRef {
+            path: crate::paths::WrapperPath::new(&home.join("bin").join("work").to_string_lossy())
+                .unwrap(),
+            command_name: InstanceName::new("work").unwrap(),
+            generator_version: "0.1.0".to_owned(),
+            content_digest: "abc".to_owned(),
+        });
+        let mut registry = Registry::default();
+        registry.insert(inst).unwrap();
+
+        let report = drift_report(&registry, &home);
+        let group = report
+            .groups
+            .iter()
+            .find(|g| g.harness.as_str() == "claude-code")
+            .expect("a claude-code group exists");
+        assert_eq!(group.instance, Some(InstanceId::new("id-group-1").unwrap()));
+        assert_eq!(group.category, DriftCategory::RecordedWrapperMissing);
+        assert_eq!(group.risk, RiskLevel::Medium);
+        assert!(group.adapter_support.is_some(), "adapter support surfaced");
+        assert!(
+            group.next_operations.iter().any(|op| op.contains("repair")),
+            "next ops: {:?}",
+            group.next_operations
+        );
+
+        // The finding carries the category too.
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == DriftCategory::RecordedWrapperMissing),
+            "findings: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.category.clone())
+                .collect::<Vec<_>>()
         );
     }
 }

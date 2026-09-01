@@ -126,6 +126,12 @@ pub struct ActiveIdentity {
     pub activated_at: String,
     /// Fixed path the profile was applied to.
     pub fixed_path: String,
+    /// WRP-06 "never auto-swap back while app may still write": when true,
+    /// the app was launched against this active content and has not been
+    /// confirmed stopped — activation refuses until
+    /// [`FixedPathProfileStore::mark_app_writes`] clears the flag.
+    #[serde(default)]
+    pub app_may_write: bool,
 }
 
 /// Result of removing a profile.
@@ -148,6 +154,99 @@ pub enum ReconcileChoice {
     Abort,
 }
 
+/// Launch instruction for the harness app (WRP-06 "launch app if
+/// requested"): derived from the adapter's invocation plan (WRP-01) —
+/// executable reference, ordered argv, environment set/unset, and
+/// working-directory policy. Guidance is surfaced even when the caller
+/// launches the app themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchInstruction {
+    /// Executable to run (name or absolute path).
+    pub executable: String,
+    /// Ordered arguments after the executable.
+    pub args: Vec<String>,
+    /// Environment to set (the plan's isolation env).
+    pub env_vars: Vec<(String, String)>,
+    /// Environment to unset before launch (no inherited credentials).
+    pub env_unset: Vec<String>,
+    /// Working directory, when the plan pins one.
+    pub working_dir: Option<String>,
+}
+
+impl LaunchInstruction {
+    /// Build the instruction from the adapter's wrapper plan (WRP-01).
+    #[must_use]
+    pub fn from_plan(plan: &crate::adapter::WrapperPlan, fallback_executable: &str) -> Self {
+        Self {
+            executable: plan
+                .executable
+                .clone()
+                .unwrap_or_else(|| fallback_executable.to_owned()),
+            args: plan.args.clone(),
+            env_vars: plan.env_vars.clone(),
+            env_unset: plan.env_unset.clone(),
+            working_dir: plan.working_dir.clone(),
+        }
+    }
+
+    /// Human guidance lines (what to run and what it needs), never a secret.
+    #[must_use]
+    pub fn guidance_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("launch: {} {}", self.executable, self.args.join(" ")),
+            format!(
+                "launch env: {}",
+                self.env_vars
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ];
+        if !self.env_unset.is_empty() {
+            lines.push(format!("launch unset: {}", self.env_unset.join(" ")));
+        }
+        if let Some(dir) = &self.working_dir {
+            lines.push(format!("launch cwd: {dir}"));
+        }
+        lines
+    }
+}
+
+/// Outcome of a bounded launch of the harness app (WRP-06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchOutcome {
+    /// Whether the app exited zero within the bound.
+    pub exited_zero: bool,
+    /// Captured output (bounded, redacted by the process layer).
+    pub stdout: String,
+    /// The guidance lines that were executed (for diagnostics).
+    pub guidance: Vec<String>,
+}
+
+/// Launch the app per `instruction` (WRP-06 "launch app if requested"):
+/// a clean environment plus exactly the plan's isolation env — inherited
+/// credentials (the plan's unset list) never reach the profile.
+pub fn launch_app(
+    instruction: &LaunchInstruction,
+    timeout: std::time::Duration,
+) -> Result<LaunchOutcome> {
+    let opts = crate::process::ExecuteOpts {
+        timeout: Some(timeout),
+        clear_env: true,
+        env: instruction.env_vars.clone(),
+        cwd: instruction.working_dir.as_ref().map(PathBuf::from),
+        redact: true,
+        ..crate::process::ExecuteOpts::default()
+    };
+    let output = crate::process::run_command(&instruction.executable, &instruction.args, &opts)?;
+    Ok(LaunchOutcome {
+        exited_zero: output.success,
+        stdout: output.stdout,
+        guidance: instruction.guidance_lines(),
+    })
+}
+
 /// Options for [`FixedPathProfileStore::activate_profile`].
 #[derive(Debug, Clone, Default)]
 pub struct ActivationOptions {
@@ -156,6 +255,11 @@ pub struct ActivationOptions {
     /// interrupted swaps (MUT-09 enablement). Use
     /// [`ActivationOptions::for_home`] for the default location.
     pub journal_root: Option<PathBuf>,
+    /// WRP-06 "launch app if requested": when set, the verified activation
+    /// also LAUNCHES the harness app per this invocation plan (bounded,
+    /// clean env). The launched app is recorded as possibly-writing, so the
+    /// next activation refuses until the app is confirmed stopped.
+    pub launch_plan: Option<crate::adapter::WrapperPlan>,
 }
 
 impl ActivationOptions {
@@ -164,6 +268,7 @@ impl ActivationOptions {
     pub fn for_home(home: &Path) -> Self {
         Self {
             journal_root: Some(superai_config::journal::journal_dir(home)),
+            launch_plan: None,
         }
     }
 }
@@ -180,6 +285,9 @@ pub struct ActivationOutcome {
     pub captured: Option<ProfileSummary>,
     /// The recorded active identity.
     pub activated: ActiveIdentity,
+    /// Launch guidance (always present) and outcome (when the option
+    /// launched the app).
+    pub launch: Option<LaunchOutcome>,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +625,10 @@ impl FixedPathProfileStore {
     /// external edit per `choice` → backup + transactional apply (atomic
     /// replace, §4.2 conflict recheck, read-back verify, optional crash
     /// journal) → verify digest → record the active identity.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "activation composes lock, reconcile, transaction, verify, and launch"
+    )]
     pub fn activate_profile(
         &self,
         name: &InstanceName,
@@ -526,6 +638,23 @@ impl FixedPathProfileStore {
     ) -> Result<ActivationOutcome> {
         self.require_fixed_path(fixed_path)?;
         let _lock = ActivationLock::acquire(&self.harness_dir(), self.harness.as_str())?;
+
+        // WRP-06 "never auto-swap back while app may still write": the
+        // recorded identity says the app was launched against the active
+        // content and has not been confirmed stopped — refuse; the caller
+        // must confirm and clear the flag first.
+        if let Some(active) = self.active_identity()
+            && active.app_may_write
+        {
+            return Err(CoreError::AppMayStillWrite {
+                path: fixed_path.to_path_buf(),
+                reason: format!(
+                    "app launched against profile `{}` at {} may still be writing; confirm it \
+                     stopped and call mark_app_writes(false)",
+                    active.profile, active.activated_at
+                ),
+            });
+        }
 
         let (summary, content) = self.load_profile(name)?;
 
@@ -595,11 +724,13 @@ impl FixedPathProfileStore {
             });
         }
 
+        let launching = opts.launch_plan.is_some();
         let activated = ActiveIdentity {
             profile: name.to_string(),
             applied_digest,
             activated_at: now_iso8601(),
             fixed_path: fixed_path.display().to_string(),
+            app_may_write: launching,
         };
         let active_bytes =
             serde_json::to_vec_pretty(&activated).map_err(|e| CoreError::Validation {
@@ -608,12 +739,48 @@ impl FixedPathProfileStore {
             })?;
         atomic_write(&self.active_path(), &active_bytes).map_err(CoreError::Config)?;
 
+        // WRP-06 "launch app if requested": launch only after the swap
+        // verified and the identity (with the possibly-writing marker) is
+        // recorded, so a launch failure never loses the write-window fact.
+        let launch = match &opts.launch_plan {
+            Some(plan) => {
+                let instruction = LaunchInstruction::from_plan(
+                    plan,
+                    &crate::wrapper::executable_for_harness(&self.harness),
+                );
+                Some(launch_app(&instruction, std::time::Duration::from_mins(1))?)
+            }
+            None => None,
+        };
+
         Ok(ActivationOutcome {
             profile: summary,
             backup_paths,
             captured,
             activated,
+            launch,
         })
+    }
+
+    /// Record whether the app may still be writing the active fixed path
+    /// (WRP-06). Setting `may_write = true` marks the write window open
+    /// (activation then refuses); `false` confirms the app stopped and lets
+    /// the next activation proceed. Fresh-read/modify/atomic-write of the
+    /// superai-owned identity record.
+    pub fn mark_app_writes(&self, may_write: bool) -> Result<ActiveIdentity> {
+        let mut identity = self
+            .active_identity()
+            .ok_or_else(|| CoreError::Validation {
+                field: "active_identity".to_owned(),
+                reason: "no activation recorded yet; nothing to mark".to_owned(),
+            })?;
+        identity.app_may_write = may_write;
+        let bytes = serde_json::to_vec_pretty(&identity).map_err(|e| CoreError::Validation {
+            field: "active_identity".to_owned(),
+            reason: format!("cannot serialize active identity: {e}"),
+        })?;
+        atomic_write(&self.active_path(), &bytes).map_err(CoreError::Config)?;
+        Ok(identity)
     }
 
     /// Reconcile a fixed-path file that changed since the last activation
@@ -1201,6 +1368,7 @@ mod tests {
                 &ReconcileChoice::Abort,
                 &ActivationOptions {
                     journal_root: Some(journal_root.clone()),
+                    launch_plan: None,
                 },
             )
             .unwrap();
@@ -1223,5 +1391,94 @@ mod tests {
             opts.journal_root,
             Some(PathBuf::from("/home/tester/.superai/journal"))
         );
+    }
+    /// WRP-06 leftovers: "launch app if requested" (bounded, clean-env
+    /// launch after the verified swap) and "never auto-swap back while the
+    /// app may still write" (the recorded write window blocks the next
+    /// activation until `mark_app_writes` clears it).
+    #[test]
+    fn activation_launches_app_and_blocks_swap_while_writing() {
+        let fx = Fixture::new("wrp06_launch");
+        // A fake harness app: proves it ran and saw the swapped content.
+        let fake_app = fx.home.join("fake-app.sh");
+        fs::write(
+            &fake_app,
+            "#!/bin/sh\nprintf 'provider=%s\\n' \"$(cat \"$1\" | tr -d '\\n')\"\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&fake_app).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_app, perms).unwrap();
+        }
+        fs::write(&fx.fixed_path, br#"{"provider": "p1"}"#).unwrap();
+        fx.store
+            .save_active_profile(&Fixture::name("p1"), &fx.fixed_path)
+            .unwrap();
+
+        // A plan whose executable is the fake app reading the config path.
+        let mut plan = crate::adapter::WrapperPlan::new("zcode launch");
+        plan.executable = Some(fake_app.display().to_string());
+        plan.args = vec![fx.fixed_path.display().to_string()];
+
+        let opts = ActivationOptions {
+            journal_root: None,
+            launch_plan: Some(plan),
+        };
+        let outcome = fx
+            .store
+            .activate_profile(
+                &Fixture::name("p1"),
+                &fx.fixed_path,
+                &ReconcileChoice::Abort,
+                &opts,
+            )
+            .unwrap();
+        let launch = outcome.launch.expect("app launched as requested");
+        assert!(launch.exited_zero, "stdout: {}", launch.stdout);
+        assert!(
+            launch.stdout.contains("provider="),
+            "the app observed the swapped content: {}",
+            launch.stdout
+        );
+        assert!(
+            !launch.guidance.is_empty(),
+            "guidance lines are always surfaced"
+        );
+        assert!(
+            outcome.activated.app_may_write,
+            "the launch opens the write window"
+        );
+
+        // Never auto-swap back while the app may still write.
+        let second = fx.store.activate_profile(
+            &Fixture::name("p1"),
+            &fx.fixed_path,
+            &ReconcileChoice::Abort,
+            &ActivationOptions::default(),
+        );
+        match second {
+            Err(CoreError::AppMayStillWrite { path, .. }) => {
+                assert_eq!(path, fx.fixed_path);
+            }
+            other => panic!("expected AppMayStillWrite, got {other:?}"),
+        }
+
+        // Confirming the app stopped lets activation proceed again.
+        let cleared = fx.store.mark_app_writes(false).unwrap();
+        assert!(!cleared.app_may_write);
+        let third = fx
+            .store
+            .activate_profile(
+                &Fixture::name("p1"),
+                &fx.fixed_path,
+                &ReconcileChoice::Abort,
+                &ActivationOptions::default(),
+            )
+            .unwrap();
+        assert!(third.launch.is_none());
+        assert!(!third.activated.app_may_write);
     }
 }

@@ -26,10 +26,11 @@ use superai_config::transaction::{FileAction, Transaction};
 
 use crate::adapter::{Adapter, ConfigScope, SurfaceOwnership, WrapperPlan};
 use crate::discovery::{
-    Fingerprint, ForeignCheck, can_adopt, canonical_config_digests, is_foreign_managed,
+    Fingerprint, ForeignCheck, WrapperFinding, WrapperFindingKind, can_adopt,
+    canonical_config_digests, is_foreign_managed,
 };
 use crate::error::{CoreError, Result};
-use crate::ids::{HarnessId, InstanceId, InstanceName, OperationId};
+use crate::ids::{HarnessId, InstanceId, InstanceName, OperationId, ProviderId};
 use crate::instance::{Instance, TemplateRef, WrapperRef};
 use crate::operation::{
     ActionKind, AuthStep, BackupPlan, CompletedAction, Conflict, Limitation, OperationKind,
@@ -162,6 +163,12 @@ pub struct CreateRequest {
     pub isolation: Isolation,
     /// Template the instance was built from, if any.
     pub template: Option<TemplateRef>,
+    /// Provider input (INS-02): the provider the new instance will use. When
+    /// set, a planned credential exists, so preflight ENFORCES that the
+    /// harness declares a writable secret sink for it
+    /// ([`crate::provider::resolve_api_key_sink`]) — a harness without a
+    /// sink is a blocking conflict, not a warning.
+    pub provider: Option<ProviderId>,
     /// Wrapper path to generate, if any.
     pub wrapper: Option<WrapperPath>,
     /// Explicit target root, if the caller wants to control the location (e.g. tests).
@@ -187,6 +194,7 @@ impl CreateRequest {
             source,
             isolation,
             template: None,
+            provider: None,
             wrapper: None,
             target_root: None,
             daemon_port: None,
@@ -226,7 +234,7 @@ impl std::fmt::Display for MirrorKind {
     }
 }
 
-/// One entry in the mirror plan.
+/// One entry in a mirror plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorEntry {
     /// Source path on disk.
@@ -237,6 +245,9 @@ pub struct MirrorEntry {
     pub kind: MirrorKind,
     /// Human-readable reason for include/exclude.
     pub reason: String,
+    /// Unix permission bits observed on the source at plan time; applied to
+    /// the copy so modes survive the mirror (INS-03 "preserve modes").
+    pub mode: Option<u32>,
 }
 
 /// Plan for mirroring a config root.
@@ -244,11 +255,14 @@ pub struct MirrorEntry {
 pub struct MirrorPlan {
     /// Files that will be copied.
     pub copied: Vec<MirrorEntry>,
+    /// Shared assets that will be LINKED instead of copied (INS-03/04 step 4).
+    pub linked: Vec<MirrorEntry>,
     /// Files that will be skipped.
     pub skipped: Vec<MirrorEntry>,
-    /// Files that will be transformed during copy.
+    /// Files that will be transformed during copy (template mutation or
+    /// adapter-declared config-root path rewrite inside content).
     pub transformed: Vec<MirrorEntry>,
-    /// Resources that remain externally authenticated.
+    /// Resources that remain externally authenticated (never copied).
     pub external_auth: Vec<MirrorEntry>,
     /// Adapter exclusions that drove the plan.
     pub exclusions: Vec<String>,
@@ -450,16 +464,53 @@ fn adapter_credential_file_names(adapter: &dyn Adapter) -> Vec<String> {
         .collect()
 }
 
+/// Fresh unix mode of `path`, when statable (INS-03 mode preservation).
+fn observed_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::symlink_metadata(path).ok().map(|_| 0o644)
+    }
+}
+
+/// Whether a relative mirror path matches an adapter-declared link-safe or
+/// rewrite-declared name (leading component or full path).
+fn matches_declared_path(relative: &Path, declared: &[String]) -> bool {
+    let rel = relative.to_string_lossy();
+    let first = relative
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    declared
+        .iter()
+        .any(|d| d == rel.as_ref() || *d == first || rel.starts_with(&format!("{d}/")))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirror classification covers every INS-03 kind explicitly"
+)]
 fn build_mirror_plan(
     source_root: &Path,
     target_root: &Path,
     exclusions: &[String],
     credential_names: &[String],
+    link_paths: &[String],
+    rewrite_files: &[String],
+    transform_targets: &[PathBuf],
 ) -> Result<MirrorPlan> {
     let mut copied: Vec<MirrorEntry> = Vec::new();
+    let mut linked: Vec<MirrorEntry> = Vec::new();
     let mut skipped: Vec<MirrorEntry> = Vec::new();
-    let transformed: Vec<MirrorEntry> = Vec::new();
-    let external_auth: Vec<MirrorEntry> = Vec::new();
+    let mut transformed: Vec<MirrorEntry> = Vec::new();
+    let mut external_auth: Vec<MirrorEntry> = Vec::new();
 
     if !source_root.exists() {
         return Err(CoreError::Validation {
@@ -490,6 +541,12 @@ fn build_mirror_plan(
         });
     }
 
+    let source_root_str = source_root.to_string_lossy().into_owned();
+    // Linked roots already claimed by a Linked entry: their descendants are
+    // part of the shared asset (the directory link carries them) and are not
+    // classified again — a file link under a linked dir would collide with
+    // the transaction's symlink step.
+    let mut linked_roots: Vec<PathBuf> = Vec::new();
     for src in all {
         let relative = if src == source_root {
             PathBuf::from(src.file_name().and_then(|n| n.to_str()).unwrap_or("file"))
@@ -502,40 +559,95 @@ fn build_mirror_plan(
                 target: target_root.join(src.file_name().unwrap_or_default()),
                 kind: MirrorKind::Skipped,
                 reason: "cannot make relative to source root".to_owned(),
+                mode: observed_mode(&src),
             });
             continue;
         };
+        if linked_roots.iter().any(|root| src.starts_with(root)) {
+            continue;
+        }
         let (excluded, reason) = is_excluded(&relative, exclusions);
         let target = target_root.join(&relative);
+        let mode = observed_mode(&src);
         if excluded {
             skipped.push(MirrorEntry {
                 source: src,
                 target,
                 kind: MirrorKind::Skipped,
                 reason,
+                mode,
             });
         } else if is_credential_path(&relative, credential_names) {
             // Credential material is never copied, even when no adapter
             // exclusion covers it: instances re-establish credentials through
-            // the documented external-auth path instead.
-            skipped.push(MirrorEntry {
+            // the documented external-auth path instead. Classified
+            // ExternalAuth (in `external_auth`, not `skipped` — INS-03).
+            external_auth.push(MirrorEntry {
                 source: src,
                 target,
                 kind: MirrorKind::ExternalAuth,
                 reason: "OAuth/keychain credentials stay external (default needs-auth)".to_owned(),
+                mode,
             });
+        } else if matches_declared_path(&relative, link_paths) {
+            // Adapter-declared shared asset (INS-03 Linked / INS-04 step 4).
+            linked_roots.push(src.clone());
+            linked.push(MirrorEntry {
+                source: src,
+                target,
+                kind: MirrorKind::Linked,
+                reason: "adapter-declared link-safe shared asset".to_owned(),
+                mode,
+            });
+        } else if transform_targets.iter().any(|t| *t == target) {
+            // The template mutation rewrites this file during copy.
+            transformed.push(MirrorEntry {
+                source: src,
+                target,
+                kind: MirrorKind::Transformed,
+                reason: "template/provider mutation applied to the copy".to_owned(),
+                mode,
+            });
+        } else if matches_declared_path(&relative, rewrite_files) {
+            // Adapter-declared content rewrite: the file embeds the config
+            // root path. Only TRANSFORMED when the content actually carries
+            // the source root — otherwise a plain copy is the honest plan.
+            let content_has_root = std::fs::read_to_string(&src)
+                .map(|text| text.contains(&source_root_str))
+                .unwrap_or(false);
+            if content_has_root {
+                transformed.push(MirrorEntry {
+                    source: src,
+                    target,
+                    kind: MirrorKind::Transformed,
+                    reason: format!(
+                        "content embeds source root {source_root_str}; rewritten to target"
+                    ),
+                    mode,
+                });
+            } else {
+                copied.push(MirrorEntry {
+                    source: src,
+                    target,
+                    kind: MirrorKind::Copied,
+                    reason: "included: user-editable settings/permissions".to_owned(),
+                    mode,
+                });
+            }
         } else {
             copied.push(MirrorEntry {
                 source: src,
                 target,
                 kind: MirrorKind::Copied,
                 reason: "included: user-editable settings/permissions".to_owned(),
+                mode,
             });
         }
     }
 
     Ok(MirrorPlan {
         copied,
+        linked,
         skipped,
         transformed,
         external_auth,
@@ -562,8 +674,15 @@ pub struct DefaultInspectPreview {
     pub snapshot: Option<Snapshot>,
     /// Whether the default is already recorded in the registry.
     pub already_recorded: bool,
-    /// Whether the default path appears foreign-managed.
+    /// Whether the default path appears foreign-managed (INS-01: the REAL
+    /// [`is_foreign_managed`] check — markers, claude-multi config links —
+    /// not a hardcoded `false`).
     pub foreign_managed: bool,
+    /// Foreign-ownership evidence captured at preview time; commit re-runs
+    /// the check fresh under the same home scope.
+    pub foreign_check: ForeignCheck,
+    /// Home the foreign check ran under.
+    pub home: Option<PathBuf>,
     /// Operation preview for registering the default instance.
     pub preview: OperationPreview,
 }
@@ -624,10 +743,13 @@ pub fn inspect_default_with_home(
         false
     };
 
-    // Foreign-managed check: simplified - if there's a marker file like .claude-multi?
-    // For now, check for a file named `.superai-foreign` or `~/.claude/.foreign`?
-    // We'll treat as false unless evidence of claude-multi directory with config matching.
-    let foreign_managed = false;
+    // Foreign-managed check (INS-01): the REAL discovery check — marker
+    // files, claude-multi sibling/config links, generic ownership markers.
+    let foreign_check = default_root_opt
+        .as_ref()
+        .map(|root| is_foreign_managed(root.as_path(), Some(home)));
+    let foreign_managed = foreign_check.as_ref().is_some_and(|f| f.is_foreign);
+    let foreign_ambiguous = foreign_check.as_ref().is_some_and(|f| f.ambiguous);
 
     // Build preview
     let preview_id = new_operation_id()?;
@@ -651,6 +773,20 @@ pub fn inspect_default_with_home(
     let mut preconditions: Vec<Precondition> = Vec::new();
     let mut conflicts: Vec<Conflict> = Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
+
+    if foreign_ambiguous {
+        warnings.push(Warning {
+            code: "foreign_ambiguous".to_owned(),
+            message: format!(
+                "ownership evidence for default {} is ambiguous: {:?}",
+                harness.as_str(),
+                foreign_check
+                    .as_ref()
+                    .map_or_else(Vec::new, |f| f.evidence.clone())
+            ),
+            path: None,
+        });
+    }
 
     if already_recorded {
         conflicts.push(Conflict {
@@ -798,6 +934,13 @@ pub fn inspect_default_with_home(
         snapshot,
         already_recorded,
         foreign_managed,
+        foreign_check: foreign_check.unwrap_or(ForeignCheck {
+            is_foreign: false,
+            owner: None,
+            evidence: Vec::new(),
+            ambiguous: false,
+        }),
+        home: Some(home.to_path_buf()),
         preview,
     })
 }
@@ -809,6 +952,32 @@ pub fn register_default(
     preview: &DefaultInspectPreview,
     registry_path: &Path,
 ) -> Result<OperationResult> {
+    // INS-01 fresh re-proof FIRST: the foreign-ownership determination is
+    // re-run against the live filesystem before anything else — a manager
+    // that claimed the default between preview and commit blocks
+    // registration with the typed error.
+    let Some(default_root) = &preview.default_root else {
+        return Err(CoreError::Validation {
+            field: "default_root".to_owned(),
+            reason: "no default root resolved".to_owned(),
+        });
+    };
+    let fresh_foreign = is_foreign_managed(
+        default_root.as_path(),
+        preview.home.as_deref().or(home_dir().as_deref()),
+    );
+    if fresh_foreign.is_foreign {
+        return Err(CoreError::ForeignOwnership {
+            path: default_root.as_path().to_path_buf(),
+            owner: fresh_foreign.owner.unwrap_or_else(|| "foreign".to_owned()),
+        });
+    }
+    if fresh_foreign.ambiguous {
+        return Err(CoreError::AmbiguousOwnership {
+            path: default_root.as_path().to_path_buf(),
+            evidence: fresh_foreign.evidence,
+        });
+    }
     if !preview.preview.conflicts.is_empty() {
         return Err(CoreError::Validation {
             field: "preview".to_owned(),
@@ -818,12 +987,6 @@ pub fn register_default(
             ),
         });
     }
-    let Some(default_root) = &preview.default_root else {
-        return Err(CoreError::Validation {
-            field: "default_root".to_owned(),
-            reason: "no default root resolved".to_owned(),
-        });
-    };
 
     // Fresh read of registry (disk is truth)
     let mut registry = Registry::load(registry_path)?;
@@ -1594,34 +1757,25 @@ fn preflight_create(
                 });
             }
         }
-        // Also wrapper command vs instance names
-        for inst in registry.instances() {
-            if inst.name.normalized() == request.name.normalized() {
-                // already handled
-            } else if inst.name.normalized() == request.name.normalized() {
-                conflicts.push(Conflict {
-                    code: "instance_wrapper_collision".to_owned(),
-                    message: format!("new name {} collides with existing wrapper", request.name),
-                    paths: Vec::new(),
-                });
-            }
-        }
-        // Wrapper file already exists on disk and is not owned?
-        if wrapper_path.as_path().exists() {
-            warnings.push(Warning {
-                code: "wrapper_exists".to_owned(),
-                message: format!("wrapper path {wrapper_path} already exists on disk"),
-                path: AbsolutePath::from_path(wrapper_path.as_path()).ok(),
+        // WRP-03: name/path resolution through the REAL resolver — PATH
+        // executable collisions, filesystem case folding + Windows
+        // extensions, registry collisions, and unowned-file refusal — all
+        // surfaced as preflight conflicts (the resolver's own checks run
+        // through `check_wrapper_collisions`/`exists_case_insensitive`/
+        // `check_executable_collision_on_path`).
+        let bin_dir = wrapper_path
+            .as_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Err(e) =
+            wrapper_helper::resolve_wrapper_destination(&bin_dir, &request.name, registry)
+        {
+            conflicts.push(Conflict {
+                code: "wrapper_destination".to_owned(),
+                message: format!("wrapper destination {wp_str} rejected: {e}"),
+                paths: vec![],
             });
-            // Check foreign ownership: if file exists but doesn't contain superai marker
-            let content = std::fs::read_to_string(wrapper_path.as_path()).unwrap_or_default();
-            if !content.contains("superai wrapper") {
-                conflicts.push(Conflict {
-                    code: "foreign_wrapper".to_owned(),
-                    message: format!("wrapper path {wrapper_path} is owned by foreign file"),
-                    paths: Vec::new(),
-                });
-            }
         }
     }
 
@@ -1696,7 +1850,10 @@ fn preflight_create(
         });
     }
 
-    // Harness supports chosen isolation
+    // Harness supports chosen isolation (INS-02): the enum-level refusal,
+    // plus a consult of the CATALOG's declared isolation class for the
+    // harness — a relocated-root request against a fixed-path or
+    // single-instance harness is surfaced before any target is built.
     if request.isolation == Isolation::Unsupported {
         conflicts.push(Conflict {
             code: "isolation_unsupported".to_owned(),
@@ -1707,6 +1864,40 @@ fn preflight_create(
             ),
             paths: vec![],
         });
+    }
+    if let Some(entry) = crate::harness_catalog::find_by_id(request.harness.as_str())
+        && entry.isolation != request.isolation
+    {
+        let mismatch_kind = if matches!(
+            request.isolation,
+            Isolation::FixedPathSingle | Isolation::DaemonService
+        ) && !matches!(
+            entry.isolation,
+            Isolation::FixedPathSingle | Isolation::DaemonService
+        ) {
+            "isolation_class_mismatch"
+        } else {
+            "isolation_class_differs"
+        };
+        let message = format!(
+            "harness {} declares isolation {} but the request asks for {}",
+            request.harness, entry.isolation, request.isolation
+        );
+        // A fixed-path/daemon harness asked to relocate (or vice versa) is a
+        // hard mismatch; softer differences stay advisory.
+        if mismatch_kind == "isolation_class_mismatch" {
+            conflicts.push(Conflict {
+                code: mismatch_kind.to_owned(),
+                message,
+                paths: vec![],
+            });
+        } else {
+            warnings.push(Warning {
+                code: mismatch_kind.to_owned(),
+                message,
+                path: None,
+            });
+        }
     }
     if request.isolation == Isolation::Unknown {
         warnings.push(Warning {
@@ -1833,23 +2024,69 @@ fn preflight_create(
         });
     }
 
-    // Planned secret sink valid (INS-02): resolve the harness-declared sink
-    // for a provider credential against the chosen adapter. A harness with
-    // no writable sink surfaces the typed refusal; hard blocking lands with
-    // the CreateRequest provider-input field (INS-02 remainder) — nothing is
-    // invented here.
+    // Planned secret sink valid (INS-02): the harness-declared sink for a
+    // provider credential, resolved against the chosen adapter. Without a
+    // planned provider the sink outcome is advisory (satisfied precondition
+    // or typed warning — 6a behavior). WITH a provider input a credential is
+    // planned, so an unresolvable sink is a BLOCKING conflict.
     match crate::provider::resolve_api_key_sink(adapter) {
-        Ok(sink) => preconditions.push(Precondition {
-            kind: PreconditionKind::AuthPresent,
-            description: format!("planned secret sink valid: {}", sink.description),
-            path: None,
-            satisfied: true,
-        }),
-        Err(e) => warnings.push(Warning {
-            code: "secret_sink_unavailable".to_owned(),
-            message: format!("no writable secret sink for {}: {e}", adapter.id()),
-            path: None,
-        }),
+        Ok(sink) => {
+            let provider_note = request
+                .provider
+                .as_ref()
+                .map_or_else(|| String::new(), |p| format!(" for planned provider {p}"));
+            preconditions.push(Precondition {
+                kind: PreconditionKind::AuthPresent,
+                description: format!(
+                    "planned secret sink valid{provider_note}: {}",
+                    sink.description
+                ),
+                path: None,
+                satisfied: true,
+            });
+        }
+        Err(e) => {
+            if request.provider.is_some() {
+                conflicts.push(Conflict {
+                    code: "secret_sink_unavailable".to_owned(),
+                    message: format!(
+                        "provider {} planned but harness {} has no writable secret sink: {e}",
+                        request
+                            .provider
+                            .as_ref()
+                            .map_or_else(|| "?".to_owned(), ToString::to_string),
+                        adapter.id()
+                    ),
+                    paths: vec![],
+                });
+            } else {
+                warnings.push(Warning {
+                    code: "secret_sink_unavailable".to_owned(),
+                    message: format!("no writable secret sink for {}: {e}", adapter.id()),
+                    path: None,
+                });
+            }
+        }
+    }
+
+    // Provider input validity (INS-02): a planned provider must exist in the
+    // bundled catalog; an unknown id is a blocking conflict, never a silent
+    // pass.
+    if let Some(provider_id) = &request.provider {
+        let known = crate::provider::load_bundled_providers()
+            .map(|providers| {
+                providers
+                    .iter()
+                    .any(|p| p.id.as_str().eq_ignore_ascii_case(provider_id.as_str()))
+            })
+            .unwrap_or(false);
+        if !known {
+            conflicts.push(Conflict {
+                code: "provider_unknown".to_owned(),
+                message: format!("planned provider {provider_id} is not in the provider catalog"),
+                paths: vec![],
+            });
+        }
     }
 
     // No daemon port conflict (INS-02/WRP-07): real for daemon-service
@@ -1895,14 +2132,30 @@ fn preflight_create(
         }
     }
 
-    // No foreign manager ownership: simplified
-    // Check for foreign marker: if source root contains .claude-multi or similar, flag
-    let foreign_marker = source_root.join(".foreign-managed");
-    if foreign_marker.exists() {
+    // No foreign manager ownership (INS-02): the REAL discovery check
+    // (markers, claude-multi config links) — not a bare marker-file probe.
+    // Ambiguity does not block a read-only mirror but is surfaced.
+    let foreign = is_foreign_managed(source_root, home_dir().as_deref());
+    if foreign.is_foreign {
         conflicts.push(Conflict {
             code: "foreign_owned".to_owned(),
-            message: format!("source {} appears foreign-managed", source_root.display()),
+            message: format!(
+                "source {} is foreign-managed ({}): {}",
+                source_root.display(),
+                foreign.owner.as_deref().unwrap_or("foreign"),
+                foreign.evidence.join("; ")
+            ),
             paths: vec![],
+        });
+    } else if foreign.ambiguous {
+        warnings.push(Warning {
+            code: "foreign_ambiguous".to_owned(),
+            message: format!(
+                "ownership evidence for source {} is ambiguous: {}",
+                source_root.display(),
+                foreign.evidence.join("; ")
+            ),
+            path: None,
         });
     }
 
@@ -1913,20 +2166,55 @@ fn preflight_create(
 // Mirror plan (public)
 // ---------------------------------------------------------------------------
 
+/// The target files a template mutation will rewrite during the copy
+/// (INS-03 `Transformed` classification for the template path).
+fn template_transform_targets(target_root: &Path, template: Option<&TemplateRef>) -> Vec<PathBuf> {
+    if template.is_some() {
+        vec![target_root.join("settings.json")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Compute a mirror plan for copying from `source_root` to `target_root`.
 ///
 /// Uses the adapter's exclusions plus the credential gate: paths named after
 /// credential material (see `is_credential_path`) and files the adapter
 /// declares as external secret-store surfaces are skipped for external
-/// re-authentication instead of being copied.
+/// re-authentication instead of being copied. Adapter-declared link-safe
+/// shared assets are classified [`MirrorKind::Linked`] (INS-03/04) and
+/// files whose content embeds the config root are classified
+/// [`MirrorKind::Transformed`].
 pub fn plan_mirror(
     source_root: &Path,
     target_root: &Path,
     adapter: &dyn Adapter,
 ) -> Result<MirrorPlan> {
+    plan_mirror_for_template(source_root, target_root, adapter, None)
+}
+
+/// [`plan_mirror`] with an optional template whose settings mutation marks
+/// the target settings file as transformed.
+pub fn plan_mirror_for_template(
+    source_root: &Path,
+    target_root: &Path,
+    adapter: &dyn Adapter,
+    template: Option<&TemplateRef>,
+) -> Result<MirrorPlan> {
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
-    build_mirror_plan(source_root, target_root, &exclusions, &credential_names)
+    let link_paths = adapter.mirror_link_paths();
+    let rewrite_files = adapter.mirror_content_rewrite_files();
+    let transform_targets = template_transform_targets(target_root, template);
+    build_mirror_plan(
+        source_root,
+        target_root,
+        &exclusions,
+        &credential_names,
+        &link_paths,
+        &rewrite_files,
+        &transform_targets,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,8 +2234,15 @@ pub fn preview_create_mirrored(
     // the plan's real byte total (fresh stats at preflight time).
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
-    let mirror_plan =
-        build_mirror_plan(&source_root, &target_root, &exclusions, &credential_names)?;
+    let mirror_plan = build_mirror_plan(
+        &source_root,
+        &target_root,
+        &exclusions,
+        &credential_names,
+        &adapter.mirror_link_paths(),
+        &adapter.mirror_content_rewrite_files(),
+        &template_transform_targets(&target_root, request.template.as_ref()),
+    )?;
     let planned_bytes = planned_copy_bytes(&mirror_plan);
     let (preconditions, conflicts, warnings) = preflight_create(
         request,
@@ -2032,6 +2327,24 @@ pub fn preview_create_mirrored(
         });
         order += 1;
     }
+    // INS-04 step 4: install/link adapter-declared shared assets.
+    for entry in &mirror_plan.linked {
+        actions.push(PlannedAction {
+            order,
+            kind: ActionKind::CreateSymlink,
+            target: AbsolutePath::from_path(&entry.target).map_err(|e| CoreError::Validation {
+                field: "target".to_owned(),
+                reason: format!("entry target invalid: {e}"),
+            })?,
+            description: format!(
+                "link shared asset {} -> {}",
+                entry.target.display(),
+                entry.source.display()
+            ),
+            requires_backup: false,
+        });
+        order += 1;
+    }
     if let Some(wrapper_path) = &request.wrapper {
         actions.push(PlannedAction {
             order,
@@ -2070,17 +2383,20 @@ pub fn preview_create_mirrored(
         })?,
         surface: "mirror".to_owned(),
         lexical_redacted: format!(
-            "mirror {} -> {} ({} copied, {} skipped, {} transformed)",
+            "mirror {} -> {} ({} copied, {} linked, {} skipped, {} transformed)",
             source_root.display(),
             target_root.display(),
             mirror_plan.copied.len(),
+            mirror_plan.linked.len(),
             mirror_plan.skipped.len(),
             mirror_plan.transformed.len()
         ),
         semantic_redacted: format!(
-            "mirror plan: {} copied, {} skipped, {} external_auth, exclusions: {:?}",
+            "mirror plan: {} copied, {} linked, {} skipped, {} transformed, {} external_auth, exclusions: {:?}",
             mirror_plan.copied.len(),
+            mirror_plan.linked.len(),
             mirror_plan.skipped.len(),
+            mirror_plan.transformed.len(),
             mirror_plan.external_auth.len(),
             exclusions
         ),
@@ -2196,30 +2512,82 @@ fn resolve_source_and_target(
 // Isolate and configure helper
 // ---------------------------------------------------------------------------
 
-/// Isolate and configure a target root from a source, applying template mutations
-/// and generating a wrapper, all via file actions that are validated transactionally.
+/// Isolate and configure a target root from a source, applying template
+/// mutations, shared-asset links, and wrapper generation, all via file
+/// actions that are validated transactionally.
 ///
-/// This is the core of INS-04 transaction order.
+/// This is the core of INS-04 transaction order:
+/// 1. Create target root. 2. Copy mirror (linked entries become symlinks,
+/// transformed entries carry their mutation). 3. Template/provider mutations
+/// to target only. 4. Install/link shared assets. 5. Wrapper. The DRF-05
+/// instance marker (`.superai-instance`, carrying the stable id) is written
+/// into the target so reconciliation matches identity before paths.
+#[expect(
+    clippy::too_many_lines,
+    reason = "INS-04 step assembly covers every mirror kind explicitly"
+)]
 fn isolate_and_configure(
     request: &CreateRequest,
     source_root: &Path,
     target_root: &Path,
     adapter: &dyn Adapter,
-) -> Result<(Vec<FileAction>, WrapperPlan)> {
+    instance_id: &InstanceId,
+) -> Result<(Vec<FileAction>, WrapperPlan, MirrorPlan)> {
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
-    let mirror_plan = build_mirror_plan(source_root, target_root, &exclusions, &credential_names)?;
+    let mirror_plan = build_mirror_plan(
+        source_root,
+        target_root,
+        &exclusions,
+        &credential_names,
+        &adapter.mirror_link_paths(),
+        &adapter.mirror_content_rewrite_files(),
+        &template_transform_targets(target_root, request.template.as_ref()),
+    )?;
 
     let mut steps: Vec<FileAction> = Vec::new();
     steps.push(FileAction::CreateDir {
         path: target_root.to_path_buf(),
     });
 
+    let source_root_str = source_root.to_string_lossy().into_owned();
+    let target_root_str = target_root.to_string_lossy().into_owned();
+    for entry in &mirror_plan.transformed {
+        // Transformed entries carry their mutation into the copy: either the
+        // template settings mutation or the adapter-declared config-root
+        // path rewrite inside content.
+        let bytes = std::fs::read(&entry.source).map_err(|e| {
+            CoreError::Config(ConfigError::Io {
+                path: entry.source.clone(),
+                source: e,
+            })
+        })?;
+        let mutated = if request.template.is_some() && entry.target.ends_with("settings.json") {
+            mutate_settings_with_template(
+                &entry.target,
+                Some(&bytes),
+                request.template.as_ref().expect("checked some above"),
+            )?
+        } else {
+            let text = String::from_utf8_lossy(&bytes);
+            text.replace(&source_root_str, &target_root_str)
+                .into_bytes()
+        };
+        steps.push(FileAction::Write {
+            path: entry.target.clone(),
+            content: mutated,
+            kind: guess_document_kind(&entry.source),
+        });
+    }
+
     // Copy mirror according to plan: each copied entry becomes a Write action
     // We read source bytes fresh (snapshot) and stage writes.
-    // If template is present and settings.json is among copied files, mutate it directly to avoid duplicate path.
+    // Transformed settings (template) are handled above, so plain copies here.
     let target_settings_path = target_root.join("settings.json");
-    let mut has_settings_write = false;
+    let mut has_settings_write = mirror_plan
+        .transformed
+        .iter()
+        .any(|e| e.target == target_settings_path);
     for entry in &mirror_plan.copied {
         if entry.target == target_settings_path && request.template.is_some() {
             let src_bytes = std::fs::read(&entry.source).ok();
@@ -2260,14 +2628,30 @@ fn isolate_and_configure(
         }
     }
 
+    // INS-04 step 4: install/link adapter-declared shared assets. The link
+    // points back at the SOURCE asset (shared by design); the transaction's
+    // owned-target rule guards any existing link at the destination.
+    for entry in &mirror_plan.linked {
+        steps.push(FileAction::Symlink {
+            link: entry.target.clone(),
+            target: entry.source.clone(),
+            expected_current: None,
+        });
+    }
+
+    // DRF-05: the stable-identity marker so reconciliation matches the
+    // InstanceId BEFORE comparing paths. Content is the id, nothing else.
+    steps.push(FileAction::Write {
+        path: target_root.join(crate::discovery::INSTANCE_MARKER_FILE),
+        content: format!("{}\n", instance_id.as_str()).into_bytes(),
+        kind: superai_config::document::DocumentKind::TextFragment,
+    });
+
     // Generate wrapper or activation artifact
     let mut wrapper_plan = WrapperPlan::new(&format!("wrapper for {}", request.name));
     if let Some(wrapper_path) = &request.wrapper {
-        // Plan via adapter if possible
-        // We construct a temporary Instance to ask adapter for plan
-        let temp_instance = Instance {
-            id: InstanceId::new("temp-id-for-plan")
-                .unwrap_or_else(|_| InstanceId::new("temp-id").unwrap()),
+        let instance = Instance {
+            id: instance_id.clone(),
             name: request.name.clone(),
             harness: request.harness.clone(),
             config_root: AbsolutePath::from_path(target_root).map_err(|e| {
@@ -2285,7 +2669,7 @@ fn isolate_and_configure(
             created_at: now_iso8601(),
             adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
         };
-        let plan = adapter.plan_wrapper(&temp_instance).unwrap_or_else(|_| {
+        let plan = adapter.plan_wrapper(&instance).unwrap_or_else(|_| {
             let mut p = WrapperPlan::new(&format!("generic wrapper for {}", request.harness));
             p.env_vars.push((
                 wrapper_helper::env_var_for_harness(&request.harness),
@@ -2295,8 +2679,7 @@ fn isolate_and_configure(
         });
         wrapper_plan = plan;
 
-        let (content, _digest) =
-            wrapper_helper::generate_shell_wrapper(&temp_instance, &wrapper_plan);
+        let (content, _digest) = wrapper_helper::generate_shell_wrapper(&instance, &wrapper_plan);
         steps.push(FileAction::Write {
             path: wrapper_path.as_path().to_path_buf(),
             content: content.into_bytes(),
@@ -2304,7 +2687,73 @@ fn isolate_and_configure(
         });
     }
 
-    Ok((steps, wrapper_plan))
+    Ok((steps, wrapper_plan, mirror_plan))
+}
+
+/// Apply a plan-observed unix mode to a superai-owned target path (INS-03
+/// mode preservation). Best-effort by design: the transaction already
+/// content-verified the copy, and a chmod failure must not fail the whole
+/// create after the bytes landed — the copy stays in place with the
+/// transaction's default mode. No-op off unix.
+fn apply_observed_mode(path: &Path, mode: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        let permissions = std::fs::Permissions::from_mode(mode);
+        drop(std::fs::set_permissions(path, permissions));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
+/// Digest of every regular file under `root`, sorted by path (INS-04
+/// source-unchanged proof; also used by reconciliation tests).
+fn source_tree_digests(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push((path, compute_digest_bytes(&bytes)));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Deterministic instance id for a create: name + digest of the target root
+/// (the derivation the record and the DRF-05 marker share).
+fn derive_instance_id(name: &InstanceName, target_root: &str) -> Result<InstanceId> {
+    let candidate = format!(
+        "{}_{}",
+        name.as_str(),
+        compute_digest_bytes(target_root.as_bytes())
+    );
+    let trimmed = candidate
+        .get(0..16)
+        .map_or_else(|| candidate.as_str(), |s| s);
+    InstanceId::new(trimmed)
+        .or_else(|_| {
+            InstanceId::new(&compute_digest_bytes(
+                format!("{}{}", name.as_str(), target_root).as_bytes(),
+            ))
+        })
+        .map_err(|e| CoreError::Validation {
+            field: "id".to_owned(),
+            reason: format!("instance id invalid: {e}"),
+        })
 }
 
 fn guess_document_kind(path: &Path) -> superai_config::document::DocumentKind {
@@ -2408,9 +2857,17 @@ pub fn create_mirrored(
         });
     }
 
+    // Stable instance id up front (same derivation the record uses), so the
+    // DRF-05 marker and the wrapper carry the id the registry will hold.
+    let instance_id = derive_instance_id(&request.name, &target_root.to_string_lossy())?;
+
+    // INS-04: capture the source tree BEFORE any staging — the copy's
+    // source-unchanged proof compares fresh digests after the transaction.
+    let source_before = source_tree_digests(&source_root);
+
     // Build file actions via isolate_and_configure
-    let (steps, wrapper_plan) =
-        isolate_and_configure(&request, &source_root, &target_root, adapter)?;
+    let (steps, wrapper_plan, mirror_plan) =
+        isolate_and_configure(&request, &source_root, &target_root, adapter, &instance_id)?;
 
     // Create operation id
     let op_id_str = generate_operation_id_string();
@@ -2496,28 +2953,7 @@ pub fn create_mirrored(
     };
 
     let instance = Instance {
-        id: InstanceId::new(
-            format!(
-                "{}_{}",
-                request.name.as_str(),
-                compute_digest_bytes(target_root.display().to_string().as_bytes())
-            )
-            .get(0..16)
-            .unwrap_or("inst"),
-        )
-        .map_err(|e| CoreError::Validation {
-            field: "id".to_owned(),
-            reason: format!("instance id invalid: {e}"),
-        })
-        .or_else(|_| {
-            InstanceId::new(&compute_digest_bytes(
-                format!("{}{}", request.name, target_root.display()).as_bytes(),
-            ))
-        })
-        .map_err(|e| CoreError::Validation {
-            field: "id".to_owned(),
-            reason: format!("fallback id invalid: {e}"),
-        })?,
+        id: instance_id,
         name: request.name.clone(),
         harness: request.harness.clone(),
         config_root: target_abs.clone(),
@@ -2560,18 +2996,37 @@ pub fn create_mirrored(
         });
     }
 
-    // Also ensure source unchanged: snapshot again and compare to initial?
-    let src_snap_after = snapshot(&source_root);
-    let src_snap_before = snapshot(&source_root); // fresh before was not saved; we snapshot again but assume not changed?
-    // Simplified: source should still exist
-    if !src_snap_after.exists {
-        warnings_log(format!(
-            "source {} disappeared after mirror",
-            source_root.display()
-        ));
+    // INS-04: REAL source-unchanged proof. The tree was digested BEFORE any
+    // staging; a fresh digest now must match exactly — the source cannot
+    // have changed during the mirror. Mismatch quarantines the residuals and
+    // aborts before any registry write.
+    let source_after = source_tree_digests(&source_root);
+    if source_after != source_before {
+        drop(quarantine_target(&target_root, &op_id_str));
+        if let Some(wrapper_path) = &request.wrapper {
+            drop(quarantine_target(wrapper_path.as_path(), &op_id_str));
+        }
+        return Err(CoreError::ConcurrentModification {
+            path: source_root,
+            expected: format!("{} files digested before staging", source_before.len()),
+            actual: format!(
+                "{} files digested after commit (source changed during mirror)",
+                source_after.len()
+            ),
+        });
     }
-    let _ = src_snap_before;
+
+    // INS-03: preserve modes on the copies — the transaction stages bytes
+    // (content-verified); the plan's observed source modes are re-applied to
+    // the superai-owned target files so permission bits survive the mirror.
     let _ = wrapper_plan;
+    for entry in mirror_plan
+        .copied
+        .iter()
+        .chain(mirror_plan.transformed.iter())
+    {
+        apply_observed_mode(&entry.target, entry.mode);
+    }
 
     // Now add registry record last (commit registry)
     let mut fresh_registry = Registry::load(registry_path)?;
@@ -2637,10 +3092,6 @@ fn quarantine_target(
     op_id: &str,
 ) -> std::result::Result<superai_config::quarantine::QuarantineEntry, ConfigError> {
     superai_config::quarantine::move_to_quarantine(path, op_id)
-}
-
-fn warnings_log(_msg: String) {
-    // In real code, log to diagnostics
 }
 
 // ---------------------------------------------------------------------------
@@ -2837,7 +3288,8 @@ pub fn rename_instance(
                 // Need to rename wrapper file to new name in same directory
                 if let Some(parent) = old_path.parent() {
                     let new_path = parent.join(new_name.as_str());
-                    // Backup old wrapper before rename
+                    // Backup old wrapper before rename (INS-05: replacement is
+                    // backed up; the rename itself is a single fs::rename).
                     if old_path.exists() {
                         drop(superai_config::backup::backup(&old_path));
                     }
@@ -2847,31 +3299,10 @@ pub fn rename_instance(
                             wrapper_renamed = true;
                             wrapper_old_path = Some(old_path.clone());
                             wrapper_new_path = Some(new_path.clone());
-                            // Update wrapper path in registry to reflect new location
-                            // Need to update the instance's wrapper.path to new_path
-                            // For now, modify registry entry directly
-                            if let Some(inst_mut) = registry
-                                .instances()
-                                .iter()
-                                .position(|i| i.id == preserved_id)
-                                .and({
-                                    // This is hacky: we need mutable access; Registry stores Vec<Instance> but no direct mutable getter.
-                                    // We'll reload and re-insert? Simpler: remove and re-insert with updated wrapper.
-                                    None::<usize>
-                                })
-                            {
-                                let _ = inst_mut;
-                            }
-                            // Instead, we will handle by re-loading registry, removing old, inserting new with correct wrapper path.
-                            // But for now, just store registry with updated wrapper via direct mutation using unsafe? Instead, we can do:
-                            // Remove the renamed instance and reinsert with updated wrapper.
-                            // However, we already have registry with new name and old wrapper path; we need to fix it.
-                            // We'll do a second step after store: update wrapper file path if needed.
-                            // This is after we haven't stored yet, so fresh still has old name.
-                            // Instead, we will adjust wrapper before storing.
-                            // The registry currently has renamed instance with old wrapper path.
-                            // We need to update wrapper path to new_path in memory before store.
-                            // Since Registry::instances is private, we need to use API: remove and insert.
+                            // Reflect the new wrapper location (and freshly
+                            // computed digest + command name, which
+                            // Registry::rename already advanced) in the
+                            // record before it is stored.
                             let mut removed =
                                 registry.remove(new_name.as_str()).ok_or_else(|| {
                                     CoreError::Validation {
@@ -2888,10 +3319,9 @@ pub fn rename_instance(
                                         reason: format!("new wrapper path invalid: {e}"),
                                     }
                                 })?;
-                            // Update wrapper path and digest
                             if let Some(w) = &mut removed.wrapper {
                                 w.path = new_wrapper_path;
-                                // Recompute digest
+                                w.command_name = new_name.clone();
                                 let content = std::fs::read(&new_path).unwrap_or_default();
                                 w.content_digest = compute_digest_bytes(&content);
                                 w.generator_version = wrapper_helper::GENERATOR_VERSION.to_owned();
@@ -2994,17 +3424,221 @@ pub fn rename_instance(
 }
 
 // ---------------------------------------------------------------------------
-// Reconfigure
+// Reconfigure (INS-06): real provider/template/skill/MCP mutations
 // ---------------------------------------------------------------------------
 
-/// Preview reconfigure of provider/template/skills for an instance.
-///
-/// Loads the instance record, re-inspects harness files fresh, builds adapter mutations,
-/// previews diffs, and ensures registry changes only for provenance after verification.
+/// One reconfiguration action (INS-06). Every variant maps to a REAL
+/// mutation path — provider changes render through
+/// [`crate::provider_render`] (PRV-03/08), template re-application goes
+/// through the same mutation create uses, MCP toggles act on the adapter's
+/// declared destination, and skill relinking re-applies the skill mode.
+/// The historical demo marker (`superai_reconfigured`) is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconfigureAction {
+    /// Add or update a provider's endpoint/model entries on the instance.
+    ApplyProvider {
+        /// Provider to render in (must exist in the provider catalog).
+        provider: ProviderId,
+    },
+    /// Switch the default model within a provider's catalog.
+    SwitchDefaultModel {
+        /// Provider whose catalog the model belongs to.
+        provider: ProviderId,
+        /// Model id or alias to make the default.
+        model: String,
+    },
+    /// Remove a provider's owned entries; dangling defaults are caught.
+    RemoveProvider {
+        /// Provider to remove.
+        provider: ProviderId,
+        /// Provider to reassign dangling defaults to, if any.
+        reassign_to: Option<ProviderId>,
+    },
+    /// Re-apply a template's settings mutation to the instance target only
+    /// (foreign keys preserved; JSONC content refused, never stripped).
+    ReapplyTemplate {
+        /// Template to re-apply.
+        template: TemplateRef,
+    },
+    /// Enable or disable an MCP server on the adapter-declared destination.
+    SetMcpEnabled {
+        /// Server id, as installed in the destination.
+        server: String,
+        /// Target state.
+        enabled: bool,
+    },
+    /// Re-apply the instance's skill links (idempotent relink of the
+    /// adapter-declared skills destination).
+    RelinkSkills,
+}
+
+/// A reconfigure request: which real mutations to apply (INS-06).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconfigureRequest {
+    /// Actions to apply, in order.
+    pub actions: Vec<ReconfigureAction>,
+}
+
+impl ReconfigureRequest {
+    /// A request from an ordered action list.
+    pub fn new(actions: Vec<ReconfigureAction>) -> Self {
+        Self { actions }
+    }
+}
+
+/// Resolve a provider from the bundled catalog (case-folded).
+fn resolve_bundled_provider(
+    provider_id: &ProviderId,
+) -> Result<crate::provider::ProviderDefinition> {
+    let providers =
+        crate::provider::load_bundled_providers().map_err(|e| CoreError::Validation {
+            field: "provider".to_owned(),
+            reason: format!("cannot load provider catalog: {e}"),
+        })?;
+    providers
+        .into_iter()
+        .find(|p| p.id.as_str().eq_ignore_ascii_case(provider_id.as_str()))
+        .ok_or_else(|| CoreError::Validation {
+            field: "provider".to_owned(),
+            reason: format!("provider {provider_id} is not in the catalog"),
+        })
+}
+
+/// Resolve the provider definitions a provider action needs (owned, so the
+/// borrowed [`crate::provider_render::ProviderChange`] can be built at each
+/// call site with locals that outlive it).
+fn resolve_action_providers(
+    action: &ReconfigureAction,
+) -> Result<(
+    crate::provider::ProviderDefinition,
+    Option<crate::provider::ProviderDefinition>,
+)> {
+    match action {
+        ReconfigureAction::ApplyProvider { provider }
+        | ReconfigureAction::SwitchDefaultModel { provider, .. } => {
+            Ok((resolve_bundled_provider(provider)?, None))
+        }
+        ReconfigureAction::RemoveProvider {
+            provider,
+            reassign_to,
+        } => Ok((
+            resolve_bundled_provider(provider)?,
+            match reassign_to {
+                Some(id) => Some(resolve_bundled_provider(id)?),
+                None => None,
+            },
+        )),
+        _ => Err(CoreError::Validation {
+            field: "action".to_owned(),
+            reason: "not a provider action".to_owned(),
+        }),
+    }
+}
+
+/// Construct the borrowed provider change for an action whose definitions
+/// are already resolved. Non-provider actions are refused (they never reach
+/// this helper through [`resolve_action_providers`]).
+fn provider_change_with<'a>(
+    action: &'a ReconfigureAction,
+    primary: &'a crate::provider::ProviderDefinition,
+    reassign: &'a Option<crate::provider::ProviderDefinition>,
+) -> Result<crate::provider_render::ProviderChange<'a>> {
+    match action {
+        ReconfigureAction::ApplyProvider { .. } => {
+            Ok(crate::provider_render::ProviderChange::AddOrUpdate { provider: primary })
+        }
+        ReconfigureAction::SwitchDefaultModel { model, .. } => {
+            Ok(crate::provider_render::ProviderChange::SwitchDefaultModel {
+                provider: primary,
+                model,
+            })
+        }
+        ReconfigureAction::RemoveProvider { provider, .. } => {
+            Ok(crate::provider_render::ProviderChange::RemoveProvider {
+                provider_id: provider,
+                reassign_to: reassign.as_ref(),
+            })
+        }
+        _ => Err(CoreError::Validation {
+            field: "action".to_owned(),
+            reason: "not a provider action".to_owned(),
+        }),
+    }
+}
+
+/// Redacted line diff between two file contents (WRP-08/INS-06 preview
+/// diffs): positional +/- lines, secret-shaped values redacted, bounded.
+pub(crate) fn redacted_line_diff(old: &str, new: &str, max_lines: usize) -> String {
+    let redact_line = |line: &str| -> String {
+        if line.contains("sk-") || line.contains("apiKey") || line.contains("api_key") {
+            if line.split_once(':').is_some() || line.split_once('=').is_some() {
+                return "[redacted credential line]".to_owned();
+            }
+        }
+        line.to_owned()
+    };
+    let mut out: Vec<String> = Vec::new();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    for (idx, line) in old_lines.iter().enumerate() {
+        let replacement = new_lines.get(idx).copied();
+        match replacement {
+            Some(n) if n == *line => {}
+            Some(n) => {
+                out.push(format!("-{}", redact_line(line)));
+                out.push(format!("+{}", redact_line(n)));
+            }
+            None => out.push(format!("-{}", redact_line(line))),
+        }
+    }
+    for line in new_lines.iter().skip(old_lines.len()) {
+        out.push(format!("+{}", redact_line(line)));
+    }
+    if out.len() > max_lines {
+        out.truncate(max_lines);
+        out.push("… (diff truncated)".to_owned());
+    }
+    out.join("\n")
+}
+
+/// The skills destination dir the adapter declares for the instance root,
+/// when it declares one (surface id containing `skills`).
+fn adapter_skills_dir(instance: &Instance, adapter: &dyn Adapter) -> Option<PathBuf> {
+    adapter
+        .config_surfaces()
+        .iter()
+        .find(|surface| surface.id.contains("skills"))
+        .map(|surface| instance.config_root.as_path().join(&surface.id))
+}
+
+/// MCP destination path for the instance, from the adapter's declaration.
+fn mcp_dest_path(
+    instance: &Instance,
+    adapter: &dyn Adapter,
+) -> Result<(PathBuf, crate::adapter::McpAdapterDecl)> {
+    let decl = adapter
+        .mcp_decl()
+        .ok_or_else(|| CoreError::UnsupportedOperation {
+            harness: adapter.id().to_string(),
+            operation: "reconfigure_mcp".to_owned(),
+            reason: "harness declares no MCP destination".to_owned(),
+        })?;
+    Ok((instance.config_root.as_path().join(&decl.dest_file), decl))
+}
+
+/// Preview reconfigure of provider/template/skills/MCP for an instance
+/// (INS-06): loads the record, re-inspects harness files FRESH, builds the
+/// real adapter mutations, and previews semantic + lexical redacted diffs.
+/// No file is written.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preview covers every reconfigure action kind"
+)]
 pub fn preview_reconfigure(
     registry: &Registry,
     name: &str,
     adapter: &dyn Adapter,
+    request: &ReconfigureRequest,
 ) -> Result<OperationPreview> {
     let preview_id = new_operation_id()?;
     let instance = registry.get(name).ok_or_else(|| CoreError::Validation {
@@ -3015,7 +3649,6 @@ pub fn preview_reconfigure(
     // Fresh snapshot of config root
     let config_snap = snapshot(instance.config_root.as_path());
     let settings_path = instance.config_root.as_path().join("settings.json");
-    let settings_snap = snapshot(&settings_path);
 
     let requested_target = RequestedTarget {
         display: format!("reconfigure {name}"),
@@ -3030,11 +3663,11 @@ pub fn preview_reconfigure(
         owned_by_superai: true,
     }];
 
-    // Build diffs by reading current settings and showing what would change if we re-applied?
-    // For demo, show that external edits are visible.
     let mut diffs: Vec<RedactedDiff> = Vec::new();
     let mut preconditions: Vec<Precondition> = Vec::new();
     let mut conflicts: Vec<Conflict> = Vec::new();
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut actions: Vec<PlannedAction> = Vec::new();
 
     preconditions.push(Precondition {
         kind: PreconditionKind::Exists,
@@ -3049,28 +3682,6 @@ pub fn preview_reconfigure(
             paths: vec![instance.config_root.clone()],
         });
     }
-    // Check concurrent modification: if settings file changed since last preview, we surface it.
-    // Here we just report snapshot digest.
-
-    if settings_snap.exists {
-        let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
-        diffs.push(RedactedDiff {
-            path: AbsolutePath::from_path(&settings_path).unwrap_or_else(|_| instance.config_root.clone()),
-            surface: "settings.json".to_owned(),
-            lexical_redacted: format!("current settings (redacted): {}", content.chars().take(200).collect::<String>()),
-            semantic_redacted: "reconfigure will preserve unowned keys, apply provider/template changes".to_owned(),
-            redacted_fields: vec!["api_key".to_owned()],
-        });
-    } else {
-        diffs.push(RedactedDiff {
-            path: instance.config_root.clone(),
-            surface: "settings.json".to_owned(),
-            lexical_redacted: "settings.json missing, will create with template defaults"
-                .to_owned(),
-            semantic_redacted: "create new settings with redacted secrets".to_owned(),
-            redacted_fields: Vec::new(),
-        });
-    }
 
     // Verify adapter can validate instance
     if let Err(e) = adapter.validate_instance(instance) {
@@ -3081,18 +3692,206 @@ pub fn preview_reconfigure(
         });
     }
 
-    let actions = if conflicts.is_empty() {
-        vec![PlannedAction {
-            order: 0,
-            kind: ActionKind::WriteFile,
-            target: AbsolutePath::from_path(&settings_path)
-                .unwrap_or_else(|_| instance.config_root.clone()),
-            description: format!("reconfigure {name} via adapter mutations"),
-            requires_backup: true,
-        }]
-    } else {
-        Vec::new()
-    };
+    for (order, action) in request.actions.iter().enumerate() {
+        let order = order as u32;
+        match action {
+            ReconfigureAction::ApplyProvider { .. }
+            | ReconfigureAction::SwitchDefaultModel { .. }
+            | ReconfigureAction::RemoveProvider { .. } => {
+                match resolve_action_providers(action).and_then(|(primary, reassign)| {
+                    let change = provider_change_with(action, &primary, &reassign)?;
+                    Ok(crate::provider_render::preview_provider_change(
+                        instance, adapter, &change,
+                    ))
+                }) {
+                    Ok(preview) => {
+                        if !preview.supported {
+                            conflicts.push(Conflict {
+                                code: "provider_unsupported".to_owned(),
+                                message: format!(
+                                    "harness cannot express the provider change: {}",
+                                    preview.unsupported_reason.unwrap_or_default()
+                                ),
+                                paths: vec![],
+                            });
+                            continue;
+                        }
+                        for warning in &preview.warnings {
+                            warnings.push(Warning {
+                                code: "provider_change".to_owned(),
+                                message: warning.clone(),
+                                path: None,
+                            });
+                        }
+                        diffs.push(RedactedDiff {
+                            path: AbsolutePath::from_path(&preview.path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            surface: preview.surface_id.clone(),
+                            lexical_redacted: preview.edits.join("\n"),
+                            semantic_redacted: format!(
+                                "provider mutation on {} (foreign keys preserved)",
+                                preview.surface_id
+                            ),
+                            redacted_fields: vec!["api_key".to_owned()],
+                        });
+                        actions.push(PlannedAction {
+                            order,
+                            kind: ActionKind::WriteFile,
+                            target: AbsolutePath::from_path(&preview.path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            description: "apply provider mutation via provider rendering"
+                                .to_owned(),
+                            requires_backup: true,
+                        });
+                    }
+                    Err(e) => conflicts.push(Conflict {
+                        code: "provider_change_failed".to_owned(),
+                        message: format!("provider change cannot be planned: {e}"),
+                        paths: vec![],
+                    }),
+                }
+            }
+            ReconfigureAction::ReapplyTemplate { template } => {
+                // codec-honesty: JSONC settings refuse, never strip.
+                let current = std::fs::read(&settings_path).ok();
+                match mutate_settings_with_template(&settings_path, current.as_deref(), template) {
+                    Ok(new_bytes) => {
+                        let old_text = current
+                            .as_deref()
+                            .map_or_else(String::new, |b| String::from_utf8_lossy(b).into_owned());
+                        let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
+                        diffs.push(RedactedDiff {
+                            path: AbsolutePath::from_path(&settings_path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            surface: "settings.json".to_owned(),
+                            lexical_redacted: redacted_line_diff(&old_text, &new_text, 32),
+                            semantic_redacted: format!(
+                                "re-apply template {} {} (foreign keys preserved)",
+                                template.name, template.version
+                            ),
+                            redacted_fields: vec!["api_key".to_owned()],
+                        });
+                        actions.push(PlannedAction {
+                            order,
+                            kind: ActionKind::WriteFile,
+                            target: AbsolutePath::from_path(&settings_path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            description: format!(
+                                "re-apply template {} to target only",
+                                template.name
+                            ),
+                            requires_backup: true,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            ReconfigureAction::SetMcpEnabled { server, enabled } => {
+                match mcp_dest_path(instance, adapter) {
+                    Ok((path, decl)) => {
+                        if decl.read_only.is_some() {
+                            conflicts.push(Conflict {
+                                code: "mcp_read_only".to_owned(),
+                                message: format!(
+                                    "MCP destination is inspect-only: {}",
+                                    decl.read_only.clone().unwrap_or_default()
+                                ),
+                                paths: vec![],
+                            });
+                            continue;
+                        }
+                        let existing = crate::mcp::inspect_servers(&path, &decl)
+                            .map(|servers| servers.contains_key(server.as_str()))
+                            .unwrap_or(false);
+                        if !existing {
+                            conflicts.push(Conflict {
+                                code: "mcp_unknown_server".to_owned(),
+                                message: format!(
+                                    "MCP server `{server}` not present at {}",
+                                    path.display()
+                                ),
+                                paths: vec![],
+                            });
+                            continue;
+                        }
+                        diffs.push(RedactedDiff {
+                            path: AbsolutePath::from_path(&path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            surface: decl.dest_file.clone(),
+                            lexical_redacted: format!(
+                                "mcp server `{server}` {}",
+                                if *enabled { "enable" } else { "disable" }
+                            ),
+                            semantic_redacted: format!(
+                                "toggle `{server}` in {} (foreign servers preserved)",
+                                decl.dest_key
+                            ),
+                            redacted_fields: Vec::new(),
+                        });
+                        actions.push(PlannedAction {
+                            order,
+                            kind: ActionKind::WriteFile,
+                            target: AbsolutePath::from_path(&path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            description: format!(
+                                "{} MCP server `{server}`",
+                                if *enabled { "enable" } else { "disable" }
+                            ),
+                            requires_backup: true,
+                        });
+                    }
+                    Err(e) => conflicts.push(Conflict {
+                        code: "mcp_unsupported".to_owned(),
+                        message: format!("{e}"),
+                        paths: vec![],
+                    }),
+                }
+            }
+            ReconfigureAction::RelinkSkills => match adapter_skills_dir(instance, adapter) {
+                Some(dir) => {
+                    if adapter.supported_skill_modes().is_empty() {
+                        conflicts.push(Conflict {
+                            code: "skills_unsupported".to_owned(),
+                            message: format!("harness {} supports no skill modes", adapter.id()),
+                            paths: vec![],
+                        });
+                        continue;
+                    }
+                    diffs.push(RedactedDiff {
+                        path: AbsolutePath::from_path(&dir)
+                            .unwrap_or_else(|_| instance.config_root.clone()),
+                        surface: "skills".to_owned(),
+                        lexical_redacted: format!("relink skills at {}", dir.display()),
+                        semantic_redacted:
+                            "re-apply the skill mode links (idempotent; foreign content kept)"
+                                .to_owned(),
+                        redacted_fields: Vec::new(),
+                    });
+                    actions.push(PlannedAction {
+                        order,
+                        kind: ActionKind::CreateSymlink,
+                        target: AbsolutePath::from_path(&dir)
+                            .unwrap_or_else(|_| instance.config_root.clone()),
+                        description: "re-apply skill links".to_owned(),
+                        requires_backup: false,
+                    });
+                }
+                None => conflicts.push(Conflict {
+                    code: "skills_unsupported".to_owned(),
+                    message: format!("harness {} declares no skills surface", adapter.id()),
+                    paths: vec![],
+                }),
+            },
+        }
+    }
+
+    if actions.is_empty() && conflicts.is_empty() {
+        warnings.push(Warning {
+            code: "no_actions".to_owned(),
+            message: "reconfigure request carried no applicable actions".to_owned(),
+            path: None,
+        });
+    }
 
     let rollback_plan = RollbackPlan {
         steps: if actions.is_empty() {
@@ -3100,9 +3899,8 @@ pub fn preview_reconfigure(
         } else {
             vec![RollbackStep {
                 order: 0,
-                description: "restore settings.json from backup".to_owned(),
-                target: AbsolutePath::from_path(&settings_path)
-                    .unwrap_or_else(|_| instance.config_root.clone()),
+                description: "restore mutated files from their backups".to_owned(),
+                target: instance.config_root.clone(),
                 backup_id: None,
             }]
         },
@@ -3119,7 +3917,7 @@ pub fn preview_reconfigure(
         actions,
         diffs,
         backups: Vec::new(),
-        warnings: Vec::new(),
+        warnings,
         conflicts,
         limitations: Vec::new(),
         auth_steps: Vec::new(),
@@ -3128,11 +3926,20 @@ pub fn preview_reconfigure(
     })
 }
 
-/// Commit reconfigure: read fresh, apply mutations via transaction, verify, update provenance.
+/// Commit reconfigure (INS-06): read fresh, apply the REAL adapter
+/// mutations (provider rendering, template re-apply, MCP toggle, skill
+/// relink) through their transaction layers, then re-resolve capabilities
+/// and health WITHOUT persisting mirrors. Registry changes only for
+/// superai-owned provenance/version facts after file verification.
+#[expect(
+    clippy::too_many_lines,
+    reason = "commit applies every reconfigure action kind"
+)]
 pub fn reconfigure(
     registry_path: &Path,
     name: &str,
     adapter: &dyn Adapter,
+    request: &ReconfigureRequest,
 ) -> Result<OperationResult> {
     let preview_id = new_operation_id()?;
     let mut registry = Registry::load(registry_path)?;
@@ -3144,113 +3951,191 @@ pub fn reconfigure(
         })?
         .clone();
 
-    let settings_path = instance.config_root.as_path().join("settings.json");
-    let snap_before = snapshot(&settings_path);
+    // Fresh preview: every conflict the preview sees blocks the commit.
+    let preview = preview_reconfigure(&registry, name, adapter, request)?;
+    if !preview.conflicts.is_empty() {
+        return Err(CoreError::Validation {
+            field: "preview".to_owned(),
+            reason: format!("reconfigure conflicts: {:?}", preview.conflicts),
+        });
+    }
 
-    // Build mutations: for demo, ensure file contains a marker "reconfigured": true
-    // codec-honesty (DOC-05): bytes that fail strict-JSON parsing (JSONC
-    // content — comments/trailing commas) must not be swapped for a fabricated
-    // empty map and rewritten as normalized JSON; refuse before any disk
-    // mutation, same gate as `mutate_settings_with_template`.
-    let current_bytes = std::fs::read(&settings_path).ok();
-    let mut value: serde_json::Value = match current_bytes {
-        Some(bytes) if !bytes.is_empty() => match serde_json::from_slice(&bytes) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                return Err(CoreError::Config(ConfigError::LossyWrite {
-                    path: settings_path,
-                    format: "jsonc",
-                }));
+    let journal_root = home_dir().map(|home| superai_config::journal::journal_dir(&home));
+    let mut applied: Vec<String> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+    let mut verification: Vec<VerificationResult> = Vec::new();
+
+    for action in &request.actions {
+        match action {
+            ReconfigureAction::ApplyProvider { .. }
+            | ReconfigureAction::SwitchDefaultModel { .. }
+            | ReconfigureAction::RemoveProvider { .. } => {
+                let (primary, reassign) = resolve_action_providers(action)?;
+                let change = provider_change_with(action, &primary, &reassign)?;
+                let options = crate::provider_render::ProviderChangeOptions {
+                    journal_root: journal_root.clone(),
+                };
+                let outcome = crate::provider_render::commit_provider_change(
+                    &instance, adapter, &change, &options,
+                )?;
+                applied.extend(outcome.applied.iter().cloned());
+                for warning in &outcome.warnings {
+                    diagnostics.push(format!("provider change warning: {warning}"));
+                }
+                verification.push(VerificationResult {
+                    path: AbsolutePath::from_path(&outcome.path)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    kind: VerificationKind::Parse,
+                    passed: true,
+                    message: "provider mutation committed (foreign entries preserved)".to_owned(),
+                });
             }
-        },
-        _ => serde_json::Value::Object(serde_json::Map::new()),
-    };
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "superai_reconfigured".to_owned(),
-            serde_json::Value::Bool(true),
-        );
-        obj.insert(
-            "superai_reconfigure_at".to_owned(),
-            serde_json::Value::String(now_iso8601()),
-        );
-    }
-    let new_bytes = serde_json::to_vec_pretty(&value).map_err(|e| {
-        CoreError::Config(ConfigError::Json {
-            path: settings_path.clone(),
-            source: e,
-        })
-    })?;
-
-    // Use transaction to write atomically with backup
-    let op_id_str = generate_operation_id_string();
-    let tx_op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
-        CoreError::Validation {
-            field: "operation_id".to_owned(),
-            reason: format!("op id invalid: {e}"),
+            ReconfigureAction::ReapplyTemplate { template } => {
+                let settings_path = instance.config_root.as_path().join("settings.json");
+                let snap_before = snapshot(&settings_path);
+                let current_bytes = std::fs::read(&settings_path).ok();
+                // codec-honesty gate happens inside the mutation helper.
+                let new_bytes = mutate_settings_with_template(
+                    &settings_path,
+                    current_bytes.as_deref(),
+                    template,
+                )?;
+                let op_id_str = generate_operation_id_string();
+                let tx_op_id =
+                    superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
+                        CoreError::Validation {
+                            field: "operation_id".to_owned(),
+                            reason: format!("op id invalid: {e}"),
+                        }
+                    })?;
+                let steps = vec![FileAction::Write {
+                    path: settings_path.clone(),
+                    content: new_bytes.clone(),
+                    kind: superai_config::document::DocumentKind::StrictJson,
+                }];
+                let mut tx = Transaction::new(tx_op_id, steps);
+                if let Some(root) = &journal_root {
+                    tx = tx.with_journal(root.clone());
+                }
+                let outcome = tx.execute().map_err(CoreError::Config)?;
+                if !outcome.success {
+                    return Ok(OperationResult {
+                        id: preview_id,
+                        kind: OperationKind::ReconfigureInstance,
+                        actions_completed: Vec::new(),
+                        backups: Vec::new(),
+                        verification: vec![VerificationResult {
+                            path: AbsolutePath::from_path(&settings_path)
+                                .unwrap_or_else(|_| instance.config_root.clone()),
+                            kind: VerificationKind::Parse,
+                            passed: false,
+                            message: format!(
+                                "template re-apply failed: {:?}",
+                                outcome.diagnostics_redacted
+                            ),
+                        }],
+                        rollback_status: RollbackStatus::Failed,
+                        diagnostics_redacted: outcome.diagnostics_redacted,
+                        success: false,
+                    });
+                }
+                let verify_bytes = std::fs::read(&settings_path).map_err(|e| {
+                    CoreError::Config(ConfigError::Io {
+                        path: settings_path.clone(),
+                        source: e,
+                    })
+                })?;
+                if compute_digest_bytes(&verify_bytes) != compute_digest_bytes(&new_bytes) {
+                    return Err(CoreError::Verification {
+                        path: settings_path,
+                        kind: "digest".to_owned(),
+                        reason: "template re-apply digest mismatch after commit".to_owned(),
+                    });
+                }
+                let changed = snap_before.digest.as_deref()
+                    != Some(compute_digest_bytes(&new_bytes).as_str());
+                applied.push(format!(
+                    "template {} re-applied (changed={changed})",
+                    template.name
+                ));
+                verification.push(VerificationResult {
+                    path: AbsolutePath::from_path(&settings_path)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    kind: VerificationKind::Digest,
+                    passed: true,
+                    message: "template re-apply verified against staged bytes".to_owned(),
+                });
+            }
+            ReconfigureAction::SetMcpEnabled { server, enabled } => {
+                let (path, decl) = mcp_dest_path(&instance, adapter)?;
+                let server_id =
+                    crate::ids::McpServerId::new(server).map_err(|e| CoreError::Validation {
+                        field: "mcp.server".to_owned(),
+                        reason: format!("invalid server id: {e}"),
+                    })?;
+                crate::mcp::set_mcp_enabled(&path, &decl, &server_id, *enabled)?;
+                applied.push(format!(
+                    "mcp server `{server}` {}",
+                    if *enabled { "enabled" } else { "disabled" }
+                ));
+                verification.push(VerificationResult {
+                    path: AbsolutePath::from_path(&path)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    kind: VerificationKind::Parse,
+                    passed: true,
+                    message: "mcp destination re-parses after toggle".to_owned(),
+                });
+            }
+            ReconfigureAction::RelinkSkills => {
+                let skills_dir = adapter_skills_dir(&instance, adapter).ok_or_else(|| {
+                    CoreError::UnsupportedOperation {
+                        harness: adapter.id().to_string(),
+                        operation: "relink_skills".to_owned(),
+                        reason: "harness declares no skills surface".to_owned(),
+                    }
+                })?;
+                let mode = adapter
+                    .supported_skill_modes()
+                    .first()
+                    .copied()
+                    .ok_or_else(|| CoreError::UnsupportedOperation {
+                        harness: adapter.id().to_string(),
+                        operation: "relink_skills".to_owned(),
+                        reason: "harness supports no skill modes".to_owned(),
+                    })?;
+                let root = crate::skills::default_skills_root()?;
+                let skill_registry = crate::skills::SkillRegistry::load(&root)?;
+                let provenance = crate::skills::apply_skill_mode(
+                    &skill_registry,
+                    &skills_dir,
+                    mode,
+                    &[],
+                    adapter,
+                )?;
+                applied.push(format!(
+                    "skills relinked ({mode}, {} destinations)",
+                    provenance.len()
+                ));
+                verification.push(VerificationResult {
+                    path: AbsolutePath::from_path(&skills_dir)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    kind: VerificationKind::Parse,
+                    passed: true,
+                    message: "skill links re-applied".to_owned(),
+                });
+            }
         }
-    })?;
-    let steps = vec![FileAction::Write {
-        path: settings_path.clone(),
-        content: new_bytes.clone(),
-        kind: superai_config::document::DocumentKind::StrictJson,
-    }];
-    let mut tx = Transaction::new(tx_op_id, steps);
-    let outcome = tx.execute().map_err(CoreError::Config)?;
-    if !outcome.success {
-        return Ok(OperationResult {
-            id: preview_id,
-            kind: OperationKind::ReconfigureInstance,
-            actions_completed: Vec::new(),
-            backups: Vec::new(),
-            verification: vec![VerificationResult {
-                path: AbsolutePath::from_path(&settings_path)
-                    .unwrap_or_else(|_| instance.config_root.clone()),
-                kind: VerificationKind::Parse,
-                passed: false,
-                message: format!("reconfigure failed: {:?}", outcome.diagnostics_redacted),
-            }],
-            rollback_status: RollbackStatus::Failed,
-            diagnostics_redacted: outcome.diagnostics_redacted,
-            success: false,
-        });
     }
 
-    // Verify fresh read + parse
-    let verify_bytes = std::fs::read(&settings_path).map_err(|e| {
-        CoreError::Config(ConfigError::Io {
-            path: settings_path.clone(),
-            source: e,
-        })
-    })?;
-    let verify_digest = compute_digest_bytes(&verify_bytes);
-    let expected_digest = compute_digest_bytes(&new_bytes);
-    if verify_digest != expected_digest {
-        return Err(CoreError::Verification {
-            path: settings_path,
-            kind: "digest".to_owned(),
-            reason: format!(
-                "digest mismatch after reconfigure: expected {expected_digest}, got {verify_digest}"
-            ),
-        });
-    }
-    // Also check concurrent modification after commit? Ensure snap changed as expected
-    let snap_after = snapshot(&settings_path);
-    if snap_before.exists && snap_before.digest == snap_after.digest && !snap_before.is_missing() {
-        // File should have changed (we wrote), but digest same means no change? But we did change, so if digest same, maybe we didn't mutate?
-        // Not an error, but warning.
-    }
-
-    // Re-resolve capabilities and health without persisting mirrors (stub)
-    // Registry changes only for superai-owned provenance/version facts after verification
-    // Update adapter_revision if needed
+    // Registry changes only for superai-owned provenance/version facts,
+    // after the file mutations verified above.
     let mut needs_registry_update = false;
-    let current_rev = instance.adapter_revision.clone();
+    let current_rev = instance.adapter_revision.as_str().to_owned();
     let new_rev = crate::adapter::ADAPTER_REVISION;
     if current_rev != new_rev {
         let mut removed = registry.remove(name).ok_or_else(|| CoreError::Validation {
             field: "name".to_owned(),
-            reason: "instance missing after reconfigure transaction".to_owned(),
+            reason: "instance missing after reconfigure transactions".to_owned(),
         })?;
         removed.adapter_revision = new_rev.to_owned();
         registry.insert(removed)?;
@@ -3260,34 +4145,73 @@ pub fn reconfigure(
         registry.store(registry_path)?;
     }
 
-    // Validate via adapter
+    // Validate via adapter against the mutated target.
     let updated_instance = registry.get(name).ok_or_else(|| CoreError::Validation {
         field: "name".to_owned(),
         reason: "instance missing after update".to_owned(),
     })?;
     adapter.validate_instance(updated_instance)?;
 
+    // Re-resolve capabilities and health WITHOUT persisting mirrors (INS-06):
+    // capability resolution is fresh from adapter/provider/template sources;
+    // the health summary reports the detected provider and its compat
+    // verdict — reconfigure never fires a live network probe.
+    let capability_sources = crate::capability_resolver::InstanceCapabilitySources::default();
+    let resolved =
+        crate::capability_resolver::resolve_for_instance(updated_instance, &capability_sources);
+    let providers = crate::provider::load_bundled_providers().unwrap_or_default();
+    let effective =
+        crate::provider_render::inspect_effective_provider(updated_instance, adapter, &providers);
+    let mut capability_summary = String::new();
+    for (capability, support) in &resolved {
+        capability_summary.push_str(&format!("{capability}={}; ", support.support));
+    }
+    if capability_summary.is_empty() {
+        capability_summary = "no capability claims (provider not detected)".to_owned();
+    }
+    let health_summary = match &effective {
+        Ok(report) => {
+            let provider = report
+                .detected_provider
+                .as_ref()
+                .and_then(|d| d.id.clone())
+                .unwrap_or_else(|| "none detected".to_owned());
+            let credential = report.credential.as_ref().map_or("absent".to_owned(), |c| {
+                format!(
+                    "{} at {}",
+                    if c.present { "present" } else { "absent" },
+                    c.selector
+                )
+            });
+            format!(
+                "effective provider {provider}, compat {:?}, credential {credential}",
+                report.compatibility
+            )
+        }
+        Err(e) => format!("effective provider inspection unavailable: {e}"),
+    };
+    diagnostics.push(format!("reconfigured {name}: {} applied", applied.len()));
+    diagnostics.push(format!("capabilities re-resolved: {capability_summary}"));
+    diagnostics.push(format!("health: {health_summary}"));
+
     Ok(OperationResult {
         id: preview_id,
         kind: OperationKind::ReconfigureInstance,
-        actions_completed: vec![CompletedAction {
-            order: 0,
-            kind: ActionKind::WriteFile,
-            target: AbsolutePath::from_path(&settings_path)
-                .unwrap_or_else(|_| instance.config_root.clone()),
-            success: true,
-            elapsed_ms: None,
-        }],
+        actions_completed: applied
+            .iter()
+            .enumerate()
+            .map(|(order, _description)| CompletedAction {
+                order: order as u32,
+                kind: ActionKind::WriteFile,
+                target: updated_instance.config_root.clone(),
+                success: true,
+                elapsed_ms: None,
+            })
+            .collect(),
         backups: Vec::new(),
-        verification: vec![VerificationResult {
-            path: AbsolutePath::from_path(&settings_path)
-                .unwrap_or_else(|_| instance.config_root.clone()),
-            kind: VerificationKind::Parse,
-            passed: true,
-            message: "reconfigure verified".to_owned(),
-        }],
+        verification,
         rollback_status: RollbackStatus::NotNeeded,
-        diagnostics_redacted: vec![format!("reconfigured {}", name)],
+        diagnostics_redacted: diagnostics,
         success: true,
     })
 }
@@ -3485,6 +4409,13 @@ pub enum RemoveChoice {
     RecordAndWrapper,
     /// Remove record, wrapper, and superai-created instance root (quarantined).
     RecordWrapperAndRoot,
+    /// Remove the record plus superai's fixed-path config entries — saved
+    /// profiles and the active-identity record under the superai-owned
+    /// profile store (INS-08, enabled by INS-10). The harness's own fixed
+    /// config file is NEVER touched: superai never captured pre-activation
+    /// bytes, so the on-disk content stays exactly as last activated
+    /// (surfaced as a limitation in the preview).
+    FixedPathEntries,
 }
 
 impl std::fmt::Display for RemoveChoice {
@@ -3493,6 +4424,7 @@ impl std::fmt::Display for RemoveChoice {
             Self::RecordOnly => "record_only",
             Self::RecordAndWrapper => "record_and_wrapper",
             Self::RecordWrapperAndRoot => "record_wrapper_and_root",
+            Self::FixedPathEntries => "fixed_path_entries",
         };
         f.write_str(s)
     }
@@ -3518,6 +4450,20 @@ pub fn preview_remove(
 
     let mut conflicts: Vec<Conflict> = Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
+
+    // INS-08: the fixed-path entries choice applies only to fixed-path
+    // instances; there is nothing profile-store-managed to remove otherwise.
+    if choice == RemoveChoice::FixedPathEntries && instance.isolation != Isolation::FixedPathSingle
+    {
+        conflicts.push(Conflict {
+            code: "not_fixed_path".to_owned(),
+            message: format!(
+                "instance {name} uses isolation {}, but fixed_path_entries removes the superai-owned profile store of a fixed-path instance",
+                instance.isolation
+            ),
+            paths: vec![instance.config_root.clone()],
+        });
+    }
 
     // Adopted/default/foreign roots are never recursively removed under generic removal.
     if choice == RemoveChoice::RecordWrapperAndRoot && !is_safe_to_remove_root(instance) {
@@ -3557,6 +4503,10 @@ pub fn preview_remove(
                     } else {
                         "config root removal refused".to_owned()
                     }
+                }
+                RemoveChoice::FixedPathEntries => {
+                    "saved profiles and active identity removed from the superai store; the harness config file is left as last activated"
+                        .to_owned()
                 }
             },
             owned_by_superai: is_safe_to_remove_root(instance),
@@ -3619,6 +4569,16 @@ pub fn preview_remove(
         estimated_steps: 1,
     };
 
+    let limitations = if choice == RemoveChoice::FixedPathEntries {
+        vec![Limitation {
+            code: "fixed_path_bytes_remain".to_owned(),
+            description: "superai never captured pre-activation bytes; the fixed-path config keeps the last activated content until the next activation replaces it"
+                .to_owned(),
+        }]
+    } else {
+        Vec::new()
+    };
+
     Ok(OperationPreview {
         id: preview_id,
         kind: OperationKind::RemoveInstance,
@@ -3630,7 +4590,7 @@ pub fn preview_remove(
         backups: Vec::new(),
         warnings,
         conflicts,
-        limitations: Vec::new(),
+        limitations,
         auth_steps: Vec::new(),
         restart_requirements: Vec::new(),
         rollback_plan,
@@ -3642,6 +4602,21 @@ pub fn remove_instance(
     registry_path: &Path,
     name: &str,
     choice: RemoveChoice,
+) -> Result<OperationResult> {
+    remove_instance_with_home(registry_path, name, choice, home_dir().as_deref())
+}
+
+/// [`remove_instance`] with an explicit home scope, so fixed-path profile
+/// stores resolve against the caller's home (and tests stay hermetic).
+#[expect(
+    clippy::too_many_lines,
+    reason = "removal covers every choice kind explicitly"
+)]
+pub fn remove_instance_with_home(
+    registry_path: &Path,
+    name: &str,
+    choice: RemoveChoice,
+    home_scope: Option<&Path>,
 ) -> Result<OperationResult> {
     let preview_id = new_operation_id()?;
     let mut registry = Registry::load(registry_path)?;
@@ -3661,6 +4636,42 @@ pub fn remove_instance(
                 instance.config_root, instance.name, instance.ownership
             ),
         });
+    }
+    if choice == RemoveChoice::FixedPathEntries && instance.isolation != Isolation::FixedPathSingle
+    {
+        return Err(CoreError::Validation {
+            field: "remove".to_owned(),
+            reason: format!(
+                "fixed_path_entries applies to fixed-path instances; {} uses {}",
+                instance.name, instance.isolation
+            ),
+        });
+    }
+
+    // INS-08: remove superai's fixed-path config entries — every saved
+    // profile and the active-identity record under the superai-owned store.
+    // The store directory is superai-owned (outside the harness tree), so
+    // removing it is safe; the harness config file is never touched.
+    let mut fixed_path_store_cleared = false;
+    if choice == RemoveChoice::FixedPathEntries
+        && let Some(home) = home_scope
+    {
+        let store_root = crate::activation::default_store_root(&home);
+        let harness_root = crate::adapters::zcode::fixed_path_layout(&home).harness_root;
+        if let Ok(store) = crate::activation::FixedPathProfileStore::new(
+            &store_root,
+            instance.harness.clone(),
+            &harness_root,
+        ) {
+            for profile in store.list_profiles().unwrap_or_default() {
+                if let Ok(name) = InstanceName::new(&profile.name) {
+                    drop(store.remove_profile(&name));
+                }
+            }
+            // The identity record lives in the same superai-owned directory.
+            drop(std::fs::remove_dir_all(store.harness_dir()));
+            fixed_path_store_cleared = true;
+        }
     }
 
     // Remove wrapper if requested
@@ -3750,7 +4761,7 @@ pub fn remove_instance(
         verification,
         rollback_status: RollbackStatus::NotNeeded,
         diagnostics_redacted: vec![format!(
-            "removed {} via {choice} (wrapper_removed={wrapper_removed} root_quarantined={root_quarantined})",
+            "removed {} via {choice} (wrapper_removed={wrapper_removed} root_quarantined={root_quarantined} fixed_path_store_cleared={fixed_path_store_cleared})",
             name
         )],
         success: true,
@@ -3759,6 +4770,7 @@ pub fn remove_instance(
 
 // ---------------------------------------------------------------------------
 // Repair
+// Repair (INS-09)
 // ---------------------------------------------------------------------------
 
 /// Kind of repair needed.
@@ -3766,7 +4778,8 @@ pub fn remove_instance(
 pub enum RepairKind {
     /// Wrapper file missing.
     MissingWrapper,
-    /// Wrapper content drift.
+    /// Wrapper content drift (full-content comparison against the expected
+    /// generation, INS-09 — not a substring match).
     WrapperDrift,
     /// Config root missing.
     MissingConfig,
@@ -3774,8 +4787,10 @@ pub enum RepairKind {
     MissingBinary,
     /// Adapter version changed.
     AdapterVersionChanged,
-    /// Template version drift.
+    /// Template version record ahead/behind the on-disk verified marker.
     TemplateVersionDrift,
+    /// An incomplete transaction journal is pending recovery.
+    IncompleteJournal,
 }
 
 impl std::fmt::Display for RepairKind {
@@ -3787,6 +4802,7 @@ impl std::fmt::Display for RepairKind {
             Self::MissingBinary => "missing_binary",
             Self::AdapterVersionChanged => "adapter_version_changed",
             Self::TemplateVersionDrift => "template_version_drift",
+            Self::IncompleteJournal => "incomplete_journal",
         };
         f.write_str(s)
     }
@@ -3807,18 +4823,74 @@ pub struct RepairItem {
     pub requires_adoption: bool,
 }
 
-/// Detect repairs needed for all instances.
-pub fn detect_repairs(registry: &Registry, _adapter: &dyn Adapter) -> Vec<RepairItem> {
+/// The wrapper content a repair would regenerate for `instance`: the
+/// adapter's plan when it provides one, else the generic env-var plan.
+fn expected_wrapper_for(
+    instance: &Instance,
+    adapter: &dyn Adapter,
+) -> (String, String, WrapperPlan) {
+    let plan = adapter.plan_wrapper(instance).unwrap_or_else(|_| {
+        let mut p = WrapperPlan::new(&format!("repair wrapper for {}", instance.name));
+        p.env_vars.push((
+            wrapper_helper::env_var_for_harness(&instance.harness),
+            instance.config_root.to_string(),
+        ));
+        p
+    });
+    let (content, digest) = wrapper_helper::generate_shell_wrapper(instance, &plan);
+    (content, digest, plan)
+}
+
+/// The template version marker lifecycle writes into mutated settings
+/// (`superai_template_version`) — INS-09 compares the registry record's
+/// template version against this on-disk fact.
+const TEMPLATE_VERSION_MARKER_KEY: &str = "superai_template_version";
+
+/// Read the on-disk template version marker from the instance settings, if
+/// the file parses (strict JSON gate; JSONC content yields `None`, never a
+/// stripped read).
+fn on_disk_template_version(instance: &Instance) -> Option<String> {
+    let settings = instance.config_root.as_path().join("settings.json");
+    let bytes = std::fs::read(settings).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get(TEMPLATE_VERSION_MARKER_KEY)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Detect repairs needed for all instances (INS-09): missing wrapper,
+/// FULL-CONTENT wrapper drift, missing config root, missing binary, adapter
+/// version change, template version drift against the on-disk marker, and
+/// incomplete transaction journals.
+pub fn detect_repairs(registry: &Registry, adapter: &dyn Adapter) -> Vec<RepairItem> {
+    detect_repairs_with_home(registry, adapter, home_dir().as_deref())
+}
+
+/// [`detect_repairs`] with an explicit home scope, so callers (and tests)
+/// can scan a specific user's journal root instead of the ambient one.
+#[expect(
+    clippy::too_many_lines,
+    reason = "repair detection covers every INS-09 kind"
+)]
+pub fn detect_repairs_with_home(
+    registry: &Registry,
+    adapter: &dyn Adapter,
+    home: Option<&Path>,
+) -> Vec<RepairItem> {
     let mut items: Vec<RepairItem> = Vec::new();
     for inst in registry.instances() {
-        // Missing wrapper
+        // Missing wrapper / wrapper drift (full-content comparison)
         if let Some(wrapper) = &inst.wrapper {
             let wrapper_path = wrapper.path.as_path();
             if wrapper_path.exists() {
-                // Check drift
                 let content = std::fs::read_to_string(wrapper_path).unwrap_or_default();
-                if !content.contains(&wrapper.content_digest) {
-                    // Check ownership
+                let (expected_content, _expected_digest, _plan) =
+                    expected_wrapper_for(inst, adapter);
+                // Full-content comparison: any byte difference from the
+                // deterministic regeneration is drift, even when a digest
+                // substring survives inside an edited file.
+                if content != expected_content {
                     let owned = wrapper_helper::is_owned_wrapper(
                         wrapper_path,
                         Some(&wrapper.content_digest),
@@ -3827,7 +4899,10 @@ pub fn detect_repairs(registry: &Registry, _adapter: &dyn Adapter) -> Vec<Repair
                         instance: inst.id.clone(),
                         name: inst.name.clone(),
                         kind: RepairKind::WrapperDrift,
-                        description: format!("wrapper drift at {}", wrapper_path.display()),
+                        description: format!(
+                            "wrapper content at {} differs from the expected generation",
+                            wrapper_path.display()
+                        ),
                         requires_adoption: !owned,
                     });
                 }
@@ -3881,13 +4956,95 @@ pub fn detect_repairs(registry: &Registry, _adapter: &dyn Adapter) -> Vec<Repair
                 requires_adoption: false,
             });
         }
+
+        // Template version drift: the registry record's template version
+        // against the on-disk verified marker (INS-09).
+        if let Some(template) = &inst.template
+            && inst.config_root.as_path().exists()
+        {
+            match on_disk_template_version(inst) {
+                Some(on_disk) if on_disk != template.version.to_string() => {
+                    items.push(RepairItem {
+                        instance: inst.id.clone(),
+                        name: inst.name.clone(),
+                        kind: RepairKind::TemplateVersionDrift,
+                        description: format!(
+                            "registry template {} {} but on-disk marker says {on_disk}",
+                            template.name, template.version
+                        ),
+                        requires_adoption: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Incomplete transaction journals (INS-09): any journal file still on
+    // disk under the superai journal root is an operation that never
+    // verified to completion and is pending recovery. Journal findings
+    // are attributed to the pseudo-instance `journal`, never to an
+    // arbitrary registry record.
+    if let Some(home) = home {
+        let journal_root = superai_config::journal::journal_dir(home);
+        if let Ok(entries) = std::fs::read_dir(&journal_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    let id = InstanceId::new("journal")
+                        .unwrap_or_else(|_| InstanceId::new("unknown").unwrap());
+                    let name = InstanceName::new("journal")
+                        .unwrap_or_else(|_| InstanceName::new("unknown").unwrap());
+                    items.push(RepairItem {
+                        instance: id,
+                        name,
+                        kind: RepairKind::IncompleteJournal,
+                        description: format!(
+                            "incomplete transaction journal pending recovery at {}",
+                            path.display()
+                        ),
+                        requires_adoption: false,
+                    });
+                    break;
+                }
+            }
+        }
     }
     items
+}
+
+/// Repair action for incomplete transaction journals (INS-09): production
+/// recovery through the journal layer — inspect the filesystem, restore from
+/// recorded backups, never replay planned content. Journals are attributed
+/// to the pseudo-instance `journal` by [`detect_repairs`], so repairing a
+/// concrete instance never sweeps global recovery state.
+pub fn repair_incomplete_journals(home: &Path) -> Result<Vec<String>> {
+    let report = superai_config::journal::recover_pending(home)?;
+    let summaries = report
+        .journals
+        .iter()
+        .map(|j| {
+            format!(
+                "journal {} (op {}, phase {:?}, recovered={})",
+                j.journal_path.display(),
+                j.operation_id,
+                j.phase,
+                j.recovered
+            )
+        })
+        .collect();
+    Ok(summaries)
 }
 
 /// Preview repair for a single instance.
 ///
 /// Repair never overwrites a changed wrapper unless ownership/content digest proves it is superai-created or caller explicitly adopts it.
+/// WRP-08: wrapper repairs preview a REAL redacted content diff (expected vs
+/// on-disk), not a description-only placeholder.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preview covers every repair kind with real diffs"
+)]
 pub fn preview_repair(
     registry: &Registry,
     name: &str,
@@ -3914,6 +5071,7 @@ pub fn preview_repair(
     let mut conflicts: Vec<Conflict> = Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
     let mut actions: Vec<PlannedAction> = Vec::new();
+    let mut diffs: Vec<RedactedDiff> = Vec::new();
 
     for (idx, item) in relevant.iter().enumerate() {
         if item.requires_adoption {
@@ -3947,10 +5105,7 @@ pub fn preview_repair(
                         },
                     )
                 }
-                RepairKind::MissingConfig => instance.config_root.clone(),
-                RepairKind::MissingBinary => instance.config_root.clone(),
-                RepairKind::AdapterVersionChanged => instance.config_root.clone(),
-                RepairKind::TemplateVersionDrift => instance.config_root.clone(),
+                _ => instance.config_root.clone(),
             };
             actions.push(PlannedAction {
                 order: idx as u32,
@@ -3966,18 +5121,44 @@ pub fn preview_repair(
                 requires_backup: matches!(item.kind, RepairKind::WrapperDrift),
             });
         }
-    }
 
-    let diffs = relevant
-        .iter()
-        .map(|item| RedactedDiff {
-            path: instance.config_root.clone(),
-            surface: "repair".to_owned(),
-            lexical_redacted: format!("repair {}: {}", item.kind, item.description),
-            semantic_redacted: format!("repair kind {}", item.kind),
-            redacted_fields: Vec::new(),
-        })
-        .collect::<Vec<_>>();
+        // WRP-08: real redacted content diffs for wrapper repairs.
+        if matches!(
+            item.kind,
+            RepairKind::MissingWrapper | RepairKind::WrapperDrift
+        ) && let Some(wrapper) = &instance.wrapper
+        {
+            let (expected_content, _, _) = expected_wrapper_for(instance, adapter);
+            let actual_content =
+                std::fs::read_to_string(wrapper.path.as_path()).unwrap_or_default();
+            diffs.push(RedactedDiff {
+                path: AbsolutePath::from_path(wrapper.path.as_path())
+                    .unwrap_or_else(|_| instance.config_root.clone()),
+                surface: "wrapper".to_owned(),
+                lexical_redacted: if actual_content.is_empty() {
+                    format!(
+                        "wrapper missing; expected generation:\n{}",
+                        redacted_line_diff("", &expected_content, 32)
+                    )
+                } else {
+                    redacted_line_diff(&actual_content, &expected_content, 32)
+                },
+                semantic_redacted: format!(
+                    "regenerate wrapper for {} (owned replacement only)",
+                    instance.name
+                ),
+                redacted_fields: vec!["api_key".to_owned()],
+            });
+        } else {
+            diffs.push(RedactedDiff {
+                path: instance.config_root.clone(),
+                surface: "repair".to_owned(),
+                lexical_redacted: format!("repair {}: {}", item.kind, item.description),
+                semantic_redacted: format!("repair kind {}", item.kind),
+                redacted_fields: Vec::new(),
+            });
+        }
+    }
 
     let rollback_plan = RollbackPlan {
         steps: Vec::new(),
@@ -4009,6 +5190,12 @@ pub fn preview_repair(
 }
 
 /// Commit repair for an instance, ownership-aware.
+///
+/// MissingBinary repair RE-DETECTS the binary: a found installation updates
+/// the record's pinned binary; nothing found clears the pin (marking the
+/// instance binary-missing honestly instead of pointing at a dead path).
+/// IncompleteJournal repair runs the production recovery.
+#[expect(clippy::too_many_lines, reason = "commit covers every repair kind")]
 pub fn repair(
     registry_path: &Path,
     name: &str,
@@ -4033,6 +5220,7 @@ pub fn repair(
 
     let mut actions_completed: Vec<CompletedAction> = Vec::new();
     let mut order: u32 = 0;
+    let mut diagnostics: Vec<String> = Vec::new();
 
     for item in relevant {
         if item.requires_adoption && !force_adopt {
@@ -4049,18 +5237,8 @@ pub fn repair(
                 if let Some(wrapper) = &instance.wrapper {
                     let wrapper_path = wrapper.path.as_path();
                     // Regenerate wrapper content deterministically
-                    let temp_instance = instance.clone();
-                    let plan = adapter.plan_wrapper(&temp_instance).unwrap_or_else(|_| {
-                        let mut p = WrapperPlan::new(&format!("repair wrapper for {name}"));
-                        p.env_vars.push((
-                            wrapper_helper::env_var_for_harness(&instance.harness),
-                            instance.config_root.to_string(),
-                        ));
-                        p
-                    });
-                    let (content, new_digest) =
-                        wrapper_helper::generate_shell_wrapper(&temp_instance, &plan);
-                    // Write wrapper
+                    let (content, new_digest, _plan) = expected_wrapper_for(&instance, adapter);
+                    // Write wrapper (refuses foreign files — WRP-08)
                     wrapper_helper::write_wrapper(&wrapper.path, &content)?;
                     // Update registry wrapper digest if changed
                     let mut updated = instance.clone();
@@ -4115,8 +5293,77 @@ pub fn repair(
                 });
                 order += 1;
             }
-            RepairKind::MissingBinary | RepairKind::TemplateVersionDrift => {
-                // For now, just record diagnostic
+            RepairKind::MissingBinary => {
+                // Re-detect the harness binary; a found install re-pins the
+                // record, nothing found clears the stale pin (binary-missing
+                // is marked honestly, never left pointing at a dead path).
+                let detections = crate::detect::detect_all(&instance.harness);
+                let mut updated = instance.clone();
+                match detections.first() {
+                    Some(detection) => {
+                        if let Ok(abs) = AbsolutePath::from_path(&detection.path) {
+                            updated.binary =
+                                Some(crate::paths::ExecutableRef::Absolute(abs.clone()));
+                            diagnostics.push(format!(
+                                "binary re-detected at {} (source {:?})",
+                                abs, detection.source
+                            ));
+                        }
+                    }
+                    None => {
+                        updated.binary = None;
+                        diagnostics.push(format!(
+                            "no {} binary detected; cleared the stale pin (instance marked \
+                             binary-missing)",
+                            instance.harness
+                        ));
+                    }
+                }
+                registry.remove(name);
+                registry.insert(updated)?;
+                actions_completed.push(CompletedAction {
+                    order,
+                    kind: ActionKind::UpdateRegistry,
+                    target: instance.config_root.clone(),
+                    success: true,
+                    elapsed_ms: None,
+                });
+                order += 1;
+            }
+            RepairKind::TemplateVersionDrift => {
+                // Re-apply the record's template so the on-disk marker matches
+                // the verified record (foreign keys preserved; JSONC refused).
+                if let Some(template) = &instance.template {
+                    let request =
+                        ReconfigureRequest::new(vec![ReconfigureAction::ReapplyTemplate {
+                            template: template.clone(),
+                        }]);
+                    // Reuse the reconfigure commit for the real mutation.
+                    drop(reconfigure(registry_path, name, adapter, &request)?);
+                    diagnostics.push(format!(
+                        "template {} re-applied so the on-disk marker matches the record",
+                        template.name
+                    ));
+                    actions_completed.push(CompletedAction {
+                        order,
+                        kind: ActionKind::WriteFile,
+                        target: instance.config_root.clone(),
+                        success: true,
+                        elapsed_ms: None,
+                    });
+                    order += 1;
+                    // registry was re-read inside reconfigure; reload ours.
+                    registry = Registry::load(registry_path)?;
+                }
+            }
+            RepairKind::IncompleteJournal => {
+                // Pseudo-instance finding: recovered through the dedicated
+                // [`repair_incomplete_journals`] action, never as a side
+                // effect of repairing a concrete instance.
+                diagnostics.push(
+                    "incomplete journal reported; run repair_incomplete_journals (or let startup recovery handle it)"
+                        .to_owned(),
+                );
                 actions_completed.push(CompletedAction {
                     order,
                     kind: ActionKind::UpdateRegistry,
@@ -4131,6 +5378,9 @@ pub fn repair(
 
     registry.store(registry_path)?;
 
+    let mut result_diagnostics = vec![format!("repaired {name}")];
+    result_diagnostics.extend(diagnostics);
+
     Ok(OperationResult {
         id: preview_id,
         kind: OperationKind::UpdateConfig,
@@ -4143,8 +5393,326 @@ pub fn repair(
             message: "repair verified".to_owned(),
         }],
         rollback_status: RollbackStatus::NotNeeded,
-        diagnostics_redacted: vec![format!("repaired {}", name)],
+        diagnostics_redacted: result_diagnostics,
         success: true,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Orphan-wrapper choices + unmanaged-root quarantine (DRF-06/07)
+// ---------------------------------------------------------------------------
+
+/// How to resolve an orphan wrapper found by the DRF-03 scan (DRF-07).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrphanWrapperChoice {
+    /// Leave the wrapper alone.
+    Ignore,
+    /// Record the instance the wrapper's marker names (adopt-into-registry).
+    Record {
+        /// Proceed even when the registry holds a colliding record for a
+        /// DIFFERENT root (caller explicitly overrides).
+        force: bool,
+    },
+    /// Quarantine the wrapper file. Only offered when the file itself proves
+    /// safe to move: a superai marker whose digest verifies (target/digest
+    /// proof per DRF-07).
+    Quarantine,
+}
+
+/// Result of resolving an orphan wrapper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanResolution {
+    /// What was done, redacted.
+    pub summary: String,
+    /// Quarantine path when the wrapper was moved aside.
+    pub quarantine_path: Option<PathBuf>,
+    /// Instance id recorded, when Record was chosen.
+    pub recorded_instance: Option<InstanceId>,
+}
+
+/// Resolve one orphan-wrapper finding per DRF-07. Never touches a foreign
+/// or opaque launcher: Record requires a superai marker, Quarantine
+/// additionally requires the marker digest to verify.
+pub fn resolve_orphan_wrapper(
+    finding: &WrapperFinding,
+    choice: &OrphanWrapperChoice,
+    registry_path: &Path,
+) -> Result<OrphanResolution> {
+    let WrapperFindingKind::SuperaiWrapper {
+        instance_id,
+        digest,
+    } = &finding.kind
+    else {
+        return Err(CoreError::ForeignOwnership {
+            path: finding.path.clone(),
+            owner: "not a superai wrapper; orphan choices do not apply".to_owned(),
+        });
+    };
+    match choice {
+        OrphanWrapperChoice::Ignore => Ok(OrphanResolution {
+            summary: format!("left {} untouched", finding.path.display()),
+            quarantine_path: None,
+            recorded_instance: None,
+        }),
+        OrphanWrapperChoice::Record { force } => {
+            // Re-parse the wrapper fresh: the marker names the instance and
+            // harness the record should carry (disk is truth).
+            let content = std::fs::read_to_string(&finding.path).map_err(|e| {
+                CoreError::Config(ConfigError::Io {
+                    path: finding.path.clone(),
+                    source: e,
+                })
+            })?;
+            let parsed = wrapper_helper::parse_wrapper_content(&content).ok_or_else(|| {
+                CoreError::Verification {
+                    path: finding.path.clone(),
+                    kind: "parse".to_owned(),
+                    reason: "orphan wrapper no longer matches the generated grammar".to_owned(),
+                }
+            })?;
+            let marker = parsed.marker.clone().unwrap_or_default();
+            let instance_name = marker
+                .split("instance=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or("orphan")
+                .to_owned();
+            let harness_str = marker
+                .split("harness=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or("claude-code")
+                .to_owned();
+            let harness = HarnessId::new(&harness_str).map_err(|e| CoreError::Validation {
+                field: "harness".to_owned(),
+                reason: format!("orphan wrapper names invalid harness {harness_str}: {e}"),
+            })?;
+            let name = InstanceName::new(&instance_name).map_err(|e| CoreError::Validation {
+                field: "name".to_owned(),
+                reason: format!("orphan wrapper names invalid instance {instance_name}: {e}"),
+            })?;
+            let mut registry = Registry::load(registry_path)?;
+            if registry.get_by_id(instance_id).is_some() {
+                return Ok(OrphanResolution {
+                    summary: format!("instance {instance_id} already recorded; nothing to do"),
+                    quarantine_path: None,
+                    recorded_instance: None,
+                });
+            }
+            if let Some(existing) = registry.get_case_fold(name.as_str()).cloned() {
+                if !force {
+                    return Err(CoreError::NameCollision {
+                        kind: "InstanceName".to_owned(),
+                        name: name.to_string(),
+                        reason: format!(
+                            "orphan wrapper instance name collides with {} (different root {}); \
+                             pass force to override",
+                            existing.name, existing.config_root
+                        ),
+                    });
+                }
+                registry.remove(existing.name.as_str());
+            }
+            let config_root = parsed
+                .env_vars
+                .iter()
+                .find(|(k, _)| k.ends_with("CONFIG_DIR") || k == "HOME")
+                .map(|(_, v)| PathBuf::from(v))
+                .unwrap_or_else(|| PathBuf::from("/tmp/orphan-root"));
+            let root_abs =
+                AbsolutePath::from_path(&config_root).map_err(|e| CoreError::InvalidPath {
+                    kind: "config_root".to_owned(),
+                    value: config_root.display().to_string(),
+                    reason: format!("orphan wrapper names a non-absolute root: {e}"),
+                })?;
+            let record = Instance {
+                id: InstanceId::new(instance_id).map_err(|e| CoreError::Validation {
+                    field: "id".to_owned(),
+                    reason: format!("orphan marker id invalid: {e}"),
+                })?,
+                name,
+                harness,
+                config_root: root_abs,
+                binary: None,
+                wrapper: Some(WrapperRef {
+                    path: WrapperPath::from_path(&finding.path).map_err(|e| {
+                        CoreError::InvalidPath {
+                            kind: "wrapper.path".to_owned(),
+                            value: finding.path.display().to_string(),
+                            reason: format!("orphan wrapper path invalid: {e}"),
+                        }
+                    })?,
+                    command_name: InstanceName::new(
+                        finding
+                            .path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("orphan"),
+                    )
+                    .map_err(|e| CoreError::Validation {
+                        field: "wrapper.command_name".to_owned(),
+                        reason: format!("orphan wrapper file name invalid: {e}"),
+                    })?,
+                    generator_version: wrapper_helper::GENERATOR_VERSION.to_owned(),
+                    content_digest: digest.clone(),
+                }),
+                isolation: Isolation::RelocatedRoot,
+                origin: InstanceOrigin::Adopted,
+                ownership: Ownership::ExplicitlyAdopted,
+                template: None,
+                created_at: now_iso8601(),
+                adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+            };
+            record.validate()?;
+            let recorded_id = record.id.clone();
+            registry.insert(record)?;
+            registry.store(registry_path)?;
+            Ok(OrphanResolution {
+                summary: format!(
+                    "recorded orphan wrapper {} as instance {recorded_id}",
+                    finding.path.display()
+                ),
+                quarantine_path: None,
+                recorded_instance: Some(recorded_id),
+            })
+        }
+        OrphanWrapperChoice::Quarantine => {
+            // DRF-07: quarantine only when target/digest prove safe — the
+            // file must be a superai wrapper whose marker digest verifies.
+            if !wrapper_helper::is_owned_wrapper(&finding.path, Some(digest)) {
+                return Err(CoreError::ForeignOwnership {
+                    path: finding.path.clone(),
+                    owner: "digest does not verify; quarantine refuses".to_owned(),
+                });
+            }
+            let op_id = generate_operation_id_string();
+            let entry = quarantine_target(&finding.path, &op_id).map_err(CoreError::Config)?;
+            Ok(OrphanResolution {
+                summary: format!(
+                    "quarantined orphan wrapper {} (recoverable)",
+                    finding.path.display()
+                ),
+                quarantine_path: Some(entry.quarantine_path),
+                recorded_instance: None,
+            })
+        }
+    }
+}
+
+/// Quarantine an unmanaged config root (DRF-07): only on the caller's
+/// EXPLICIT request, only when ownership is unmanaged — never recorded,
+/// foreign, or ambiguous roots.
+pub fn quarantine_unmanaged_root(path: &Path, home: Option<&Path>) -> Result<OrphanResolution> {
+    let ownership = crate::discovery::classify_ownership(path, &Registry::default(), home);
+    if ownership != Ownership::Unmanaged {
+        return Err(CoreError::ForeignOwnership {
+            path: path.to_path_buf(),
+            owner: format!(
+                "root classification is {ownership:?}; only unmanaged roots may be quarantined \
+                 on explicit request"
+            ),
+        });
+    }
+    let foreign = is_foreign_managed(path, home);
+    if foreign.is_foreign {
+        return Err(CoreError::ForeignOwnership {
+            path: path.to_path_buf(),
+            owner: foreign.owner.unwrap_or_else(|| "foreign".to_owned()),
+        });
+    }
+    if foreign.ambiguous {
+        return Err(CoreError::AmbiguousOwnership {
+            path: path.to_path_buf(),
+            evidence: foreign.evidence,
+        });
+    }
+    let op_id = generate_operation_id_string();
+    let entry = quarantine_target(path, &op_id).map_err(CoreError::Config)?;
+    Ok(OrphanResolution {
+        summary: format!(
+            "quarantined unmanaged root {} (recoverable)",
+            path.display()
+        ),
+        quarantine_path: Some(entry.quarantine_path),
+        recorded_instance: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Wrapper-on-adopt (DRF-06 step 5)
+// ---------------------------------------------------------------------------
+
+/// Adopt a previewed candidate AND create its superai wrapper (DRF-06
+/// optional step 5): record-first (the registry record is committed by
+/// [`adopt`]), then the wrapper is generated from the adapter's plan and
+/// the record is updated with the wrapper reference. The candidate config
+/// itself is never touched — the wrapper only names its root. Wrapper
+/// failure rolls the record back so adoption stays atomic from the user's
+/// perspective.
+pub fn adopt_with_wrapper(
+    preview: &AdoptPreview,
+    registry_path: &Path,
+    wrapper_path: &WrapperPath,
+    adapter: &dyn Adapter,
+) -> Result<OperationResult> {
+    let result = adopt(preview, registry_path)?;
+    let registry = Registry::load(registry_path)?;
+    let instance = registry
+        .get(preview.name.as_str())
+        .cloned()
+        .ok_or_else(|| CoreError::Verification {
+            path: registry_path.to_path_buf(),
+            kind: "registry".to_owned(),
+            reason: "adopted record missing before wrapper creation".to_owned(),
+        })?;
+    let plan = adapter.plan_wrapper(&instance).unwrap_or_else(|_| {
+        let mut p = WrapperPlan::new(&format!("wrapper for {}", preview.name));
+        p.env_vars.push((
+            wrapper_helper::env_var_for_harness(&preview.harness),
+            instance.config_root.to_string(),
+        ));
+        p
+    });
+    let (content, digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan);
+    if let Err(e) = wrapper_helper::write_wrapper(wrapper_path, &content) {
+        // Roll the record back: adoption without its wrapper is not a
+        // half-state the user asked for.
+        let mut fresh = Registry::load(registry_path)?;
+        fresh.remove(preview.name.as_str());
+        fresh.store(registry_path)?;
+        return Err(e);
+    }
+    let mut updated = instance;
+    updated.wrapper = Some(WrapperRef {
+        path: wrapper_path.clone(),
+        command_name: preview.name.clone(),
+        generator_version: wrapper_helper::GENERATOR_VERSION.to_owned(),
+        content_digest: digest,
+    });
+    let mut fresh = Registry::load(registry_path)?;
+    fresh.remove(preview.name.as_str());
+    fresh.insert(updated)?;
+    fresh.store(registry_path)?;
+    Ok(OperationResult {
+        id: result.id,
+        kind: result.kind,
+        actions_completed: result.actions_completed,
+        backups: result.backups,
+        verification: result.verification,
+        rollback_status: result.rollback_status,
+        diagnostics_redacted: vec![
+            result
+                .diagnostics_redacted
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            format!(
+                "wrapper created at {} for adopted {} (config untouched)",
+                wrapper_path.as_path().display(),
+                preview.name
+            ),
+        ],
+        success: result.success,
     })
 }
 
@@ -4286,6 +5854,7 @@ mod tests {
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
+            provider: None,
         };
         let registry = Registry::load(&tmp.join("registry.json")).unwrap();
         let preview = preview_create_mirrored(&request, &registry, &adapter).unwrap();
@@ -4335,6 +5904,7 @@ mod tests {
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
+            provider: None,
         };
         let registry = Registry::load(&tmp.join("registry.json")).unwrap();
 
@@ -4396,6 +5966,7 @@ mod tests {
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
+            provider: None,
         };
 
         // A real adapter with an api-key owned selector resolves a sink.
@@ -4468,6 +6039,7 @@ mod tests {
             wrapper: Some(wrapper_path.clone()),
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
             daemon_port: None,
+            provider: None,
         };
 
         let registry = Registry::load(&registry_path).unwrap();
@@ -4573,6 +6145,7 @@ mod tests {
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
             daemon_port: None,
+            provider: None,
         };
 
         let result = create_mirrored(request, &registry_path, &adapter);
@@ -4620,7 +6193,7 @@ mod tests {
         let target_root = tmp.join("target");
 
         // Worst case: an adapter contributing zero exclusions of its own.
-        let plan = build_mirror_plan(&source_root, &target_root, &[], &[]).unwrap();
+        let plan = build_mirror_plan(&source_root, &target_root, &[], &[], &[], &[], &[]).unwrap();
 
         let credential_sources = [
             source_root.join(".credentials.json"),
@@ -4631,14 +6204,14 @@ mod tests {
         ];
         for cred in &credential_sources {
             let entry = plan
-                .skipped
+                .external_auth
                 .iter()
                 .find(|e| &e.source == cred)
                 .unwrap_or_else(|| panic!("{} must be classified in the plan", cred.display()));
             assert_eq!(
                 entry.kind,
                 MirrorKind::ExternalAuth,
-                "{} must be skipped as external-auth",
+                "{} must be classified external-auth",
                 cred.display()
             );
             assert!(
@@ -4695,7 +6268,7 @@ mod tests {
         for cred_rel in ["credentials", "auth.keychain"] {
             let src = source_root.join(cred_rel);
             let entry = plan
-                .skipped
+                .external_auth
                 .iter()
                 .find(|e| e.source == src)
                 .unwrap_or_else(|| panic!("{cred_rel} must be classified in the plan"));
@@ -4741,6 +6314,7 @@ mod tests {
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
             daemon_port: None,
+            provider: None,
         };
         let result = create_mirrored(request, &registry_path, &adapter).unwrap();
         assert!(
@@ -4792,7 +6366,7 @@ mod tests {
 
         // Worst case: no adapter exclusions and no adapter-declared names —
         // the static corpus list alone must gate every credential path.
-        let plan = build_mirror_plan(&source_root, &target_root, &[], &[]).unwrap();
+        let plan = build_mirror_plan(&source_root, &target_root, &[], &[], &[], &[], &[]).unwrap();
 
         let credential_sources = [
             source_root.join("data/auth.json"),
@@ -4807,14 +6381,14 @@ mod tests {
         ];
         for cred in &credential_sources {
             let entry = plan
-                .skipped
+                .external_auth
                 .iter()
                 .find(|e| &e.source == cred)
                 .unwrap_or_else(|| panic!("{} must be classified in the plan", cred.display()));
             assert_eq!(
                 entry.kind,
                 MirrorKind::ExternalAuth,
-                "{} must be skipped as external-auth",
+                "{} must be classified external-auth",
                 cred.display()
             );
             assert!(
@@ -4859,7 +6433,7 @@ mod tests {
         for cred in ["data/auth.json", "data/mcp-auth.json"] {
             let src = source_root.join(cred);
             let entry = plan
-                .skipped
+                .external_auth
                 .iter()
                 .find(|e| e.source == src)
                 .unwrap_or_else(|| panic!("{cred} must be classified in the plan"));
@@ -4904,7 +6478,7 @@ mod tests {
         for cred in [".env", "config.local.toml", "gptme.local.toml"] {
             let src = source_root.join(cred);
             let entry = plan
-                .skipped
+                .external_auth
                 .iter()
                 .find(|e| e.source == src)
                 .unwrap_or_else(|| panic!("{cred} must be classified in the plan"));
@@ -4955,11 +6529,20 @@ mod tests {
         let target_root = tmp.join("target");
 
         let adapter_names = vec!["vendor-tokens.bin".to_owned()];
-        let plan = build_mirror_plan(&source_root, &target_root, &[], &adapter_names).unwrap();
+        let plan = build_mirror_plan(
+            &source_root,
+            &target_root,
+            &[],
+            &adapter_names,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
 
         let tokens = source_root.join("vendor-tokens.bin");
         let entry = plan
-            .skipped
+            .external_auth
             .iter()
             .find(|e| e.source == tokens)
             .unwrap_or_else(|| panic!("vendor-tokens.bin must be classified in the plan"));
@@ -5001,6 +6584,7 @@ mod tests {
             wrapper: Some(wrapper1),
             target_root: Some(AbsolutePath::from_path(&target_root1).unwrap()),
             daemon_port: None,
+            provider: None,
         };
         let r = create_mirrored(req1, &registry_path, &adapter).unwrap();
         assert!(r.success);
@@ -5017,6 +6601,7 @@ mod tests {
             wrapper: Some(wrapper2),
             target_root: Some(AbsolutePath::from_path(&target_root2).unwrap()),
             daemon_port: None,
+            provider: None,
         };
         let registry = Registry::load(&registry_path).unwrap();
         let preview = preview_create_mirrored(&req2, &registry, &adapter).unwrap();
@@ -5217,7 +6802,11 @@ mod tests {
     }
 
     #[test]
-    fn reconfigure_sees_external_edit() {
+    fn reconfigure_reapplies_template_and_sees_external_edit() {
+        // INS-06: reconfigure performs REAL mutations — re-applying the
+        // template mutates only the template-owned keys, preserves foreign
+        // keys (including ones edited externally after the record was
+        // written), and writes no demo marker.
         let tmp = unique_temp("reconfigure_external");
         let registry_path = tmp.join("registry.json");
         let root = tmp.join(".claude-work");
@@ -5238,7 +6827,7 @@ mod tests {
             ownership: Ownership::SuperaiCreated,
             template: None,
             created_at: now_iso8601(),
-            adapter_revision: "0.1.0".to_owned(),
+            adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
         };
         registry.insert(inst).unwrap();
         registry.store(&registry_path).unwrap();
@@ -5251,24 +6840,122 @@ mod tests {
         )
         .unwrap();
 
-        // Preview should see external edit
-        let loaded = Registry::load(&registry_path).unwrap();
-        let preview = preview_reconfigure(&loaded, "work", &adapter).unwrap();
-        assert!(!preview.diffs.is_empty());
-        let diff_redacted = &preview.diffs[0].lexical_redacted;
-        assert!(diff_redacted.contains("externally_edited") || diff_redacted.contains("opus"));
+        let template = TemplateRef {
+            name: TemplateId::new("glm").unwrap(),
+            version: TemplateVersion::new("1.4.0").unwrap(),
+        };
+        let request =
+            ReconfigureRequest::new(vec![ReconfigureAction::ReapplyTemplate { template }]);
 
-        // Commit reconfigure should preserve foreign keys
-        let result = reconfigure(&registry_path, "work", &adapter).unwrap();
-        assert!(result.success);
-        let after = std::fs::read_to_string(&settings).unwrap();
-        // Should still contain externally edited extra? Our reconfigure adds marker but preserves other keys via merge?
-        // Our simple reconfigure merges with existing content, so extra should be preserved.
+        // Preview should see the external edit in its real diff.
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview = preview_reconfigure(&loaded, "work", &adapter, &request).unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+        assert!(!preview.diffs.is_empty());
+        let diff = &preview.diffs[0];
         assert!(
-            after.contains("extra") || after.contains("custom"),
-            "should preserve unowned keys"
+            diff.lexical_redacted.contains("superai_template"),
+            "preview diff must show the template mutation: {}",
+            diff.lexical_redacted
         );
-        assert!(after.contains("superai_reconfigured"));
+        assert!(
+            diff.semantic_redacted.contains("foreign keys preserved"),
+            "{}",
+            diff.semantic_redacted
+        );
+
+        // Commit reconfigures via the real mutation.
+        let result = reconfigure(&registry_path, "work", &adapter, &request).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            after.contains("extra") && after.contains("custom"),
+            "foreign keys must survive reconfigure: {after}"
+        );
+        assert!(
+            after.contains("superai_template") && after.contains("1.4.0"),
+            "template keys must be applied: {after}"
+        );
+        assert!(
+            !after.contains("superai_reconfigured"),
+            "the demo marker must not exist: {after}"
+        );
+        // Capability/health re-resolution is surfaced without persisting.
+        assert!(
+            result
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("capabilities re-resolved")),
+            "diagnostics: {:?}",
+            result.diagnostics_redacted
+        );
+        assert!(
+            result
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("health:")),
+            "diagnostics: {:?}",
+            result.diagnostics_redacted
+        );
+
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn reconfigure_provider_change_mutates_real_config() {
+        // INS-06: a provider action renders through provider_render (PRV-03)
+        // and commits real endpoint/model entries on a claude-code instance.
+        let tmp = unique_temp("reconfigure_provider");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        let inst = Instance {
+            id: InstanceId::new("id-reconf-prov").unwrap(),
+            name: InstanceName::new("work").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            config_root: AbsolutePath::from_path(&root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: now_iso8601(),
+            adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+        };
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let request = ReconfigureRequest::new(vec![ReconfigureAction::ApplyProvider {
+            provider: ProviderId::new("anthropic").unwrap(),
+        }]);
+
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview = preview_reconfigure(&loaded, "work", &adapter, &request).unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+        assert!(
+            preview.diffs.iter().any(|d| d.surface == "settings.json"
+                && d.lexical_redacted.contains("env.ANTHROPIC_BASE_URL")),
+            "diffs: {:?}",
+            preview.diffs
+        );
+
+        let result = reconfigure(&registry_path, "work", &adapter, &request).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let after = std::fs::read_to_string(root.join("settings.json")).unwrap();
+        assert!(
+            after.contains("ANTHROPIC_BASE_URL"),
+            "provider endpoint must be rendered into the config: {after}"
+        );
+        assert!(
+            after.contains("sonnet"),
+            "foreign model key preserved: {after}"
+        );
+        assert!(!after.contains("sk-"), "no secret embedded: {after}");
 
         drop(std::fs::remove_dir_all(&tmp));
     }
@@ -5277,9 +6964,8 @@ mod tests {
     fn reconfigure_refuses_jsonc_settings_instead_of_stripping() {
         // codec-honesty (DOC-05): JSONC settings (comments/trailing commas)
         // must make reconfigure fail with the typed lossy-write error before
-        // any disk mutation. Previously the unparseable bytes became a
-        // fabricated empty map, so the rewrite destroyed every comment and
-        // foreign key and the post-commit digest check blessed the result.
+        // any disk mutation. The unparseable bytes must never become a
+        // fabricated empty map.
         let tmp = unique_temp("reconfigure_jsonc");
         let registry_path = tmp.join("registry.json");
         let root = tmp.join(".claude-work");
@@ -5287,6 +6973,7 @@ mod tests {
         let settings = root.join("settings.json");
         let jsonc =
             "{\n  // user comment\n  \"model\": \"sonnet\",\n  \"foreignKey\": \"keep\",\n}\n";
+        let jsonc = jsonc.replace("\\n", "\n");
         std::fs::write(&settings, jsonc).unwrap();
         let before = std::fs::read(&settings).unwrap();
 
@@ -5303,13 +6990,19 @@ mod tests {
             ownership: Ownership::SuperaiCreated,
             template: None,
             created_at: now_iso8601(),
-            adapter_revision: "0.1.0".to_owned(),
+            adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
         };
         registry.insert(inst).unwrap();
         registry.store(&registry_path).unwrap();
 
         let adapter = make_adapter("claude-code");
-        let result = reconfigure(&registry_path, "work", &adapter);
+        let request = ReconfigureRequest::new(vec![ReconfigureAction::ReapplyTemplate {
+            template: TemplateRef {
+                name: TemplateId::new("glm").unwrap(),
+                version: TemplateVersion::new("1.2.0").unwrap(),
+            },
+        }]);
+        let result = reconfigure(&registry_path, "work", &adapter, &request);
         match result {
             Err(CoreError::Config(ConfigError::LossyWrite { format, .. })) => {
                 assert_eq!(format, "jsonc");
@@ -5317,7 +7010,7 @@ mod tests {
             other => panic!("expected LossyWrite, got {other:?}"),
         }
 
-        // Refusal is total: bytes untouched, no backup, no marker written.
+        // Refusal is total: bytes untouched, no marker written.
         assert_eq!(
             std::fs::read(&settings).unwrap(),
             before,
@@ -5326,12 +7019,12 @@ mod tests {
         assert!(
             !std::fs::read_to_string(&settings)
                 .unwrap()
-                .contains("superai_reconfigured"),
-            "refused reconfigure must not write its marker"
+                .contains("superai_template"),
+            "refused reconfigure must not write its mutation"
         );
-        let backups: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
+        let entries: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
         assert_eq!(
-            backups.len(),
+            entries.len(),
             1,
             "refused reconfigure must not create backups"
         );
@@ -5363,11 +7056,17 @@ mod tests {
             created_at: now_iso8601(),
             adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
         };
-        let mut plan = WrapperPlan::new("test");
-        plan.env_vars.push((
-            crate::wrapper::env_var_for_harness(&HarnessId::new("claude-code").unwrap()),
-            root.display().to_string(),
-        ));
+        let adapter_for_plan = make_adapter("claude-code");
+        let plan = adapter_for_plan
+            .plan_wrapper(&temp_inst)
+            .unwrap_or_else(|_| {
+                let mut p = WrapperPlan::new("test");
+                p.env_vars.push((
+                    crate::wrapper::env_var_for_harness(&HarnessId::new("claude-code").unwrap()),
+                    root.display().to_string(),
+                ));
+                p
+            });
         let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
         std::fs::write(&wrapper_path, &content).unwrap();
         inst.wrapper = Some(WrapperRef {
@@ -5965,6 +7664,954 @@ mod tests {
         );
         assert_eq!(candidate_before, tree_digests(&candidate));
 
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+    // -------------------------------------------------------------------
+    // INS-01: foreign-managed default determination is the real check
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn register_default_refuses_foreign_managed_default() {
+        let tmp = unique_temp("default_foreign");
+        let registry_path = tmp.join("registry.json");
+        let harness = HarnessId::new("claude-code").unwrap();
+        let adapter = make_adapter("claude-code");
+        let home = tmp.join("home");
+        let default_root = home.join(".claude");
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::write(default_root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        // claude-multi references the default root.
+        let multi = home.join(".claude-multi");
+        std::fs::create_dir_all(&multi).unwrap();
+        std::fs::write(
+            multi.join("config.json"),
+            format!(
+                r#"{{"instances":[{{"configDir":"{}"}}]}}"#,
+                default_root.display()
+            ),
+        )
+        .unwrap();
+
+        let registry = Registry::load(&registry_path).unwrap();
+        let preview = inspect_default_with_home(&harness, &registry, &adapter, &home).unwrap();
+        assert!(
+            preview.foreign_managed,
+            "the real check must see claude-multi"
+        );
+        assert!(
+            preview
+                .preview
+                .conflicts
+                .iter()
+                .any(|c| c.code == "foreign_owned"),
+            "{:?}",
+            preview.preview.conflicts
+        );
+        assert!(preview.preview.actions.is_empty());
+
+        // Commit re-proofs fresh and refuses before writing the registry.
+        let err = register_default(&preview, &registry_path).unwrap_err();
+        match err {
+            CoreError::ForeignOwnership { path, owner } => {
+                assert_eq!(path, default_root);
+                assert_eq!(owner, "claude-multi");
+            }
+            other => panic!("expected ForeignOwnership, got {other:?}"),
+        }
+        assert!(
+            !registry_path.exists(),
+            "refused registration must not create the registry"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -------------------------------------------------------------------
+    // INS-02: provider input enforces a writable secret sink
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn preflight_provider_enforces_secret_sink() {
+        let tmp = unique_temp("preflight-provider");
+        let registry = Registry::load(&tmp.join("registry.json")).unwrap();
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let base = CreateRequest {
+            name: InstanceName::new("prov").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source_root).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
+            daemon_port: None,
+            provider: None,
+        };
+
+        // A planned provider on a sink-less adapter is a BLOCKING conflict.
+        let generic = make_adapter("claude-code");
+        let with_provider = CreateRequest {
+            provider: Some(ProviderId::new("anthropic").unwrap()),
+            ..base.clone()
+        };
+        let preview = preview_create_mirrored(&with_provider, &registry, &generic).unwrap();
+        assert!(
+            preview
+                .conflicts
+                .iter()
+                .any(|c| c.code == "secret_sink_unavailable"),
+            "conflicts: {:?}",
+            preview.conflicts
+        );
+
+        // The same provider on the real claude adapter resolves a sink.
+        let claude = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let preview_ok = preview_create_mirrored(&with_provider, &registry, &claude).unwrap();
+        assert!(
+            !preview_ok
+                .conflicts
+                .iter()
+                .any(|c| c.code == "secret_sink_unavailable"),
+            "{:?}",
+            preview_ok.conflicts
+        );
+        let sink = preview_ok
+            .preconditions
+            .iter()
+            .find(|p| p.kind == PreconditionKind::AuthPresent)
+            .expect("sink precondition");
+        assert!(sink.satisfied);
+        assert!(
+            sink.description.contains("anthropic"),
+            "the precondition names the planned provider: {}",
+            sink.description
+        );
+
+        // An unknown provider id is a blocking conflict.
+        let unknown = CreateRequest {
+            provider: Some(ProviderId::new("no-such-provider").unwrap()),
+            ..base
+        };
+        let preview_unknown = preview_create_mirrored(&unknown, &registry, &claude).unwrap();
+        assert!(
+            preview_unknown
+                .conflicts
+                .iter()
+                .any(|c| c.code == "provider_unknown"),
+            "{:?}",
+            preview_unknown.conflicts
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -------------------------------------------------------------------
+    // INS-03: Linked / Transformed classifications + mode preservation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mirror_plan_classifies_linked_and_transformed() {
+        // claude-code declares `skills` link-safe: a skills dir in the
+        // source becomes a LINK, not a copy.
+        let tmp = unique_temp("mirror_linked");
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let source = tmp.join("source");
+        std::fs::create_dir_all(source.join("skills")).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        std::fs::write(source.join("skills").join("SKILL.md"), "# skill\n").unwrap();
+        let target = tmp.join("target");
+        let plan = plan_mirror(&source, &target, &adapter).unwrap();
+        assert!(
+            plan.linked
+                .iter()
+                .any(|e| e.source == source.join("skills")),
+            "skills dir must be classified Linked: {:?}",
+            plan.linked
+        );
+        assert!(
+            !plan
+                .copied
+                .iter()
+                .any(|e| e.source == source.join("skills")),
+            "linked entries never enter the copy set"
+        );
+
+        // gptme declares config.toml as content-rewriting: a config embedding
+        // the source root becomes TRANSFORMED; one without it stays Copied.
+        let gptme = crate::adapters::gptme::GptmeAdapter::new().unwrap();
+        let gsource = tmp.join("gsource");
+        std::fs::create_dir_all(&gsource).unwrap();
+        std::fs::write(
+            gsource.join("config.toml"),
+            format!(
+                "paths = [\"./plugins\", \"{}/plugins\"]\n",
+                gsource.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(gsource.join("plain.toml"), "no paths\n").unwrap();
+        let gtarget = tmp.join("gtarget");
+        let gplan = plan_mirror(&gsource, &gtarget, &gptme).unwrap();
+        let transformed_entry = gplan
+            .transformed
+            .iter()
+            .find(|e| e.source == gsource.join("config.toml"))
+            .expect("config.toml embedding the root must be transformed");
+        assert!(transformed_entry.reason.contains("rewritten"));
+        assert!(
+            gplan
+                .copied
+                .iter()
+                .any(|e| e.source == gsource.join("plain.toml")),
+            "files without the root stay plain copies"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// Platform: unix — mode bits carry through the mirror; other platforms
+    /// have no observable mode to preserve.
+    #[cfg(unix)]
+    #[test]
+    fn create_mirrored_preserves_source_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp("mirror_modes");
+        let adapter = make_adapter("claude-code");
+        let source = tmp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let secret_mode_file = source.join("a-script.sh");
+        std::fs::write(&secret_mode_file, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&secret_mode_file, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(
+            source.join("settings.json"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+
+        let target = tmp.join("target");
+        let request = CreateRequest {
+            name: InstanceName::new("modes").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&target).unwrap()),
+            daemon_port: None,
+            provider: None,
+        };
+        let registry_path = tmp.join("registry.json");
+        let result = create_mirrored(request, &registry_path, &adapter).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let copied_mode = std::fs::metadata(target.join("a-script.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            copied_mode & 0o777,
+            0o700,
+            "copied file must carry the source mode"
+        );
+        let settings_mode = std::fs::metadata(target.join("settings.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(settings_mode & 0o777, 0o640);
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-04 step 4 end to end: adapter-declared shared assets are installed
+    /// as LINKS inside the created target.
+    #[test]
+    fn create_mirrored_links_shared_assets() {
+        let tmp = unique_temp("mirror_shared_link");
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let source = tmp.join("source");
+        std::fs::create_dir_all(source.join("skills")).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        std::fs::write(source.join("skills").join("SKILL.md"), "# shared skill\n").unwrap();
+        let target = tmp.join("target");
+
+        let request = CreateRequest {
+            name: InstanceName::new("shared").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&target).unwrap()),
+            daemon_port: None,
+            provider: None,
+        };
+        let registry_path = tmp.join("registry.json");
+        let result = create_mirrored(request, &registry_path, &adapter).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let linked = target.join("skills");
+        let meta = std::fs::symlink_metadata(&linked).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "skills must be a symlink to the shared source"
+        );
+        assert_eq!(std::fs::read_link(&linked).unwrap(), source.join("skills"));
+        // And it resolves to the shared content.
+        assert!(linked.join("SKILL.md").exists());
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-04: the source-unchanged proof is real — a tree that changed
+    /// between the before-digest and the check aborts with the typed error.
+    #[test]
+    fn source_unchanged_check_detects_mid_mirror_change() {
+        let tmp = unique_temp("source_change");
+        let source = tmp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"a"}"#).unwrap();
+        let before = source_tree_digests(&source);
+        // No change: the digests match.
+        let after_unchanged = source_tree_digests(&source);
+        assert_eq!(before, after_unchanged);
+        // A change (any file) makes the digests differ — the create flow
+        // turns exactly this comparison into ConcurrentModification.
+        std::fs::write(source.join("history.jsonl"), "sneaky edit\n").unwrap();
+        let after_changed = source_tree_digests(&source);
+        assert_ne!(
+            before, after_changed,
+            "the digest proof must observe mid-mirror changes"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-04: failure AFTER wrapper creation (adapter validation refuses)
+    /// rolls the wrapper and target back and leaves no registry record.
+    #[test]
+    fn failure_after_wrapper_creation_rolls_back() {
+        let tmp = unique_temp("post_wrapper_rollback");
+        let registry_path = tmp.join("registry.json");
+        // Adapter whose harness id never matches: plan_wrapper falls back to
+        // the generic plan, validate_instance then REFUSES after the
+        // transaction wrote target + wrapper.
+        let adapter = make_adapter("other-harness");
+        let source = tmp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let target = tmp.join("target");
+        let wrapper = WrapperPath::new(&tmp.join("bin/work").to_string_lossy()).unwrap();
+
+        let request = CreateRequest {
+            name: InstanceName::new("work").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: Some(wrapper.clone()),
+            target_root: Some(AbsolutePath::from_path(&target).unwrap()),
+            daemon_port: None,
+            provider: None,
+        };
+        let result = create_mirrored(request, &registry_path, &adapter);
+        assert!(result.is_err(), "adapter validation must refuse");
+        assert!(
+            !wrapper.as_path().exists(),
+            "wrapper must be rolled back / quarantined"
+        );
+        assert!(
+            !target.join("settings.json").exists(),
+            "target residuals must be rolled back / quarantined"
+        );
+        assert!(
+            !registry_path.exists()
+                || Registry::load(&registry_path)
+                    .unwrap()
+                    .instances()
+                    .is_empty(),
+            "no registry record may survive the failure"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// DRF-05: create writes the stable-identity marker into the target root.
+    #[test]
+    fn create_mirrored_writes_instance_marker_matching_record() {
+        let tmp = unique_temp("marker_write");
+        let registry_path = tmp.join("registry.json");
+        let adapter = make_adapter("claude-code");
+        let source = tmp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let target = tmp.join("target");
+        let request = CreateRequest {
+            name: InstanceName::new("marked").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&target).unwrap()),
+            daemon_port: None,
+            provider: None,
+        };
+        let result = create_mirrored(request, &registry_path, &adapter).unwrap();
+        assert!(result.success);
+        let registry = Registry::load(&registry_path).unwrap();
+        let record = registry.get("marked").unwrap();
+        assert_eq!(
+            crate::discovery::read_instance_marker(&target),
+            Some(record.id.clone()),
+            "the marker must carry the recorded instance id"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -------------------------------------------------------------------
+    // INS-05: the wrapper FILE rename branch (with the file on disk)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rename_moves_wrapper_file_and_updates_record() {
+        let tmp = unique_temp("rename_wrapper_file");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // Generate + write the wrapper for instance "work" at bin/work.
+        let harness = HarnessId::new("claude-code").unwrap();
+        let temp_inst = make_instance("work", &root, "claude-code");
+        let mut plan = WrapperPlan::new("test");
+        plan.env_vars.push((
+            crate::wrapper::env_var_for_harness(&harness),
+            root.display().to_string(),
+        ));
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+        std::fs::write(bin.join("work"), &content).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        let mut inst = make_instance("work", &root, "claude-code");
+        inst.wrapper = Some(WrapperRef {
+            path: WrapperPath::from_path(&bin.join("work")).unwrap(),
+            command_name: InstanceName::new("work").unwrap(),
+            generator_version: crate::wrapper::GENERATOR_VERSION.to_owned(),
+            content_digest: digest,
+        });
+        let preserved_id = inst.id.clone();
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let result =
+            rename_instance(&registry_path, "work", InstanceName::new("work2").unwrap()).unwrap();
+        assert!(result.success);
+
+        // The wrapper FILE moved on disk, atomically, with its backup kept.
+        assert!(!bin.join("work").exists(), "old wrapper path is gone");
+        let new_wrapper = bin.join("work2");
+        assert!(new_wrapper.exists(), "wrapper moved to the new name");
+        assert_eq!(
+            std::fs::read_to_string(&new_wrapper).unwrap(),
+            content,
+            "rename moves bytes; it does not regenerate"
+        );
+
+        // The record's wrapper metadata followed: path, command name, digest.
+        let after = Registry::load(&registry_path).unwrap();
+        let renamed = after.get("work2").unwrap();
+        assert_eq!(renamed.id, preserved_id);
+        let wrapper = renamed.wrapper.as_ref().expect("wrapper preserved");
+        assert_eq!(wrapper.path.as_path(), new_wrapper);
+        assert_eq!(wrapper.command_name.as_str(), "work2");
+        assert_eq!(
+            wrapper.content_digest,
+            compute_digest_bytes(content.as_bytes())
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -------------------------------------------------------------------
+    // INS-09: template drift + binary repair + redacted repair diffs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn repair_detects_and_heals_template_version_drift() {
+        let tmp = unique_temp("repair_template_drift");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        // On-disk marker says 1.0.0; the record says 1.2.0 -> drift.
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"model":"x","superai_template":"glm","superai_template_version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let mut inst = make_instance("work", &root, "claude-code");
+        inst.template = Some(TemplateRef {
+            name: TemplateId::new("glm").unwrap(),
+            version: TemplateVersion::new("1.2.0").unwrap(),
+        });
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = make_adapter("claude-code");
+        let loaded = Registry::load(&registry_path).unwrap();
+        let repairs = detect_repairs(&loaded, &adapter);
+        let drift = repairs
+            .iter()
+            .find(|r| r.kind == RepairKind::TemplateVersionDrift)
+            .expect("template version drift detected");
+        assert!(drift.description.contains("1.0.0"));
+        assert!(drift.description.contains("1.2.0"));
+
+        // preview_repair surfaces the drift as a diff.
+        let preview = preview_repair(&loaded, "work", &adapter).unwrap();
+        assert!(
+            preview
+                .diffs
+                .iter()
+                .any(|d| d.semantic_redacted.contains("template_version_drift")),
+            "diffs: {:?}",
+            preview.diffs
+        );
+
+        // repair() re-applies the record's template: the marker now matches.
+        let result = repair(&registry_path, "work", &adapter, false).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let after = std::fs::read_to_string(root.join("settings.json")).unwrap();
+        assert!(
+            after.contains("superai_template_version") && after.contains("1.2.0"),
+            "on-disk marker healed to the record: {after}"
+        );
+        assert!(after.contains("\"model\":\"x\"") || after.contains("\"model\": \"x\""));
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn repair_missing_binary_redetects_or_clears() {
+        let tmp = unique_temp("repair_binary");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let dead_binary = tmp.join("does-not-exist-bin");
+        let mut inst = make_instance("work", &root, "claude-code");
+        inst.binary = Some(crate::paths::ExecutableRef::Absolute(
+            AbsolutePath::from_path(&dead_binary).unwrap(),
+        ));
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = make_adapter("claude-code");
+        let loaded = Registry::load(&registry_path).unwrap();
+        assert!(
+            detect_repairs(&loaded, &adapter)
+                .iter()
+                .any(|r| r.kind == RepairKind::MissingBinary),
+            "dead binary pin detected"
+        );
+
+        // repair re-detects: with no claude binary found the stale pin is
+        // CLEARED (marked binary-missing), never left pointing at a dead path.
+        let result = repair(&registry_path, "work", &adapter, false).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let after = Registry::load(&registry_path).unwrap();
+        let record = after.get("work").unwrap();
+        let pin = record
+            .binary
+            .as_ref()
+            .and_then(|b| b.as_absolute_path().map(|p| p.as_path().to_path_buf()));
+        assert!(
+            pin.clone().is_none_or(|p| p.exists()),
+            "the pin must point at a live binary or be cleared: {pin:?}"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn preview_repair_shows_redacted_wrapper_diff() {
+        let tmp = unique_temp("repair_diff");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let adapter = make_adapter("claude-code");
+        let inst = make_instance("work", &root, "claude-code");
+        let plan = adapter.plan_wrapper(&inst).unwrap();
+        let (expected, digest) = crate::wrapper::generate_shell_wrapper(&inst, &plan);
+        // Drifted content: a redacted-looking credential line was added.
+        let drifted = expected.replace(
+            "set -eu\n",
+            "set -eu\nexport ANTHROPIC_API_KEY='sk-live-tampered123'\n",
+        );
+        std::fs::write(bin.join("work"), &drifted).unwrap();
+
+        let mut with_wrapper = inst;
+        with_wrapper.wrapper = Some(WrapperRef {
+            path: WrapperPath::from_path(&bin.join("work")).unwrap(),
+            command_name: InstanceName::new("work").unwrap(),
+            generator_version: crate::wrapper::GENERATOR_VERSION.to_owned(),
+            content_digest: digest,
+        });
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry.insert(with_wrapper).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview = preview_repair(&loaded, "work", &adapter).unwrap();
+        let wrapper_diff = preview
+            .diffs
+            .iter()
+            .find(|d| d.surface == "wrapper")
+            .expect("wrapper diff present");
+        assert!(
+            wrapper_diff.lexical_redacted.contains('-')
+                && wrapper_diff.lexical_redacted.contains('+'),
+            "real +/- diff: {}",
+            wrapper_diff.lexical_redacted
+        );
+        assert!(
+            wrapper_diff.redacted_fields.contains(&"api_key".to_owned()),
+            "the diff declares its redaction"
+        );
+        // Secret-shaped values never appear in the diff.
+        assert!(
+            !wrapper_diff
+                .lexical_redacted
+                .contains("sk-live-tampered123"),
+            "credential must be redacted: {}",
+            wrapper_diff.lexical_redacted
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -------------------------------------------------------------------
+    // DRF-06 step 5: wrapper-on-adopt
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn adopt_with_wrapper_creates_wrapper_and_preserves_config() {
+        let tmp = unique_temp("adopt_wrapper");
+        let registry_path = tmp.join("registry.json");
+        let home = tmp.join("home");
+        let candidate = adopt_candidate(&home, "wrappable");
+        let before = tree_digests(&candidate);
+
+        let name = InstanceName::new("with-wrapper").unwrap();
+        let registry = Registry::load(&registry_path).unwrap();
+        let preview = preview_adopt(&candidate, &name, &registry, Some(&home)).unwrap();
+        let wrapper_path =
+            WrapperPath::new(&tmp.join("bin").join("with-wrapper").to_string_lossy()).unwrap();
+        let adapter = make_adapter("claude-code");
+
+        let result = adopt_with_wrapper(&preview, &registry_path, &wrapper_path, &adapter).unwrap();
+        assert!(result.success);
+
+        // Config untouched; wrapper created and owned.
+        assert_eq!(before, tree_digests(&candidate));
+        let wrapper_content = std::fs::read_to_string(wrapper_path.as_path()).unwrap();
+        assert!(wrapper_content.contains("superai wrapper"));
+        assert!(wrapper_content.contains(candidate.display().to_string().as_str()));
+        assert!(!wrapper_content.contains("secret-token-material"));
+
+        // The record carries the wrapper reference.
+        let loaded = Registry::load(&registry_path).unwrap();
+        let inst = loaded.get("with-wrapper").unwrap();
+        let wrapper = inst.wrapper.as_ref().expect("wrapper recorded");
+        assert_eq!(wrapper.path, wrapper_path);
+        assert!(
+            crate::wrapper::is_owned_wrapper(wrapper_path.as_path(), Some(&wrapper.content_digest)),
+            "the recorded digest proves ownership"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    // -------------------------------------------------------------------
+    // DRF-07: orphan-wrapper choices
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn orphan_wrapper_choices_record_and_quarantine() {
+        let tmp = unique_temp("orphan_choices");
+        let registry_path = tmp.join("registry.json");
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // An orphan wrapper for an unrecorded instance.
+        let orphan_root = tmp.join(".claude-orphan");
+        std::fs::create_dir_all(&orphan_root).unwrap();
+        let orphan = make_instance("orphaned", &orphan_root, "claude-code");
+        let mut plan = WrapperPlan::new("test");
+        plan.env_vars.push((
+            crate::wrapper::env_var_for_harness(&HarnessId::new("claude-code").unwrap()),
+            orphan_root.display().to_string(),
+        ));
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&orphan, &plan);
+        let wrapper_file = bin.join("orphaned");
+        std::fs::write(&wrapper_file, &content).unwrap();
+
+        let finding = WrapperFinding {
+            path: wrapper_file,
+            kind: WrapperFindingKind::SuperaiWrapper {
+                instance_id: orphan.id.to_string(),
+                digest: digest.clone(),
+            },
+            recorded: false,
+            risk: crate::discovery::RiskLevel::Medium,
+            next_operations: vec![],
+        };
+
+        // Foreign/opaque launchers never get these choices.
+        let foreign_finding = WrapperFinding {
+            path: bin.join("user-tool"),
+            kind: WrapperFindingKind::Foreign {
+                reason: "user recipe".to_owned(),
+            },
+            recorded: false,
+            risk: crate::discovery::RiskLevel::Low,
+            next_operations: vec![],
+        };
+        assert!(matches!(
+            resolve_orphan_wrapper(
+                &foreign_finding,
+                &OrphanWrapperChoice::Ignore,
+                &registry_path
+            ),
+            Err(CoreError::ForeignOwnership { .. })
+        ));
+
+        // Record: the marker's instance is adopted into the registry.
+        let resolution = resolve_orphan_wrapper(
+            &finding,
+            &OrphanWrapperChoice::Record { force: false },
+            &registry_path,
+        )
+        .unwrap();
+        assert!(resolution.recorded_instance.is_some());
+        let registry = Registry::load(&registry_path).unwrap();
+        let record = registry.get("orphaned").expect("recorded by marker name");
+        assert_eq!(record.origin, InstanceOrigin::Adopted);
+        assert_eq!(record.config_root.as_path(), orphan_root);
+        assert_eq!(record.wrapper.as_ref().unwrap().content_digest, digest);
+
+        // Quarantine (on a fresh copy): the digest proof allows moving it.
+        let quarantine_file = bin.join("second-orphan");
+        std::fs::write(&quarantine_file, &content).unwrap();
+        let quarantine_finding = WrapperFinding {
+            path: quarantine_file.clone(),
+            kind: WrapperFindingKind::SuperaiWrapper {
+                instance_id: orphan.id.to_string(),
+                digest: digest.clone(),
+            },
+            recorded: false,
+            risk: crate::discovery::RiskLevel::Medium,
+            next_operations: vec![],
+        };
+        let quarantined = resolve_orphan_wrapper(
+            &quarantine_finding,
+            &OrphanWrapperChoice::Quarantine,
+            &registry_path,
+        )
+        .unwrap();
+        assert!(quarantined.quarantine_path.is_some());
+        assert!(!quarantine_file.exists(), "moved to quarantine");
+
+        // Quarantine refuses when the digest does not verify.
+        let tampered = bin.join("tampered-orphan");
+        std::fs::write(&tampered, content.replace(&digest, "00000000deadbeef")).unwrap();
+        let tampered_finding = WrapperFinding {
+            path: tampered.clone(),
+            kind: WrapperFindingKind::SuperaiWrapper {
+                instance_id: orphan.id.to_string(),
+                digest,
+            },
+            recorded: false,
+            risk: crate::discovery::RiskLevel::Medium,
+            next_operations: vec![],
+        };
+        assert!(matches!(
+            resolve_orphan_wrapper(
+                &tampered_finding,
+                &OrphanWrapperChoice::Quarantine,
+                &registry_path
+            ),
+            Err(CoreError::ForeignOwnership { .. })
+        ));
+        assert!(tampered.exists(), "unproven wrapper is untouched");
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn quarantine_unmanaged_root_requires_unmanaged_ownership() {
+        let tmp = unique_temp("quarantine_root");
+        let home = tmp.join("home");
+        // Unmanaged root: quarantine succeeds (explicit request only).
+        let unmanaged = home.join(".claude-loose");
+        std::fs::create_dir_all(&unmanaged).unwrap();
+        std::fs::write(unmanaged.join("settings.json"), "{}").unwrap();
+        let resolution = quarantine_unmanaged_root(&unmanaged, Some(&home)).unwrap();
+        assert!(resolution.quarantine_path.is_some());
+        assert!(!unmanaged.exists(), "moved to quarantine");
+
+        // Foreign-managed root: refused.
+        let foreign = home.join(".claude-foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("settings.json"), "{}").unwrap();
+        std::fs::write(foreign.join(".foreign-managed"), "").unwrap();
+        assert!(matches!(
+            quarantine_unmanaged_root(&foreign, Some(&home)),
+            Err(CoreError::ForeignOwnership { .. })
+        ));
+        assert!(foreign.exists());
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+    /// INS-09: incomplete-transaction-journal detection + the dedicated
+    /// repair action. The journal lives under an ISOLATED home so the test
+    /// never sweeps the developer's real recovery state.
+    #[test]
+    fn detect_and_repair_incomplete_journal() {
+        let tmp = unique_temp("journal_repair");
+        let home = tmp.join("home");
+        let journal_root = superai_config::journal::journal_dir(&home);
+        std::fs::create_dir_all(&journal_root).unwrap();
+        // A realistic abandoned journal: recorded backups, no content.
+        let journal = superai_config::journal::CrashJournal::new(
+            "op-journal-repair-1",
+            superai_config::journal::JournalPhase::Commit,
+            vec![tmp.join("resource.json").display().to_string()],
+        );
+        let journal_file =
+            superai_config::journal::journal_path(&journal_root, "op-journal-repair-1");
+        journal.write_to(&journal_file).unwrap();
+
+        let registry_path = tmp.join("registry.json");
+        let adapter = make_adapter("claude-code");
+        let registry = Registry::load(&registry_path).unwrap();
+        let repairs = detect_repairs_with_home(&registry, &adapter, Some(&home));
+        let journal_item = repairs
+            .iter()
+            .find(|r| r.kind == RepairKind::IncompleteJournal)
+            .expect("pending journal detected");
+        assert_eq!(journal_item.name.as_str(), "journal");
+        assert!(journal_item.description.contains("pending recovery"));
+
+        // The dedicated action recovers it (file inspected, journal removed
+        // when no residuals remain).
+        let summaries = repair_incomplete_journals(&home).unwrap();
+        assert!(
+            summaries.iter().any(|s| s.contains("op-journal-repair-1")),
+            "{summaries:?}"
+        );
+        assert!(!journal_file.exists(), "recovered journal is removed");
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+    /// INS-08: the fixed-path config-entries-only removal choice clears the
+    /// superai-owned profile store (profiles + active identity) for a
+    /// fixed-path instance, never touching the harness config bytes, and is
+    /// refused for non-fixed-path instances.
+    #[test]
+    fn remove_fixed_path_entries_clears_store_only() {
+        let tmp = unique_temp("remove_fixed_path");
+        let home = tmp.join("home");
+        let registry_path = tmp.join("registry.json");
+        let layout = crate::adapters::zcode::fixed_path_layout(&home);
+        let fixed_config = layout.fixed_config;
+        std::fs::create_dir_all(fixed_config.parent().unwrap()).unwrap();
+        std::fs::write(&fixed_config, br#"{"provider":"zai"}"#).unwrap();
+
+        // A saved profile + active identity in the superai-owned store.
+        let store = crate::activation::FixedPathProfileStore::new(
+            &crate::activation::default_store_root(&home),
+            HarnessId::new("zcode").unwrap(),
+            &layout.harness_root,
+        )
+        .unwrap();
+        store
+            .save_active_profile(&InstanceName::new("profile-a").unwrap(), &fixed_config)
+            .unwrap();
+        let opts = crate::activation::ActivationOptions::default();
+        store
+            .activate_profile(
+                &InstanceName::new("profile-a").unwrap(),
+                &fixed_config,
+                &crate::activation::ReconcileChoice::Abort,
+                &opts,
+            )
+            .unwrap();
+        assert!(!store.list_profiles().unwrap().is_empty());
+        assert!(store.active_identity().is_some());
+
+        // A fixed-path instance record.
+        let mut inst = make_instance("zp", layout.harness_root.as_path(), "zcode");
+        inst.isolation = Isolation::FixedPathSingle;
+        inst.harness = HarnessId::new("zcode").unwrap();
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        // The choice is refused for a non-fixed-path instance.
+        let mut relocated = make_instance("rp", &tmp.join(".claude-rp"), "claude-code");
+        relocated.isolation = Isolation::RelocatedRoot;
+        let mut reg2 = Registry::load(&registry_path).unwrap();
+        reg2.insert(relocated).unwrap();
+        reg2.store(&registry_path).unwrap();
+        let loaded = Registry::load(&registry_path).unwrap();
+        assert!(
+            preview_remove(&loaded, "rp", RemoveChoice::FixedPathEntries)
+                .unwrap()
+                .conflicts
+                .iter()
+                .any(|c| c.code == "not_fixed_path")
+        );
+        let refused = remove_instance_with_home(
+            &registry_path,
+            "rp",
+            RemoveChoice::FixedPathEntries,
+            Some(&home),
+        );
+        assert!(refused.is_err(), "non-fixed-path choice must be refused");
+
+        // Preview for the fixed-path instance carries the honest limitation.
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview = preview_remove(&loaded, "zp", RemoveChoice::FixedPathEntries).unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+        assert!(
+            preview
+                .limitations
+                .iter()
+                .any(|l| l.code == "fixed_path_bytes_remain"),
+            "{:?}",
+            preview.limitations
+        );
+
+        // Commit clears the store, keeps the harness bytes, drops the record.
+        let bytes_before = std::fs::read(&fixed_config).unwrap();
+        let result = remove_instance_with_home(
+            &registry_path,
+            "zp",
+            RemoveChoice::FixedPathEntries,
+            Some(&home),
+        )
+        .unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        assert!(
+            result
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("fixed_path_store_cleared=true")),
+            "{:?}",
+            result.diagnostics_redacted
+        );
+        assert!(store.list_profiles().unwrap().is_empty());
+        assert!(
+            Registry::load(&registry_path).unwrap().get("zp").is_none(),
+            "the record is removed with its config entries"
+        );
+        assert_eq!(
+            std::fs::read(&fixed_config).unwrap(),
+            bytes_before,
+            "the harness fixed-path config is never touched"
+        );
         drop(std::fs::remove_dir_all(&tmp));
     }
 }

@@ -818,6 +818,24 @@ impl Adapter for ClineAdapter {
             vscode_data.display(),
             extensions.display()
         );
+        // WRP-01 invocation spec (cline.md / WRP-05): the VS Code `code`
+        // executable with per-profile user-data + extensions dirs; the split
+        // surfaces are the CLI env and the two editor directories; VS Code's
+        // login/keychain/globalStorage stay shared — the honest constrained
+        // channel.
+        plan.executable = Some("code".to_owned());
+        plan.state_paths = vec![
+            format!("{DATA_DIR_ENV_VAR}={}", instance.config_root),
+            format!("--user-data-dir={}", vscode_data.display()),
+            format!("--extensions-dir={}", extensions.display()),
+        ];
+        plan.isolation_guarantees =
+            vec!["editor state, extensions, and CLI data split per profile".to_owned()];
+        plan.shared_state_warnings = vec![
+            "VS Code sign-in/keychain secrets and any globalStorage the extension writes \
+             outside --user-data-dir remain shared across profiles"
+                .to_owned(),
+        ];
         Ok(plan)
     }
 

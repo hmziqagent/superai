@@ -756,7 +756,78 @@ impl VersionResolution {
 // Wrapper plan
 // ---------------------------------------------------------------------------
 
+/// How the launched process's standard streams behave (WRP-01).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdioPolicy {
+    /// The process inherits the terminal (interactive/ACP frontends). The
+    /// wrapper uses `exec` replacement semantics so signals reach the
+    /// harness directly.
+    #[default]
+    Terminal,
+    /// The process runs detached from stdio (background daemon); output is
+    /// the harness's own logging, not the wrapper's.
+    Detached,
+}
+
+impl fmt::Display for StdioPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Terminal => "terminal",
+            Self::Detached => "detached",
+        };
+        f.write_str(s)
+    }
+}
+
+/// An auth prerequisite the harness needs before the wrapper can run
+/// (WRP-01). Always a reference — the env var NAME the harness reads or a
+/// login step the user performs in the harness itself — never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPrerequisite {
+    /// What must exist: an env var name or an in-harness login step.
+    pub kind: AuthPrereqKind,
+    /// Reference (env var name or login instruction), never a secret value.
+    pub reference: String,
+}
+
+/// Kind of auth prerequisite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPrereqKind {
+    /// An environment variable must carry a credential at launch time.
+    EnvVar,
+    /// The user must complete an in-harness login (OAuth/keychain) first;
+    /// superai never proxies the flow.
+    HarnessLogin,
+}
+
+impl AuthPrerequisite {
+    /// Declare an env-var credential reference.
+    pub fn env_var(name: &str) -> Self {
+        Self {
+            kind: AuthPrereqKind::EnvVar,
+            reference: name.to_owned(),
+        }
+    }
+
+    /// Declare an in-harness login step.
+    pub fn harness_login(instruction: &str) -> Self {
+        Self {
+            kind: AuthPrereqKind::HarnessLogin,
+            reference: instruction.to_owned(),
+        }
+    }
+}
+
 /// Plan for invoking an isolated instance via a wrapper.
+///
+/// WRP-01: the full invocation specification — executable reference, argv
+/// policy, environment set/unset operations, working-directory policy,
+/// config/state paths, stdio/daemon behavior, auth prerequisites, and the
+/// isolation guarantees plus shared-state warnings the harness honestly
+/// has. Values are references (env var names, paths); secrets are never
+/// embedded here, in the registry, or in previews.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapperPlan {
     /// Environment variables to set before exec.
@@ -765,6 +836,37 @@ pub struct WrapperPlan {
     pub args: Vec<String>,
     /// Human-readable description of the isolation mechanism.
     pub description: String,
+    /// Environment variables to UNSET before exec (WRP-01/02): a global
+    /// credential must not leak into an isolated profile through an
+    /// inherited variable.
+    #[serde(default)]
+    pub env_unset: Vec<String>,
+    /// Executable reference: bare name resolved via `PATH`, or an absolute
+    /// path. `None` means the harness default executable on `PATH`.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Working-directory policy: fixed directory to launch from, or `None`
+    /// to inherit the caller's cwd.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Config and state paths the isolation splits (labels), e.g.
+    /// `CLAUDE_CONFIG_DIR=/x/.claude-work` or `user-data-dir=/x/vscode`.
+    #[serde(default)]
+    pub state_paths: Vec<String>,
+    /// stdin/stdout/daemon behavior of the launched process.
+    #[serde(default)]
+    pub stdio: StdioPolicy,
+    /// Auth prerequisites (references only, never secret values).
+    #[serde(default)]
+    pub auth_prerequisites: Vec<AuthPrerequisite>,
+    /// What this isolation class guarantees (split surfaces).
+    #[serde(default)]
+    pub isolation_guarantees: Vec<String>,
+    /// State that stays SHARED across profiles despite the split (e.g. an
+    /// OS keychain, a subscription, cloud state) — the honest constrained
+    /// channel.
+    #[serde(default)]
+    pub shared_state_warnings: Vec<String>,
 }
 
 impl WrapperPlan {
@@ -774,6 +876,14 @@ impl WrapperPlan {
             env_vars: Vec::new(),
             args: Vec::new(),
             description: description.to_owned(),
+            env_unset: Vec::new(),
+            executable: None,
+            working_dir: None,
+            state_paths: Vec::new(),
+            stdio: StdioPolicy::Terminal,
+            auth_prerequisites: Vec::new(),
+            isolation_guarantees: Vec::new(),
+            shared_state_warnings: Vec::new(),
         }
     }
 }
@@ -1171,6 +1281,31 @@ pub trait Adapter: Send + Sync + fmt::Debug {
 
     /// File patterns to exclude when mirroring an instance root.
     fn plan_mirror_exclusions(&self) -> Vec<String>;
+
+    /// Relative paths inside a config root that are safe to LINK instead of
+    /// copy when mirroring (INS-03 `Linked` / INS-04 step 4 shared assets).
+    ///
+    /// A declared path must be shared, re-derivable state the harness reads
+    /// through the relocated root — e.g. a skills directory the harness
+    /// resolves through `$CONFIG_DIR/skills` and that superai already
+    /// manages by symlinking (EXT-03 `LinkAll`). The mirror plan classifies
+    /// matching entries [`crate::lifecycle::MirrorKind::Linked`] and the
+    /// create transaction installs a symlink instead of copying bytes.
+    /// Default: none (everything copyable is copied).
+    fn mirror_link_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Relative file names whose CONTENT embeds the config-root path and
+    /// therefore must be rewritten (source root → target root) when
+    /// mirrored (INS-03 `Transformed`).
+    ///
+    /// Only files whose format genuinely carries absolute config paths
+    /// belong here (e.g. gptme's `config.toml` plugin search paths like
+    /// `~/.config/gptme/plugins`). Default: none.
+    fn mirror_content_rewrite_files(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Plan how to invoke the instance via a wrapper.
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError>;
