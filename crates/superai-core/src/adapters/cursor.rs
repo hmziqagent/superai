@@ -673,6 +673,24 @@ impl Adapter for CursorAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (cursor.md 1.2: `~/.cursor/mcp.json` global + project `.cursor/mcp.json`)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "plugins managed via the Cursor Marketplace UI; no file-staged mechanism documented (cursor.md)",
+        )
+    }
 }
 
 #[cfg(test)]

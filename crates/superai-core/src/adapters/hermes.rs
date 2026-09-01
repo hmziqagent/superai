@@ -660,6 +660,27 @@ impl Adapter for HermesAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (hermes-agent.md 1.5: `mcp_servers:` map; `hermes mcp add/remove/list/test`)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "config.yaml",
+            "mcp_servers",
+            DocumentKind::Yaml,
+            ConfigScope::User,
+            RestartBehavior::Restart,
+        ).with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
+    }
+
+    /// EXT-06/07: plugin mechanism (hermes-agent.md 5: `hermes plugins install/remove`; user plugins install into ~/.hermes/plugins/)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::requires_execution(
+            "hermes plugins install",
+            "plugins",
+            crate::adapter::PluginKind::NpmRef,
+            RestartBehavior::Restart,
+        ))
+    }
 }
 
 #[cfg(test)]

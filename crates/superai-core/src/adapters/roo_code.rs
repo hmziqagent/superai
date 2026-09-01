@@ -561,6 +561,29 @@ impl Adapter for RooCodeAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-08/09: MCP destination (roo-code.md MCP paths: project `.roo/mcp.json`; the global store lives inside VS Code globalStorage)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(
+            crate::adapter::McpAdapterDecl::new(
+                ".roo/mcp.json",
+                "mcpServers",
+                DocumentKind::Json,
+                ConfigScope::ProjectWorkspace,
+                RestartBehavior::Reload,
+            )
+            .with_read_only(
+                "migration-only (archived May 2026, successor kilo-code); inspect/diff only",
+            ),
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "community Marketplace installs land as mode YAML through the VS Code UI; no superai-writable plugin record documented (roo-code.md)",
+        )
+    }
 }
 
 #[cfg(test)]

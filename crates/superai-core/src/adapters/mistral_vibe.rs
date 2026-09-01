@@ -632,6 +632,27 @@ impl Adapter for MistralVibeAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (mistral-vibe.md 5: `[[mcp_servers]]` array of tables identified by `name`)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(
+            crate::adapter::McpAdapterDecl::new(
+                "config.toml",
+                "mcp_servers",
+                DocumentKind::Toml,
+                ConfigScope::User,
+                RestartBehavior::Restart,
+            )
+            .with_shape(crate::adapter::McpDestShape::IdentityList {
+                key: "name".to_owned(),
+            }),
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (mistral-vibe.md)")
+    }
 }
 
 #[cfg(test)]

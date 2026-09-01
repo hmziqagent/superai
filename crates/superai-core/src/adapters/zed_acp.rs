@@ -581,6 +581,24 @@ impl Adapter for ZedAcpAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (zed-acp.md 1.2: `context_servers` in settings.json)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "settings.json",
+            "context_servers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ).with_read_only("context_servers entries use a nested command object schema the canonical renderer does not emit; inspect/diff-only until a per-adapter renderer exists"))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "extensions are Zed addons/extensions managed by the editor, not the ACP agent (zed-acp.md)",
+        )
+    }
 }
 
 #[cfg(test)]

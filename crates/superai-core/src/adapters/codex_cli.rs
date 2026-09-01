@@ -684,6 +684,22 @@ impl Adapter for CodexCliAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (codex-cli.md MCP servers: `[mcp_servers.<name>]` TOML tables)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "config.toml",
+            "mcp_servers",
+            DocumentKind::Toml,
+            ConfigScope::User,
+            RestartBehavior::Restart,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("codex documents no plugin mechanism (codex-cli.md)")
+    }
 }
 
 /// Config era of codex `config.toml` content (HAD-05).

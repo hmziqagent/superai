@@ -565,6 +565,22 @@ impl Adapter for TraeAgentAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (trae-agent.md: `mcp_servers:` optional map of stdio servers in `trae_config.yaml`)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "trae_config.yaml",
+            "mcp_servers",
+            DocumentKind::Yaml,
+            ConfigScope::User,
+            RestartBehavior::Restart,
+        ).with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (trae-agent.md)")
+    }
 }
 
 #[cfg(test)]

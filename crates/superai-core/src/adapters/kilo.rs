@@ -679,6 +679,24 @@ impl Adapter for KiloAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (kilo-code.md 5.1: top-level `mcp` key in kilo.jsonc; local argv-array commands, `kilo mcp` CLI)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "global kilo.jsonc",
+            "mcp",
+            DocumentKind::Jsonc,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "modes/marketplaces managed through the Settings webview; no file-staged plugin mechanism documented (kilo-code.md)",
+        )
+    }
 }
 
 #[cfg(test)]

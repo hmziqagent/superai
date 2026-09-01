@@ -621,6 +621,24 @@ impl Adapter for CopilotCliAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (copilot-cli.md 1.2: `~/.copilot/mcp-config.json` with `mcpServers`)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "mcp-config.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "extensions/installed-plugins directories documented with mixed ownership; install contract unverified in corpus (copilot-cli.md)",
+        )
+    }
 }
 
 #[cfg(test)]

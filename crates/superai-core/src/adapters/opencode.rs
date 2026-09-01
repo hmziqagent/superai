@@ -775,6 +775,26 @@ impl Adapter for OpenCodeAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (opencode.md mcp servers: top-level `mcp` object in opencode.json JSONC)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "opencode.json",
+            "mcp",
+            DocumentKind::Jsonc,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
+    }
+
+    /// EXT-06/07: plugin mechanism (opencode.md: npm `plugin` list plus files in `.opencode/plugins/` or `~/.config/opencode/plugins/`)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::directory_bundle(
+            "plugins",
+            None,
+            RestartBehavior::Reload,
+        ))
+    }
 }
 
 #[cfg(test)]

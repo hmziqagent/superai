@@ -532,6 +532,25 @@ impl Adapter for KiroAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-08/09: MCP destination (kiro.md: `~/.kiro/settings/mcp.json`; `KIRO_HOME` relocates)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(
+            crate::adapter::McpAdapterDecl::new(
+                "settings/mcp.json",
+                "mcpServers",
+                DocumentKind::Json,
+                ConfigScope::User,
+                RestartBehavior::Reload,
+            )
+            .with_read_only("read-only supported harness (BYO unsupported); inspect/diff only"),
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (kiro.md)")
+    }
 }
 
 #[cfg(test)]

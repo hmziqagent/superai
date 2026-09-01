@@ -633,6 +633,20 @@ impl Adapter for SculptorAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "orchestrator: MCP servers are carried into managed harnesses via Claude settings sync; sculptor has no own MCP dest (orchestrators.md)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "orchestrator: bundled plugins are injected into Claude sessions by sculptor itself; no user plugin mechanism (orchestrators.md)",
+        )
+    }
 }
 
 #[cfg(test)]

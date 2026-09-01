@@ -536,6 +536,18 @@ impl Adapter for OpenClawAdapter {
             _ => None,
         }
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "research-blocked; the openclaw.json schema is not walked end to end in the corpus (openclaw.md)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("skills/plugin layout not walked end to end in the corpus (openclaw.md)")
+    }
 }
 
 #[cfg(test)]

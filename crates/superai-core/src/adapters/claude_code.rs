@@ -664,6 +664,26 @@ impl Adapter for ClaudeCodeAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (claude-code.md: project `.mcp.json` team-shared servers; the user-scope `~/.claude.json` store is harness-managed and deliberately not declared)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            ".mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::ProjectWorkspace,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06/07: plugin mechanism (claude-code.md: `~/.claude/plugins/` installed plugins/marketplaces; `CLAUDE_CONFIG_DIR` relocates it)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::directory_bundle(
+            "plugins",
+            None,
+            RestartBehavior::Reload,
+        ))
+    }
 }
 
 #[cfg(test)]

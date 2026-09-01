@@ -643,6 +643,22 @@ impl Adapter for GrokBuildAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "MCP servers documented as a config.toml section but the table key spelling is not shown in the corpus (grok-build.md 6)",
+        )
+    }
+
+    /// EXT-06/07: plugin mechanism (grok-build.md: `~/.grok/plugins/` user scope and `.grok/plugins/` project scope)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::directory_bundle(
+            "plugins",
+            None,
+            RestartBehavior::Reload,
+        ))
+    }
 }
 
 #[cfg(test)]

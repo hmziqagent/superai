@@ -908,6 +908,24 @@ impl Adapter for ClineAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (cline.md 1.4: `cline_mcp_settings.json`)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "cline_mcp_settings.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "no plugin mechanism documented; extensions are VS Code-level, not Cline plugins (cline.md)",
+        )
+    }
 }
 
 #[cfg(test)]

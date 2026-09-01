@@ -644,6 +644,20 @@ impl Adapter for GptmeAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "a config.toml [mcp] section is documented but the per-server schema is unverified in corpus (gptme.md points at gptme.org/docs/mcp.html, not fetched)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "python plugin system; config carries path lists (plugins.paths/enabled), no file-staged plugin record documented (gptme.md)",
+        )
+    }
 }
 
 #[cfg(test)]

@@ -616,6 +616,24 @@ impl Adapter for WindsurfAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (windsurf.md 1: `~/.codeium/windsurf/mcp_config.json` with `mcpServers`; remote entries use serverUrl)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "mcp_config.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "plugins managed via the Customize page/Marketplace; no file-staged mechanism documented (windsurf.md)",
+        )
+    }
 }
 
 #[cfg(test)]

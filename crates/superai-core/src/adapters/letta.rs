@@ -697,6 +697,18 @@ impl Adapter for LettaAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "no dedicated MCP config page in corpus (404); MCP access is mediated through skills + permissions (letta-code.md 5)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (letta-code.md)")
+    }
 }
 
 #[cfg(test)]

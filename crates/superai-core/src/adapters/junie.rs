@@ -661,6 +661,26 @@ impl Adapter for JunieAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (junie-cli.md: user `~/.junie/mcp/mcp.json`, project `.junie/mcp/mcp.json`; `JUNIE_HOME` relocates)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "mcp/mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06/07: plugin mechanism (junie-cli.md: `~/.junie/extensions` default extensions directory, overridable)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::directory_bundle(
+            "extensions",
+            None,
+            RestartBehavior::Reload,
+        ))
+    }
 }
 
 #[cfg(test)]

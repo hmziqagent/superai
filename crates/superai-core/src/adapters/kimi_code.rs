@@ -619,6 +619,27 @@ impl Adapter for KimiCodeAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (kimi-cli.md MCP config: `$KIMI_CODE_HOME/mcp.json`; project `.kimi-code/mcp.json` overrides by name)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06/07: plugin mechanism (kimi-cli.md 5: marketplace plugins package skills + MCP servers + data sources)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::requires_execution(
+            "kimi plugins marketplace (/plugins)",
+            "config.toml",
+            crate::adapter::PluginKind::MarketplaceRecord,
+            RestartBehavior::Restart,
+        ))
+    }
 }
 
 #[cfg(test)]

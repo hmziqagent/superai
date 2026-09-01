@@ -586,6 +586,26 @@ impl Adapter for AmpAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (amp.md: `amp.mcpServers` under the JSONC settings file; `amp mcp add` is the native writer)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "settings.json",
+            "amp.mcpServers",
+            DocumentKind::Jsonc,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
+    }
+
+    /// EXT-06/07: plugin mechanism (amp.md: project `.amp/plugins/`, system `~/.config/amp/plugins/`; no bundle manifest documented)
+    fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
+        Some(crate::adapter::PluginAdapterDecl::directory_bundle(
+            "plugins",
+            None,
+            RestartBehavior::Reload,
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -747,6 +747,27 @@ impl Adapter for OpenHandsAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (openhands.md: `mcp.json` listed under server-managed config files)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(
+            crate::adapter::McpAdapterDecl::new(
+                "mcp.json",
+                "mcpServers",
+                DocumentKind::Json,
+                ConfigScope::User,
+                RestartBehavior::Reload,
+            )
+            .with_read_only(
+                "server-managed config (OH_PERSISTENCE_DIR); superai must not write it",
+            ),
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (openhands.md)")
+    }
 }
 
 #[cfg(test)]

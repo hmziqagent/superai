@@ -585,6 +585,20 @@ impl Adapter for DeepSeekAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "developer preview; the plugin/MCP contracts are explicitly not traced in the corpus (deepseek-harness.md)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "Everything is a Plugin per upstream, but the plugin contract is not traced in the corpus (deepseek-harness.md)",
+        )
+    }
 }
 
 #[cfg(test)]

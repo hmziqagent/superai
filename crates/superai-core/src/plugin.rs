@@ -248,6 +248,11 @@ pub struct PluginRecord {
     /// Optional dependency key (e.g., npm package name) for shared tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_key: Option<String>,
+    /// Files staged into the harness destination for DirectoryBundle plugins
+    /// (paths relative to the instance config root, EXT-07). Removal touches
+    /// exactly these owned files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_files: Option<Vec<String>>,
 }
 
 impl PluginRecord {
@@ -575,6 +580,7 @@ impl PluginRegistry {
             installed_at,
             enabled: true,
             dependency_key,
+            staged_files: None,
         };
         record.validate()?;
         // Insert or replace
@@ -593,29 +599,40 @@ impl PluginRegistry {
     }
 
     /// Remove an owned plugin entry. Foreign registry entries (keys not in `plugins`) are preserved.
-    /// Shared package dependency is not removed until no consumer remains – we just drop the record,
-    /// the underlying shared dep (npm package) is logically retained if another record references it.
     pub fn remove(&mut self, id: &PluginId) -> Result<Option<PluginRecord>> {
+        self.remove_with_report(id)
+            .map(|outcome| outcome.map(|o| o.record))
+    }
+
+    /// Remove an owned plugin entry and report shared-dependency retention
+    /// (EXT-06/07: a shared package dependency is not removed until no
+    /// consumer remains — the removal outcome names every dependency key
+    /// still referenced by other installed plugins, so callers surface the
+    /// retention instead of guessing).
+    pub fn remove_with_report(&mut self, id: &PluginId) -> Result<Option<PluginRemoval>> {
         let idx = match self.records.iter().position(|r| &r.id == id) {
             Some(i) => i,
             None => return Ok(None),
         };
-        let rec = self.records.get(idx).cloned();
-        if let Some(ref r) = rec {
+        let mut retained_shared_deps: Vec<String> = Vec::new();
+        if let Some(r) = self.records.get(idx) {
             if let Some(k) = r.dependency_key.clone() {
-                let other = self
+                let consumers = self
                     .records
                     .iter()
-                    .filter(|x| x.dependency_key.as_deref() == Some(k.as_str()) && &x.id != id)
+                    .filter(|x| x.dependency_key.as_deref() == Some(k.as_str()) && x.id != r.id)
                     .count();
-                if other > 0 {
-                    // shared dep retained
+                if consumers > 0 {
+                    retained_shared_deps.push(k);
                 }
             }
         }
         let removed = self.records.remove(idx);
         self.store()?;
-        Ok(Some(removed))
+        Ok(Some(PluginRemoval {
+            record: removed,
+            retained_shared_deps,
+        }))
     }
 
     /// Enable a plugin (reversible, distinct from remove).
@@ -682,6 +699,540 @@ pub struct PluginInstallPreview {
     pub conflicts: Vec<String>,
     /// Whether can auto-apply.
     pub can_auto_apply: bool,
+}
+
+/// Outcome of a plugin removal (EXT-06/07): the removed record plus every
+/// shared dependency key still referenced by other installed plugins —
+/// those dependencies are retained, not removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRemoval {
+    /// The removed record.
+    pub record: PluginRecord,
+    /// Shared dependency keys retained because consumers remain.
+    pub retained_shared_deps: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// DirectoryBundle staging (EXT-07)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of files staged from one plugin bundle.
+const MAX_BUNDLE_FILES: usize = 512;
+/// Maximum total bytes staged from one plugin bundle.
+const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum directory depth walked inside a plugin bundle.
+const MAX_BUNDLE_DEPTH: usize = 8;
+
+/// One file read from a plugin bundle source, with its destination-relative
+/// path (forward slashes, no `..`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleFile {
+    rel_path: String,
+    bytes: Vec<u8>,
+}
+
+/// Read every regular file under `source_dir` (bounded; symlinks and special
+/// files refused — bundle content is untrusted and must not escape the
+/// destination through links).
+fn read_bundle_files(source_dir: &Path) -> Result<Vec<BundleFile>> {
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<BundleFile>) -> Result<()> {
+        if depth > MAX_BUNDLE_DEPTH {
+            return Err(CoreError::InvalidPath {
+                kind: "plugin_bundle".to_owned(),
+                value: dir.display().to_string(),
+                reason: format!("bundle nested deeper than {MAX_BUNDLE_DEPTH} levels"),
+            });
+        }
+        let entries = std::fs::read_dir(dir).map_err(|e| CoreError::InvalidPath {
+            kind: "plugin_bundle".to_owned(),
+            value: dir.display().to_string(),
+            reason: format!("cannot read bundle directory: {e}"),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| CoreError::InvalidPath {
+                kind: "plugin_bundle".to_owned(),
+                value: dir.display().to_string(),
+                reason: format!("cannot read bundle entry: {e}"),
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let path = entry.path();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let meta = entry.metadata().map_err(|e| CoreError::InvalidPath {
+                kind: "plugin_bundle".to_owned(),
+                value: path.display().to_string(),
+                reason: format!("cannot stat bundle entry: {e}"),
+            })?;
+            if meta.is_dir() {
+                walk(&path, &rel, depth + 1, out)?;
+                continue;
+            }
+            if !meta.is_file() {
+                return Err(CoreError::InvalidPath {
+                    kind: "plugin_bundle".to_owned(),
+                    value: path.display().to_string(),
+                    reason: "bundle contains a symlink or special file; refusing to stage"
+                        .to_owned(),
+                });
+            }
+            let bytes = std::fs::read(&path).map_err(|e| CoreError::InvalidPath {
+                kind: "plugin_bundle".to_owned(),
+                value: path.display().to_string(),
+                reason: format!("cannot read bundle file: {e}"),
+            })?;
+            out.push(BundleFile {
+                rel_path: rel,
+                bytes,
+            });
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(source_dir, "", 0, &mut files)?;
+    if files.is_empty() {
+        return Err(CoreError::InvalidPath {
+            kind: "plugin_bundle".to_owned(),
+            value: source_dir.display().to_string(),
+            reason: "bundle directory contains no files".to_owned(),
+        });
+    }
+    if files.len() > MAX_BUNDLE_FILES {
+        return Err(CoreError::InvalidPath {
+            kind: "plugin_bundle".to_owned(),
+            value: source_dir.display().to_string(),
+            reason: format!("bundle has {} files, limit {MAX_BUNDLE_FILES}", files.len()),
+        });
+    }
+    let total: usize = files.iter().map(|f| f.bytes.len()).sum();
+    if total > MAX_BUNDLE_BYTES {
+        return Err(CoreError::InvalidPath {
+            kind: "plugin_bundle".to_owned(),
+            value: source_dir.display().to_string(),
+            reason: format!("bundle is {total} bytes, limit {MAX_BUNDLE_BYTES}"),
+        });
+    }
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(files)
+}
+
+/// Deterministic content digest over a bundle's files (sorted relative
+/// paths + bytes).
+fn bundle_digest(files: &[BundleFile]) -> String {
+    let mut hasher = Sha256::new();
+    for file in files {
+        hasher.update(file.rel_path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(&file.bytes);
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Stage a DirectoryBundle plugin's files into the adapter-declared
+/// destination through a compensated transaction (EXT-07 steps 4-7):
+///
+/// - source identity/version/digest validated (declared digest verified
+///   against the staged content);
+/// - existing destination inspected: a foreign bundle (no registry record
+///   for the id) is refused with `ForeignOwnership`, an owned bundle is
+///   backed up and replaced;
+/// - every file written atomically with read-back verification; bundle
+///   bytes are opaque — nothing is parsed or executed;
+/// - harness discovery verified post-install when the adapter declares a
+///   discovery manifest.
+///
+/// Returns the registry record (already persisted) with the staged file
+/// list attached.
+pub fn install_directory_bundle(
+    registry: &mut PluginRegistry,
+    source: &PluginSource,
+    decl: &PluginAdapterDecl,
+    instance_root: &Path,
+) -> Result<PluginRecord> {
+    source.validate()?;
+    if source.kind != PluginKind::DirectoryBundle || decl.kind != PluginKind::DirectoryBundle {
+        return Err(CoreError::Validation {
+            field: "plugin.kind".to_owned(),
+            reason: format!(
+                "install_directory_bundle requires DirectoryBundle source and decl, got source {} / decl {}",
+                source.kind, decl.kind
+            ),
+        });
+    }
+    if decl.requires_execution {
+        return Err(CoreError::RequiresApproval {
+            plugin: source.id.to_string(),
+            operation: "install".to_owned(),
+            reason: format!(
+                "adapter decl `{}` marks this plugin kind as requiring harness command execution",
+                decl.source_hint
+            ),
+        });
+    }
+    let Some(dest_dir_name) = decl.dest_dir.as_deref() else {
+        return Err(CoreError::Validation {
+            field: "plugin.dest_dir".to_owned(),
+            reason: format!(
+                "adapter decl for `{}` declares no destination directory",
+                decl.source_hint
+            ),
+        });
+    };
+    let source_dir = Path::new(&source.locator);
+    if !source_dir.is_absolute() {
+        return Err(CoreError::InvalidPath {
+            kind: "plugin_source".to_owned(),
+            value: source.locator.clone(),
+            reason: "DirectoryBundle source locator must be an absolute path".to_owned(),
+        });
+    }
+    if !source_dir.is_dir() {
+        return Err(CoreError::InvalidPath {
+            kind: "plugin_source".to_owned(),
+            value: source.locator.clone(),
+            reason: "DirectoryBundle source is not a directory".to_owned(),
+        });
+    }
+
+    // Collision detection (EXT-07 step 3): a destination bundle that exists
+    // without a matching registry record is foreign — refuse, never replace.
+    let dest_root = instance_root.join(dest_dir_name);
+    let dest_bundle = dest_root.join(source.id.as_str());
+    if dest_bundle.exists() && registry.get(&source.id).is_none() {
+        return Err(CoreError::ForeignOwnership {
+            path: dest_bundle.clone(),
+            owner: "foreign bundle already installed at the destination".to_owned(),
+        });
+    }
+
+    let preview = registry.preview_install(source)?;
+    if !preview.can_auto_apply {
+        return Err(CoreError::NameCollision {
+            kind: "PluginId".to_owned(),
+            name: source.id.to_string(),
+            reason: preview.conflicts.join("; "),
+        });
+    }
+
+    // Stage: read the bundle, verify the declared digest if any.
+    let files = read_bundle_files(source_dir)?;
+    let digest = bundle_digest(&files);
+    if let Some(declared) = &source.digest
+        && !declared.eq_ignore_ascii_case(&digest)
+    {
+        return Err(CoreError::Verification {
+            path: source_dir.to_path_buf(),
+            kind: "digest".to_owned(),
+            reason: "bundle content digest does not match the declared digest".to_owned(),
+        });
+    }
+
+    // Commit through the transaction: foreign destinations are backed up by
+    // the Write actions themselves.
+    let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
+    steps.push(superai_config::transaction::FileAction::CreateDir {
+        path: dest_bundle.clone(),
+    });
+    let mut staged_rel: Vec<String> = Vec::new();
+    for file in &files {
+        let rel_in_instance = format!("{dest_dir_name}/{}/{}", source.id.as_str(), file.rel_path);
+        let target = instance_root.join(&rel_in_instance);
+        steps.push(superai_config::transaction::FileAction::Write {
+            path: target,
+            content: file.bytes.clone(),
+            // Bundle payloads are opaque: parsed by nothing, executed by
+            // nothing (EXT-06 safe scope).
+            kind: superai_config::document::DocumentKind::Opaque,
+        });
+        staged_rel.push(rel_in_instance);
+    }
+    let op_id_str = format!(
+        "plugin-bundle-{}-{}",
+        source.id.as_str().replace(['.', '/'], "-"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    );
+    let op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
+        CoreError::Validation {
+            field: "operation_id".to_owned(),
+            reason: format!("invalid op id: {e}"),
+        }
+    })?;
+    let mut txn = superai_config::transaction::Transaction::new(op_id, steps);
+    txn.validate_plan().map_err(|e| CoreError::Validation {
+        field: "plugin_transaction".to_owned(),
+        reason: format!("plan invalid: {e}"),
+    })?;
+    let outcome = txn.execute().map_err(|e| CoreError::Commit {
+        path: dest_bundle.clone(),
+        reason: format!("bundle staging failed: {e}"),
+    })?;
+    if !outcome.success {
+        return Err(CoreError::Commit {
+            path: dest_bundle.clone(),
+            reason: format!(
+                "bundle staging failed: {}",
+                outcome.diagnostics_redacted.join("; ")
+            ),
+        });
+    }
+    // A re-stage over owned files leaves prepare-phase backups of the old
+    // superai-owned content inside the harness plugin directory; once the
+    // staging is verified they are dead weight — remove them.
+    if let Some(commit) = &outcome.commit {
+        for backup in &commit.backups {
+            let path = backup.backup_path.as_path();
+            if path.exists()
+                && let Err(e) = std::fs::remove_file(path)
+            {
+                return Err(CoreError::Commit {
+                    path: path.to_path_buf(),
+                    reason: format!("cannot clean up owned-file backup: {e}"),
+                });
+            }
+        }
+    }
+
+    // Harness-discovery verification (EXT-07 step 6): where the adapter
+    // declares a required manifest, the harness cannot discover the plugin
+    // without it — a staged bundle missing it is a failed install.
+    if let Some(manifest) = decl.discovery_manifest.as_deref()
+        && !dest_bundle.join(manifest).is_file()
+    {
+        return Err(CoreError::Verification {
+            path: dest_bundle.join(manifest),
+            kind: "discovery".to_owned(),
+            reason: format!("harness discovery manifest `{manifest}` missing after staging"),
+        });
+    }
+
+    // Read-back verify one file's bytes (staging discipline).
+    if let Some(first) = staged_rel.first() {
+        let target = instance_root.join(first);
+        let read_back = std::fs::read(&target).map_err(|e| CoreError::Verification {
+            path: target.clone(),
+            kind: "readback".to_owned(),
+            reason: format!("staged bundle file unreadable after commit: {e}"),
+        })?;
+        let expected = files
+            .iter()
+            .find(|f| format!("{dest_dir_name}/{}/{}", source.id.as_str(), f.rel_path) == *first)
+            .map(|f| f.bytes.clone())
+            .unwrap_or_default();
+        if read_back != expected {
+            return Err(CoreError::Verification {
+                path: target,
+                kind: "readback".to_owned(),
+                reason: "staged bundle file bytes differ from the staged content".to_owned(),
+            });
+        }
+    }
+
+    // Registry record (persisted last: a failed staging leaves no record).
+    let mut record = registry.install(source, Some(decl))?;
+    record.digest = Some(digest);
+    record.staged_files = Some(staged_rel);
+    if let Some(pos) = registry.records.iter().position(|r| r.id == record.id) {
+        if let Some(slot) = registry.records.get_mut(pos) {
+            *slot = record.clone();
+        }
+    }
+    registry.store()?;
+    Ok(record)
+}
+
+/// Remove a staged DirectoryBundle plugin: exactly the recorded owned files
+/// are removed through the transaction, the (now possibly empty) bundle
+/// directory is pruned when superai owns it, and the registry record is
+/// dropped with a shared-dependency retention report (EXT-07 removal).
+pub fn remove_directory_bundle(
+    registry: &mut PluginRegistry,
+    id: &PluginId,
+    decl: &PluginAdapterDecl,
+    instance_root: &Path,
+) -> Result<Option<PluginRemoval>> {
+    let Some(record) = registry.get(id).cloned() else {
+        return Ok(None);
+    };
+    if record.kind != PluginKind::DirectoryBundle {
+        return Err(CoreError::Validation {
+            field: "plugin.kind".to_owned(),
+            reason: format!(
+                "remove_directory_bundle requires a DirectoryBundle record, got {}",
+                record.kind
+            ),
+        });
+    }
+    let Some(dest_dir_name) = decl.dest_dir.as_deref() else {
+        return Err(CoreError::Validation {
+            field: "plugin.dest_dir".to_owned(),
+            reason: "adapter decl declares no destination directory".to_owned(),
+        });
+    };
+    let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
+    if let Some(staged) = &record.staged_files {
+        for rel in staged {
+            steps.push(superai_config::transaction::FileAction::RemoveFile {
+                path: instance_root.join(rel),
+            });
+        }
+    }
+    let bundle_dir = instance_root.join(dest_dir_name).join(id.as_str());
+    if !steps.is_empty() {
+        let op_id_str = format!(
+            "plugin-bundle-remove-{}-{}",
+            id.as_str().replace(['.', '/'], "-"),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        );
+        let op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
+            CoreError::Validation {
+                field: "operation_id".to_owned(),
+                reason: format!("invalid op id: {e}"),
+            }
+        })?;
+        let mut txn = superai_config::transaction::Transaction::new(op_id, steps);
+        txn.validate_plan().map_err(|e| CoreError::Validation {
+            field: "plugin_transaction".to_owned(),
+            reason: format!("plan invalid: {e}"),
+        })?;
+        let outcome = txn.execute().map_err(|e| CoreError::Commit {
+            path: bundle_dir.clone(),
+            reason: format!("bundle removal failed: {e}"),
+        })?;
+        if !outcome.success {
+            return Err(CoreError::Commit {
+                path: bundle_dir.clone(),
+                reason: format!(
+                    "bundle removal failed: {}",
+                    outcome.diagnostics_redacted.join("; ")
+                ),
+            });
+        }
+        // The prepare phase backs up every existing target — including the
+        // superai-owned files being removed. Once the removal is verified
+        // successful those recovery backups are dead weight inside the
+        // harness plugin directory; remove them so discovery sees a clean
+        // uninstall.
+        if let Some(commit) = &outcome.commit {
+            for backup in &commit.backups {
+                let path = backup.backup_path.as_path();
+                if path.exists()
+                    && let Err(e) = std::fs::remove_file(path)
+                {
+                    return Err(CoreError::Commit {
+                        path: path.to_path_buf(),
+                        reason: format!("cannot clean up owned-file backup: {e}"),
+                    });
+                }
+            }
+        }
+        // Prune now-empty owned directories deepest-first. `remove_dir`
+        // only succeeds on empty directories, so foreign content inside the
+        // bundle keeps its directories by construction.
+        let mut owned_dirs: Vec<PathBuf> = record
+            .staged_files
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|rel| instance_root.join(rel).parent().map(Path::to_path_buf))
+            .collect();
+        owned_dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        owned_dirs.dedup();
+        for dir in owned_dirs {
+            if dir.is_dir()
+                && let Err(e) = std::fs::remove_dir(&dir)
+                && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            {
+                return Err(CoreError::Commit {
+                    path: dir,
+                    reason: format!("cannot prune empty bundle directory: {e}"),
+                });
+            }
+        }
+    }
+    registry.remove_with_report(id)
+}
+
+/// Enable or disable an installed plugin with per-adapter enforcement
+/// (EXT-06): config-entry plugins toggle their destination entry
+/// (disable removes the entry, enable re-adds it — reversible); directory
+/// bundles toggle their staged files the same way. The registry record's
+/// enabled flag is the superai-owned source of truth either way.
+pub fn set_plugin_enabled(
+    registry: &mut PluginRegistry,
+    decl: &PluginAdapterDecl,
+    dest_path: &Path,
+    source: &PluginSource,
+    enabled: bool,
+) -> Result<PluginRecord> {
+    let record = if enabled {
+        registry.enable(&source.id)?
+    } else {
+        registry.disable(&source.id)?
+    };
+    match decl.kind {
+        PluginKind::ConfigEntry => {
+            let Some(dest_key) = decl.dest_key.as_deref() else {
+                return Err(CoreError::Validation {
+                    field: "plugin.dest_key".to_owned(),
+                    reason: "config-entry decl declares no destination key".to_owned(),
+                });
+            };
+            if enabled {
+                install_config_entry(dest_path, dest_key, source)?;
+            } else {
+                remove_config_entry(dest_path, dest_key, &source.id)?;
+            }
+        }
+        PluginKind::DirectoryBundle => {
+            let instance_root = dest_path.parent().unwrap_or_else(|| Path::new("."));
+            if enabled {
+                // Re-stage from the recorded source locator.
+                let mut restore_source = source.clone();
+                restore_source.locator = record.source_locator.clone();
+                install_directory_bundle(registry, &restore_source, decl, instance_root)?;
+            } else {
+                let mut reg =
+                    std::mem::replace(registry, PluginRegistry::new(registry.root.clone()));
+                let outcome = remove_directory_bundle(&mut reg, &source.id, decl, instance_root)?;
+                *registry = reg;
+                let Some(removal) = outcome else {
+                    return Ok(record);
+                };
+                // Keep the (disabled) record: disable is reversible, the
+                // removal report's retained deps still apply.
+                let mut kept = removal.record;
+                kept.enabled = false;
+                let disabled_record = kept.clone();
+                registry.records.push(kept);
+                registry
+                    .records
+                    .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+                registry.store()?;
+                return Ok(registry.get(&source.id).cloned().unwrap_or(disabled_record));
+            }
+        }
+        _ => {
+            return Err(CoreError::RequiresApproval {
+                plugin: source.id.to_string(),
+                operation: if enabled { "enable" } else { "disable" }.to_owned(),
+                reason: format!(
+                    "enable/disable for kind {} requires harness command execution per adapter decl",
+                    source.kind
+                ),
+            });
+        }
+    }
+    Ok(registry.get(&source.id).cloned().unwrap_or(record))
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1668,7 @@ mod tests {
             installed_at: now_iso8601(),
             enabled: true,
             dependency_key: Some("shared-package".to_owned()),
+            staged_files: None,
         };
         let rec2 = PluginRecord {
             id: PluginId::new("plug-b").unwrap(),
@@ -1127,6 +1679,7 @@ mod tests {
             installed_at: now_iso8601(),
             enabled: true,
             dependency_key: Some("shared-package".to_owned()),
+            staged_files: None,
         };
         reg.records.push(rec1);
         reg.records.push(rec2);
@@ -1195,10 +1748,263 @@ mod tests {
             installed_at: now_iso8601(),
             enabled: true,
             dependency_key: None,
+            staged_files: None,
         };
         rec.validate().unwrap();
         let json2 = serde_json::to_string(&rec).unwrap();
         let back2: PluginRecord = serde_json::from_str(&json2).unwrap();
         assert_eq!(rec, back2);
+    }
+
+    // -------------------------------------------------------------------
+    // EXT-07 DirectoryBundle staging
+    // -------------------------------------------------------------------
+
+    fn make_bundle(dir: &Path, manifest: bool) {
+        std::fs::create_dir_all(dir.join("skills")).unwrap();
+        if manifest {
+            std::fs::write(
+                dir.join("plugin.json"),
+                b"{\"name\": \"test-plugin\", \"description\": \"staged\"}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("skills").join("greet.md"), b"# greet\nsay hi\n").unwrap();
+    }
+
+    #[test]
+    fn directory_bundle_stages_files_and_verifies_discovery() {
+        let home = tmp_root("bundle");
+        let instance_root = home.join("instance");
+        let source_dir = home.join("bundle-src");
+        make_bundle(&source_dir, true);
+        let mut reg = PluginRegistry::load(&home.join("registry-root")).unwrap();
+
+        let decl = PluginAdapterDecl::directory_bundle(
+            "plugins",
+            Some("plugin.json"),
+            RestartBehavior::Restart,
+        );
+        let src = PluginSource {
+            id: PluginId::new("test-plugin").unwrap(),
+            kind: PluginKind::DirectoryBundle,
+            locator: source_dir.display().to_string(),
+            version: Some("1.0.0".to_owned()),
+            digest: None,
+        };
+        let record = install_directory_bundle(&mut reg, &src, &decl, &instance_root).unwrap();
+
+        // Files staged to the adapter-declared destination.
+        let manifest_path = instance_root
+            .join("plugins")
+            .join("test-plugin")
+            .join("plugin.json");
+        assert!(manifest_path.is_file(), "manifest must be staged");
+        assert!(
+            instance_root
+                .join("plugins")
+                .join("test-plugin")
+                .join("skills")
+                .join("greet.md")
+                .is_file()
+        );
+        // Record carries the digest and the exact staged file list.
+        assert!(record.digest.as_deref().is_some_and(|d| d.len() == 64));
+        let staged = record.staged_files.unwrap();
+        assert!(staged.contains(&"plugins/test-plugin/plugin.json".to_owned()));
+        assert!(staged.contains(&"plugins/test-plugin/skills/greet.md".to_owned()));
+        // Re-load: the record persisted.
+        let reloaded = PluginRegistry::load(&home.join("registry-root")).unwrap();
+        assert!(
+            reloaded
+                .get(&PluginId::new("test-plugin").unwrap())
+                .is_some()
+        );
+
+        // Removal takes exactly the owned files and reports the record.
+        let outcome = remove_directory_bundle(
+            &mut reg,
+            &PluginId::new("test-plugin").unwrap(),
+            &decl,
+            &instance_root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.record.id.as_str(), "test-plugin");
+        assert!(outcome.retained_shared_deps.is_empty());
+        assert!(!manifest_path.exists(), "owned files must be removed");
+        assert!(!instance_root.join("plugins").join("test-plugin").exists());
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn directory_bundle_refuses_foreign_destination_and_bad_digest() {
+        let home = tmp_root("bundle-foreign");
+        let instance_root = home.join("instance");
+        let source_dir = home.join("bundle-src");
+        make_bundle(&source_dir, true);
+        let mut reg = PluginRegistry::load(&home.join("registry-root")).unwrap();
+        let decl = PluginAdapterDecl::directory_bundle(
+            "plugins",
+            Some("plugin.json"),
+            RestartBehavior::Restart,
+        );
+
+        // Foreign bundle already at the destination, no registry record.
+        let foreign = instance_root.join("plugins").join("other-plugin");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("foreign.txt"), b"foreign\n").unwrap();
+        let src = PluginSource {
+            id: PluginId::new("other-plugin").unwrap(),
+            kind: PluginKind::DirectoryBundle,
+            locator: source_dir.display().to_string(),
+            version: None,
+            digest: None,
+        };
+        match install_directory_bundle(&mut reg, &src, &decl, &instance_root).unwrap_err() {
+            CoreError::ForeignOwnership { path, .. } => {
+                assert_eq!(path, foreign);
+            }
+            other => panic!("expected ForeignOwnership, got {other:?}"),
+        }
+        // Foreign bytes untouched.
+        assert_eq!(
+            std::fs::read(foreign.join("foreign.txt")).unwrap(),
+            b"foreign\n"
+        );
+
+        // Declared digest mismatch refuses before any staging.
+        let src_bad = PluginSource {
+            id: PluginId::new("digest-plugin").unwrap(),
+            kind: PluginKind::DirectoryBundle,
+            locator: source_dir.display().to_string(),
+            version: None,
+            digest: Some("0".repeat(64)),
+        };
+        match install_directory_bundle(&mut reg, &src_bad, &decl, &instance_root).unwrap_err() {
+            CoreError::Verification { kind, .. } => assert_eq!(kind, "digest"),
+            other => panic!("expected digest Verification, got {other:?}"),
+        }
+        assert!(!instance_root.join("plugins").join("digest-plugin").exists());
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn directory_bundle_discovery_manifest_missing_fails_honestly() {
+        let home = tmp_root("bundle-nodisc");
+        let instance_root = home.join("instance");
+        let source_dir = home.join("bundle-src");
+        // Bundle WITHOUT the manifest the adapter declares as required.
+        make_bundle(&source_dir, false);
+        let mut reg = PluginRegistry::load(&home.join("registry-root")).unwrap();
+        let decl = PluginAdapterDecl::directory_bundle(
+            "plugins",
+            Some("plugin.json"),
+            RestartBehavior::Restart,
+        );
+        let src = PluginSource {
+            id: PluginId::new("manifestless").unwrap(),
+            kind: PluginKind::DirectoryBundle,
+            locator: source_dir.display().to_string(),
+            version: None,
+            digest: None,
+        };
+        match install_directory_bundle(&mut reg, &src, &decl, &instance_root).unwrap_err() {
+            CoreError::Verification { kind, reason, .. } => {
+                assert_eq!(kind, "discovery");
+                assert!(reason.contains("plugin.json"), "{reason}");
+            }
+            other => panic!("expected discovery Verification, got {other:?}"),
+        }
+        // No registry record for a failed install.
+        assert!(reg.get(&PluginId::new("manifestless").unwrap()).is_none());
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn removal_reports_retained_shared_deps() {
+        let root = tmp_root("shared-report");
+        let mut reg = PluginRegistry::load(&root).unwrap();
+        let mk = |name: &str| PluginRecord {
+            id: PluginId::new(name).unwrap(),
+            kind: PluginKind::NpmRef,
+            version: None,
+            digest: None,
+            source_locator: "shared-pkg".to_owned(),
+            installed_at: now_iso8601(),
+            enabled: true,
+            dependency_key: Some("shared-pkg".to_owned()),
+            staged_files: None,
+        };
+        reg.records.push(mk("plug-a"));
+        reg.records.push(mk("plug-b"));
+        reg.store().unwrap();
+        // First removal reports the retained shared dependency.
+        let outcome = reg
+            .remove_with_report(&PluginId::new("plug-a").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.retained_shared_deps, vec!["shared-pkg".to_owned()]);
+        // Last consumer removal reports none.
+        let last = reg
+            .remove_with_report(&PluginId::new("plug-b").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(last.retained_shared_deps.is_empty());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn config_entry_enable_disable_toggles_destination_entry() {
+        let home = tmp_root("cfg-toggle");
+        std::fs::create_dir_all(&home).unwrap();
+        let dest = home.join("settings.json");
+        std::fs::write(
+            &dest,
+            r#"{"plugins": {"foreign-plugin": {"version": "0.1"}}}"#,
+        )
+        .unwrap();
+        let mut reg = PluginRegistry::load(&home.join("registry-root")).unwrap();
+        let decl = PluginAdapterDecl::file_config(
+            "settings.json",
+            Some("plugins"),
+            PluginKind::ConfigEntry,
+            RestartBehavior::None,
+        );
+        let src = PluginSource {
+            id: PluginId::new("owned-plugin").unwrap(),
+            kind: PluginKind::ConfigEntry,
+            locator: "loc".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            digest: None,
+        };
+        // The bundle installer must refuse a config-entry kind.
+        assert!(matches!(
+            install_directory_bundle(&mut reg, &src, &decl, &home),
+            Err(CoreError::Validation { .. })
+        ));
+        install_config_entry(&dest, "plugins", &src).unwrap();
+        reg.install(&src, Some(&decl)).unwrap();
+
+        // Disable: registry flag + destination entry removed (reversible),
+        // foreign entry preserved.
+        let disabled = set_plugin_enabled(&mut reg, &decl, &dest, &src, false).unwrap();
+        assert!(!disabled.enabled);
+        let val: Value = serde_json::from_slice(&std::fs::read(&dest).unwrap()).unwrap();
+        let plugins = val.get("plugins").and_then(Value::as_object).unwrap();
+        assert!(!plugins.contains_key("owned-plugin"));
+        assert!(plugins.contains_key("foreign-plugin"));
+
+        // Enable: entry re-added.
+        let enabled = set_plugin_enabled(&mut reg, &decl, &dest, &src, true).unwrap();
+        assert!(enabled.enabled);
+        let val2: Value = serde_json::from_slice(&std::fs::read(&dest).unwrap()).unwrap();
+        assert!(
+            val2.get("plugins")
+                .and_then(Value::as_object)
+                .unwrap()
+                .contains_key("owned-plugin")
+        );
+        drop(std::fs::remove_dir_all(&home));
     }
 }

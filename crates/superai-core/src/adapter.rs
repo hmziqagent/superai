@@ -838,12 +838,42 @@ impl fmt::Display for McpTransport {
     }
 }
 
+/// Shape of the MCP server container under `dest_key` (EXT-09).
+///
+/// The corpus documents two container families: name-keyed maps
+/// (`mcpServers`, codex `[mcp_servers.<name>]`, goose `extensions:`) and
+/// identity-field arrays (`[[mcp_servers]]` TOML tables keyed by `name`,
+/// continue's YAML `mcpServers:` list keyed by `name`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpDestShape {
+    /// Map of server name to server config (the `mcpServers` family).
+    #[default]
+    NameMap,
+    /// Array of server entries identified by a per-entry field.
+    IdentityList {
+        /// Field inside each entry carrying the server identity (e.g.
+        /// `name`).
+        key: String,
+    },
+}
+
+impl fmt::Display for McpDestShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameMap => f.write_str("name map"),
+            Self::IdentityList { key } => write!(f, "identity list (by {key})"),
+        }
+    }
+}
+
 /// Where an adapter expects MCP servers to be persisted (EXT-08/09).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpAdapterDecl {
     /// File name or path hint relative to instance root (e.g. `settings.json`).
     pub dest_file: String,
     /// Key inside the file that holds the server map (e.g. `mcpServers`).
+    /// Dotted paths address nested containers (e.g. `amp.mcpServers`).
     pub dest_key: String,
     /// Document kind of the destination file.
     pub kind: DocumentKind,
@@ -851,10 +881,27 @@ pub struct McpAdapterDecl {
     pub scope: ConfigScope,
     /// Restart required after mutation.
     pub restart: RestartBehavior,
+    /// Container shape under `dest_key` (defaults to [`McpDestShape::NameMap`]).
+    #[serde(default, skip_serializing_if = "mcp_shape_is_default")]
+    pub shape: McpDestShape,
+    /// Honest inspect/diff-only marker (EXT-09): `Some(reason)` marks a
+    /// destination the MCP lifecycle must not write. Reasons are
+    /// corpus-grounded: JSONC/YAML surfaces whose only codecs refuse
+    /// changing writes (`ConfigError::LossyWrite`), harness-managed stores
+    /// superai must not edit, read-only-supported harnesses, or native
+    /// schemas the canonical renderer cannot emit. Reads, inspection, and
+    /// diff previews keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<String>,
+}
+
+/// Whether `shape` is the default name map (serialization skip predicate).
+fn mcp_shape_is_default(shape: &McpDestShape) -> bool {
+    *shape == McpDestShape::NameMap
 }
 
 impl McpAdapterDecl {
-    /// Create a new MCP adapter declaration.
+    /// Create a new MCP adapter declaration (name-map container, writable).
     pub fn new(
         dest_file: &str,
         dest_key: &str,
@@ -868,7 +915,24 @@ impl McpAdapterDecl {
             kind,
             scope,
             restart,
+            shape: McpDestShape::NameMap,
+            read_only: None,
         }
+    }
+
+    /// Set a non-default container shape.
+    #[must_use]
+    pub fn with_shape(mut self, shape: McpDestShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// Mark the destination inspect/diff-only with the honest reason writes
+    /// refuse (EXT-09 read-only surfaces).
+    #[must_use]
+    pub fn with_read_only(mut self, reason: impl Into<String>) -> Self {
+        self.read_only = Some(reason.into());
+        self
     }
 }
 
@@ -910,6 +974,15 @@ pub struct PluginAdapterDecl {
     pub dest_file: String,
     /// Optional key inside destination file for config-entry plugins.
     pub dest_key: Option<String>,
+    /// Directory destination (relative to the instance config root) for
+    /// `DirectoryBundle` plugins, e.g. `plugins` (EXT-07 staging target).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest_dir: Option<String>,
+    /// File name the harness requires inside an installed bundle for
+    /// discovery (EXT-07 step 6 harness-discovery verification), e.g.
+    /// antigravity's `plugin.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_manifest: Option<String>,
     /// Plugin kind this declaration handles.
     pub kind: PluginKind,
     /// Whether install requires executing a harness/package command.
@@ -938,12 +1011,40 @@ impl PluginAdapterDecl {
             source_hint: "local".to_owned(),
             dest_file: dest_file.to_owned(),
             dest_key: dest_key.map(ToOwned::to_owned),
+            dest_dir: None,
+            discovery_manifest: None,
             kind,
             requires_execution: false,
             enable_semantics: "add entry / create link".to_owned(),
             disable_semantics: "remove entry / remove link (reversible)".to_owned(),
             remove_semantics: "remove owned entry only".to_owned(),
             dependency_effect: "none (file/config only)".to_owned(),
+            restart,
+        }
+    }
+
+    /// Create a directory-bundle declaration (EXT-06/07): bundle files are
+    /// staged into `dest_dir` (relative to the instance config root) without
+    /// executing anything; `discovery_manifest` names the file the harness
+    /// requires inside the bundle for discovery verification when the corpus
+    /// documents one.
+    pub fn directory_bundle(
+        dest_dir: &str,
+        discovery_manifest: Option<&str>,
+        restart: RestartBehavior,
+    ) -> Self {
+        Self {
+            source_hint: "local".to_owned(),
+            dest_file: dest_dir.to_owned(),
+            dest_key: None,
+            dest_dir: Some(dest_dir.to_owned()),
+            discovery_manifest: discovery_manifest.map(ToOwned::to_owned),
+            kind: PluginKind::DirectoryBundle,
+            requires_execution: false,
+            enable_semantics: "bundle present in destination directory".to_owned(),
+            disable_semantics: "remove bundle from destination (reversible)".to_owned(),
+            remove_semantics: "remove owned bundle files only".to_owned(),
+            dependency_effect: "none (file staging only)".to_owned(),
             restart,
         }
     }
@@ -959,6 +1060,8 @@ impl PluginAdapterDecl {
             source_hint: source_hint.to_owned(),
             dest_file: dest_file.to_owned(),
             dest_key: None,
+            dest_dir: None,
+            discovery_manifest: None,
             kind,
             requires_execution: true,
             enable_semantics: "execute harness command to enable".to_owned(),
@@ -1123,8 +1226,25 @@ pub trait Adapter: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Explicit MCP absence (EXT-09 coverage honesty): the harness's corpus
+    /// documents that it has NO MCP mechanism (e.g. pi: "intentionally does
+    /// not include built-in MCP"). `Some(reason)` distinguishes
+    /// verified-absent from not-yet-modeled and takes precedence over
+    /// [`Adapter::mcp_decl`].
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Plugin adapter declaration, if the harness supports plugins (EXT-06).
     fn plugin_decl(&self) -> Option<PluginAdapterDecl> {
+        None
+    }
+
+    /// Explicit plugin-mechanism absence (EXT-06 coverage honesty): the
+    /// harness's corpus documents no plugin mechanism (or one whose contract
+    /// is unverified). `Some(reason)` distinguishes verified-absent from
+    /// not-yet-modeled and takes precedence over [`Adapter::plugin_decl`].
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
         None
     }
 }
@@ -1780,5 +1900,93 @@ mod tests {
         assert!(schema.root_shape.is_none());
         assert!(schema.owned_key_rules.is_empty());
         assert!(schema.deprecated_keys.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // MCP/plugin declaration vocabulary (EXT-06..09)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mcp_decl_defaults_to_writable_name_map() {
+        let decl = super::McpAdapterDecl::new(
+            "settings.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::None,
+        );
+        assert_eq!(decl.shape, super::McpDestShape::NameMap);
+        assert!(decl.read_only.is_none());
+        let json = serde_json::to_string(&decl).unwrap();
+        assert!(
+            !json.contains("read_only") && !json.contains("shape"),
+            "defaults are not serialized: {json}"
+        );
+        let back: super::McpAdapterDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, decl);
+    }
+
+    #[test]
+    fn mcp_decl_shape_and_read_only_round_trip() {
+        let decl = super::McpAdapterDecl::new(
+            "config.toml",
+            "mcp_servers",
+            DocumentKind::Toml,
+            ConfigScope::User,
+            RestartBehavior::None,
+        )
+        .with_shape(super::McpDestShape::IdentityList {
+            key: "name".to_owned(),
+        })
+        .with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists");
+        assert_eq!(
+            decl.shape,
+            super::McpDestShape::IdentityList {
+                key: "name".to_owned()
+            }
+        );
+        assert!(
+            decl.read_only
+                .as_deref()
+                .is_some_and(|reason| reason.contains("LossyWrite"))
+        );
+        let json = serde_json::to_string(&decl).unwrap();
+        let back: super::McpAdapterDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, decl);
+        assert_eq!(decl.shape.to_string(), "identity list (by name)");
+        assert_eq!(super::McpDestShape::NameMap.to_string(), "name map");
+    }
+
+    #[test]
+    fn plugin_decl_directory_bundle_carries_staging_fields() {
+        let decl = super::PluginAdapterDecl::directory_bundle(
+            "antigravity-cli/plugins",
+            Some("plugin.json"),
+            RestartBehavior::Restart,
+        );
+        assert_eq!(decl.kind, super::PluginKind::DirectoryBundle);
+        assert!(!decl.requires_execution);
+        assert_eq!(decl.dest_dir.as_deref(), Some("antigravity-cli/plugins"));
+        assert_eq!(decl.discovery_manifest.as_deref(), Some("plugin.json"));
+        let json = serde_json::to_string(&decl).unwrap();
+        let back: super::PluginAdapterDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, decl);
+        // Legacy declarations without the new fields still deserialize
+        // (serde defaults keep older serialized decls readable).
+        let legacy = r#"{
+            "source_hint": "local",
+            "dest_file": "plugins.json",
+            "dest_key": "plugins",
+            "kind": "config_entry",
+            "requires_execution": false,
+            "enable_semantics": "a",
+            "disable_semantics": "b",
+            "remove_semantics": "c",
+            "dependency_effect": "d",
+            "restart": "none"
+        }"#;
+        let old: super::PluginAdapterDecl = serde_json::from_str(legacy)
+            .expect("legacy plugin decl deserializes with default staging fields");
+        assert!(old.dest_dir.is_none() && old.discovery_manifest.is_none());
     }
 }

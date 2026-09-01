@@ -501,6 +501,27 @@ impl Adapter for AmazonQAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-08/09: MCP destination (amazon-q-cli.md `mcpServers`; read-only per the migration-only ledger state)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(
+            crate::adapter::McpAdapterDecl::new(
+                "settings.json",
+                "mcpServers",
+                DocumentKind::Json,
+                ConfigScope::User,
+                RestartBehavior::Reload,
+            )
+            .with_read_only("migration-only harness (successor kiro); inspect/diff only"),
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "IDE plugins end-of-support 2027-04-30; no CLI plugin mechanism documented (amazon-q-cli.md)",
+        )
+    }
 }
 
 #[cfg(test)]

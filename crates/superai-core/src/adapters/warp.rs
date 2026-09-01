@@ -812,6 +812,22 @@ impl Adapter for WarpAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (warp.md 5.1: global `~/.warp/.mcp.json` (and CLI `~/.warp_cli/.mcp.json`) use the `mcpServers` map)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            ".mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented; workflows are YAML commands, not plugins (warp.md)")
+    }
 }
 
 #[cfg(test)]

@@ -513,6 +513,29 @@ impl Adapter for GeminiCliAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-08/09: MCP destination (gemini-cli.md MCP servers: `mcpServers` in settings.json; httpUrl > url > command precedence)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(
+            crate::adapter::McpAdapterDecl::new(
+                "settings.json",
+                "mcpServers",
+                DocumentKind::Json,
+                ConfigScope::User,
+                RestartBehavior::Reload,
+            )
+            .with_read_only(
+                "migration-only harness (successor antigravity-cli); inspect/diff only",
+            ),
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "extensions dir documented (extension.toml under ~/.gemini/extensions/) but the harness is MigrationOnly; successor converts them to plugins (gemini-cli.md 7)",
+        )
+    }
 }
 
 #[cfg(test)]

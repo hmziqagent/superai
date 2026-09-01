@@ -479,6 +479,16 @@ impl Adapter for CopilotCodingAgentAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some("cloud-only harness; no local MCP configuration surface (Unsupported ledger state)")
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("cloud-only harness; no local plugin mechanism (Unsupported ledger state)")
+    }
 }
 
 #[cfg(test)]

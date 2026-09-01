@@ -653,6 +653,16 @@ impl Adapter for AiderAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![crate::adapter::SkillMode::CopySelected]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some("aider documents no MCP server support (docs/harness-configs/aider.md)")
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("aider documents no plugin mechanism (docs/harness-configs/aider.md)")
+    }
 }
 
 #[cfg(test)]

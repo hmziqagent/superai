@@ -663,6 +663,24 @@ impl Adapter for KodeAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (kode.md: global `mcpServers` in the global config; project `.mcp.json` recommended)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "config.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            ".kode-plugin manifests documented at project scope but installs flow through the /plugin command; requires harness execution (kode.md)",
+        )
+    }
 }
 
 #[cfg(test)]

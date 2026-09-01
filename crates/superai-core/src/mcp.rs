@@ -3,12 +3,22 @@
 //! Implements:
 //! - `McpServerDef { id, command, args, env, url, disabled }` plus transport,
 //!   headers, timeout, OAuth and tool filtering (EXT-08)
-//! - Adapter declares source/destination (config file path, key) via
-//!   [`crate::adapter::McpAdapterDecl`] (EXT-08/09)
-//! - Preserve foreign entries: read fresh map, merge owned entries, retain
-//!   unmodelled keys (EXT-08/09)
+//! - Adapter declares source/destination (config file path, key, container
+//!   shape, read-only honesty) via [`crate::adapter::McpAdapterDecl`]
+//!   (EXT-08/09)
+//! - Preserve foreign entries: read fresh, merge the one owned entry being
+//!   written, retain every unmodelled key — including unknown fields the
+//!   owned entry already carries (EXT-08/09)
+//! - Multi-format round-trip: JSON destinations serialize semantically;
+//!   TOML destinations (codex `[mcp_servers.<name>]` tables, mistral
+//!   `[[mcp_servers]]` identity lists) are written through `toml_edit` so
+//!   comments and decor outside the mutated entry survive byte-for-byte;
+//!   JSONC/YAML destinations parse for inspection but refuse changing
+//!   writes with the typed `LossyWrite` error until a preserving codec
+//!   exists (EXT-09, codec honesty DOC-05/DOC-06); read-only-declared
+//!   surfaces refuse writes with their declared reason.
 //! - Lifecycle: validate, inspect, collisions, backup, transaction,
-//!   discovery-verify, commit/verify, removal leaves foreign, shared logic (EXT-10)
+//!   commit/verify, removal leaves foreign (EXT-10)
 //! - Secrets are ephemeral and only rendered to adapter-declared sinks; diffs redact.
 //! - Round-trip and foreign preservation tests.
 
@@ -476,19 +486,47 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
     };
     let command = obj
         .get("command")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned);
-    let args = obj
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .or_else(|| obj.get("cmd")) // goose `extensions:` spelling (goose.md §5)
+        .and_then(|v| match v {
+            // Zed-style nested command objects: {"path": "...", "args": [...]}
+            // (zed-acp.md §1.2, `context_servers` entries).
+            Value::Object(nested) => nested
+                .get("path")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            // Kilo-style argv arrays: ["node", "server.js"] (kilo-code.md §5.1).
+            Value::Array(parts) => parts.first().and_then(Value::as_str).map(ToOwned::to_owned),
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+    let args = if let Some(arr) = obj.get("args").and_then(Value::as_array) {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+    } else if let Some(arr) = obj
+        // Nested-command form carries args inside the command object (zed).
+        .get("command")
+        .and_then(|v| v.as_object())
+        .and_then(|n| n.get("args"))
+        .and_then(Value::as_array)
+    {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+    } else if let Some(parts) = obj.get("command").and_then(Value::as_array) {
+        // Kilo argv arrays: everything after the first element is args.
+        parts
+            .iter()
+            .skip(1)
+            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let env = obj
         .get("env")
+        .or_else(|| obj.get("environment")) // kilo spelling (kilo-code.md §5.1)
+        .or_else(|| obj.get("envs")) // goose spelling (goose.md §5)
         .and_then(|v| v.as_object())
         .map(|m| {
             let mut out = BTreeMap::new();
@@ -502,8 +540,9 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
         .unwrap_or_default();
     let url = obj
         .get("url")
-        .or_else(|| obj.get("serverUrl"))
+        .or_else(|| obj.get("serverUrl")) // antigravity/windsurf spelling
         .or_else(|| obj.get("server_url"))
+        .or_else(|| obj.get("uri")) // goose remote spelling (goose.md §5)
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned);
     let headers = obj
@@ -610,100 +649,190 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
 // Foreign-preserving file helpers (EXT-08/09)
 // ---------------------------------------------------------------------------
 
-/// Read the outer JSON object fresh, preserving all top-level keys as foreign.
+/// Keys the canonical renderer manages on a server entry (EXT-09: unknown
+/// fields of an OWNED server survive rewrites; managed keys the new
+/// rendering no longer emits are dropped so toggles stick).
+const MANAGED_SERVER_KEYS: &[&str] = &[
+    "command",
+    "args",
+    "env",
+    "url",
+    "headers",
+    "disabled",
+    "enabled",
+    "oauth_required",
+    "timeout",
+    "timeout_ms",
+    "include_tools",
+    "includeTools",
+    "exclude_tools",
+    "excludeTools",
+    "transport",
+    "type",
+];
+
+/// Merge a fresh canonical rendering into an existing native server entry,
+/// keeping every unmodelled field the harness (or user) put there.
+fn merge_server_native(existing: Option<&Value>, new: &Value) -> Value {
+    let (Some(existing_obj), Some(new_obj)) =
+        (existing.and_then(Value::as_object), new.as_object())
+    else {
+        return new.clone();
+    };
+    let mut merged = existing_obj.clone();
+    for key in MANAGED_SERVER_KEYS {
+        if !new_obj.contains_key(*key) {
+            merged.remove(*key);
+        }
+    }
+    for (k, v) in new_obj {
+        merged.insert(k.clone(), v.clone());
+    }
+    Value::Object(merged)
+}
+
+/// Convert a `toml_edit` document to its semantic JSON value.
+fn toml_document_to_value(doc: &toml_edit::DocumentMut) -> Value {
+    fn table_to_value(table: &toml_edit::Table) -> Value {
+        let mut map = Map::new();
+        for (key, item) in table {
+            if item.is_none() {
+                continue;
+            }
+            map.insert(key.to_owned(), item_to_value(item));
+        }
+        Value::Object(map)
+    }
+    fn item_to_value(item: &toml_edit::Item) -> Value {
+        match item {
+            toml_edit::Item::Value(v) => toml_value_to_value(v),
+            toml_edit::Item::Table(t) => table_to_value(t),
+            toml_edit::Item::ArrayOfTables(a) => {
+                Value::Array(a.iter().map(table_to_value).collect())
+            }
+            toml_edit::Item::None => Value::Null,
+        }
+    }
+    fn toml_value_to_value(v: &toml_edit::Value) -> Value {
+        use toml_edit::Value as Tv;
+        match v {
+            Tv::String(s) => Value::String(s.value().to_owned()),
+            Tv::Integer(i) => Value::Number((*i.value()).into()),
+            Tv::Float(f) => {
+                serde_json::Number::from_f64(*f.value()).map_or(Value::Null, Value::Number)
+            }
+            Tv::Boolean(b) => Value::Bool(*b.value()),
+            Tv::Datetime(d) => Value::String(d.to_string()),
+            Tv::Array(a) => Value::Array(a.iter().map(toml_value_to_value).collect()),
+            Tv::InlineTable(t) => {
+                let mut map = Map::new();
+                for (key, value) in t {
+                    map.insert(key.to_owned(), toml_value_to_value(value));
+                }
+                Value::Object(map)
+            }
+        }
+    }
+    table_to_value(doc.as_table())
+}
+
+/// Load the outer semantic value of an MCP destination file, fresh from
+/// disk, through the document-engine codec for the declared kind (EXT-09:
+/// the read path is no longer JSON-only — JSONC parses via the comment
+/// stripping loader, YAML via the yaml codec, TOML via `toml_edit`).
 ///
-/// Returns the outer map and the inner server map under `dest_key` (if present).
-fn read_outer_and_inner(
-    path: &Path,
-    dest_key: &str,
-) -> Result<(Map<String, Value>, BTreeMap<String, Value>)> {
-    if !path.exists() {
-        return Ok((Map::new(), BTreeMap::new()));
-    }
-    let bytes = std::fs::read(path).map_err(|e| CoreError::InvalidPath {
-        kind: "mcp_config".to_owned(),
-        value: path.display().to_string(),
-        reason: format!("cannot read mcp config: {e}"),
-    })?;
-    if bytes.is_empty() {
-        return Ok((Map::new(), BTreeMap::new()));
-    }
-    // Try JSON first; if fails, try JSONC stripping comments (fallback to json)
-    let value: Value = serde_json::from_slice(&bytes).map_err(|e| CoreError::Parse {
-        path: path.to_path_buf(),
-        kind: "json".to_owned(),
-        message: format!("parse failed for mcp config: {e}"),
-    })?;
-    let outer = match value {
-        Value::Object(m) => m,
-        _ => {
-            return Err(CoreError::SchemaValidation {
-                path: path.to_path_buf(),
-                details: "mcp config must be a JSON object".to_owned(),
+/// Missing and empty files read as an empty object; no file is created.
+fn read_outer_value(path: &Path, kind: DocumentKind) -> Result<Value> {
+    let value = match kind {
+        DocumentKind::Json => superai_config::json::load_value(path)?,
+        DocumentKind::Jsonc => superai_config::jsonc::load_value(path)?,
+        DocumentKind::Yaml => superai_config::yaml::load_value(path)?,
+        DocumentKind::Toml => toml_document_to_value(&superai_config::toml_file::load(path)?),
+        other => {
+            return Err(CoreError::UnsupportedOperation {
+                harness: "mcp".to_owned(),
+                operation: format!("read {}", path.display()),
+                reason: format!("mcp destinations of kind {other} are not readable"),
             });
         }
     };
-    let inner = outer
-        .get(dest_key)
-        .and_then(|v| v.as_object())
-        .map(|m| {
-            let mut out = BTreeMap::new();
-            for (k, v) in m {
-                out.insert(k.clone(), v.clone());
-            }
-            out
-        })
-        .unwrap_or_default();
+    if !value.is_object() {
+        return Err(CoreError::SchemaValidation {
+            path: path.to_path_buf(),
+            details: format!("mcp config must be an object, got {value}"),
+        });
+    }
+    Ok(value)
+}
+
+/// Read the outer semantic value and the inner server entries for `decl`.
+///
+/// The container under `dest_key` (dotted paths address nested containers,
+/// e.g. `amp.mcpServers`) is extracted per the declared shape: name-keyed
+/// maps directly, identity lists keyed by their per-entry identity field.
+fn read_outer_and_inner(
+    path: &Path,
+    decl: &McpAdapterDecl,
+) -> Result<(Value, BTreeMap<String, Value>)> {
+    let outer = read_outer_value(path, decl.kind)?;
+    let inner = inner_entries(&outer, decl)?;
     Ok((outer, inner))
 }
 
-/// Write outer map with updated inner server map under `dest_key`, preserving foreign.
-///
-/// Uses a compensated transaction: backup, stage, validate, commit, verify.
-fn write_outer_with_inner(
-    path: &Path,
-    decl: &McpAdapterDecl,
-    outer: &Map<String, Value>,
-    inner: &BTreeMap<String, Value>,
-) -> Result<()> {
-    // codec-honesty (DOC-05/DOC-06): the only serializer available here is
-    // normalized JSON, which cannot preserve JSONC/YAML lexical material
-    // (comments, anchors, tags, scalar style). Refuse instead of corrupting;
-    // the typed config error propagates to the caller.
-    let lossy_format = match decl.kind {
-        DocumentKind::Jsonc => Some("jsonc"),
-        DocumentKind::Yaml => Some("yaml"),
-        _ => None,
-    };
-    if let Some(format) = lossy_format {
-        return Err(CoreError::Config(superai_config::ConfigError::LossyWrite {
-            path: path.to_path_buf(),
-            format,
-        }));
+/// Resolve a dotted key path inside `value`, walking objects only.
+fn navigate_dotted<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in dotted.split('.').map(str::trim).filter(|s| !s.is_empty()) {
+        current = current.get(segment)?;
     }
-
-    // Build new outer preserving foreign keys, replacing dest_key
-    let mut new_outer = outer.clone();
-    if inner.is_empty() {
-        new_outer.remove(&decl.dest_key);
+    if dotted.trim().is_empty() {
+        Some(value)
     } else {
-        let mut inner_map = Map::new();
-        for (k, v) in inner {
-            inner_map.insert(k.clone(), v.clone());
-        }
-        new_outer.insert(decl.dest_key.clone(), Value::Object(inner_map));
+        Some(current)
     }
-    // Alternative keys some harnesses use: ensure we don't duplicate foreign `mcp` vs `mcpServers`
-    // We keep whatever dest_key is canonical; foreign keys under other names are preserved as-is.
+}
 
-    let bytes = serde_json::to_vec_pretty(&Value::Object(new_outer.clone())).map_err(|e| {
-        CoreError::Validation {
-            field: "mcp_config".to_owned(),
-            reason: format!("serialize failed: {e}"),
+/// Extract the server entries under the decl's `dest_key` per its shape.
+fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> Result<BTreeMap<String, Value>> {
+    let mut out = BTreeMap::new();
+    let Some(container) = navigate_dotted(outer, &decl.dest_key) else {
+        return Ok(out);
+    };
+    match &decl.shape {
+        crate::adapter::McpDestShape::NameMap => {
+            if let Some(map) = container.as_object() {
+                for (k, v) in map {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
         }
-    })?;
+        crate::adapter::McpDestShape::IdentityList { key } => {
+            if let Some(arr) = container.as_array() {
+                for item in arr {
+                    if let Some(id) = item.get(key).and_then(Value::as_str) {
+                        out.insert(id.to_owned(), item.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
-    // If parent dir doesn't exist, we will create it via transaction CreateDir
+/// A single owned-server mutation to stage (EXT-09 per-entry writes keep
+/// foreign servers and their lexical presentation untouched).
+#[derive(Debug, Clone, PartialEq)]
+enum ServerWrite {
+    /// Insert or update the entry for `id` with the merged native value.
+    Upsert(Value),
+    /// Remove the entry for `id` only.
+    Remove,
+}
+
+/// Commit prepared document `bytes` to `path` through a compensated
+/// transaction: backup of foreign content, atomic write, read-back parse
+/// verification (EXT-07/EXT-10 lifecycle discipline).
+fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
     if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -711,31 +840,31 @@ fn write_outer_with_inner(
             path: parent.to_path_buf(),
         });
     }
-    let kind = match decl.kind {
-        DocumentKind::Json | DocumentKind::Jsonc | DocumentKind::Toml | DocumentKind::Yaml => {
-            // Map adapter DocumentKind to superai_config DocumentKind
-            match decl.kind {
-                DocumentKind::Json => superai_config::document::DocumentKind::StrictJson,
-                DocumentKind::Jsonc => superai_config::document::DocumentKind::JsonC,
-                DocumentKind::Toml => superai_config::document::DocumentKind::Toml,
-                DocumentKind::Yaml => superai_config::document::DocumentKind::Yaml,
-                _ => superai_config::document::DocumentKind::StrictJson,
-            }
+    let engine_kind = match kind {
+        DocumentKind::Json => superai_config::document::DocumentKind::StrictJson,
+        DocumentKind::Jsonc => superai_config::document::DocumentKind::JsonC,
+        DocumentKind::Toml => superai_config::document::DocumentKind::Toml,
+        DocumentKind::Yaml => superai_config::document::DocumentKind::Yaml,
+        other => {
+            return Err(CoreError::UnsupportedOperation {
+                harness: "mcp".to_owned(),
+                operation: format!("write {}", path.display()),
+                reason: format!("mcp destinations of kind {other} are not writable"),
+            });
         }
-        _ => superai_config::document::DocumentKind::StrictJson,
     };
     steps.push(superai_config::transaction::FileAction::Write {
         path: path.to_path_buf(),
         content: bytes,
-        kind,
+        kind: engine_kind,
     });
-
-    // Snapshot before for conflict detection
     let snap_before = superai_config::snapshot::snapshot(path);
-    // Execute transaction
+    let file_label = path
+        .file_name()
+        .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().to_string());
     let op_id_str = format!(
         "mcp-{}-{}",
-        decl.dest_key,
+        file_label,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis())
@@ -747,21 +876,16 @@ fn write_outer_with_inner(
         }
     })?;
     let mut txn = superai_config::transaction::Transaction::new(op_id, steps);
-    // Validate plan
-    if let Err(e) = txn.validate_plan() {
-        return Err(CoreError::Validation {
-            field: "mcp_transaction".to_owned(),
-            reason: format!("transaction plan invalid: {e}"),
-        });
-    }
-    // Prepare (backup foreign file before first write)
+    txn.validate_plan().map_err(|e| CoreError::Validation {
+        field: "mcp_transaction".to_owned(),
+        reason: format!("transaction plan invalid: {e}"),
+    })?;
     let outcome = txn.execute().map_err(|e| CoreError::Commit {
         path: path.to_path_buf(),
         reason: format!("transaction failed: {e}"),
     })?;
     if !outcome.success {
         let diag = outcome.diagnostics_redacted.join("; ");
-        // Detect concurrent modification vs general failure
         if diag.contains("modified") || diag.contains("concurrent") {
             let snap_after = superai_config::snapshot::snapshot(path);
             let exp = snap_before.digest.unwrap_or_else(|| "missing".to_owned());
@@ -777,39 +901,368 @@ fn write_outer_with_inner(
             reason: format!("mcp commit failed: {diag}"),
         });
     }
-    // Post-commit verify: read fresh and parse
-    let bytes_after = std::fs::read(path).map_err(|e| CoreError::Commit {
+    // Post-commit verify: the written bytes must parse under the same codec.
+    read_outer_value(path, kind).map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
-        reason: format!("read back after commit failed: {e}"),
+        kind: "parse".to_owned(),
+        reason: format!("written mcp config failed read-back verification: {e}"),
     })?;
-    let val_after: Value =
-        serde_json::from_slice(&bytes_after).map_err(|e| CoreError::Verification {
+    Ok(())
+}
+
+/// Write one owned server entry, preserving every other key, server, and
+/// (for TOML) comment/decor in the destination (EXT-09).
+fn write_server_entry(
+    path: &Path,
+    decl: &McpAdapterDecl,
+    id: &str,
+    write: ServerWrite,
+) -> Result<()> {
+    // Read-only surfaces refuse honestly with the declared reason (EXT-09
+    // inspect/diff-only destinations).
+    if let Some(reason) = &decl.read_only {
+        return Err(CoreError::UnsupportedOperation {
+            harness: "mcp".to_owned(),
+            operation: format!("write `{}` entry `{id}`", decl.dest_key),
+            reason: reason.clone(),
+        });
+    }
+    // codec-honesty (DOC-05/DOC-06): the only rewriters available normalize
+    // JSONC/YAML lexical material (comments, anchors, tags, scalar style).
+    // Refuse instead of corrupting; the typed config error propagates.
+    let lossy_format = match decl.kind {
+        DocumentKind::Jsonc => Some("jsonc"),
+        DocumentKind::Yaml => Some("yaml"),
+        _ => None,
+    };
+    if let Some(format) = lossy_format {
+        return Err(CoreError::Config(superai_config::ConfigError::LossyWrite {
             path: path.to_path_buf(),
-            kind: "parse".to_owned(),
-            reason: format!("written mcp config not valid json: {e}"),
-        })?;
-    if let Value::Object(m) = val_after {
-        if !m.contains_key(&decl.dest_key) && !inner.is_empty() {
-            return Err(CoreError::Verification {
-                path: path.to_path_buf(),
-                kind: "semantic".to_owned(),
-                reason: format!("dest_key `{}` missing after commit", decl.dest_key),
-            });
+            format,
+        }));
+    }
+    match (decl.kind, &decl.shape) {
+        (DocumentKind::Json, shape) => write_json_server(path, decl, id, &write, shape),
+        (DocumentKind::Toml, shape) => write_toml_server(path, decl, id, &write, shape),
+        (other, _) => Err(CoreError::UnsupportedOperation {
+            harness: "mcp".to_owned(),
+            operation: format!("write `{}` entry `{id}`", decl.dest_key),
+            reason: format!("mcp destinations of kind {other} are not writable"),
+        }),
+    }
+}
+
+/// Apply one server entry mutation to a JSON document's semantic value.
+fn apply_json_server_write(
+    outer: &mut Value,
+    decl: &McpAdapterDecl,
+    id: &str,
+    write: &ServerWrite,
+    shape: &crate::adapter::McpDestShape,
+) -> Result<()> {
+    let segments: Vec<String> = decl
+        .dest_key
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // Walk to the container's parent, creating objects as needed.
+    let mut current = outer;
+    for segment in &segments {
+        if !current.is_object() {
+            *current = Value::Object(Map::new());
+        }
+        let obj = current
+            .as_object_mut()
+            .ok_or_else(|| CoreError::SchemaValidation {
+                path: PathBuf::from(&decl.dest_file),
+                details: format!(
+                    "cannot traverse `{}` in mcp destination: not an object",
+                    decl.dest_key
+                ),
+            })?;
+        current = obj
+            .entry(segment.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    let container = if current.is_object() || current.is_array() {
+        current
+    } else {
+        *current = Value::Object(Map::new());
+        current
+    };
+    match (shape, write) {
+        (crate::adapter::McpDestShape::NameMap, ServerWrite::Upsert(value)) => {
+            let obj = container
+                .as_object_mut()
+                .ok_or_else(|| CoreError::SchemaValidation {
+                    path: PathBuf::from(&decl.dest_file),
+                    details: format!(
+                        "mcp container `{}` must be an object for name-map destinations",
+                        decl.dest_key
+                    ),
+                })?;
+            obj.insert(id.to_owned(), value.clone());
+        }
+        (crate::adapter::McpDestShape::NameMap, ServerWrite::Remove) => {
+            if let Some(obj) = container.as_object_mut() {
+                obj.remove(id);
+            }
+        }
+        (crate::adapter::McpDestShape::IdentityList { key }, ServerWrite::Upsert(value)) => {
+            // The identity field IS part of the stored entry for
+            // identity-list containers (e.g. `"name": "<id>"`).
+            let mut with_identity = value.clone();
+            if let Some(obj) = with_identity.as_object_mut() {
+                obj.insert(key.clone(), Value::String(id.to_owned()));
+            }
+            let arr = if container.is_array() {
+                container
+                    .as_array_mut()
+                    .ok_or_else(|| CoreError::SchemaValidation {
+                        path: PathBuf::from(&decl.dest_file),
+                        details: "identity-list container vanished".to_owned(),
+                    })?
+            } else {
+                *container = Value::Array(Vec::new());
+                container
+                    .as_array_mut()
+                    .ok_or_else(|| CoreError::SchemaValidation {
+                        path: PathBuf::from(&decl.dest_file),
+                        details: "identity-list container vanished".to_owned(),
+                    })?
+            };
+            match arr
+                .iter()
+                .position(|item| item.get(key).and_then(Value::as_str) == Some(id))
+            {
+                Some(pos) => {
+                    if let Some(slot) = arr.get_mut(pos) {
+                        *slot = with_identity;
+                    }
+                }
+                None => arr.push(with_identity),
+            }
+        }
+        (crate::adapter::McpDestShape::IdentityList { key }, ServerWrite::Remove) => {
+            if let Some(arr) = container.as_array_mut() {
+                arr.retain(|item| item.get(key).and_then(Value::as_str) != Some(id));
+            }
         }
     }
     Ok(())
+}
+
+/// Write one server entry into a JSON destination (foreign keys preserved).
+fn write_json_server(
+    path: &Path,
+    decl: &McpAdapterDecl,
+    id: &str,
+    write: &ServerWrite,
+    shape: &crate::adapter::McpDestShape,
+) -> Result<()> {
+    let mut outer = read_outer_value(path, decl.kind)?;
+    apply_json_server_write(&mut outer, decl, id, write, shape)?;
+    let bytes = serde_json::to_vec_pretty(&outer).map_err(|e| CoreError::Validation {
+        field: "mcp_config".to_owned(),
+        reason: format!("serialize failed: {e}"),
+    })?;
+    commit_document(path, decl.kind, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// TOML server writes (comments and decor preserved via toml_edit, EXT-09)
+// ---------------------------------------------------------------------------
+
+/// Convert a semantic JSON value into a `toml_edit` item.
+fn json_to_toml_item(value: &Value) -> std::result::Result<toml_edit::Item, String> {
+    use toml_edit::value as toml_value;
+    match value {
+        Value::Null => Err("toml cannot represent null in mcp server entries".to_owned()),
+        Value::Bool(b) => Ok(toml_value(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(toml_value(i))
+            } else {
+                Ok(toml_value(n.as_f64().unwrap_or_default()))
+            }
+        }
+        Value::String(s) => Ok(toml_value(s.as_str())),
+        Value::Array(arr) => {
+            let mut toml_arr = toml_edit::Array::new();
+            for item in arr {
+                let converted = match json_to_toml_item(item)? {
+                    toml_edit::Item::Value(v) => v,
+                    _ => return Err("nested tables inside mcp arrays are not supported".to_owned()),
+                };
+                toml_arr.push(converted);
+            }
+            Ok(toml_value(toml_arr))
+        }
+        Value::Object(map) => {
+            let mut table = toml_edit::Table::new();
+            for (k, v) in map {
+                table.insert(k.as_str(), json_to_toml_item(v)?);
+            }
+            Ok(toml_edit::Item::Value(toml_edit::Value::InlineTable(
+                table.into_inline_table(),
+            )))
+        }
+    }
+}
+
+/// Convert a server entry to a TOML table (sub-tables serialize as
+/// `[mcp_servers.<id>.<key>]` sections).
+fn json_server_to_toml_table(value: &Value) -> std::result::Result<toml_edit::Table, String> {
+    let Some(map) = value.as_object() else {
+        return Err("mcp server entry must be an object".to_owned());
+    };
+    let mut table = toml_edit::Table::new();
+    for (k, v) in map {
+        match v {
+            Value::Object(nested) => {
+                let mut nested_table = toml_edit::Table::new();
+                for (nk, nv) in nested {
+                    nested_table.insert(nk.as_str(), json_to_toml_item(nv)?);
+                }
+                table.insert(k.as_str(), toml_edit::Item::Table(nested_table));
+            }
+            other => {
+                table.insert(k.as_str(), json_to_toml_item(other)?);
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Walk to the container table at a dotted path, creating parent tables.
+fn toml_container_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    dotted: &str,
+    create: bool,
+) -> Option<&'a mut toml_edit::Table> {
+    let segments: Vec<&str> = dotted
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut table = doc.as_table_mut();
+    for segment in segments {
+        if !table.contains_key(segment) {
+            if !create {
+                return None;
+            }
+            table.insert(segment, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        match table.get_mut(segment) {
+            Some(toml_edit::Item::Table(t)) => table = t,
+            _ => return None,
+        }
+    }
+    Some(table)
+}
+
+/// Write one server entry into a TOML destination through `toml_edit`, so
+/// comments, formatting, foreign keys, and foreign servers survive the
+/// write byte-for-byte outside the mutated entry (EXT-09; area-1 DOC-04
+/// discipline).
+fn write_toml_server(
+    path: &Path,
+    decl: &McpAdapterDecl,
+    id: &str,
+    write: &ServerWrite,
+    shape: &crate::adapter::McpDestShape,
+) -> Result<()> {
+    let mut doc = superai_config::toml_file::load(path)?;
+    let schema_err = |msg: String| CoreError::SchemaValidation {
+        path: path.to_path_buf(),
+        details: msg,
+    };
+    match shape {
+        crate::adapter::McpDestShape::NameMap => {
+            let table = toml_container_table(&mut doc, &decl.dest_key, true)
+                .ok_or_else(|| schema_err(format!("cannot open mcp table `{}`", decl.dest_key)))?;
+            match write {
+                ServerWrite::Upsert(value) => {
+                    let new_table = json_server_to_toml_table(value)
+                        .map_err(|e| schema_err(format!("server `{id}`: {e}")))?;
+                    let item = toml_edit::Item::Table(new_table);
+                    if table.contains_key(id) {
+                        // Index assignment preserves the existing key's
+                        // position (DOC-04 discipline).
+                        table[id] = item;
+                    } else {
+                        table.insert(id, item);
+                    }
+                }
+                ServerWrite::Remove => {
+                    table.remove(id);
+                }
+            }
+        }
+        crate::adapter::McpDestShape::IdentityList { key } => {
+            let root = doc.as_table_mut();
+            if !root.contains_key(decl.dest_key.as_str()) {
+                root.insert(
+                    decl.dest_key.as_str(),
+                    toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+                );
+            }
+            let arr = match root.get_mut(decl.dest_key.as_str()) {
+                Some(toml_edit::Item::ArrayOfTables(a)) => a,
+                _ => {
+                    return Err(schema_err(format!(
+                        "mcp container `{}` must be an array of tables",
+                        decl.dest_key
+                    )));
+                }
+            };
+            let position = arr
+                .iter()
+                .position(|t| t.get(key.as_str()).and_then(|v| v.as_str()) == Some(id));
+            match (write, position) {
+                (ServerWrite::Upsert(value), pos) => {
+                    // The identity field IS part of the stored entry for
+                    // identity-list containers (e.g. `name = "<id>"`).
+                    let mut with_identity = value.clone();
+                    if let Some(obj) = with_identity.as_object_mut() {
+                        obj.insert(key.clone(), Value::String(id.to_owned()));
+                    }
+                    let new_table = json_server_to_toml_table(&with_identity)
+                        .map_err(|e| schema_err(format!("server `{id}`: {e}")))?;
+                    match pos {
+                        Some(index) => {
+                            if let Some(slot) = arr.get_mut(index) {
+                                *slot = new_table;
+                            }
+                        }
+                        None => arr.push(new_table),
+                    }
+                }
+                (ServerWrite::Remove, Some(pos)) => {
+                    arr.remove(pos);
+                }
+                (ServerWrite::Remove, None) => {}
+            }
+        }
+    }
+    commit_document(path, decl.kind, doc.to_string().into_bytes())
 }
 
 // ---------------------------------------------------------------------------
 // Public lifecycle API (EXT-10)
 // ---------------------------------------------------------------------------
 
-/// Inspect effective MCP servers from `path` using `decl` (read fresh, no mutation).
+/// Inspect effective MCP servers from `path` using `decl` (read fresh, no
+/// mutation). Works across destination kinds (JSON/JSONC/YAML/TOML) and
+/// container shapes; read-only declarations inspect the same as writable
+/// ones — refusing writes never blinds reads.
 pub fn inspect_servers(
     path: &Path,
     decl: &McpAdapterDecl,
 ) -> Result<BTreeMap<McpServerId, McpServerDef>> {
-    let (_outer, inner) = read_outer_and_inner(path, &decl.dest_key)?;
+    let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let mut out = BTreeMap::new();
     for (k, v) in inner {
         match from_native_value(&k, &v) {
@@ -856,7 +1309,7 @@ pub fn preview_install(
     server: &McpServerDef,
 ) -> Result<McpInstallPreview> {
     server.validate()?;
-    let (_outer, inner) = read_outer_and_inner(path, &decl.dest_key)?;
+    let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let existing_val = inner.get(server.id.as_str()).cloned();
     let existing = if let Some(v) = existing_val {
         Some(from_native_value(server.id.as_str(), &v)?)
@@ -924,8 +1377,11 @@ pub fn preview_install(
 
 /// Install or update a single MCP server, preserving foreign entries.
 ///
-/// Lifecycle: validate, inspect existing, detect collisions, backup foreign config,
-/// stage via transaction, validate discovery, commit/verify.
+/// Lifecycle: validate, inspect existing, detect collisions, backup foreign
+/// config, stage via transaction, commit/verify. The write is a per-entry
+/// merge: unknown fields already present on the entry survive, foreign
+/// servers and top-level keys are untouched, and for TOML destinations
+/// comments and formatting outside the entry survive byte-for-byte.
 /// Returns the installed definition on success.
 pub fn install_mcp_server(
     path: &Path,
@@ -947,10 +1403,11 @@ pub fn install_mcp_server(
             return Ok(server.clone());
         }
     }
-    // Read fresh outer/inner again for merge
-    let (outer, mut inner) = read_outer_and_inner(path, &decl.dest_key)?;
-    inner.insert(server.id.to_string(), to_native_value(server));
-    write_outer_with_inner(path, decl, &outer, &inner)?;
+    // Read fresh again for the merge (disk is truth).
+    let (_outer, inner) = read_outer_and_inner(path, decl)?;
+    let existing_native = inner.get(server.id.as_str());
+    let merged = merge_server_native(existing_native, &to_native_value(server));
+    write_server_entry(path, decl, server.id.as_str(), ServerWrite::Upsert(merged))?;
     Ok(server.clone())
 }
 
@@ -961,7 +1418,7 @@ pub fn set_mcp_enabled(
     id: &McpServerId,
     enabled: bool,
 ) -> Result<McpServerDef> {
-    let (outer, mut inner) = read_outer_and_inner(path, &decl.dest_key)?;
+    let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let val = inner
         .get(id.as_str())
         .cloned()
@@ -972,8 +1429,8 @@ pub fn set_mcp_enabled(
     let mut def = from_native_value(id.as_str(), &val)?;
     def.disabled = !enabled;
     def.validate()?;
-    inner.insert(id.to_string(), to_native_value(&def));
-    write_outer_with_inner(path, decl, &outer, &inner)?;
+    let merged = merge_server_native(inner.get(id.as_str()), &to_native_value(&def));
+    write_server_entry(path, decl, id.as_str(), ServerWrite::Upsert(merged))?;
     Ok(def)
 }
 
@@ -986,7 +1443,7 @@ pub fn remove_mcp_server(
     decl: &McpAdapterDecl,
     id: &McpServerId,
 ) -> Result<Option<McpServerDef>> {
-    let (outer, mut inner) = read_outer_and_inner(path, &decl.dest_key)?;
+    let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let existing_val = match inner.get(id.as_str()) {
         Some(v) => v.clone(),
         None => return Ok(None),
@@ -994,8 +1451,7 @@ pub fn remove_mcp_server(
     let def = from_native_value(id.as_str(), &existing_val)?;
     // Only owned entries should be removed; heuristic: if def validates, it's owned.
     // Foreign entries that fail parse would have been preserved as outer keys; here we just remove.
-    inner.remove(id.as_str());
-    write_outer_with_inner(path, decl, &outer, &inner)?;
+    write_server_entry(path, decl, id.as_str(), ServerWrite::Remove)?;
     Ok(Some(def))
 }
 
@@ -1350,5 +1806,312 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), before);
             drop(std::fs::remove_file(&path));
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Multi-format round-trips (EXT-09)
+    // -------------------------------------------------------------------
+
+    fn toml_decl() -> McpAdapterDecl {
+        McpAdapterDecl::new(
+            "config.toml",
+            "mcp_servers",
+            DocumentKind::Toml,
+            ConfigScope::User,
+            RestartBehavior::None,
+        )
+    }
+
+    #[test]
+    fn toml_round_trip_preserves_comments_and_foreign_servers() {
+        let dir = crate::test_util::temp_dir_unique("mcp-toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            b"# top-level comment\nmodel = \"gpt-5\"\nmodel_provider = \"openai\"\n\n# foreign server below\n[mcp_servers.context7]\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7\"]\n",
+        )
+        .unwrap();
+        let d = toml_decl();
+        let id = McpServerId::new("owned-server").unwrap();
+        let mut server = McpServerDef::stdio(id, "node", vec!["server.js".to_owned()]).unwrap();
+        server.timeout_ms = Some(5000);
+        install_mcp_server(&path, &d, &server).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# top-level comment"),
+            "top-level comment must survive: {after}"
+        );
+        assert!(
+            after.contains("# foreign server below"),
+            "foreign server comment must survive: {after}"
+        );
+        assert!(after.contains("model_provider = \"openai\""));
+        assert!(after.contains("[mcp_servers.context7]"));
+        assert!(after.contains("[mcp_servers.owned-server]"));
+
+        // Inspection reads through toml_edit.
+        let inspected = inspect_servers(&path, &d).unwrap();
+        assert!(inspected.contains_key(&McpServerId::new("context7").unwrap()));
+        assert!(inspected.contains_key(&McpServerId::new("owned-server").unwrap()));
+
+        // Remove leaves the foreign server and comments intact.
+        remove_mcp_server(&path, &d, &McpServerId::new("owned-server").unwrap()).unwrap();
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        assert!(final_text.contains("[mcp_servers.context7]"));
+        assert!(!final_text.contains("[mcp_servers.owned-server]"));
+        assert!(final_text.contains("# top-level comment"));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn toml_identity_list_round_trip() {
+        // mistral-vibe `[[mcp_servers]]` shape (mistral-vibe.md §5).
+        let dir = crate::test_util::temp_dir_unique("mcp-toml-list");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            b"# keep me\ntelemetry = false\n\n[[mcp_servers]]\nname = \"fetch_server\"\ntransport = \"stdio\"\ncommand = \"uvx\"\nargs = [\"mcp-server-fetch\"]\n",
+        )
+        .unwrap();
+        let d = McpAdapterDecl::new(
+            "config.toml",
+            "mcp_servers",
+            DocumentKind::Toml,
+            ConfigScope::User,
+            RestartBehavior::None,
+        )
+        .with_shape(crate::adapter::McpDestShape::IdentityList {
+            key: "name".to_owned(),
+        });
+        let id = McpServerId::new("owned-http").unwrap();
+        let server =
+            McpServerDef::remote(id, McpTransport::Http, "https://example.com/mcp").unwrap();
+        install_mcp_server(&path, &d, &server).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("# keep me"));
+        assert!(after.contains("name = \"fetch_server\""));
+        assert!(after.contains("name = \"owned-http\""));
+
+        let inspected = inspect_servers(&path, &d).unwrap();
+        assert!(inspected.contains_key(&McpServerId::new("fetch_server").unwrap()));
+        assert!(inspected.contains_key(&McpServerId::new("owned-http").unwrap()));
+
+        // Remove drops only the owned entry.
+        remove_mcp_server(&path, &d, &McpServerId::new("owned-http").unwrap()).unwrap();
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        assert!(final_text.contains("name = \"fetch_server\""));
+        assert!(!final_text.contains("owned-http"));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn yaml_inspects_but_refuses_writes() {
+        let dir = crate::test_util::temp_dir_unique("mcp-yaml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "GOOSE_PROVIDER: openai\nextensions:\n  developer-tools:\n    type: stdio\n    cmd: npx\n    args:\n      - server\n",
+        )
+        .unwrap();
+        let d = McpAdapterDecl::new(
+            "config.yaml",
+            "extensions",
+            DocumentKind::Yaml,
+            ConfigScope::User,
+            RestartBehavior::None,
+        );
+        // Inspection parses the YAML and the goose cmd/args spelling.
+        let inspected = inspect_servers(&path, &d).unwrap();
+        assert!(inspected.contains_key(&McpServerId::new("developer-tools").unwrap()));
+        let key = McpServerId::new("developer-tools").unwrap();
+        let def = &inspected[&key];
+        assert_eq!(def.command.as_deref(), Some("npx"));
+        // Writes refuse with the typed lossy error and leave bytes intact.
+        let before = std::fs::read(&path).unwrap();
+        let server = McpServerDef::stdio(
+            McpServerId::new("owned").unwrap(),
+            "node",
+            vec!["s.js".to_owned()],
+        )
+        .unwrap();
+        let err = install_mcp_server(&path, &d, &server).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::Config(superai_config::ConfigError::LossyWrite { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn jsonc_inspects_but_refuses_writes() {
+        let dir = crate::test_util::temp_dir_unique("mcp-jsonc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.json");
+        std::fs::write(
+            &path,
+            "{\n  // provider comment\n  \"mcp\": {\n    \"context7\": { \"command\": \"npx\", \"args\": [\"-y\", \"c7\"] }\n  }\n}\n",
+        )
+        .unwrap();
+        let d = McpAdapterDecl::new(
+            "opencode.json",
+            "mcp",
+            DocumentKind::Jsonc,
+            ConfigScope::User,
+            RestartBehavior::None,
+        );
+        let inspected = inspect_servers(&path, &d).unwrap();
+        assert!(inspected.contains_key(&McpServerId::new("context7").unwrap()));
+        let before = std::fs::read(&path).unwrap();
+        let server = McpServerDef::stdio(
+            McpServerId::new("owned").unwrap(),
+            "node",
+            vec!["s.js".to_owned()],
+        )
+        .unwrap();
+        let err = install_mcp_server(&path, &d, &server).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::Config(superai_config::ConfigError::LossyWrite { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn read_only_declared_surface_refuses_writes_with_reason() {
+        let dir = crate::test_util::temp_dir_unique("mcp-ro");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            b"{\"mcpServers\": {\"existing\": {\"command\": \"node\", \"args\": []}}}",
+        )
+        .unwrap();
+        let d = McpAdapterDecl::new(
+            "settings.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::None,
+        )
+        .with_read_only("harness-managed store; superai must not write (corpus: openhands.md)");
+        // Inspection still works.
+        assert!(
+            inspect_servers(&path, &d)
+                .unwrap()
+                .contains_key(&McpServerId::new("existing").unwrap())
+        );
+        let before = std::fs::read(&path).unwrap();
+        let server = McpServerDef::stdio(
+            McpServerId::new("owned").unwrap(),
+            "node",
+            vec!["s.js".to_owned()],
+        )
+        .unwrap();
+        let err = install_mcp_server(&path, &d, &server).unwrap_err();
+        match err {
+            CoreError::UnsupportedOperation { reason, .. } => {
+                assert!(reason.contains("harness-managed"), "{reason}")
+            }
+            other => panic!("expected UnsupportedOperation, got {other:?}"),
+        }
+        // Disable/remove of an existing entry refuse the same honest way.
+        assert!(matches!(
+            set_mcp_enabled(&path, &d, &McpServerId::new("existing").unwrap(), false),
+            Err(CoreError::UnsupportedOperation { .. })
+        ));
+        assert!(matches!(
+            remove_mcp_server(&path, &d, &McpServerId::new("existing").unwrap()),
+            Err(CoreError::UnsupportedOperation { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn owned_server_unknown_fields_survive_rewrites() {
+        let dir = crate::test_util::temp_dir_unique("mcp-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // Existing owned entry carrying harness-specific unmodelled keys
+        // (codex-style `cwd` / `bearer_token_env_var`).
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {"owned": {"command": "node", "args": ["old.js"], "cwd": "/x", "bearer_token_env_var": "TOK", "env": {"A": "1"}, "timeout": 3000, "trust": true}}}"#,
+        )
+        .unwrap();
+        let d = decl();
+        let id = McpServerId::new("owned").unwrap();
+        let mut server = McpServerDef::stdio(id, "node", vec!["new.js".to_owned()]).unwrap();
+        server.env.insert("B".to_owned(), "2".to_owned());
+        // timeout cleared in the new rendering.
+        install_mcp_server(&path, &d, &server).unwrap();
+
+        let val: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let entry = val
+            .get("mcpServers")
+            .and_then(|m| m.get("owned"))
+            .cloned()
+            .unwrap();
+        // Unknown/unmodelled fields survive.
+        assert_eq!(entry.get("cwd").and_then(Value::as_str), Some("/x"));
+        assert_eq!(
+            entry.get("bearer_token_env_var").and_then(Value::as_str),
+            Some("TOK")
+        );
+        assert_eq!(entry.get("trust").and_then(Value::as_bool), Some(true));
+        // Managed fields reflect the new rendering exactly.
+        assert_eq!(
+            entry.get("args").and_then(|a| a.as_array()).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            entry
+                .get("env")
+                .and_then(|e| e.get("B"))
+                .and_then(Value::as_str),
+            Some("2")
+        );
+        // A managed field the new rendering no longer emits is dropped.
+        assert!(entry.get("timeout").is_none());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn native_spellings_parse_for_inspection() {
+        // zed nested command object (zed-acp.md §1.2).
+        let zed = serde_json::json!({
+            "command": {"path": "uvx", "args": ["mcp-server-fetch"]}
+        });
+        let def = from_native_value("fetch", &zed).unwrap();
+        assert_eq!(def.command.as_deref(), Some("uvx"));
+        assert_eq!(def.args, vec!["mcp-server-fetch".to_owned()]);
+
+        // kilo argv array + environment key (kilo-code.md §5.1).
+        let kilo = serde_json::json!({
+            "type": "local",
+            "command": ["node", "/path/server.js"],
+            "environment": {"API_KEY": "sk-fake-x"},
+            "enabled": false
+        });
+        let def = from_native_value("kilo-srv", &kilo).unwrap();
+        assert_eq!(def.command.as_deref(), Some("node"));
+        assert_eq!(def.args, vec!["/path/server.js".to_owned()]);
+        assert_eq!(
+            def.env.get("API_KEY").map(String::as_str),
+            Some("sk-fake-x")
+        );
+        assert!(def.disabled, "enabled:false parses as disabled");
+
+        // antigravity serverUrl spelling (antigravity-cli.md §5).
+        let remote = serde_json::json!({"serverUrl": "https://example.com/mcp"});
+        let def = from_native_value("remote", &remote).unwrap();
+        assert_eq!(def.url.as_deref(), Some("https://example.com/mcp"));
     }
 }

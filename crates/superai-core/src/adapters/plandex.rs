@@ -671,6 +671,16 @@ impl Adapter for PlandexAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some("no MCP mechanism documented (plandex.md)")
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (plandex.md)")
+    }
 }
 
 #[cfg(test)]

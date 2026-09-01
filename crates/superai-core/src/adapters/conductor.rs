@@ -674,6 +674,18 @@ impl Adapter for ConductorAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "orchestrator: agents keep their native MCP config; conductor exposes an MCP server API but no own MCP config file (orchestrators.md)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("orchestrator: no own plugin mechanism documented (orchestrators.md)")
+    }
 }
 
 #[cfg(test)]

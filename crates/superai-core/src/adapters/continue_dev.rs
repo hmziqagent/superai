@@ -612,6 +612,25 @@ impl Adapter for ContinueDevAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-08/09: MCP destination (continue-dev.md 1.7: `mcpServers:` list of name-keyed entries)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "config.yaml",
+            "mcpServers",
+            DocumentKind::Yaml,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ).with_shape(crate::adapter::McpDestShape::IdentityList { key: "name".to_owned() })
+            .with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only; container is a name-keyed YAML list"))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "no plugin mechanism documented; IDE extensions are the product distribution, not plugins (continue-dev.md)",
+        )
+    }
 }
 
 #[cfg(test)]

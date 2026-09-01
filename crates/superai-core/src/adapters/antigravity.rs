@@ -507,6 +507,24 @@ impl Adapter for AntigravityAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-08/09: MCP destination (antigravity-cli.md: `mcp_config.json` profiles)
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "mcp_config.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ).with_read_only("research-blocked harness; remote entries use the serverUrl schema (antigravity-cli.md 5); inspect/diff only"))
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "plugin bundles documented (`plugin.json` under ~/.gemini/antigravity-cli/plugins/) but the harness is ResearchBlocked; revisit when research completes (antigravity-cli.md 5)",
+        )
+    }
 }
 
 #[cfg(test)]

@@ -533,6 +533,18 @@ impl Adapter for VibeKanbanAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "per-agent mcpServers are written into each agent own global config by VK itself (harness-managed); VK exposes an MCP server but has no VK-owned MCP dest (orchestrators.md)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some("no plugin mechanism documented (orchestrators.md)")
+    }
 }
 
 #[cfg(test)]

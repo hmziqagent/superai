@@ -654,6 +654,20 @@ impl Adapter for PiAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+
+    /// EXT-09: explicit MCP absence (corpus-grounded).
+    fn mcp_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "MCP is intentionally not built in; integrations come from extensions/packages (pi.md: intentionally does not include built-in MCP)",
+        )
+    }
+
+    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
+    fn plugin_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "extensions are TypeScript modules loaded via -e/--extension flags/npm/git; no file-staged plugin mechanism (pi.md)",
+        )
+    }
 }
 
 #[cfg(test)]
