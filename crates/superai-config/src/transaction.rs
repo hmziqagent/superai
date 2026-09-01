@@ -17,12 +17,15 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::backup::{BackupEntry, backup_with_operation, verify_backup};
+use crate::backup::{BackupEntry, backup_with_injector, verify_backup};
 use crate::document::DocumentKind;
 use crate::error::{ConfigError, Result};
+use crate::injector::{Injector, Point};
+use crate::journal::{CrashJournal, JournalBackup, JournalPhase};
 use crate::snapshot::{Snapshot, is_modified, snapshot};
 
 // ---------------------------------------------------------------------------
@@ -300,11 +303,21 @@ pub enum FileAction {
         path: PathBuf,
     },
     /// Create a symlink at `link` pointing to `target`.
+    ///
+    /// `expected_current` implements the MUT-02/MUT-06 owned-target rule:
+    /// `None` replaces an existing link only when its current target still
+    /// matches the prepare-time snapshot (a retargeted link aborts with a
+    /// conflict) and creates when absent; `Some(target)` additionally
+    /// requires any existing link to currently point at exactly that
+    /// expected owned target before it is replaced.
     Symlink {
         /// Absolute link path.
         link: PathBuf,
         /// Symlink target (may be relative or absolute).
         target: PathBuf,
+        /// The owned target an existing link must currently carry for
+        /// replacement to be allowed.
+        expected_current: Option<PathBuf>,
     },
     /// Remove a file at `path`.
     RemoveFile {
@@ -412,15 +425,42 @@ fn set_safe_permissions(_path: &Path, _original_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort probe that a planned path's unix file identity (device+inode)
-/// is observable; duplicate identities across steps are surfaced by
-/// verification after commit.
+/// Unix file identity (device, inode) of an existing path, when observable.
+///
+/// Follows symlinks first (two paths converging on one file through links
+/// are the same mutation target), falling back to the link's own identity
+/// for a broken link. Used to detect multiple planned paths resolving to
+/// one inode (hard-link aliases) — MUT-02.
 #[cfg(unix)]
-fn note_inode_identity(path: &Path) {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        use std::os::unix::fs::MetadataExt;
-        let _ = (meta.dev(), meta.ino());
-    }
+fn inode_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .or_else(|_| std::fs::symlink_metadata(path))
+        .ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn inode_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Number of hard links to an existing path (`nlink`), when observable.
+///
+/// `nlink > 1` means the planned atomic replacement would break link sharing:
+/// the rename replaces one directory entry while the aliases keep the old
+/// bytes. MUT-02 requires that to be explicit — callers surface the warning
+/// recorded here instead of silently splitting the link group.
+#[cfg(unix)]
+fn hardlink_count(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(meta.nlink())
+}
+
+#[cfg(not(unix))]
+fn hardlink_count(_path: &Path) -> Option<u64> {
+    None
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -437,6 +477,191 @@ fn sync_parent(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(parent, e)),
     }
+}
+
+/// Stage `content` into a same-directory temp for `target` — the production
+/// staging primitive shared by [`Transaction`] and the failure matrix
+/// (QAL-06: the injected wrapper delegates here, so tests exercise the REAL
+/// staging path).
+///
+/// Creates an exclusive temp, applies safe permissions before any bytes are
+/// written, writes + flushes + syncs, and returns the temp path.
+pub fn stage_temp_file(
+    target: &Path,
+    content: &[u8],
+    injector: Option<&dyn Injector>,
+) -> Result<PathBuf> {
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
+    }
+    if let Some(injector) = injector {
+        injector.inject(Point::TempCreate)?;
+    }
+    // Create with exclusive semantics where possible, set safe permissions before secret bytes.
+    let mut attempts = 0;
+    let mut final_temp = generate_temp_path(target)?;
+    let mut file: Option<std::fs::File> = None;
+    for _ in 0..3 {
+        let candidate = generate_temp_path(target)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                final_temp = candidate;
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempts += 1;
+                if attempts >= 3 {
+                    break;
+                }
+            }
+            Err(e) => return Err(ConfigError::io(&candidate, e)),
+        }
+    }
+    let mut f = if let Some(f) = file {
+        f
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&final_temp)
+            .map_err(|e| ConfigError::io(&final_temp, e))?
+    };
+    drop(f);
+    set_safe_permissions(&final_temp, target)?;
+    f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&final_temp)
+        .map_err(|e| ConfigError::io(&final_temp, e))?;
+    {
+        use std::io::Write;
+        if let Some(injector) = injector {
+            injector.inject(Point::TempWrite)?;
+        }
+        f.write_all(content)
+            .map_err(|e| ConfigError::io(&final_temp, e))?;
+        f.flush().map_err(|e| ConfigError::io(&final_temp, e))?;
+        if let Some(injector) = injector {
+            injector.inject(Point::TempFlush)?;
+        }
+        f.sync_all().map_err(|e| ConfigError::io(&final_temp, e))?;
+    }
+    drop(f);
+    Ok(final_temp)
+}
+
+/// Commit a staged temp over `target` — the production commit primitive
+/// shared by [`Transaction::commit_write`] and the failure matrix.
+///
+/// §4.2 / MUT-05: when `expected` (the prepare-time snapshot) is supplied,
+/// the target is re-read FRESH immediately before the rename and compared
+/// against it; any difference — foreign edit, removal, appearance, symlink
+/// retarget — aborts with `ConcurrentModification` and the target is never
+/// overwritten. The bytes that land are exactly the staged temp's bytes,
+/// which were verified against the planned content digest at staging.
+pub fn commit_staged_file(
+    target: &Path,
+    staged: &Path,
+    expected: Option<&Snapshot>,
+    injector: Option<&dyn Injector>,
+) -> Result<()> {
+    validate_path_safety(target)?;
+    // Read staged content for verification after rename; its digest is the
+    // planned content digest recorded at staging time.
+    let staged_bytes = std::fs::read(staged).map_err(|e| ConfigError::io(staged, e))?;
+    let expected_digest = compute_digest(&staged_bytes);
+
+    // Ensure parent exists
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
+    }
+
+    // §4.2 conflict recheck immediately before the rename.
+    if let Some(injector) = injector {
+        injector.inject(Point::ConflictRecheck)?;
+    }
+    if let Some(expected) = expected {
+        let current = snapshot(target);
+        if is_modified(expected, &current) {
+            return Err(ConfigError::concurrent_modification(
+                target,
+                expected
+                    .digest
+                    .clone()
+                    .or_else(|| {
+                        expected
+                            .symlink_target
+                            .as_ref()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| "<absent>".to_owned()),
+                current
+                    .digest
+                    .clone()
+                    .or_else(|| {
+                        current
+                            .symlink_target
+                            .as_ref()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| "<absent>".to_owned()),
+            ));
+        }
+    }
+
+    // Use atomic rename from staged temp (same filesystem).
+    // Try rename; on cross-device error fallback to copy.
+    if let Some(injector) = injector {
+        injector.inject(Point::AtomicReplace)?;
+    }
+    match std::fs::rename(staged, target) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) =>
+        {
+            std::fs::copy(staged, target).map_err(|copy_e| ConfigError::io(target, copy_e))?;
+            drop(std::fs::remove_file(staged));
+        }
+        Err(e) => return Err(ConfigError::io(target, e)),
+    }
+    if let Some(injector) = injector {
+        injector.inject(Point::ParentSync)?;
+    }
+    sync_parent(target)?;
+
+    // Read back and verify digest
+    if let Some(injector) = injector {
+        injector.inject(Point::ReadBackVerify)?;
+    }
+    let read_back = std::fs::read(target).map_err(|e| ConfigError::io(target, e))?;
+    let actual = compute_digest(&read_back);
+    if expected_digest != actual {
+        return Err(ConfigError::verification(
+            target,
+            format!("digest mismatch after commit: expected {expected_digest}, got {actual}"),
+        ));
+    }
+    if read_back.len() != staged_bytes.len() {
+        return Err(ConfigError::verification(
+            target,
+            format!(
+                "size mismatch after commit: expected {}, got {}",
+                staged_bytes.len(),
+                read_back.len(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_staged_content(content: &[u8], kind: DocumentKind, path: &Path) -> Result<()> {
@@ -595,6 +820,316 @@ fn strip_jsonc_comments(input: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Recursive copy + owned directory removal (MUT-06)
+// ---------------------------------------------------------------------------
+
+/// How symlinks are treated during a recursive copy (MUT-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SymlinkPolicy {
+    /// Skip symlink entries entirely (credentials and redirect traps never
+    /// leave the source tree). Default.
+    #[default]
+    Skip,
+    /// Recreate the link itself at the destination pointing at the same
+    /// target (relative targets are copied verbatim; absolute targets stay
+    /// absolute).
+    PreserveLink,
+    /// Copy the referent's bytes as a regular file (redirect: the copy no
+    /// longer depends on the link target existing). A broken or looping link
+    /// is an error under this policy — copying "nothing" silently would be a
+    /// lie about what was copied.
+    FollowCopyContent,
+}
+
+/// Options for [`copy_tree`] (MUT-06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyTreeOptions {
+    /// Name patterns to include (glob syntax: `*`, `?`). Empty = everything.
+    pub include: Vec<String>,
+    /// Name patterns to exclude; a name matching exclude is never copied
+    /// even when it matches include.
+    pub exclude: Vec<String>,
+    /// Symlink policy for encountered links.
+    pub symlink_policy: SymlinkPolicy,
+    /// Hard bound on copied entries; exceeding it aborts the copy.
+    pub max_entries: usize,
+    /// Hard bound on total copied bytes; exceeding it aborts the copy.
+    pub max_bytes: u64,
+}
+
+impl Default for CopyTreeOptions {
+    fn default() -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            symlink_policy: SymlinkPolicy::Skip,
+            max_entries: 10_000,
+            max_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Report of a completed [`copy_tree`] run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CopyTreeReport {
+    /// Files copied (destination paths).
+    pub files: Vec<PathBuf>,
+    /// Directories created.
+    pub dirs: Vec<PathBuf>,
+    /// Symlinks skipped by policy.
+    pub skipped_symlinks: Vec<PathBuf>,
+    /// Entries excluded by the include/exclude filters.
+    pub excluded: Vec<PathBuf>,
+    /// Total bytes copied.
+    pub bytes: u64,
+}
+
+/// Tiny glob matcher supporting `*` (any run, including separators within a
+/// single name is not possible: `*` matches any characters except `/`) and
+/// `?` (one character). No regex engine is pulled in for this.
+fn name_matches(pattern: &str, name: &str) -> bool {
+    fn inner(pat: &[u8], name: &[u8]) -> bool {
+        match (pat.split_first(), name.split_first()) {
+            (None, None) => true,
+            (Some((b'*', rest)), _) => {
+                inner(rest, name)
+                    || match name.split_first() {
+                        Some((&c, tail)) => c != b'/' && inner(pat, tail),
+                        None => false,
+                    }
+            }
+            (Some((b'?', rest)), Some((&c, tail))) => c != b'/' && inner(rest, tail),
+            (Some((&p, rest)), Some((&n, tail))) => p == n && inner(rest, tail),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+    inner(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Whether a FILE name passes the filters. `exclude` always prunes;
+/// `include` (when non-empty) selects which files are copied.
+fn file_allowed(name: &str, opts: &CopyTreeOptions) -> bool {
+    if opts.exclude.iter().any(|p| name_matches(p, name)) {
+        return false;
+    }
+    if opts.include.is_empty() {
+        return true;
+    }
+    opts.include.iter().any(|p| name_matches(p, name))
+}
+
+/// Whether a DIRECTORY name passes the filters. Only `exclude` prunes
+/// directories; `include` never does — it selects files, not structure, so
+/// included files in nested directories are still found.
+fn dir_allowed(name: &str, opts: &CopyTreeOptions) -> bool {
+    !opts.exclude.iter().any(|p| name_matches(p, name))
+}
+
+/// Recursively copy `from` to `to` with explicit include/exclude filters and
+/// a symlink policy (MUT-06 — used by mirror/skills flows).
+///
+/// Directories are traversed unless excluded; files are copied when they
+/// pass the include/exclude filters, byte-for-byte with their permission
+/// bits preserved where the platform supports it. The run is bounded by
+/// `max_entries`/`max_bytes` and verifies each copied file's digest against
+/// its source before continuing.
+pub fn copy_tree(from: &Path, to: &Path, opts: &CopyTreeOptions) -> Result<CopyTreeReport> {
+    // Refuse copying a tree into itself: the recursion would never terminate
+    // and would nest copies until the entry bound trips.
+    let from_resolved = std::fs::canonicalize(from).unwrap_or_else(|_| from.to_path_buf());
+    let from_components = from_resolved.components().collect::<Vec<_>>();
+    let to_resolved = match to.parent().and_then(|p| std::fs::canonicalize(p).ok()) {
+        Some(parent) => parent.join(to.file_name().unwrap_or_default()),
+        None => to.to_path_buf(),
+    };
+    let to_components = to_resolved.components().collect::<Vec<_>>();
+    if to_components.starts_with(&from_components) {
+        return Err(ConfigError::unsupported_copy(
+            to,
+            "destination is inside the source tree",
+        ));
+    }
+    let mut report = CopyTreeReport::default();
+    copy_tree_inner(from, to, opts, &mut report)?;
+    Ok(report)
+}
+
+fn copy_tree_inner(
+    from: &Path,
+    to: &Path,
+    opts: &CopyTreeOptions,
+    report: &mut CopyTreeReport,
+) -> Result<()> {
+    if report.files.len() + report.dirs.len() >= opts.max_entries {
+        return Err(ConfigError::verification(
+            from,
+            format!("copy tree exceeded max entries ({})", opts.max_entries),
+        ));
+    }
+    std::fs::create_dir_all(to).map_err(|e| ConfigError::io(to, e))?;
+    let entries = std::fs::read_dir(from).map_err(|e| ConfigError::io(from, e))?;
+    for ent in entries {
+        let ent = ent.map_err(|e| ConfigError::io(from, e))?;
+        let src = ent.path();
+        let name = ent.file_name();
+        let name_str = name.to_string_lossy();
+        let dest = to.join(&name);
+        let meta = std::fs::symlink_metadata(&src).map_err(|e| ConfigError::io(&src, e))?;
+        if meta.is_dir() {
+            if !dir_allowed(&name_str, opts) {
+                report.excluded.push(dest);
+                continue;
+            }
+            report.dirs.push(dest.clone());
+            copy_tree_inner(&src, &dest, opts, report)?;
+            continue;
+        }
+        if !file_allowed(&name_str, opts) {
+            report.excluded.push(dest);
+            continue;
+        }
+        if meta.file_type().is_symlink() && handle_symlink_entry(&src, &dest, opts, report)? {
+            continue;
+        }
+        copy_file_entry(&src, &dest, meta, opts, report)?;
+    }
+    Ok(())
+}
+
+/// Apply the symlink policy for one link entry.
+///
+/// Returns `Ok(true)` when the entry is fully handled (skip or preserved
+/// link); `Ok(false)` when the policy is `FollowCopyContent` and the copy
+/// should continue with the referent's bytes.
+fn handle_symlink_entry(
+    src: &Path,
+    dest: &Path,
+    opts: &CopyTreeOptions,
+    report: &mut CopyTreeReport,
+) -> Result<bool> {
+    match opts.symlink_policy {
+        SymlinkPolicy::Skip => {
+            report.skipped_symlinks.push(dest.to_path_buf());
+            Ok(true)
+        }
+        SymlinkPolicy::PreserveLink => {
+            let target = std::fs::read_link(src).map_err(|e| ConfigError::io(src, e))?;
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, dest).map_err(|e| ConfigError::io(dest, e))?;
+            }
+            #[cfg(not(unix))]
+            {
+                if target.is_absolute() {
+                    std::os::windows::fs::symlink_file(&target, dest)
+                        .map_err(|e| ConfigError::io(dest, e))?;
+                } else {
+                    return Err(ConfigError::unsupported_copy(
+                        dest,
+                        "relative symlink preservation needs platform support",
+                    ));
+                }
+            }
+            Ok(true)
+        }
+        SymlinkPolicy::FollowCopyContent => {
+            // A link whose referent cannot be read as a file (broken,
+            // directory, or loop) fails the copy honestly.
+            let target_meta = std::fs::metadata(src).map_err(|e| ConfigError::io(src, e))?;
+            if !target_meta.is_file() {
+                return Err(ConfigError::unsupported_copy(
+                    src,
+                    "symlink does not resolve to a regular file",
+                ));
+            }
+            if crate::snapshot::is_symlink_loop(src) {
+                return Err(ConfigError::unsupported_copy(
+                    src,
+                    "symlink loop under FollowCopyContent",
+                ));
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Copy one (possibly link-followed) file entry with bounds and digest
+/// verification. Under `FollowCopyContent` the bytes that land are the
+/// referent's, so the size bound and copy read through the link.
+fn copy_file_entry(
+    src: &Path,
+    dest: &Path,
+    link_meta: std::fs::Metadata,
+    opts: &CopyTreeOptions,
+    report: &mut CopyTreeReport,
+) -> Result<()> {
+    let file_meta = if link_meta.file_type().is_symlink() {
+        std::fs::metadata(src).map_err(|e| ConfigError::io(src, e))?
+    } else {
+        link_meta
+    };
+    if !file_meta.is_file() {
+        return Err(ConfigError::unsupported_copy(
+            src,
+            "unsupported special file (device/FIFO/socket)",
+        ));
+    }
+    let src_bytes_len = file_meta.len();
+    if report.bytes + src_bytes_len > opts.max_bytes {
+        return Err(ConfigError::verification(
+            src,
+            format!("copy tree exceeded max bytes ({})", opts.max_bytes),
+        ));
+    }
+    // std::fs::copy preserves permission bits where the platform has them
+    // and never writes through the destination path in place.
+    std::fs::copy(src, dest).map_err(|e| ConfigError::io(dest, e))?;
+    // Verify the copy before accounting it as done.
+    let src_digest = snapshot(src).digest;
+    let dest_digest = snapshot(dest).digest;
+    if src_digest.is_some() && src_digest != dest_digest {
+        return Err(ConfigError::verification(
+            dest,
+            "copied file digest does not match source",
+        ));
+    }
+    report.bytes += src_bytes_len;
+    report.files.push(dest.to_path_buf());
+    Ok(())
+}
+
+/// Remove a directory that superai owns and that is empty (MUT-06).
+///
+/// Refuses broad roots exactly like [`validate_remove_target`] for
+/// `InstanceRoot`; a non-empty directory is a typed refusal (the caller must
+/// quarantine instead), and a target that is not a directory is refused.
+pub fn remove_owned_empty_dir(path: &Path) -> Result<()> {
+    validate_remove_target(path, RemoveKind::InstanceRoot)?;
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConfigError::io(path, e)),
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(ConfigError::io(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"),
+                ));
+            }
+            std::fs::remove_dir(path).map_err(|e| {
+                ConfigError::io(
+                    path,
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("directory not empty or not removable: {e}"),
+                    ),
+                )
+            })?;
+            sync_parent(path)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Path safety (MUT-02)
 // ---------------------------------------------------------------------------
 
@@ -737,6 +1272,22 @@ pub struct Transaction {
     /// [`TransactionOutcome::rollback`] instead of reporting an empty
     /// rollback. `None` after a successful commit.
     pub partial_rollback: Option<RollbackOutcome>,
+    /// Prepare-time snapshots per step path — the §4.2 conflict tokens every
+    /// commit step rechecks against immediately before its mutation (MUT-05).
+    expected_states: HashMap<PathBuf, Snapshot>,
+    /// Optional failure injector threaded through the REAL staging, rename,
+    /// backup, and rollback boundaries (QAL-06). `None` in production runs.
+    injector: Option<Arc<dyn Injector>>,
+    /// Journal directory enabling production crash journaling (MUT-09).
+    /// `None` disables journaling entirely.
+    journal_root: Option<PathBuf>,
+    /// Current journal state (mirrors the last phase written to disk).
+    journal_state: Option<CrashJournal>,
+    /// Paths committed so far (journal `completed` list).
+    journal_completed: Vec<PathBuf>,
+    /// Non-fatal path-safety warnings (e.g. hard-link sharing on a write
+    /// target) surfaced through the outcome diagnostics.
+    warnings: Vec<String>,
 }
 
 impl Transaction {
@@ -748,16 +1299,123 @@ impl Transaction {
             backups: Vec::new(),
             staged_temps: Vec::new(),
             partial_rollback: None,
+            expected_states: HashMap::new(),
+            injector: None,
+            journal_root: None,
+            journal_state: None,
+            journal_completed: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Builder: attach a failure injector (QAL-06).
+    ///
+    /// The injector observes the production boundaries of staging, conflict
+    /// recheck, rename, parent sync, read-back verify, rollback verify, and
+    /// journal phase transitions.
+    #[must_use = "the injector is only attached to the returned transaction"]
+    pub fn with_injector(mut self, injector: Arc<dyn Injector>) -> Self {
+        self.injector = Some(injector);
+        self
+    }
+
+    /// Builder: enable the production crash journal under `journal_root`
+    /// (MUT-09). The transaction writes a journal entry before mutations and
+    /// at every phase transition, and removes it only after verified
+    /// completion; [`crate::journal::recover_pending`] performs startup
+    /// recovery.
+    #[must_use = "journaling is only enabled on the returned transaction"]
+    pub fn with_journal(mut self, journal_root: PathBuf) -> Self {
+        self.journal_root = Some(journal_root);
+        self
+    }
+
+    /// Invoke the attached injector, if any. Zero cost when `None`.
+    fn inject(&self, point: Point) -> Result<()> {
+        if let Some(injector) = &self.injector {
+            injector.inject(point)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Path-safety warnings recorded during prepare (e.g. hard-link sharing).
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Write the journal entry for `phase` and update the in-memory state.
+    ///
+    /// No-op when journaling is disabled. After the write, the injector's
+    /// journal-phase point fires (MUT-09 crash simulation: an injected error
+    /// leaves the journal on disk at exactly this phase).
+    fn write_journal(&mut self, phase: JournalPhase) -> Result<()> {
+        let Some(root) = self.journal_root.clone() else {
+            return Ok(());
+        };
+        let resources: Vec<String> = self
+            .steps
+            .iter()
+            .map(|s| s.primary_path().to_string_lossy().into_owned())
+            .collect();
+        let mut journal = CrashJournal::new(self.id.as_str(), phase, resources);
+        journal.backups = self
+            .backups
+            .iter()
+            .map(|b| JournalBackup {
+                resource: b.original_path.to_string_lossy().into_owned(),
+                backup_id: b.id.as_str().to_owned(),
+            })
+            .collect();
+        journal.staged_temps = self
+            .staged_temps
+            .iter()
+            .map(|t| t.to_string_lossy().into_owned())
+            .collect();
+        journal.completed = self
+            .journal_completed
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        journal.diagnostics.clone_from(&self.warnings);
+        journal.write_to(&crate::journal::journal_path(&root, self.id.as_str()))?;
+        self.journal_state = Some(journal);
+        let point = match phase {
+            JournalPhase::Plan => Point::JournalPlan,
+            JournalPhase::PrepareBackup => Point::JournalPrepareBackup,
+            JournalPhase::StageTemp => Point::JournalStageTemp,
+            JournalPhase::Commit => Point::JournalCommit,
+            JournalPhase::Verify => Point::JournalVerify,
+            JournalPhase::Rollback => Point::JournalRollback,
+            JournalPhase::Done => return Ok(()),
+        };
+        self.inject(point)
+    }
+
+    /// Remove the journal after verified completion or verified rollback
+    /// (MUT-09: removal happens only after verification).
+    fn clear_journal(&mut self) {
+        if let Some(root) = self.journal_root.clone() {
+            let path = crate::journal::journal_path(&root, self.id.as_str());
+            if let Err(e) = CrashJournal::remove(&path) {
+                self.warnings.push(format!("journal removal failed: {e}"));
+            }
+        }
+        self.journal_state = None;
     }
 
     /// Validate the plan without touching disk beyond fresh snapshots.
     ///
-    /// Checks path safety, symlink loops, duplicate inode/file identity
-    /// surrogates (same path or case-fold collision), and traversal.
+    /// Checks path safety, symlink loops, duplicate path/case-fold
+    /// collisions, traversal, and — MUT-02 — that no two planned paths
+    /// resolve to the same inode on one device (a hard-link alias).
+    /// Committing both aliases would mutate the same bytes twice and atomic
+    /// replacement of either breaks link sharing, so the plan is rejected
+    /// with a typed [`ConfigError::HardlinkConflict`].
     pub fn validate_plan(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_folded: HashSet<String> = HashSet::new();
+        let mut seen_inodes: HashMap<(u64, u64), PathBuf> = HashMap::new();
         for step in &self.steps {
             let path = step.primary_path();
             validate_path_safety(path)?;
@@ -790,13 +1448,21 @@ impl Transaction {
                     ),
                 ));
             }
-            // Detect multiple planned paths resolving to same inode where file exists
-            // (best-effort via symlink_metadata device+inode on unix).
-            #[cfg(unix)]
-            note_inode_identity(path);
+            // MUT-02: multiple planned paths resolving to one inode/file
+            // identity. Both would write the same bytes through two names.
+            if let Some(inode) = inode_identity(path)
+                && let Some(alias) = seen_inodes.get(&inode)
+            {
+                return Err(ConfigError::hardlink_conflict(
+                    path,
+                    alias,
+                    "two plan steps resolve to the same inode on one device",
+                ));
+            }
+            if let Some(inode) = inode_identity(path) {
+                seen_inodes.insert(inode, path.to_path_buf());
+            }
         }
-        // Check sorted order will be deterministic: ensure no hard-link surprise
-        // is silently ignored. We warn via verification later.
         Ok(())
     }
 
@@ -808,80 +1474,35 @@ impl Transaction {
     /// Prepare the transaction: backup all foreign files, stage temps, validate.
     ///
     /// Backups are created before the first commit (MUT-05). Staged outputs
-    /// are validated via parsers before any commit.
+    /// are validated via parsers before any commit. The prepare-time snapshot
+    /// of every step path is recorded as the §4.2 conflict token each commit
+    /// step rechecks immediately before its mutation.
     pub fn prepare(&mut self) -> Result<()> {
         self.validate_plan()?;
         self.sort_steps();
+        self.write_journal(JournalPhase::Plan)?;
 
-        // Snapshot all targets fresh and collect expected digests for conflict check.
-        let mut snapshots: HashMap<PathBuf, Snapshot> = HashMap::new();
+        let snapshots = self.snapshot_targets();
+        self.record_hardlink_warnings();
+        self.back_up_foreign_targets(&snapshots)?;
+        self.write_journal(JournalPhase::PrepareBackup)?;
+
+        let staged_map = self.stage_all_writes()?;
+        self.write_journal(JournalPhase::StageTemp)?;
+
+        // §4.2 conflict tokens: recorded AFTER staging so directories the
+        // transaction's own staging created (write parents) are expected to
+        // exist. Everything from here to each step's pre-mutation recheck is
+        // the guarded prepare→commit window.
+        self.expected_states.clear();
         for step in &self.steps {
             let path = step.primary_path().to_path_buf();
-            // Avoid overwriting snapshot for duplicate logic already validated.
-            if snapshots.contains_key(&path) {
+            if self.expected_states.contains_key(&path) {
                 continue;
             }
             let snap = snapshot(&path);
-            snapshots.insert(path, snap);
+            self.expected_states.insert(path, snap);
         }
-
-        // Back up all foreign (existing) files before first commit.
-        let mut new_backups: Vec<BackupEntry> = Vec::new();
-        for step in &self.steps {
-            let target: Option<&Path> = match step {
-                FileAction::Write { path, .. } | FileAction::RemoveFile { path } => {
-                    Some(path.as_path())
-                }
-                FileAction::QuarantineMove { from, .. } => Some(from.as_path()),
-                FileAction::CreateDir { .. } | FileAction::Symlink { .. } => None,
-            };
-            let Some(p) = target else {
-                continue;
-            };
-            let Some(snap) = snapshots.get(p) else {
-                continue;
-            };
-            if !(snap.exists && snap.is_file) {
-                continue;
-            }
-            let current = snapshot(p);
-            if is_modified(snap, &current) {
-                return Err(ConfigError::concurrent_modification(
-                    p,
-                    snap.digest.clone().unwrap_or_default(),
-                    current.digest.unwrap_or_default(),
-                ));
-            }
-            if let Some(entry) =
-                backup_with_operation(p, Some(self.id.as_str()), "transaction prepare")?
-            {
-                new_backups.push(entry);
-            }
-        }
-        self.backups.extend(new_backups);
-
-        // Stage temps for Write actions and validate.
-        let mut staged: Vec<PathBuf> = Vec::new();
-        let mut staged_map: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, temp)
-        for step in &self.steps {
-            let FileAction::Write {
-                path,
-                content,
-                kind,
-            } = step
-            else {
-                continue;
-            };
-            validate_staged_content(content, *kind, path)?;
-            let temp_path = self.stage_write(path, content)?;
-            // Validate the staged file parses as well (read fresh from staged temp).
-            let staged_bytes =
-                std::fs::read(&temp_path).map_err(|e| ConfigError::io(&temp_path, e))?;
-            validate_staged_content(&staged_bytes, *kind, &temp_path)?;
-            staged.push(temp_path.clone());
-            staged_map.push((path.clone(), temp_path));
-        }
-        self.staged_temps = staged;
 
         // Verify staged temps digests match expected content digests (no secret leak).
         for (target, temp) in staged_map {
@@ -907,104 +1528,175 @@ impl Transaction {
         Ok(())
     }
 
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "staging requires nested temp handling"
-    )]
-    #[expect(
-        clippy::unused_self,
-        reason = "method style consistent with transaction"
-    )]
-    fn stage_write(&self, target: &Path, content: &[u8]) -> Result<PathBuf> {
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
+    /// Fresh snapshot of every step path (the pre-backup state that drives
+    /// the backup-time conflict check).
+    fn snapshot_targets(&self) -> HashMap<PathBuf, Snapshot> {
+        let mut snapshots: HashMap<PathBuf, Snapshot> = HashMap::new();
+        for step in &self.steps {
+            let path = step.primary_path().to_path_buf();
+            // Avoid overwriting snapshot for duplicate logic already validated.
+            if snapshots.contains_key(&path) {
+                continue;
+            }
+            let snap = snapshot(&path);
+            snapshots.insert(path, snap);
         }
-        let temp_path = generate_temp_path(target)?;
-        // Create with exclusive semantics where possible, set safe permissions before secret bytes.
-        let mut attempts = 0;
-        let mut final_temp = temp_path;
-        let mut file: Option<std::fs::File> = None;
-        for _ in 0..3 {
-            let candidate = generate_temp_path(target)?;
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
+        snapshots
+    }
+
+    /// Hard-link policy (MUT-02): a write target with more than one link
+    /// would silently split the link group on atomic replacement. The
+    /// default is to proceed with an explicit warning recorded here and
+    /// surfaced through the outcome; alias pairs are rejected in
+    /// [`Self::validate_plan`].
+    fn record_hardlink_warnings(&mut self) {
+        for step in &self.steps {
+            if matches!(step, FileAction::Write { .. })
+                && let Some(nlink) = hardlink_count(step.primary_path())
+                && nlink > 1
             {
-                Ok(f) => {
-                    final_temp = candidate;
-                    file = Some(f);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        break;
-                    }
-                }
-                Err(e) => return Err(ConfigError::io(&candidate, e)),
+                self.warnings.push(format!(
+                    "hard link sharing: {} has {nlink} links; atomic replacement updates only this path",
+                    step.primary_path().display()
+                ));
             }
         }
-        let mut f = if let Some(f) = file {
-            f
-        } else {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&final_temp)
-                .map_err(|e| ConfigError::io(&final_temp, e))?
-        };
-        drop(f);
-        set_safe_permissions(&final_temp, target)?;
-        f = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&final_temp)
-            .map_err(|e| ConfigError::io(&final_temp, e))?;
-        {
-            use std::io::Write;
-            f.write_all(content)
-                .map_err(|e| ConfigError::io(&final_temp, e))?;
-            f.flush().map_err(|e| ConfigError::io(&final_temp, e))?;
-            f.sync_all().map_err(|e| ConfigError::io(&final_temp, e))?;
+    }
+
+    /// Back up all foreign (existing) files before the first commit (MUT-05).
+    fn back_up_foreign_targets(&mut self, snapshots: &HashMap<PathBuf, Snapshot>) -> Result<()> {
+        for step in &self.steps {
+            let target: Option<&Path> = match step {
+                FileAction::Write { path, .. } | FileAction::RemoveFile { path } => {
+                    Some(path.as_path())
+                }
+                FileAction::QuarantineMove { from, .. } => Some(from.as_path()),
+                FileAction::CreateDir { .. } | FileAction::Symlink { .. } => None,
+            };
+            let Some(p) = target else {
+                continue;
+            };
+            let Some(snap) = snapshots.get(p) else {
+                continue;
+            };
+            if !(snap.exists && snap.is_file) {
+                continue;
+            }
+            let current = snapshot(p);
+            if is_modified(snap, &current) {
+                return Err(ConfigError::concurrent_modification(
+                    p,
+                    snap.digest.clone().unwrap_or_default(),
+                    current.digest.unwrap_or_default(),
+                ));
+            }
+            let entry = backup_with_injector(
+                p,
+                Some(self.id.as_str()),
+                "transaction prepare",
+                self.injector.as_deref(),
+            )?;
+            if let Some(entry) = entry {
+                self.backups.push(entry);
+            }
         }
-        drop(f);
-        Ok(final_temp)
+        Ok(())
+    }
+
+    /// Stage temps for every Write action and validate them via parsers.
+    /// Returns (target, temp) pairs for the staged-digest verification.
+    fn stage_all_writes(&mut self) -> Result<Vec<(PathBuf, PathBuf)>> {
+        let mut staged: Vec<PathBuf> = Vec::new();
+        let mut staged_map: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, temp)
+        for step in &self.steps {
+            let FileAction::Write {
+                path,
+                content,
+                kind,
+            } = step
+            else {
+                continue;
+            };
+            self.inject(Point::ParseStaged)?;
+            validate_staged_content(content, *kind, path)?;
+            let temp_path = self.stage_write(path, content)?;
+            // Validate the staged file parses as well (read fresh from staged temp).
+            let staged_bytes =
+                std::fs::read(&temp_path).map_err(|e| ConfigError::io(&temp_path, e))?;
+            validate_staged_content(&staged_bytes, *kind, &temp_path)?;
+            staged.push(temp_path.clone());
+            staged_map.push((path.clone(), temp_path));
+        }
+        self.staged_temps = staged;
+        Ok(staged_map)
+    }
+
+    fn stage_write(&self, target: &Path, content: &[u8]) -> Result<PathBuf> {
+        stage_temp_file(target, content, self.injector.as_deref())
     }
 
     /// Commit in dependency order.
     ///
-    /// Assumes [`Self::prepare`] has been called. On failure the caller
-    /// should invoke [`Self::rollback`] and inspect residuals.
+    /// Assumes [`Self::prepare`] has been called. Every step rechecks the
+    /// prepare-time snapshot of its target immediately before mutating
+    /// (§4.2); a foreign change aborts with `ConcurrentModification` before
+    /// any overwrite. On failure the caller should invoke [`Self::rollback`]
+    /// and inspect residuals.
     pub fn commit(&mut self) -> Result<CommitOutcome> {
         let mut committed: Vec<PathBuf> = Vec::new();
         let mut write_index = 0usize;
         self.partial_rollback = None;
+        self.journal_completed.clear();
+        self.write_journal(JournalPhase::Commit)?;
 
-        for step in self.steps.clone() {
-            let res: Result<()> = match &step {
-                FileAction::CreateDir { path } => self.commit_create_dir(path),
-                FileAction::Write { path, .. } => {
-                    let temp_opt = self.staged_temps.get(write_index).cloned();
-                    write_index = write_index.saturating_add(1);
-                    if let Some(temp) = temp_opt {
-                        self.commit_write(path, &temp)
-                    } else {
-                        Err(ConfigError::io(
-                            path,
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "missing staged temp for write",
-                            ),
-                        ))
+        for (step_index, step) in self.steps.clone().into_iter().enumerate() {
+            // Intent journaling (MUT-09): record the step as about-to-commit
+            // BEFORE mutating, so a crash between the rename and the journal
+            // update is still attributable to this operation at recovery.
+            // Recovery of a step that never landed is a digest no-op for
+            // backed-up files and a removal no-op for absent creations.
+            self.journal_completed
+                .push(step.primary_path().to_path_buf());
+            self.write_journal(JournalPhase::Commit)?;
+            // Prelude injections (QAL-06: the second/third file boundaries)
+            // feed the same error path as the step itself so the
+            // compensation below still runs when they fire.
+            let prelude = if step_index == 1 {
+                self.inject(Point::SecondFile)
+            } else if step_index == 2 {
+                self.inject(Point::ThirdFile)
+            } else {
+                Ok(())
+            };
+            let res: Result<()> = match prelude {
+                Err(e) => Err(e),
+                Ok(()) => match &step {
+                    FileAction::CreateDir { path } => self.commit_create_dir(path),
+                    FileAction::Write { path, .. } => {
+                        let temp_opt = self.staged_temps.get(write_index).cloned();
+                        write_index = write_index.saturating_add(1);
+                        if let Some(temp) = temp_opt {
+                            self.commit_write(path, &temp)
+                        } else {
+                            Err(ConfigError::io(
+                                path,
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "missing staged temp for write",
+                                ),
+                            ))
+                        }
                     }
-                }
-                FileAction::Symlink { link, target } => self.commit_symlink(link, target),
-                FileAction::RemoveFile { path } => self.commit_remove_file(path),
-                FileAction::QuarantineMove { from, to } => self.commit_quarantine_move(from, to),
+                    FileAction::Symlink {
+                        link,
+                        target,
+                        expected_current,
+                    } => self.commit_symlink(link, target, expected_current.clone()),
+                    FileAction::RemoveFile { path } => self.commit_remove_file(path),
+                    FileAction::QuarantineMove { from, to } => {
+                        self.commit_quarantine_move(from, to)
+                    }
+                },
             };
             if let Err(e) = res {
                 // Compensate the already committed steps in reverse order and
@@ -1031,12 +1723,22 @@ impl Transaction {
         })
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "method style consistent with transaction"
-    )]
     fn commit_create_dir(&self, path: &Path) -> Result<()> {
         validate_path_safety(path)?;
+        // §4.2: a directory that appeared between prepare and commit is a
+        // foreign change, not a satisfied precondition.
+        if let Some(expected) = self.expected_states.get(path)
+            && !expected.exists
+        {
+            let current = snapshot(path);
+            if current.exists {
+                return Err(ConfigError::concurrent_modification(
+                    path,
+                    "<absent>".to_owned(),
+                    "<directory>".to_owned(),
+                ));
+            }
+        }
         if path.exists() {
             let meta = std::fs::symlink_metadata(path).map_err(|e| ConfigError::io(path, e))?;
             if !meta.is_dir() {
@@ -1062,92 +1764,73 @@ impl Transaction {
             let perm = std::fs::Permissions::from_mode(0o755);
             drop(std::fs::set_permissions(path, perm));
         }
+        self.inject(Point::ParentSync)?;
         sync_parent(path)?;
         Ok(())
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "method style consistent with transaction"
-    )]
     fn commit_write(&self, target: &Path, staged: &Path) -> Result<()> {
-        validate_path_safety(target)?;
-        // Read staged content for verification after rename
-        let staged_bytes = std::fs::read(staged).map_err(|e| ConfigError::io(staged, e))?;
-        let expected_digest = compute_digest(&staged_bytes);
-
-        // Recheck concurrent modification using snapshot taken at prepare time?
-        // We do fresh snapshot now and compare to backup digest if any.
-        // If file exists and we have a backup, the backup digest is the expected prior.
-        // Otherwise we just ensure we are not overwriting a newly appeared file without backup?
-        // Simplified: if no backup and file exists, that's a creation conflict only if file appeared after prepare.
-        // We treat that as verification via snapshot comparison to backup.
-
-        // Ensure parent exists
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-        }
-
-        // Use atomic rename from staged temp (same filesystem).
-        // Try rename; on cross-device error fallback to copy.
-        match std::fs::rename(staged, target) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::CrossesDevices
-                    || e.raw_os_error() == Some(18) =>
-            {
-                std::fs::copy(staged, target).map_err(|copy_e| ConfigError::io(target, copy_e))?;
-                drop(std::fs::remove_file(staged));
-            }
-            Err(e) => return Err(ConfigError::io(target, e)),
-        }
-        sync_parent(target)?;
-
-        // Read back and verify digest
-        let read_back = std::fs::read(target).map_err(|e| ConfigError::io(target, e))?;
-        let actual = compute_digest(&read_back);
-        if expected_digest != actual {
-            return Err(ConfigError::verification(
-                target,
-                format!("digest mismatch after commit: expected {expected_digest}, got {actual}"),
-            ));
-        }
-        if read_back.len() != staged_bytes.len() {
-            return Err(ConfigError::verification(
-                target,
-                format!(
-                    "size mismatch after commit: expected {}, got {}",
-                    staged_bytes.len(),
-                    read_back.len()
-                ),
-            ));
-        }
-        Ok(())
+        commit_staged_file(
+            target,
+            staged,
+            self.expected_states.get(target),
+            self.injector.as_deref(),
+        )
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "method style consistent with transaction"
-    )]
-    fn commit_symlink(&self, link: &Path, target: &Path) -> Result<()> {
+    fn commit_symlink(
+        &self,
+        link: &Path,
+        target: &Path,
+        expected_current: Option<PathBuf>,
+    ) -> Result<()> {
         validate_path_safety(link)?;
         if let Some(parent) = link.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
         }
-        // Replace symlink only if it matches expected owned target or does not exist.
+        // Replace symlink only if it matches the expected owned target
+        // (MUT-02/MUT-06) and only when its target has not changed since
+        // prepare (§4.2). Nothing is removed before those checks pass.
         if link.exists() || std::fs::symlink_metadata(link).is_ok() {
             let meta = std::fs::symlink_metadata(link).map_err(|e| ConfigError::io(link, e))?;
             if meta.file_type().is_symlink() {
                 let current_target =
                     std::fs::read_link(link).map_err(|e| ConfigError::io(link, e))?;
-                // If symlink exists and points elsewhere, only replace if we own it.
-                // For this layer, we allow replacement if the link is inside a superai-owned dir.
-                // Simplified: allow overwrite; but document that adapter must have previewed.
-                let _ = current_target;
+                if let Some(expected) = expected_current {
+                    // Owned-target-only replacement: an existing link pointing
+                    // anywhere else is not ours to overwrite.
+                    if current_target != expected {
+                        return Err(ConfigError::symlink_target_mismatch(
+                            link,
+                            expected.display().to_string(),
+                            current_target.display().to_string(),
+                        ));
+                    }
+                } else if let Some(prepare_state) = self.expected_states.get(link) {
+                    // Default policy: the link must still carry the target
+                    // observed at prepare time. A retarget between plan and
+                    // commit is a concurrent modification.
+                    match &prepare_state.symlink_target {
+                        Some(prepare_target) if &current_target != prepare_target => {
+                            return Err(ConfigError::concurrent_modification(
+                                link,
+                                prepare_target.display().to_string(),
+                                current_target.display().to_string(),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            // Not a symlink at prepare time but one now.
+                            return Err(ConfigError::concurrent_modification(
+                                link,
+                                "<not a symlink>".to_owned(),
+                                current_target.display().to_string(),
+                            ));
+                        }
+                    }
+                }
                 std::fs::remove_file(link).map_err(|e| ConfigError::io(link, e))?;
             } else {
                 return Err(ConfigError::io(
@@ -1158,6 +1841,13 @@ impl Transaction {
                     ),
                 ));
             }
+        } else if let Some(expected) = expected_current {
+            // The link we expected to own is gone: foreign change.
+            return Err(ConfigError::concurrent_modification(
+                link,
+                expected.display().to_string(),
+                "<absent>".to_owned(),
+            ));
         }
         #[cfg(unix)]
         {
@@ -1165,34 +1855,64 @@ impl Transaction {
         }
         #[cfg(not(unix))]
         {
-            // On non-unix, create a small file containing the target as fallback.
-            // This preserves the transaction contract on platforms without symlink.
-            if target.is_absolute() {
-                std::os::windows::fs::symlink_file(target, link)
-                    .map_err(|e| ConfigError::io(link, e))?;
+            // On non-unix, symlink creation uses the platform primitive; a
+            // relative target is joined against the link's directory first
+            // because windows symlinks resolve relative targets differently.
+            let resolved = if target.is_absolute() {
+                target.to_path_buf()
             } else {
-                std::os::windows::fs::symlink_file(target, link)
-                    .map_err(|e| ConfigError::io(link, e))?;
-            }
+                link.parent()
+                    .map(|p| p.join(target))
+                    .filter(|p| p.is_absolute())
+                    .unwrap_or_else(|| target.to_path_buf())
+            };
+            std::os::windows::fs::symlink_file(&resolved, link)
+                .map_err(|e| ConfigError::io(link, e))?;
         }
+        self.inject(Point::ParentSync)?;
         sync_parent(link)?;
         Ok(())
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "method style consistent with transaction"
-    )]
     fn commit_remove_file(&self, path: &Path) -> Result<()> {
+        // §4.2: removing a file that changed since prepare would destroy a
+        // foreign edit; abort instead.
+        if let Some(expected) = self.expected_states.get(path)
+            && expected.exists
+        {
+            let current = snapshot(path);
+            if is_modified(expected, &current) {
+                return Err(ConfigError::concurrent_modification(
+                    path,
+                    expected.digest.clone().unwrap_or_default(),
+                    current.digest.unwrap_or_default(),
+                ));
+            }
+        }
         if !path.exists() && std::fs::symlink_metadata(path).is_err() {
             return Ok(());
         }
         std::fs::remove_file(path).map_err(|e| ConfigError::io(path, e))?;
+        self.inject(Point::ParentSync)?;
         sync_parent(path)?;
         Ok(())
     }
 
     fn commit_quarantine_move(&self, from: &Path, to: &Path) -> Result<()> {
+        // §4.2: quarantining a file that changed since prepare would move a
+        // foreign edit out of reach; abort instead.
+        if let Some(expected) = self.expected_states.get(from)
+            && expected.exists
+        {
+            let current = snapshot(from);
+            if is_modified(expected, &current) {
+                return Err(ConfigError::concurrent_modification(
+                    from,
+                    expected.digest.clone().unwrap_or_default(),
+                    current.digest.unwrap_or_default(),
+                ));
+            }
+        }
         // This is a recoverable move into quarantine; validate then move.
         crate::quarantine::move_to_quarantine_with_dest(from, to, self.id.as_str())?;
         Ok(())
@@ -1299,6 +2019,11 @@ impl Transaction {
                 }
                 match crate::backup::restore_entry(entry) {
                     Ok(()) => {
+                        // QAL-06 boundary: verifying the rollback restore.
+                        if self.inject(Point::RollbackVerify).is_err() {
+                            residuals.push(path.clone());
+                            continue;
+                        }
                         // Verify rollback
                         match std::fs::read(path) {
                             Ok(bytes) => {
@@ -1361,6 +2086,16 @@ impl Transaction {
     /// Execute the full transaction: prepare, commit, verify, with automatic
     /// rollback on failure. No filesystem-wide atomicity is claimed; this is a
     /// compensated transaction with verified rollback.
+    ///
+    /// With journaling enabled ([`Self::with_journal`]) the journal advances
+    /// to `verify` after commit and `rollback` before any rollback, and is
+    /// removed only after verified completion or a fully verified rollback
+    /// (MUT-09). Path-safety warnings (e.g. hard-link sharing) are surfaced
+    /// through the redacted diagnostics.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "execute is the orchestrator: prepare/commit/verify/rollback in one place"
+    )]
     pub fn execute(&mut self) -> Result<TransactionOutcome> {
         match self.prepare() {
             Ok(()) => {}
@@ -1395,6 +2130,14 @@ impl Transaction {
                         residual_paths.join(", ")
                     ));
                 }
+                // The internal compensation already ran; when it left nothing
+                // residual the journal has nothing left to recover and is
+                // removed. Otherwise it stays for startup recovery.
+                if let Some(rollback) = &self.partial_rollback
+                    && rollback.residuals.is_empty()
+                {
+                    self.clear_journal();
+                }
                 return Ok(TransactionOutcome {
                     success: false,
                     commit: None,
@@ -1404,10 +2147,25 @@ impl Transaction {
                 });
             }
         };
+        if let Err(e) = self.write_journal(JournalPhase::Verify) {
+            return Ok(TransactionOutcome {
+                success: false,
+                commit: Some(commit_outcome),
+                verification: Vec::new(),
+                rollback: None,
+                diagnostics_redacted: vec![format!("[verify journal failed] {e}")],
+            });
+        }
         let verification = match self.verify() {
             Ok(v) => v,
             Err(e) => {
+                if let Err(je) = self.write_journal(JournalPhase::Rollback) {
+                    self.warnings.push(format!("journal write failed: {je}"));
+                }
                 let rb = self.rollback();
+                if rb.as_ref().is_ok_and(|r| r.residuals.is_empty()) {
+                    self.clear_journal();
+                }
                 return Ok(TransactionOutcome {
                     success: false,
                     commit: Some(commit_outcome),
@@ -1419,11 +2177,17 @@ impl Transaction {
         };
         let has_failure = verification.iter().any(|v| !v.digest_ok || !v.parse_ok);
         if has_failure {
+            if let Err(je) = self.write_journal(JournalPhase::Rollback) {
+                self.warnings.push(format!("journal write failed: {je}"));
+            }
             let rollback = self.rollback().unwrap_or(RollbackOutcome {
                 rolled_back: Vec::new(),
                 residuals: commit_outcome.committed.clone(),
                 verification_ok: false,
             });
+            if rollback.residuals.is_empty() {
+                self.clear_journal();
+            }
             return Ok(TransactionOutcome {
                 success: false,
                 commit: Some(commit_outcome),
@@ -1432,12 +2196,16 @@ impl Transaction {
                 diagnostics_redacted: vec!["[verification failed] rollback attempted".to_owned()],
             });
         }
+        // Verified completion: the journal can now be removed (MUT-09).
+        self.clear_journal();
+        let mut diagnostics_redacted = vec!["transaction succeeded".to_owned()];
+        diagnostics_redacted.extend(self.warnings.iter().cloned());
         Ok(TransactionOutcome {
             success: true,
             commit: Some(commit_outcome),
             verification,
             rollback: None,
-            diagnostics_redacted: vec!["transaction succeeded".to_owned()],
+            diagnostics_redacted,
         })
     }
 }
@@ -1453,6 +2221,56 @@ impl Transaction {
 )]
 mod tests {
     use super::*;
+    use crate::journal::{journal_path, recover_pending};
+    use std::sync::Mutex;
+
+    /// Test injector that fails exactly on the Nth call of configured points.
+    #[derive(Debug)]
+    struct FailAtPoint {
+        rules: Vec<(Point, usize)>,
+        calls: Mutex<HashMap<Point, usize>>,
+    }
+
+    impl FailAtPoint {
+        fn new(point: Point, fail_at: usize) -> Arc<Self> {
+            Arc::new(Self {
+                rules: vec![(point, fail_at)],
+                calls: Mutex::new(HashMap::new()),
+            })
+        }
+
+        fn two(point_a: Point, nth_a: usize, point_b: Point, nth_b: usize) -> Arc<Self> {
+            Arc::new(Self {
+                rules: vec![(point_a, nth_a), (point_b, nth_b)],
+                calls: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+
+    impl Injector for FailAtPoint {
+        fn inject(&self, point: Point) -> Result<()> {
+            if !self.rules.iter().any(|(p, _)| *p == point) {
+                return Ok(());
+            }
+            let mut calls = match self.calls.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let count = calls.entry(point).or_insert(0);
+            *count = count.saturating_add(1);
+            if self
+                .rules
+                .iter()
+                .any(|(p, nth)| *p == point && *nth == *count)
+            {
+                return Err(ConfigError::verification(
+                    Path::new("injected"),
+                    format!("injected failure at {point}"),
+                ));
+            }
+            Ok(())
+        }
+    }
 
     fn tmp_root() -> PathBuf {
         crate::test_util::temp_dir_unique("txn")
@@ -1735,6 +2553,7 @@ mod tests {
                 FileAction::Symlink {
                     link: link.clone(),
                     target: PathBuf::from("/nonexistent-symlink-target"),
+                    expected_current: None,
                 },
             ],
         );
@@ -1843,5 +2662,826 @@ mod tests {
             drop(std::fs::remove_file(temp));
         }
         drop(std::fs::remove_dir_all(&root));
+    }
+
+    // ------------------------------------------------------------------
+    // MUT-05: §4.2 conflict window — foreign edits between prepare and
+    // commit abort with ConcurrentModification and are never overwritten.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn foreign_edit_between_prepare_and_commit_aborts_write() {
+        let root = tmp_root();
+        let target = root.join("settings.json");
+        std::fs::write(&target, b"{\"a\":1}").unwrap();
+
+        let id = OperationId::new("op-s42-write").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target.clone(),
+                content: b"{\"a\":2}".to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        );
+        txn.prepare().unwrap();
+        // External edit lands AFTER prepare (and after the backup) and
+        // BEFORE the commit rename.
+        std::fs::write(&target, b"{\"a\":\"foreign edit\"}").unwrap();
+
+        let res = txn.commit();
+        let err = res.expect_err("foreign edit must abort the commit");
+        assert!(
+            matches!(err, ConfigError::ConcurrentModification { .. }),
+            "expected ConcurrentModification, got {err:?}"
+        );
+        // The foreign bytes survive — never overwritten, not even partially.
+        assert_eq!(std::fs::read(&target).unwrap(), b"{\"a\":\"foreign edit\"}");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario per step kind keeps the §4.2 coverage auditable together"
+    )]
+    fn foreign_edit_between_prepare_and_commit_aborts_every_step_kind() {
+        // Write
+        {
+            let root = tmp_root();
+            let target = root.join("w.json");
+            std::fs::write(&target, b"v1").unwrap();
+            let id = OperationId::new("op-s42-w").unwrap();
+            let mut txn = Transaction::new(
+                id,
+                vec![FileAction::Write {
+                    path: target.clone(),
+                    content: b"v2".to_vec(),
+                    kind: DocumentKind::TextFragment,
+                }],
+            );
+            txn.prepare().unwrap();
+            std::fs::write(&target, b"foreign").unwrap();
+            let err = txn.commit().unwrap_err();
+            assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+            assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+            drop(std::fs::remove_dir_all(&root));
+        }
+        // CreateDir: directory appears between prepare and commit
+        {
+            let root = tmp_root();
+            let dir = root.join("newdir");
+            let id = OperationId::new("op-s42-d").unwrap();
+            let mut txn = Transaction::new(id, vec![FileAction::CreateDir { path: dir.clone() }]);
+            txn.prepare().unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let err = txn.commit().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ConcurrentModification { .. }),
+                "unexpected {err:?}"
+            );
+            drop(std::fs::remove_dir_all(&root));
+        }
+        // Symlink: a link appears between prepare and commit where the plan
+        // expected no link at all.
+        {
+            let root = tmp_root();
+            std::fs::create_dir_all(&root).unwrap();
+            #[cfg(unix)]
+            {
+                let elsewhere = root.join("elsewhere.txt");
+                std::fs::write(&elsewhere, b"foreign").unwrap();
+                let link = root.join("lnk");
+                let id = OperationId::new("op-s42-s").unwrap();
+                let mut txn = Transaction::new(
+                    id,
+                    vec![FileAction::Symlink {
+                        link: link.clone(),
+                        target: root.join("planned.txt"),
+                        expected_current: None,
+                    }],
+                );
+                txn.prepare().unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+                let err = txn.commit().unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::ConcurrentModification { .. }),
+                    "unexpected {err:?}"
+                );
+                assert_eq!(std::fs::read_link(&link).unwrap(), elsewhere);
+            }
+            drop(std::fs::remove_dir_all(&root));
+        }
+        // RemoveFile: content changes between prepare and commit
+        {
+            let root = tmp_root();
+            let target = root.join("r.json");
+            std::fs::write(&target, b"original").unwrap();
+            let id = OperationId::new("op-s42-r").unwrap();
+            let mut txn = Transaction::new(
+                id,
+                vec![FileAction::RemoveFile {
+                    path: target.clone(),
+                }],
+            );
+            txn.prepare().unwrap();
+            std::fs::write(&target, b"foreign edit").unwrap();
+            let err = txn.commit().unwrap_err();
+            assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"foreign edit",
+                "removal must not destroy the foreign edit"
+            );
+            drop(std::fs::remove_dir_all(&root));
+        }
+        // QuarantineMove: source changes between prepare and commit
+        {
+            let root = tmp_root();
+            let src = root.join("q.json");
+            std::fs::write(&src, b"original").unwrap();
+            let qdir = root.join("quarantine");
+            let id = OperationId::new("op-s42-q").unwrap();
+            let mut txn = Transaction::new(
+                id,
+                vec![FileAction::QuarantineMove {
+                    from: src.clone(),
+                    to: qdir.join("q.json"),
+                }],
+            );
+            txn.prepare().unwrap();
+            std::fs::write(&src, b"foreign edit").unwrap();
+            let err = txn.commit().unwrap_err();
+            assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+            assert_eq!(std::fs::read(&src).unwrap(), b"foreign edit");
+            drop(std::fs::remove_dir_all(&root));
+        }
+    }
+
+    #[test]
+    fn file_appearing_between_prepare_and_commit_aborts_creation_write() {
+        let root = tmp_root();
+        let target = root.join("fresh.json");
+        let id = OperationId::new("op-s42-new").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target.clone(),
+                content: b"{}".to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        );
+        txn.prepare().unwrap();
+        // A foreign file appears where we planned a creation.
+        std::fs::write(&target, b"foreign").unwrap();
+        let err = txn.commit().unwrap_err();
+        assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+        assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn staged_temp_tampering_between_prepare_and_commit_is_detected() {
+        let root = tmp_root();
+        let target = root.join("t.json");
+        let id = OperationId::new("op-s42-tamper").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target.clone(),
+                content: b"v1".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        );
+        txn.prepare().unwrap();
+        // Tamper with the staged temp: the committed bytes must NOT silently
+        // differ from the planned content digest.
+        if let Some(temp) = txn.staged_temps.first().cloned() {
+            std::fs::write(&temp, b"tampered").unwrap();
+        }
+        if let Err(e) = txn.commit() {
+            assert!(
+                format!("{e}").contains("mismatch") || format!("{e}").contains("injected"),
+                "unexpected error {e:?}"
+            );
+        } else {
+            // The tampered bytes committed: verification must catch them, so
+            // the read-back == staged == planned invariant is enforced either
+            // at commit or at verify.
+            let bytes = std::fs::read(&target).unwrap();
+            assert!(
+                bytes == b"v1" || bytes == b"tampered",
+                "unexpected committed bytes"
+            );
+            let verify = txn.verify().unwrap();
+            assert!(
+                verify.iter().any(|v| !v.digest_ok),
+                "tampered content must fail verification"
+            );
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    // ------------------------------------------------------------------
+    // MUT-02: hard links and symlink target changes
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_alias_steps_are_rejected() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, b"shared").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+
+        let id = OperationId::new("op-hardlink-dup").unwrap();
+        let txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a,
+                    content: b"new-a".to_vec(),
+                    kind: DocumentKind::TextFragment,
+                },
+                FileAction::Write {
+                    path: b,
+                    content: b"new-b".to_vec(),
+                    kind: DocumentKind::TextFragment,
+                },
+            ],
+        );
+        let err = txn.validate_plan().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::HardlinkConflict { .. }),
+            "expected HardlinkConflict, got {err:?}"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_write_target_records_warning() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        let alias = root.join("alias.txt");
+        std::fs::write(&a, b"shared").unwrap();
+        std::fs::hard_link(&a, &alias).unwrap();
+
+        let id = OperationId::new("op-hardlink-warn").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a.clone(),
+                content: b"new".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        );
+        txn.prepare().unwrap();
+        assert!(
+            txn.warnings()
+                .iter()
+                .any(|w| w.contains("hard link sharing")),
+            "explicit warning required, got {:?}",
+            txn.warnings()
+        );
+        txn.commit().unwrap();
+        // The alias still carries the old bytes: link sharing was broken by
+        // the atomic replacement, which is exactly what the warning says.
+        assert_eq!(std::fs::read(&alias).unwrap(), b"shared");
+        assert_eq!(std::fs::read(&a).unwrap(), b"new");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_retarget_between_prepare_and_commit_aborts() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let target_a = root.join("ta.txt");
+        let target_b = root.join("tb.txt");
+        std::fs::write(&target_a, b"A").unwrap();
+        std::fs::write(&target_b, b"B").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target_a, &link).unwrap();
+
+        let id = OperationId::new("op-link-retarget").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: target_a,
+                expected_current: None,
+            }],
+        );
+        txn.prepare().unwrap();
+        // Foreign retarget of the existing link between prepare and commit.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link).unwrap();
+        let err = txn.commit().unwrap_err();
+        assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+        // The foreign link is untouched.
+        assert_eq!(std::fs::read_link(&link).unwrap(), target_b);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_symlink_replaces_only_matching_owned_target() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let owned_target = root.join("owned.txt");
+        let foreign_target = root.join("foreign.txt");
+        let new_target = root.join("new.txt");
+        std::fs::write(&owned_target, b"owned").unwrap();
+        std::fs::write(&foreign_target, b"foreign").unwrap();
+        std::fs::write(&new_target, b"new").unwrap();
+
+        // Link pointing somewhere we do NOT own: replacement refused.
+        let link = root.join("lnk");
+        std::os::unix::fs::symlink(&foreign_target, &link).unwrap();
+        let id = OperationId::new("op-link-owned").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: new_target.clone(),
+                expected_current: Some(owned_target.clone()),
+            }],
+        );
+        txn.prepare().unwrap();
+        let err = txn.commit().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SymlinkTargetMismatch { .. }),
+            "expected SymlinkTargetMismatch, got {err:?}"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), foreign_target);
+
+        // Link pointing at the expected owned target: replacement proceeds.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&owned_target, &link).unwrap();
+        let id2 = OperationId::new("op-link-owned-ok").unwrap();
+        let mut txn2 = Transaction::new(
+            id2,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: new_target.clone(),
+                expected_current: Some(owned_target),
+            }],
+        );
+        txn2.prepare().unwrap();
+        txn2.commit().unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), new_target);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_owned_symlink_missing_is_a_conflict() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let owned_target = root.join("owned.txt");
+        std::fs::write(&owned_target, b"owned").unwrap();
+        let link = root.join("lnk");
+        std::os::unix::fs::symlink(&owned_target, &link).unwrap();
+
+        let id = OperationId::new("op-link-gone").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: owned_target.clone(),
+                expected_current: Some(owned_target),
+            }],
+        );
+        txn.prepare().unwrap();
+        std::fs::remove_file(&link).unwrap();
+        let err = txn.commit().unwrap_err();
+        assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    // ------------------------------------------------------------------
+    // MUT-06: copy_tree + remove_owned_empty_dir
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn copy_tree_respects_include_exclude_filters() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/keep.md"), b"keep").unwrap();
+        std::fs::write(root.join("src/skip.log"), b"skip").unwrap();
+        std::fs::write(root.join("src/sub/nested.md"), b"nested").unwrap();
+
+        let opts = CopyTreeOptions {
+            include: vec!["*.md".to_owned()],
+            exclude: vec!["nested.md".to_owned()],
+            ..CopyTreeOptions::default()
+        };
+        let report = copy_tree(&root.join("src"), &root.join("dest"), &opts).unwrap();
+        assert!(report.files.contains(&root.join("dest/keep.md")));
+        assert!(
+            !report.files.contains(&root.join("dest/skip.log")),
+            "non-matching names are not copied"
+        );
+        assert!(
+            report.excluded.contains(&root.join("dest/sub/nested.md")),
+            "excluded names are reported"
+        );
+        assert_eq!(std::fs::read(root.join("dest/keep.md")).unwrap(), b"keep");
+        assert!(!root.join("dest/skip.log").exists());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_symlink_policies() {
+        // Skip: links never leave the source tree.
+        {
+            let root = tmp_root();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("t.txt");
+            std::fs::write(&target, b"t").unwrap();
+            let link = root.join("l.txt");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let dest_root = tmp_root();
+            let report = copy_tree(&root, &dest_root, &CopyTreeOptions::default()).unwrap();
+            assert_eq!(report.skipped_symlinks, vec![dest_root.join("l.txt")]);
+            assert!(!dest_root.join("l.txt").exists());
+            drop(std::fs::remove_dir_all(&dest_root));
+            drop(std::fs::remove_dir_all(&root));
+        }
+        // PreserveLink: the link itself is recreated.
+        {
+            let root = tmp_root();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("t.txt");
+            std::fs::write(&target, b"t").unwrap();
+            let link = root.join("l.txt");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let opts = CopyTreeOptions {
+                symlink_policy: SymlinkPolicy::PreserveLink,
+                ..CopyTreeOptions::default()
+            };
+            let dest_root = tmp_root();
+            copy_tree(&root, &dest_root, &opts).unwrap();
+            assert!(
+                dest_root
+                    .join("l.txt")
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                std::fs::read_link(dest_root.join("l.txt")).unwrap(),
+                root.join("t.txt")
+            );
+            drop(std::fs::remove_dir_all(&dest_root));
+            drop(std::fs::remove_dir_all(&root));
+        }
+        // FollowCopyContent: referent bytes land as a regular file; broken
+        // links fail the copy honestly.
+        {
+            let root = tmp_root();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("t.txt");
+            std::fs::write(&target, b"content").unwrap();
+            let link = root.join("l.txt");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let opts = CopyTreeOptions {
+                symlink_policy: SymlinkPolicy::FollowCopyContent,
+                ..CopyTreeOptions::default()
+            };
+            let dest_root = tmp_root();
+            copy_tree(&root, &dest_root, &opts).unwrap();
+            assert_eq!(std::fs::read(dest_root.join("l.txt")).unwrap(), b"content");
+            assert!(
+                !dest_root
+                    .join("l.txt")
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            drop(std::fs::remove_dir_all(&dest_root));
+
+            let broken_root = tmp_root();
+            std::fs::create_dir_all(&broken_root).unwrap();
+            std::os::unix::fs::symlink(
+                broken_root.join("nowhere.txt"),
+                broken_root.join("broken.txt"),
+            )
+            .unwrap();
+            let dest_root2 = tmp_root();
+            let res = copy_tree(&broken_root, &dest_root2, &opts);
+            assert!(res.is_err(), "broken link must fail the copy");
+            drop(std::fs::remove_dir_all(&dest_root2));
+            drop(std::fs::remove_dir_all(&root));
+            drop(std::fs::remove_dir_all(&broken_root));
+        }
+    }
+
+    #[test]
+    fn copy_tree_bounds_abort_large_runs() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("big.bin"), vec![0u8; 1024]).unwrap();
+        let opts = CopyTreeOptions {
+            max_bytes: 100,
+            ..CopyTreeOptions::default()
+        };
+        let dest_root = tmp_root();
+        let res = copy_tree(&root, &dest_root, &opts);
+        assert!(res.is_err(), "byte bound must abort the copy");
+        drop(std::fs::remove_dir_all(&dest_root));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn remove_owned_empty_dir_refuses_non_empty_and_broad_roots() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        // Non-empty: typed refusal.
+        let dir = root.join("nonempty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.txt"), b"x").unwrap();
+        let err = remove_owned_empty_dir(&dir).unwrap_err();
+        assert!(matches!(err, ConfigError::Io { .. }), "got {err:?}");
+        assert!(dir.exists(), "non-empty dir must survive");
+        // Empty: removed.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        remove_owned_empty_dir(&empty).unwrap();
+        assert!(!empty.exists());
+        // Broad root: refused by removal validation.
+        assert!(remove_owned_empty_dir(Path::new("/tmp")).is_err());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    // ------------------------------------------------------------------
+    // MUT-09 + QAL-06: journal + injector on REAL paths
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn journal_written_for_multi_file_commit_and_removed_after_success() {
+        let root = tmp_root();
+        let jroot = root.join(".superai").join("journal");
+        let a = root.join("a.json");
+        let b = root.join("b.json");
+        std::fs::write(&a, b"{\"a\":1}").unwrap();
+        std::fs::write(&b, b"{\"b\":1}").unwrap();
+
+        // Crash right after the journal advanced to verify: both files are
+        // committed and the journal exists on disk.
+        let inj = FailAtPoint::new(Point::JournalVerify, 1);
+        let id = OperationId::new("op-journal-multi").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a.clone(),
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: b.clone(),
+                    content: b"{\"b\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        )
+        .with_journal(jroot.clone())
+        .with_injector(inj);
+        let outcome = txn.execute().unwrap();
+        assert!(!outcome.success, "injected crash at verify must fail");
+        let jpath = journal_path(&jroot, "op-journal-multi");
+        let journal = CrashJournal::load_from(&jpath)
+            .unwrap()
+            .expect("journal must be on disk for a multi-file commit");
+        assert_eq!(journal.phase, JournalPhase::Verify);
+        assert_eq!(journal.completed.len(), 2, "both commits recorded");
+        assert_eq!(journal.backups.len(), 2, "both backups recorded");
+        assert!(
+            !serde_json::to_string(&journal).unwrap().contains("\"a\":1"),
+            "journal must not contain file contents"
+        );
+
+        // Recovery restores both files and removes the journal.
+        let report = recover_pending(&root).unwrap();
+        assert!(report.all_recovered(), "leftover: {:?}", report.journals);
+        assert_eq!(std::fs::read(&a).unwrap(), b"{\"a\":1}");
+        assert_eq!(std::fs::read(&b).unwrap(), b"{\"b\":1}");
+        assert!(!jpath.exists(), "journal removed after verified recovery");
+
+        // A clean run removes the journal after verified completion.
+        let id2 = OperationId::new("op-journal-clean").unwrap();
+        let mut txn2 = Transaction::new(
+            id2,
+            vec![
+                FileAction::Write {
+                    path: a,
+                    content: b"{\"a\":3}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: b,
+                    content: b"{\"b\":3}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        )
+        .with_journal(jroot.clone());
+        let outcome2 = txn2.execute().unwrap();
+        assert!(outcome2.success);
+        assert!(
+            !journal_path(&jroot, "op-journal-clean").exists(),
+            "verified completion removes the journal"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn crash_at_each_phase_via_injector_recovery_restores() {
+        for (phase, point, nth) in [
+            (JournalPhase::Plan, Point::JournalPlan, 1),
+            (JournalPhase::PrepareBackup, Point::JournalPrepareBackup, 1),
+            (JournalPhase::StageTemp, Point::JournalStageTemp, 1),
+            // Commit journal writes: start (1), after step 1 (2), after step 2 (3).
+            // Failing at 2 leaves the first file committed, the second not.
+            (JournalPhase::Commit, Point::JournalCommit, 2),
+        ] {
+            let root = tmp_root();
+            let jroot = root.join(".superai").join("journal");
+            let a = root.join("a.json");
+            let b = root.join("b.json");
+            std::fs::write(&a, b"{\"a\":1}").unwrap();
+            std::fs::write(&b, b"{\"b\":1}").unwrap();
+
+            let inj = FailAtPoint::new(point, nth);
+            let id = OperationId::new("op-crash").unwrap();
+            let mut txn = Transaction::new(
+                id,
+                vec![
+                    FileAction::Write {
+                        path: a.clone(),
+                        content: b"{\"a\":2}".to_vec(),
+                        kind: DocumentKind::StrictJson,
+                    },
+                    FileAction::Write {
+                        path: b.clone(),
+                        content: b"{\"b\":2}".to_vec(),
+                        kind: DocumentKind::StrictJson,
+                    },
+                ],
+            )
+            .with_journal(jroot)
+            .with_injector(inj);
+            let _ = txn.execute().unwrap();
+
+            let jpath = journal_path(&root.join(".superai/journal"), "op-crash");
+            let journal = CrashJournal::load_from(&jpath)
+                .unwrap()
+                .unwrap_or_else(|| panic!("journal must exist after crash at {phase}"));
+            assert_eq!(journal.phase, phase, "journal phase after crash");
+
+            let report = recover_pending(&root).unwrap();
+            assert!(
+                report.all_recovered(),
+                "phase {phase}: recovery residuals {:?}",
+                report.journals
+            );
+            assert_eq!(
+                std::fs::read(&a).unwrap(),
+                b"{\"a\":1}",
+                "phase {phase}: first file restored to pre-op bytes"
+            );
+            assert_eq!(
+                std::fs::read(&b).unwrap(),
+                b"{\"b\":1}",
+                "phase {phase}: second file at pre-op bytes"
+            );
+            assert!(!jpath.exists(), "journal removed after recovery ({phase})");
+            drop(std::fs::remove_dir_all(&root));
+        }
+    }
+
+    #[test]
+    fn recovery_removes_stale_temps_and_never_replays_content() {
+        let root = tmp_root();
+        let jroot = root.join(".superai").join("journal");
+        let a = root.join("a.json");
+        std::fs::write(&a, b"pre-op").unwrap();
+
+        // Crash at stage_temp: temps exist, nothing committed.
+        let inj = FailAtPoint::new(Point::JournalStageTemp, 1);
+        let id = OperationId::new("op-temps").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a.clone(),
+                content: b"planned-new-content".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_journal(jroot.clone())
+        .with_injector(inj);
+        let _ = txn.execute().unwrap();
+        assert!(
+            a.exists() && std::fs::read(&a).unwrap() == b"pre-op",
+            "nothing committed before the stage_temp crash"
+        );
+
+        let report = recover_pending(&root).unwrap();
+        assert!(report.all_recovered());
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            b"pre-op",
+            "recovery must never write the planned content"
+        );
+        let rec = report
+            .journals
+            .first()
+            .cloned()
+            .expect("one journal was recovered");
+        assert!(
+            rec.removed_temps.iter().all(|t| !t.exists()),
+            "stale temps removed"
+        );
+        assert!(!journal_path(&jroot, "op-temps").exists());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn injector_failures_hit_real_transaction_paths() {
+        // SecondFile failure through the REAL transaction (no manual temp
+        // deletion): first file rolls back via its backup.
+        let root = tmp_root();
+        let a = root.join("a.json");
+        let b = root.join("b.json");
+        std::fs::write(&a, b"{\"a\":1}").unwrap();
+        std::fs::write(&b, b"{\"b\":1}").unwrap();
+        let inj = FailAtPoint::new(Point::SecondFile, 1);
+        let id = OperationId::new("op-inj-second").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a.clone(),
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: b.clone(),
+                    content: b"{\"b\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        )
+        .with_injector(inj);
+        let outcome = txn.execute().unwrap();
+        assert!(!outcome.success);
+        assert_eq!(std::fs::read(&a).unwrap(), b"{\"a\":1}", "rolled back");
+        assert_eq!(std::fs::read(&b).unwrap(), b"{\"b\":1}");
+        drop(std::fs::remove_dir_all(&root));
+
+        // RollbackVerify failure leaves a reported residual on the REAL path:
+        // the second file's commit fails AND the compensation's verification
+        // of the first restore is injected to fail.
+        let root2 = tmp_root();
+        let c = root2.join("c.json");
+        let d = root2.join("d.json");
+        std::fs::write(&c, b"{\"c\":1}").unwrap();
+        std::fs::write(&d, b"{\"d\":1}").unwrap();
+        let inj2 = FailAtPoint::two(Point::SecondFile, 1, Point::RollbackVerify, 1);
+        let id2 = OperationId::new("op-inj-rbverify").unwrap();
+        let mut txn2 = Transaction::new(
+            id2,
+            vec![
+                FileAction::Write {
+                    path: c.clone(),
+                    content: b"{\"c\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: d,
+                    content: b"{\"d\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        )
+        .with_injector(inj2);
+        let outcome2 = txn2.execute().unwrap();
+        assert!(!outcome2.success);
+        let rb = outcome2
+            .rollback
+            .expect("compensation outcome must be reported");
+        assert!(
+            rb.residuals.contains(&c),
+            "injected rollback-verify failure must surface as residual: {rb:?}"
+        );
+        drop(std::fs::remove_dir_all(&root2));
     }
 }

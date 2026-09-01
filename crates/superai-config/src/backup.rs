@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::atomic::{WriteExpectation, atomic_write_expecting};
 use crate::error::{ConfigError, Result};
+use crate::injector::{Injector, Point, run as inject};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -187,6 +188,30 @@ pub fn backup_with_operation(
     operation_id: Option<&str>,
     reason: &str,
 ) -> Result<Option<BackupEntry>> {
+    backup_inner(path, operation_id, reason, None)
+}
+
+/// Back up `path` through the REAL production path with an optional failure
+/// injector attached (QAL-06).
+///
+/// The injector observes the backup open, write, flush, and verify
+/// boundaries of [`backup_with_operation`] in production order.
+pub fn backup_with_injector(
+    path: &Path,
+    operation_id: Option<&str>,
+    reason: &str,
+    injector: Option<&dyn Injector>,
+) -> Result<Option<BackupEntry>> {
+    backup_inner(path, operation_id, reason, injector)
+}
+
+fn backup_inner(
+    path: &Path,
+    operation_id: Option<&str>,
+    reason: &str,
+    injector: Option<&dyn Injector>,
+) -> Result<Option<BackupEntry>> {
+    inject(injector, Point::BackupOpen)?;
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -235,6 +260,7 @@ pub fn backup_with_operation(
     let size = original_bytes.len() as u64;
     let permissions = get_permissions_u32(&meta);
 
+    inject(injector, Point::BackupWrite)?;
     std::fs::copy(path, &target).map_err(|e| ConfigError::io(path, e))?;
 
     // No POSIX mode exists off unix, so `permissions` is always None there
@@ -244,6 +270,7 @@ pub fn backup_with_operation(
     }
 
     {
+        inject(injector, Point::BackupFlush)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .open(&target)
@@ -251,6 +278,7 @@ pub fn backup_with_operation(
         file.sync_all().map_err(|e| ConfigError::io(&target, e))?;
     }
 
+    inject(injector, Point::BackupVerify)?;
     let backup_bytes = std::fs::read(&target).map_err(|e| ConfigError::io(&target, e))?;
     let backup_digest = compute_digest(&backup_bytes);
     if backup_digest != digest {
@@ -308,7 +336,7 @@ pub fn restore(backup_path: &Path, path: &Path) -> Result<()> {
     // `backup` copies the original's permission bits onto the backup file, so
     // deriving the mode from the backup reinstates the recorded permissions.
     let mode = get_permissions_u32(&backup_meta);
-    atomic_write_expecting(path, &backup_bytes, WriteExpectation::Any, mode)
+    atomic_write_expecting(path, &backup_bytes, WriteExpectation::Any, mode, None)
 }
 
 /// Restore via a [`BackupEntry`], verifying the backup first.
@@ -658,6 +686,7 @@ pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
         &backup_bytes,
         expectation,
         entry.permissions,
+        None,
     )?;
     // 6. Fresh read-back verification of the replaced file.
     let restored_bytes = std::fs::read(&entry.original_path)

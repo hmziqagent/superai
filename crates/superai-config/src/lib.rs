@@ -17,6 +17,10 @@ pub mod env_file;
 mod error;
 /// Operation executor enforcing DOC-02 policies through the codecs.
 pub mod executor;
+/// Failure-injection surface for the mutation family (QAL-06).
+pub mod injector;
+/// Operation journal and startup crash recovery (MUT-09).
+pub mod journal;
 /// Strict JSON configs, key order preserved.
 pub mod json;
 /// JSONC configs (comments + trailing commas); lossy changing writes refused.

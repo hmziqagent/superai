@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ConfigError, Result};
+use crate::injector::{Injector, Point, run as inject};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -150,7 +151,17 @@ fn is_directory(path: &Path) -> bool {
 /// Never truncates the original in place; the original is only replaced via
 /// atomic rename.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    atomic_write_expecting(path, bytes, WriteExpectation::Any, None)
+    atomic_write_expecting(path, bytes, WriteExpectation::Any, None, None)
+}
+
+/// Atomically write `bytes` to `path` through the REAL production path with a
+/// failure injector attached (QAL-06).
+///
+/// Every boundary of [`atomic_write`] — temp create, temp write, temp flush,
+/// conflict recheck, rename, parent sync, read-back verify — calls
+/// `injector.inject` first, so the failure matrix exercises this exact code.
+pub fn atomic_write_injected(path: &Path, bytes: &[u8], injector: &dyn Injector) -> Result<()> {
+    atomic_write_expecting(path, bytes, WriteExpectation::Any, None, Some(injector))
 }
 
 /// Atomically write `bytes` to `path`, failing if the current file digest
@@ -173,7 +184,7 @@ pub fn atomic_write_with_expected_digest(
         Some(digest) => WriteExpectation::Digest(digest),
         None => WriteExpectation::Missing,
     };
-    atomic_write_expecting(path, bytes, expectation, None)
+    atomic_write_expecting(path, bytes, expectation, None, None)
 }
 
 /// How the current on-disk state of the target must relate to the write.
@@ -237,6 +248,7 @@ pub(crate) fn atomic_write_expecting(
     bytes: &[u8],
     expectation: WriteExpectation<'_>,
     mode: Option<u32>,
+    injector: Option<&dyn Injector>,
 ) -> Result<()> {
     if is_directory(path) {
         return Err(ConfigError::io(
@@ -254,6 +266,7 @@ pub(crate) fn atomic_write_expecting(
     let original_digest = read_digest_if_exists(path)?;
     expectation.check(path, original_digest.as_deref())?;
 
+    inject(injector, Point::TempCreate)?;
     let mut temp_path: PathBuf = generate_temp_path(path)?;
     let mut attempts = 0;
     while temp_path.exists() && attempts < 5 {
@@ -302,11 +315,13 @@ pub(crate) fn atomic_write_expecting(
         .open(&temp_path)
         .map_err(|e| ConfigError::io(&temp_path, e))?;
 
+    inject(injector, Point::TempWrite)?;
     {
         use std::io::Write;
         file.write_all(bytes)
             .map_err(|e| ConfigError::io(&temp_path, e))?;
         file.flush().map_err(|e| ConfigError::io(&temp_path, e))?;
+        inject(injector, Point::TempFlush)?;
         file.sync_all()
             .map_err(|e| ConfigError::io(&temp_path, e))?;
     }
@@ -320,6 +335,10 @@ pub(crate) fn atomic_write_expecting(
         return Err(e);
     }
 
+    // §4.2 / MUT-01: the conflict recheck immediately before the rename. A
+    // target that changed anywhere inside the preparation window aborts the
+    // write with ConcurrentModification and leaves the target untouched.
+    inject(injector, Point::ConflictRecheck)?;
     let current_digest = read_digest_if_exists(path)?;
     if original_digest != current_digest {
         drop(std::fs::remove_file(&temp_path));
@@ -332,6 +351,7 @@ pub(crate) fn atomic_write_expecting(
         return Err(e);
     }
 
+    inject(injector, Point::AtomicReplace)?;
     let mut rename_attempts: u64 = 0;
     loop {
         match std::fs::rename(&temp_path, path) {
@@ -347,8 +367,10 @@ pub(crate) fn atomic_write_expecting(
         }
     }
 
+    inject(injector, Point::ParentSync)?;
     sync_parent(path)?;
 
+    inject(injector, Point::ReadBackVerify)?;
     let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let expected = compute_digest(bytes);
     let actual = compute_digest(&read_back);

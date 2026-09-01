@@ -460,6 +460,7 @@ pub fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
         FailurePoint::TempWrite,
         FailurePoint::TempFlush,
         FailurePoint::ParseStaged,
+        FailurePoint::ConflictRecheck,
         FailurePoint::AtomicReplace,
         FailurePoint::ParentSync,
         FailurePoint::ReadBackVerify,
@@ -974,7 +975,7 @@ mod tests {
             report.complete,
             "failure matrix must be complete: {report:?}"
         );
-        assert_eq!(report.required.len(), 17);
+        assert_eq!(report.required.len(), 18);
         assert_eq!(report.surfaces.len(), 6);
         // Each required point must be distinct
         let mut distinct = BTreeSet::new();

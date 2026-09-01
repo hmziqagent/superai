@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -22,6 +22,34 @@ fn get_permissions_u32(meta: &std::fs::Metadata) -> Option<u32> {
 
 #[cfg(not(unix))]
 fn get_permissions_u32(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// Owner identity where the platform exposes it (unix uid/gid).
+#[cfg(unix)]
+#[expect(clippy::unnecessary_wraps, reason = "Option needed for non-unix None")]
+fn get_owner_ids(meta: &std::fs::Metadata) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.uid(), meta.gid()))
+}
+
+#[cfg(not(unix))]
+fn get_owner_ids(_meta: &std::fs::Metadata) -> Option<(u32, u32)> {
+    None
+}
+
+/// Inode change time where the platform exposes it (unix ctime). Recorded as
+/// a hint (MUT-01), never the sole identity for conflict decisions.
+#[cfg(unix)]
+#[expect(clippy::unnecessary_wraps, reason = "Option needed for non-unix None")]
+fn get_ctime(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let secs = u64::try_from(meta.ctime().max(0)).unwrap_or(0);
+    Some(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+#[cfg(not(unix))]
+fn get_ctime(_meta: &std::fs::Metadata) -> Option<SystemTime> {
     None
 }
 
@@ -47,6 +75,18 @@ pub struct Snapshot {
     pub size: Option<u64>,
     /// Permissions mode where available.
     pub permissions: Option<u32>,
+    /// Owner uid where the platform exposes it (MUT-01).
+    pub uid: Option<u32>,
+    /// Owner gid where the platform exposes it (MUT-01).
+    pub gid: Option<u32>,
+    /// Inode change time hint where available (MUT-01; hint only).
+    pub ctime: Option<SystemTime>,
+    /// Target of the symlink when the path is a symlink (MUT-01/MUT-02:
+    /// target changes between plan and commit are conflicts).
+    pub symlink_target: Option<PathBuf>,
+    /// Document kind inferred from the path (MUT-01). This is the envelope's
+    /// heuristic; adapters stay authoritative for the real kind.
+    pub kind: Option<crate::document::DocumentKind>,
     /// Whether the path exists.
     pub exists: bool,
     /// Whether the path is a symlink (without following).
@@ -72,24 +112,19 @@ impl Snapshot {
 /// Does not follow a symlink loop; such cases are captured as existing but
 /// with `digest: None` and `is_symlink: true` where detectable.
 pub fn snapshot(path: &Path) -> Snapshot {
+    let kind = Some(crate::document::DocumentKind::from_path(path));
     let symlink_meta = std::fs::symlink_metadata(path);
     match symlink_meta {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot {
-            path: path.to_path_buf(),
-            digest: None,
-            size: None,
-            permissions: None,
-            exists: false,
-            is_symlink: false,
-            is_file: false,
-            is_dir: false,
-            mtime: None,
-        },
         Err(_) => Snapshot {
             path: path.to_path_buf(),
             digest: None,
             size: None,
             permissions: None,
+            uid: None,
+            gid: None,
+            ctime: None,
+            symlink_target: None,
+            kind,
             exists: false,
             is_symlink: false,
             is_file: false,
@@ -99,6 +134,13 @@ pub fn snapshot(path: &Path) -> Snapshot {
         Ok(meta) => {
             let is_symlink = meta.file_type().is_symlink();
             let is_dir = meta.is_dir();
+            let symlink_target = if is_symlink {
+                std::fs::read_link(path).ok()
+            } else {
+                None
+            };
+            let owner = get_owner_ids(&meta);
+            let ctime = get_ctime(&meta);
             let (is_file, target_meta) = if is_symlink {
                 match std::fs::metadata(path) {
                     Ok(tm) => (tm.is_file(), Some(tm)),
@@ -137,6 +179,11 @@ pub fn snapshot(path: &Path) -> Snapshot {
                 digest,
                 size,
                 permissions,
+                uid: owner.map(|(u, _)| u),
+                gid: owner.map(|(_, g)| g),
+                ctime,
+                symlink_target,
+                kind,
                 exists: true,
                 is_symlink,
                 is_file,
@@ -150,9 +197,11 @@ pub fn snapshot(path: &Path) -> Snapshot {
 /// Returns `true` if `current` differs from `previous` in a way that indicates
 /// the file was modified externally.
 ///
-/// Compares `exists`, `digest` and `size`. Mtime and permissions are hints
-/// only and not used for the equality decision, matching MUT-01 which says
-/// mtime is a hint, not sole identity.
+/// Compares `exists`, `digest`, `size`, and the symlink target (MUT-02: a
+/// retargeted link between plan and commit is a conflict even when the
+/// referent bytes are unchanged). Mtime, permissions, owner ids, and ctime are
+/// hints only and not used for the equality decision, matching MUT-01 which
+/// says metadata is a hint, not sole identity.
 pub fn is_modified(previous: &Snapshot, current: &Snapshot) -> bool {
     if previous.exists != current.exists {
         return true;
@@ -164,6 +213,9 @@ pub fn is_modified(previous: &Snapshot, current: &Snapshot) -> bool {
         return true;
     }
     if previous.size != current.size {
+        return true;
+    }
+    if previous.symlink_target != current.symlink_target {
         return true;
     }
     false
@@ -238,7 +290,6 @@ pub fn is_symlink_loop(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::UNIX_EPOCH;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = crate::test_util::temp_dir_unique("config-snapshot");
@@ -376,5 +427,53 @@ mod tests {
         let actual = s2.digest.as_deref().unwrap_or_default();
         assert_ne!(expected, actual);
         drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn snapshot_records_owner_ctime_and_kind() {
+        let dir = crate::test_util::temp_dir_unique("config-snapshot-owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, br#"{"a":1}"#).unwrap();
+        let snap = snapshot(&path);
+        assert_eq!(
+            snap.kind,
+            Some(crate::document::DocumentKind::StrictJson),
+            "kind inference must land in the conflict token"
+        );
+        assert!(snap.ctime.is_some(), "ctime hint where the platform has it");
+        #[cfg(unix)]
+        {
+            assert!(snap.uid.is_some(), "uid must be recorded on unix");
+            assert!(snap.gid.is_some(), "gid must be recorded on unix");
+            let expected_uid =
+                std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&path).unwrap());
+            assert_eq!(snap.uid, Some(expected_uid));
+        }
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn retargeted_symlink_is_a_modification() {
+        #[cfg(unix)]
+        {
+            let target_a = unique_scratch("retarget-a");
+            let target_b = unique_scratch("retarget-b");
+            let link = unique_scratch("retarget-link");
+            std::fs::write(&target_a, b"same-bytes").unwrap();
+            std::fs::write(&target_b, b"same-bytes").unwrap();
+            std::os::unix::fs::symlink(&target_a, &link).unwrap();
+            let before = snapshot(&link);
+            // Retarget to a different path with IDENTICAL referent bytes: the
+            // digest alone cannot see this, the recorded target can.
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&target_b, &link).unwrap();
+            let after = snapshot(&link);
+            assert_eq!(before.digest, after.digest);
+            assert!(is_modified(&before, &after), "retarget must be a conflict");
+            drop(std::fs::remove_file(&link));
+            drop(std::fs::remove_file(&target_a));
+            drop(std::fs::remove_file(&target_b));
+        }
     }
 }

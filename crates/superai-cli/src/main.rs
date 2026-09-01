@@ -16,6 +16,21 @@ fn main() -> ExitCode {
 }
 
 fn run() -> superai_core::Result<()> {
+    // Startup crash recovery (MUT-09): finish or roll back any operation
+    // abandoned mid-transaction before anything else runs. Recovery inspects
+    // the actual filesystem state and never replays stale writes.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| superai_core::CoreError::Validation {
+            field: "home".to_owned(),
+            reason: "neither HOME nor USERPROFILE is set".to_owned(),
+        })?;
+    let recovery = superai_core::failure::recover_pending(&home)?;
+    for journal in &recovery.journals {
+        println!("recovered: {}", journal.outcome);
+    }
+
     let path = Registry::default_path()?;
     let registry = Registry::load(&path)?;
 

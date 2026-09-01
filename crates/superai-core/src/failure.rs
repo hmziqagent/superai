@@ -63,6 +63,10 @@ pub enum FailurePoint {
     TempFlush,
     /// Validating staged output (parse).
     ParseStaged,
+    /// The prepare→commit conflict recheck (master-plan §4.2): comparing the
+    /// current on-disk state to the expectation recorded at prepare time,
+    /// immediately before the replacement.
+    ConflictRecheck,
     /// Atomic rename/replace.
     AtomicReplace,
     /// Parent directory sync.
@@ -94,6 +98,7 @@ impl std::fmt::Display for FailurePoint {
             Self::TempWrite => "temp_write",
             Self::TempFlush => "temp_flush",
             Self::ParseStaged => "parse_staged",
+            Self::ConflictRecheck => "conflict_recheck",
             Self::AtomicReplace => "atomic_replace",
             Self::ParentSync => "parent_sync",
             Self::ReadBackVerify => "read_back_verify",
@@ -283,6 +288,13 @@ fn injected_error(point: FailurePoint, nth: usize) -> CoreError {
             kind: "injected".to_owned(),
             message: reason,
         },
+        FailurePoint::ConflictRecheck => {
+            CoreError::Config(superai_config::ConfigError::ConcurrentModification {
+                path: PathBuf::from(format!("injected:{point}")),
+                expected: "injected".to_owned(),
+                actual: reason,
+            })
+        }
         FailurePoint::AtomicReplace | FailurePoint::ParentSync => CoreError::Commit {
             path: PathBuf::from(format!("injected:{point}")),
             reason,
@@ -314,138 +326,141 @@ fn injected_error(point: FailurePoint, nth: usize) -> CoreError {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers that thread the injector through config operations
+// Helpers that thread the injector through the REAL config operations (QAL-06)
 // ---------------------------------------------------------------------------
 
-/// Wrapper around `superai_config::backup::backup` that injects `point` before the real call.
+/// Adapter presenting a core [`FailureInjector`] as a
+/// `superai_config::injector::Injector`, mapping config-layer injection
+/// points onto the core failure points.
+#[derive(Debug, Clone, Copy)]
+struct ConfigInjector<'a>(&'a dyn FailureInjector);
+
+fn map_config_point(point: superai_config::injector::Point) -> FailurePoint {
+    use superai_config::injector::Point as P;
+    match point {
+        P::BackupOpen => FailurePoint::BackupOpen,
+        P::BackupWrite => FailurePoint::BackupWrite,
+        P::BackupFlush => FailurePoint::BackupFlush,
+        P::BackupVerify => FailurePoint::BackupVerify,
+        P::TempCreate => FailurePoint::TempCreate,
+        P::TempWrite => FailurePoint::TempWrite,
+        P::TempFlush => FailurePoint::TempFlush,
+        P::ParseStaged => FailurePoint::ParseStaged,
+        P::ConflictRecheck => FailurePoint::ConflictRecheck,
+        P::AtomicReplace => FailurePoint::AtomicReplace,
+        P::ParentSync => FailurePoint::ParentSync,
+        P::ReadBackVerify => FailurePoint::ReadBackVerify,
+        P::RollbackVerify => FailurePoint::RollbackVerify,
+        P::SecondFile => FailurePoint::SecondFile,
+        P::ThirdFile => FailurePoint::ThirdFile,
+        // Journal-phase points double as the crash-at-phase simulation; they
+        // map onto the boundary that historically simulated each phase.
+        P::JournalPlan => FailurePoint::ParseStaged,
+        P::JournalPrepareBackup => FailurePoint::BackupWrite,
+        P::JournalStageTemp => FailurePoint::TempWrite,
+        P::JournalCommit => FailurePoint::SecondFile,
+        P::JournalVerify => FailurePoint::ReadBackVerify,
+        P::JournalRollback => FailurePoint::RollbackVerify,
+    }
+}
+
+impl superai_config::injector::Injector for ConfigInjector<'_> {
+    fn inject(&self, point: superai_config::injector::Point) -> superai_config::Result<()> {
+        self.0
+            .inject(map_config_point(point))
+            .map_err(core_error_to_config)
+    }
+}
+
+/// Owned adapter: attaches a shared core [`FailureInjector`] to a production
+/// `Transaction` via `with_injector` (used by the QAL-06 matrix and by
+/// higher layers that need the fault-injected real transaction paths).
+#[derive(Debug, Clone)]
+pub struct OwnedConfigInjector(std::sync::Arc<dyn FailureInjector>);
+
+/// Build an [`OwnedConfigInjector`] from a shared injector.
+pub fn owned_config_injector(injector: std::sync::Arc<dyn FailureInjector>) -> OwnedConfigInjector {
+    OwnedConfigInjector(injector)
+}
+
+impl superai_config::injector::Injector for OwnedConfigInjector {
+    fn inject(&self, point: superai_config::injector::Point) -> superai_config::Result<()> {
+        self.0
+            .inject(map_config_point(point))
+            .map_err(core_error_to_config)
+    }
+}
+
+fn core_error_to_config(err: CoreError) -> superai_config::ConfigError {
+    match err {
+        CoreError::Config(inner) => inner,
+        other => superai_config::ConfigError::Verification {
+            path: PathBuf::from("injected"),
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// Backup through the REAL production path with the injector observing every
+/// backup boundary (QAL-06).
 pub fn injected_backup(
     path: &Path,
     injector: &dyn FailureInjector,
 ) -> CoreResult<Option<superai_config::backup::BackupEntry>> {
-    injector.inject(FailurePoint::BackupOpen)?;
-    // Simulate write/flush boundaries as separate checks after open
-    injector.inject(FailurePoint::BackupWrite)?;
-    injector.inject(FailurePoint::BackupFlush)?;
-    let entry = superai_config::backup::backup(path).map_err(CoreError::Config)?;
-    injector.inject(FailurePoint::BackupVerify)?;
-    if let Some(ref entry) = entry {
-        let ok = superai_config::backup::verify_backup(entry).map_err(CoreError::Config)?;
-        if !ok {
-            return Err(CoreError::Verification {
-                path: entry.backup_path.clone(),
-                kind: "backup_verify".to_owned(),
-                reason: "backup digest mismatch (injected path)".to_owned(),
-            });
-        }
-    }
-    Ok(entry)
+    let adapter = ConfigInjector(injector);
+    superai_config::backup::backup_with_injector(
+        path,
+        None,
+        "pre-write backup",
+        Some(&adapter as &dyn superai_config::injector::Injector),
+    )
+    .map_err(CoreError::Config)
 }
 
-/// Stage a temp file with injected temp boundaries and parse validation.
+/// Stage a temp through the REAL production staging primitive with the
+/// injector observing temp create/write/flush and staged parse validation
+/// (QAL-06). Delegates to `superai_config::transaction::stage_temp_file`,
+/// which `Transaction::prepare` itself uses.
 pub fn injected_stage_temp(
     target: &Path,
     content: &[u8],
     kind: superai_config::document::DocumentKind,
     injector: &dyn FailureInjector,
 ) -> CoreResult<PathBuf> {
-    injector.inject(FailurePoint::TempCreate)?;
-    // Create temp via same logic as superai_config::transaction but simplified for testing
-    let temp = {
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CoreError::Config(superai_config::ConfigError::Io {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })
-            })?;
-        }
-        // Generate temp name deterministically using target + nanos
-        let file_name = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let pid = std::process::id();
-        let temp_name = format!(".tmp.{file_name}.{nanos}.{pid}");
-        parent.join(temp_name)
-    };
-    injector.inject(FailurePoint::TempWrite)?;
-    std::fs::write(&temp, content).map_err(|e| {
-        CoreError::Config(superai_config::ConfigError::Io {
-            path: temp.clone(),
-            source: e,
-        })
-    })?;
-    injector.inject(FailurePoint::TempFlush)?;
-    // Flush via reopen and sync
-    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&temp) {
-        drop(f.sync_all());
-    }
+    let adapter = ConfigInjector(injector);
+    let temp = superai_config::transaction::stage_temp_file(target, content, Some(&adapter))
+        .map_err(CoreError::Config)?;
     injector.inject(FailurePoint::ParseStaged)?;
-    // Validate staged output parses
     let bytes = std::fs::read(&temp).map_err(|e| {
         CoreError::Config(superai_config::ConfigError::Io {
             path: temp.clone(),
             source: e,
         })
     })?;
-    superai_config::raw_editor::validate(&bytes, kind);
-    // For strict check, actually ensure it would parse
     let diags = superai_config::raw_editor::validate(&bytes, kind);
     if !diags.is_empty() {
-        // Keep injected parse error distinct
-        if injector.is_real() {
-            // Real path would have already errored; we surface as verification
-            return Err(CoreError::Verification {
-                path: temp.clone(),
-                kind: "parse_staged".to_owned(),
-                reason: format!("staged validation failed: {diags:?}"),
-            });
-        }
+        return Err(CoreError::Verification {
+            path: temp.clone(),
+            kind: "parse_staged".to_owned(),
+            reason: format!("staged validation failed: {diags:?}"),
+        });
     }
     Ok(temp)
 }
 
-/// Injected atomic replace (rename) with parent sync and read-back verify.
+/// Atomic replace through the REAL production commit primitive (QAL-06).
+/// Delegates to `superai_config::transaction::commit_staged_file`, which
+/// `Transaction::commit_write` itself uses, then cross-checks the expected
+/// bytes.
 pub fn injected_atomic_replace(
     staged: &Path,
     target: &Path,
     expected_bytes: &[u8],
     injector: &dyn FailureInjector,
 ) -> CoreResult<()> {
-    injector.inject(FailurePoint::AtomicReplace)?;
-    match std::fs::rename(staged, target) {
-        Ok(()) => {}
-        Err(e)
-            if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) =>
-        {
-            std::fs::copy(staged, target).map_err(|copy_e| {
-                CoreError::Config(superai_config::ConfigError::Io {
-                    path: target.to_path_buf(),
-                    source: copy_e,
-                })
-            })?;
-            drop(std::fs::remove_file(staged));
-        }
-        Err(e) => {
-            return Err(CoreError::Config(superai_config::ConfigError::Io {
-                path: target.to_path_buf(),
-                source: e,
-            }));
-        }
-    }
-    injector.inject(FailurePoint::ParentSync)?;
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(f) = std::fs::File::open(parent) {
-                drop(f.sync_all());
-            }
-        }
-    }
-    injector.inject(FailurePoint::ReadBackVerify)?;
+    let adapter = ConfigInjector(injector);
+    superai_config::transaction::commit_staged_file(target, staged, None, Some(&adapter))
+        .map_err(CoreError::Config)?;
     let read_back = std::fs::read(target).map_err(|e| {
         CoreError::Config(superai_config::ConfigError::Io {
             path: target.to_path_buf(),
@@ -463,228 +478,21 @@ pub fn injected_atomic_replace(
 }
 
 // ---------------------------------------------------------------------------
-// Abandoned journal / crash injection
+// Abandoned journal / crash recovery (MUT-09) — production wiring
 // ---------------------------------------------------------------------------
 
-/// Phase at which a crash is simulated, leaving an abandoned journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JournalPhase {
-    /// Before any mutation (plan only).
-    Plan,
-    /// After backups but before staged temps.
-    PrepareBackup,
-    /// After staging temps but before commit.
-    StageTemp,
-    /// During commit (after first file, before second).
-    Commit,
-    /// After commit but before verification.
-    Verify,
-    /// During rollback.
-    Rollback,
-    /// Fully completed (no journal should remain).
-    Done,
-}
-
-impl std::fmt::Display for JournalPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::Plan => "plan",
-            Self::PrepareBackup => "prepare_backup",
-            Self::StageTemp => "stage_temp",
-            Self::Commit => "commit",
-            Self::Verify => "verify",
-            Self::Rollback => "rollback",
-            Self::Done => "done",
-        };
-        f.write_str(s)
-    }
-}
-
-/// Minimal journal record written to disk; no secrets are stored.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CrashJournal {
-    /// Operation id.
-    pub operation_id: String,
-    /// Phase reached before crash.
-    pub phase: JournalPhase,
-    /// Resource ids involved (paths as strings, no content).
-    pub resources: Vec<String>,
-    /// Backup ids created before crash.
-    pub backup_ids: Vec<String>,
-    /// Staged temp paths (if any).
-    pub staged_temps: Vec<String>,
-    /// Redacted diagnostics (no secret).
-    pub diagnostics: Vec<String>,
-}
-
-impl CrashJournal {
-    /// Create a new journal for testing.
-    pub fn new(operation_id: &str, phase: JournalPhase, resources: Vec<String>) -> Self {
-        Self {
-            operation_id: operation_id.to_owned(),
-            phase,
-            resources,
-            backup_ids: Vec::new(),
-            staged_temps: Vec::new(),
-            diagnostics: Vec::new(),
-        }
-    }
-
-    /// Write the journal to `path` atomically (no secret).
-    pub fn write_to(&self, path: &Path) -> CoreResult<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    CoreError::Config(superai_config::ConfigError::Io {
-                        path: parent.to_path_buf(),
-                        source: e,
-                    })
-                })?;
-            }
-        }
-        let json = serde_json::to_vec(self).map_err(CoreError::Records)?;
-        superai_config::atomic::atomic_write(path, &json).map_err(CoreError::Config)?;
-        Ok(())
-    }
-
-    /// Load a journal from `path` if it exists.
-    pub fn load_from(path: &Path) -> CoreResult<Option<Self>> {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    return Ok(None);
-                }
-                let journal: Self = serde_json::from_slice(&bytes).map_err(CoreError::Records)?;
-                Ok(Some(journal))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(CoreError::Config(superai_config::ConfigError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })),
-        }
-    }
-
-    /// Remove the journal after successful recovery.
-    pub fn remove(path: &Path) -> CoreResult<()> {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(CoreError::Config(superai_config::ConfigError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })),
-        }
-    }
-}
-
-/// Simulate a crash leaving an abandoned journal at `phase` and return the journal path.
-pub fn simulate_abandoned_journal(
-    dir: &Path,
-    operation_id: &str,
-    phase: JournalPhase,
-    resources: Vec<String>,
-    injector: &dyn FailureInjector,
-) -> CoreResult<PathBuf> {
-    // Use injector to decide whether to actually simulate; real injector still writes journal but does not inject error after
-    let journal_path = dir.join(format!("{operation_id}.{phase}.journal.json"));
-    let journal = CrashJournal::new(operation_id, phase, resources);
-    journal.write_to(&journal_path)?;
-    // Inject a fake crash error for the given phase (except Done)
-    if phase != JournalPhase::Done {
-        match phase {
-            JournalPhase::Commit => injector.inject(FailurePoint::SecondFile)?,
-            JournalPhase::Verify => injector.inject(FailurePoint::ReadBackVerify)?,
-            JournalPhase::Rollback => injector.inject(FailurePoint::RollbackVerify)?,
-            JournalPhase::PrepareBackup => injector.inject(FailurePoint::BackupWrite)?,
-            JournalPhase::StageTemp => injector.inject(FailurePoint::TempWrite)?,
-            JournalPhase::Plan => injector.inject(FailurePoint::ParseStaged)?,
-            JournalPhase::Done => {}
-        }
-    }
-    Ok(journal_path)
-}
-
-/// Recovery result for an abandoned journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryResult {
-    /// Whether recovery succeeded (rolled back or finished verification).
-    pub recovered: bool,
-    /// Human-readable outcome.
-    pub outcome: String,
-    /// Residual paths that could not be recovered (empty when fully recovered).
-    pub residuals: Vec<PathBuf>,
-}
-
-/// Attempt to recover from an abandoned journal by inspecting actual filesystem state.
+/// Perform startup crash recovery for `home` (MUT-09).
 ///
-/// This is a simplified deterministic recovery: for phases before commit, simply
-/// remove staged temps; for commit/verify phases, verify files and roll back if
-/// digest mismatches; for done, remove journal.
-pub fn recover_journal(journal_path: &Path, dir: &Path) -> CoreResult<RecoveryResult> {
-    let journal = match CrashJournal::load_from(journal_path)? {
-        Some(j) => j,
-        None => {
-            return Ok(RecoveryResult {
-                recovered: true,
-                outcome: "no journal to recover".to_owned(),
-                residuals: Vec::new(),
-            });
-        }
-    };
-    // Remove staged temps if they exist (best-effort)
-    let mut residuals: Vec<PathBuf> = Vec::new();
-    for staged in &journal.staged_temps {
-        let p = PathBuf::from(staged);
-        if p.exists() {
-            if let Err(_e) = std::fs::remove_file(&p) {
-                residuals.push(p);
-            }
-        }
-    }
-    // For verify/rollback phases, check that resources still exist and are readable
-    for res in &journal.resources {
-        let p = PathBuf::from(res);
-        if journal.phase == JournalPhase::Commit || journal.phase == JournalPhase::Verify {
-            if !p.exists() {
-                // Missing after commit should be reported as residual
-                residuals.push(p);
-            }
-        }
-        let _ = p;
-    }
-    // Cleanup stray temps in dir that look like ".tmp.*"
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with(".tmp.") {
-                let p = entry.path();
-                drop(std::fs::remove_file(&p));
-            }
-        }
-    }
-    // Journal removal only after verified completion
-    let recovered = residuals.is_empty();
-    let outcome = if recovered {
-        format!("recovered from {}", journal.phase)
-    } else {
-        format!(
-            "residuals after {} recovery: {}",
-            journal.phase,
-            residuals.len()
-        )
-    };
-    // Only remove journal when recovered or phase is Done
-    if recovered || journal.phase == JournalPhase::Done {
-        CrashJournal::remove(journal_path)?;
-    }
-    Ok(RecoveryResult {
-        recovered,
-        outcome,
-        residuals,
-    })
+/// Scans `<home>/.superai/journal` for operation journals left behind by
+/// crashed transactions and recovers each against the actual filesystem
+/// state: stale temps are removed, resources whose current bytes differ from
+/// their recorded backup are restored (with a backup of the current bytes
+/// first), committed creations are removed, and journals are deleted only
+/// after verified recovery. Recovery never replays writes from stale staged
+/// content. The implementation lives in `superai_config::journal`; this is
+/// the layer-3 entry point the CLI calls at startup.
+pub fn recover_pending(home: &Path) -> CoreResult<superai_config::journal::RecoveryReport> {
+    superai_config::journal::recover_pending(home).map_err(CoreError::Config)
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,69 +1959,161 @@ mod tests {
         assert!(preserved.contains_key("authorization"));
     }
 
-    // ---- crash / abandoned journal ----
+    // ---- crash / abandoned journal (production journaling, MUT-09) ----
+
+    /// Runs a real two-file transaction with journaling enabled under
+    /// `home/.superai/journal`, crashing at `point`/`nth` via the TestInjector
+    /// mapped onto the production injection points. Returns the journal path.
+    fn run_journaled_transaction_crashing_at(
+        home: &Path,
+        op_id: &str,
+        point: FailurePoint,
+        nth: usize,
+    ) -> PathBuf {
+        use superai_config::transaction::{FileAction, OperationId, Transaction};
+        let a = home.join("a.json");
+        let b = home.join("b.json");
+        std::fs::write(&a, b"{\"a\":1}").unwrap();
+        std::fs::write(&b, b"{\"b\":1}").unwrap();
+        let inj = TestInjector::new();
+        inj.fail_at(point, nth);
+        let id = OperationId::new(op_id).unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a,
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: b,
+                    content: b"{\"b\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        )
+        .with_journal(superai_config::journal::journal_dir(home))
+        .with_injector(std::sync::Arc::new(OwnedConfigInjector(
+            std::sync::Arc::new(inj),
+        )));
+        let _ = txn.execute().unwrap();
+        superai_config::journal::journal_path(&superai_config::journal::journal_dir(home), op_id)
+    }
 
     #[test]
-    fn abandoned_journal_at_each_phase_recovers() {
-        for phase in [
-            JournalPhase::Plan,
-            JournalPhase::PrepareBackup,
-            JournalPhase::StageTemp,
-            JournalPhase::Commit,
-            JournalPhase::Verify,
-            JournalPhase::Rollback,
+    fn abandoned_journal_at_each_phase_recovers_via_production_journal() {
+        use superai_config::journal::{JournalPhase, recover_pending};
+        // (expected journal phase, core point that fires at that phase, nth
+        // call for a two-file transaction). The journal-phase points map onto
+        // the historical phase-simulation boundaries; the counts skip the
+        // production calls of the same point that precede the journal write.
+        // Commit nth=3 fires at the intent-journal write of the SECOND step:
+        // the first file is committed on disk, the second is not.
+        for (phase, point, nth) in [
+            (JournalPhase::Plan, FailurePoint::ParseStaged, 1),
+            (JournalPhase::PrepareBackup, FailurePoint::BackupWrite, 3),
+            (JournalPhase::StageTemp, FailurePoint::TempWrite, 3),
+            (JournalPhase::Commit, FailurePoint::SecondFile, 3),
+            (JournalPhase::Verify, FailurePoint::ReadBackVerify, 3),
         ] {
-            let dir = test_dir(&format!("journal-recover-{}", phase));
-            let op_id = format!("op-journal-{}", phase);
-            let resources = vec![dir.join("file.json").to_string_lossy().into_owned()];
-            // Ensure file exists for phases where recovery checks existence
-            std::fs::write(dir.join("file.json"), br#"{"a":1}"#).unwrap();
+            let dir = test_dir(&format!("journal-prod-{}", phase));
             let journal_path =
-                simulate_abandoned_journal(&dir, &op_id, phase, resources, &RealInjector).unwrap();
-            assert!(journal_path.exists());
-            // Add a staged temp to simulate stray
-            let stray = dir.join(".tmp.file.json.abc123.123456");
-            std::fs::write(&stray, b"temp").unwrap();
-            // Create journal with staged_temps entries to ensure recovery removes them
-            let mut journal = CrashJournal::load_from(&journal_path).unwrap().unwrap();
-            journal
-                .staged_temps
-                .push(stray.to_string_lossy().into_owned());
-            journal.write_to(&journal_path).unwrap();
+                run_journaled_transaction_crashing_at(&dir, "op-journal-prod", point, nth);
+            assert!(journal_path.exists(), "journal at {phase} must be on disk");
+            let loaded = superai_config::journal::CrashJournal::load_from(&journal_path)
+                .unwrap()
+                .expect("journal parses");
+            assert_eq!(loaded.phase, phase, "phase recorded before the crash");
 
-            let result = recover_journal(&journal_path, &dir).unwrap();
+            let report = recover_pending(&dir).unwrap();
             assert!(
-                result.recovered,
-                "phase {phase} should recover, got {:?}",
-                result.residuals
+                report.all_recovered(),
+                "phase {phase}: residuals {:?}",
+                report.journals
+            );
+            assert_eq!(
+                std::fs::read(dir.join("a.json")).unwrap(),
+                b"{\"a\":1}",
+                "phase {phase}: pre-op bytes restored"
+            );
+            assert_eq!(
+                std::fs::read(dir.join("b.json")).unwrap(),
+                b"{\"b\":1}",
+                "phase {phase}: pre-op bytes restored"
             );
             assert!(
-                !stray.exists(),
-                "stray temp should be cleaned for phase {phase}"
-            );
-            assert!(
-                !journal_path.exists() || phase == JournalPhase::Rollback || result.recovered,
-                "journal should be removed after recovery for phase {phase}"
+                !journal_path.exists(),
+                "journal removed after verified recovery at {phase}"
             );
             drop(std::fs::remove_dir_all(&dir));
         }
     }
 
     #[test]
-    fn abandoned_journal_done_is_removed_without_residual() {
-        let dir = test_dir("journal-done");
-        let op_id = "op-done";
-        let path =
-            simulate_abandoned_journal(&dir, op_id, JournalPhase::Done, vec![], &RealInjector)
-                .unwrap();
-        let result = recover_journal(&path, &dir).unwrap();
-        assert!(result.recovered);
-        assert!(!path.exists(), "done journal should be removed");
+    fn rollback_phase_journal_recovers() {
+        use superai_config::journal::{CrashJournal, JournalBackup, JournalPhase, recover_pending};
+        // The rollback phase is written by `execute` when post-commit
+        // verification fails; the recoverable state (committed foreign bytes
+        // + recorded backup) is reconstructed here exactly as that path
+        // leaves it, then recovered.
+        let dir = test_dir("journal-prod-rollback");
+        let resource = dir.join("settings.json");
+        std::fs::write(&resource, b"original").unwrap();
+        let entry = superai_config::backup::backup(&resource).unwrap().unwrap();
+        std::fs::write(&resource, b"committed-but-unverified").unwrap();
+        let jroot = superai_config::journal::journal_dir(&dir);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let mut journal = CrashJournal::new(
+            "op-rollback-phase",
+            JournalPhase::Rollback,
+            vec![resource.to_string_lossy().into_owned()],
+        );
+        journal.backups.push(JournalBackup {
+            resource: resource.to_string_lossy().into_owned(),
+            backup_id: entry.id.as_str().to_owned(),
+        });
+        journal
+            .completed
+            .push(resource.to_string_lossy().into_owned());
+        let jpath = superai_config::journal::journal_path(&jroot, "op-rollback-phase");
+        journal.write_to(&jpath).unwrap();
+
+        let report = recover_pending(&dir).unwrap();
+        assert!(report.all_recovered());
+        assert_eq!(std::fs::read(&resource).unwrap(), b"original");
+        assert!(!jpath.exists());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn clean_journaled_transaction_removes_journal() {
+        let dir = test_dir("journal-clean");
+        let jroot = superai_config::journal::journal_dir(&dir);
+        let target = dir.join("settings.json");
+        std::fs::write(&target, br#"{"a":1}"#).unwrap();
+        let id = superai_config::transaction::OperationId::new("op-clean").unwrap();
+        let mut txn = superai_config::transaction::Transaction::new(
+            id,
+            vec![superai_config::transaction::FileAction::Write {
+                path: target.clone(),
+                content: br#"{"a":2}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        )
+        .with_journal(jroot.clone());
+        let outcome = txn.execute().unwrap();
+        assert!(outcome.success);
+        assert!(
+            !superai_config::journal::journal_path(&jroot, "op-clean").exists(),
+            "verified completion removes the journal (no abandoned operation)"
+        );
         drop(std::fs::remove_dir_all(&dir));
     }
 
     #[test]
     fn journal_never_contains_secret_sentinel() {
+        use superai_config::journal::{CrashJournal, JournalPhase};
         let dir = test_dir("journal-secret");
         let op_id = "op-secret";
         let sentinel = "sk-live-sentinel-xyz-999-not-fake";
@@ -2516,7 +2416,9 @@ mod tests {
 
     #[test]
     fn all_points_journal_recovery_is_secret_free() {
-        // QAL-06: every journal phase must recover without leaking sentinel via diagnostics
+        // QAL-06: every journal phase must recover without leaking sentinel
+        // via diagnostics — exercised on the production journal + recovery.
+        use superai_config::journal::{CrashJournal, JournalPhase, recover_pending};
         let sentinel = "sk-superai-test-sentinel-12345-fake";
         for phase in [
             JournalPhase::Plan,
@@ -2530,24 +2432,112 @@ mod tests {
             let op_id = format!("op-journal-all-{phase}");
             let resources = vec![dir.join("file.json").to_string_lossy().into_owned()];
             std::fs::write(dir.join("file.json"), br#"{"a":1}"#).unwrap();
-            let journal_path =
-                simulate_abandoned_journal(&dir, &op_id, phase, resources, &RealInjector).unwrap();
+            let jroot = superai_config::journal::journal_dir(&dir);
+            std::fs::create_dir_all(&jroot).unwrap();
+            let journal = CrashJournal::new(&op_id, phase, resources);
+            let journal_path = superai_config::journal::journal_path(&jroot, &op_id);
+            journal.write_to(&journal_path).unwrap();
             let loaded = CrashJournal::load_from(&journal_path).unwrap().unwrap();
             let ser = serde_json::to_string(&loaded).unwrap();
             assert!(
                 !ser.contains(sentinel),
                 "journal leaked sentinel at {phase}"
             );
-            let result = recover_journal(&journal_path, &dir).unwrap();
-            assert!(result.recovered, "must recover at {phase}");
+            let report = recover_pending(&dir).unwrap();
             assert!(
-                !result.outcome.contains(sentinel),
-                "outcome leaked sentinel at {phase}"
+                report.all_recovered(),
+                "must recover at {phase}: {:?}",
+                report.journals
             );
-            for residual in result.residuals {
-                assert!(!residual.to_string_lossy().contains(sentinel));
+            for rec in report.journals {
+                assert!(
+                    !rec.outcome.contains(sentinel),
+                    "outcome leaked sentinel at {phase}"
+                );
+                for residual in rec.residuals {
+                    assert!(!residual.to_string_lossy().contains(sentinel));
+                }
             }
             drop(std::fs::remove_dir_all(&dir));
         }
+    }
+    // ---- QAL-06: injector on the REAL production paths ----
+
+    #[test]
+    fn single_file_matrix_hits_real_atomic_write_path() {
+        // Every temp/rename boundary here is the production
+        // atomic_write_expecting body, not a parallel wrapper.
+        let dir = test_dir("failure-real-atomic");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, br#"{"a":1}"#).unwrap();
+        for point in [
+            FailurePoint::TempCreate,
+            FailurePoint::TempWrite,
+            FailurePoint::TempFlush,
+            FailurePoint::ConflictRecheck,
+            FailurePoint::AtomicReplace,
+            FailurePoint::ParentSync,
+            FailurePoint::ReadBackVerify,
+        ] {
+            let inj = TestInjector::new();
+            inj.fail_at(point, 1);
+            let adapter = ConfigInjector(&inj as &dyn FailureInjector);
+            let res = superai_config::atomic::atomic_write_injected(&file, br#"{"a":2}"#, &adapter);
+            assert!(res.is_err(), "point {point} must fail the real write");
+            match res.unwrap_err() {
+                superai_config::ConfigError::ConcurrentModification { .. }
+                    if point == FailurePoint::ConflictRecheck => {}
+                superai_config::ConfigError::Verification { .. }
+                    if point == FailurePoint::ReadBackVerify => {}
+                other => {
+                    let msg = format!("{other}");
+                    assert!(
+                        msg.contains("injected failure"),
+                        "point {point}: expected injected error, got {msg}"
+                    );
+                }
+            }
+            // The original survives every injected failure (a failed write
+            // never truncates in place); after AtomicReplace the new bytes
+            // may have landed, so reset for the next iteration.
+            let cur = std::fs::read(&file).unwrap();
+            if cur == br#"{"a":2}"# {
+                std::fs::write(&file, br#"{"a":1}"#).unwrap();
+            } else {
+                assert_eq!(cur, br#"{"a":1}"#, "point {point} corrupted the file");
+            }
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn conflict_recheck_injection_aborts_transaction_before_overwrite() {
+        // The §4.2 recheck point fires inside the REAL transaction commit;
+        // the injected failure aborts before the rename.
+        let dir = test_dir("failure-real-conflict-recheck");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, b"original").unwrap();
+        let inj = TestInjector::new();
+        inj.fail_at(FailurePoint::ConflictRecheck, 1);
+        let id = superai_config::transaction::OperationId::new("op-conflict-recheck").unwrap();
+        let mut txn = superai_config::transaction::Transaction::new(
+            id,
+            vec![superai_config::transaction::FileAction::Write {
+                path: file.clone(),
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(std::sync::Arc::new(OwnedConfigInjector(
+            std::sync::Arc::new(inj),
+        )));
+        let outcome = txn.execute().unwrap();
+        assert!(!outcome.success);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"original",
+            "the target is never overwritten when the recheck aborts"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

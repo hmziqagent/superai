@@ -2499,6 +2499,10 @@ pub fn apply_skill_mode(
                 steps.push(superai_config::transaction::FileAction::Symlink {
                     link: dest,
                     target: src,
+                    // No explicit owned-target expectation: the default policy
+                    // replaces an existing link only when it still carries the
+                    // target observed at prepare time.
+                    expected_current: None,
                 });
             }
             if steps.is_empty() {

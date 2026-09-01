@@ -178,6 +178,44 @@ pub enum ConfigError {
         /// Why the write was refused.
         reason: String,
     },
+
+    /// Two planned paths resolve to the same inode on one device (MUT-02):
+    /// a hard link alias. Committing both would silently mutate the same
+    /// bytes twice and atomic replacement of one path breaks link sharing,
+    /// so the plan is rejected.
+    #[error("hard link conflict at {path}: also targets {alias} ({reason})")]
+    HardlinkConflict {
+        /// Path that collided.
+        path: PathBuf,
+        /// The other planned path sharing the inode.
+        alias: PathBuf,
+        /// Why the shared identity is rejected.
+        reason: String,
+    },
+
+    /// An existing symlink does not point at the owned/expected target
+    /// (MUT-02/MUT-06 `replace symlink only if it matches expected owned
+    /// target`). Nothing was replaced.
+    #[error("symlink target mismatch at {path}: expected {expected}, found {actual}")]
+    SymlinkTargetMismatch {
+        /// Link path that was refused replacement.
+        path: PathBuf,
+        /// Expected (owned) target rendering.
+        expected: String,
+        /// Actual target rendering observed on disk.
+        actual: String,
+    },
+
+    /// A recursive copy cannot proceed with the requested policy for this
+    /// entry (MUT-06): special file, broken/looping link under a
+    /// content-following policy, or platform limitation.
+    #[error("copy unsupported at {path}: {reason}")]
+    UnsupportedCopy {
+        /// Path the copy was refused for.
+        path: PathBuf,
+        /// Why the copy is unsupported.
+        reason: String,
+    },
 }
 
 impl ConfigError {
@@ -278,6 +316,37 @@ impl ConfigError {
         reason: impl Into<String>,
     ) -> Self {
         Self::UnmanagedSpanWrite {
+            path: path.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn hardlink_conflict(
+        path: impl Into<PathBuf>,
+        alias: impl Into<PathBuf>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::HardlinkConflict {
+            path: path.into(),
+            alias: alias.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn symlink_target_mismatch(
+        path: impl Into<PathBuf>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        Self::SymlinkTargetMismatch {
+            path: path.into(),
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+
+    pub(crate) fn unsupported_copy(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
+        Self::UnsupportedCopy {
             path: path.into(),
             reason: reason.into(),
         }
