@@ -694,6 +694,7 @@ mod tests {
             digest: digest.unwrap_or_else(|| "0".repeat(64)),
             harness_version_req: None,
             provider_protocol: None,
+            replacement: None,
         };
         serde_json::to_vec(&tmpl).unwrap()
     }
@@ -739,6 +740,7 @@ mod tests {
                     },
                 ],
                 status: TemplateStatus::Active,
+                replacement: None,
             }],
         };
         let path = dir.join("catalog.json");
@@ -789,6 +791,7 @@ mod tests {
                     digest: catalog_digest,
                 }],
                 status: TemplateStatus::Active,
+                replacement: None,
             }],
         };
         let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
@@ -838,6 +841,7 @@ mod tests {
                     digest: "a".repeat(64),
                 }],
                 status: TemplateStatus::Active,
+                replacement: None,
             }],
         };
         // This catalog should fail validation, not traversal at fetch time.

@@ -653,6 +653,31 @@ impl Adapter for CodexCliAdapter {
         profile_era_conflict(version, content)
     }
 
+    fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
+        vec![
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::WebSearch,
+                crate::capability::Support::Native,
+                "web search tool on the responses/chat APIs",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Vision,
+                crate::capability::Support::Native,
+                "image input on the responses transport",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::ComputerUse,
+                crate::capability::Support::Absent,
+                "no computer-use loop in the CLI harness",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Mcp,
+                crate::capability::Support::Native,
+                "mcp_servers table in config.toml",
+            ),
+        ]
+    }
+
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkSelected,

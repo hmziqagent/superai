@@ -632,6 +632,31 @@ impl Adapter for ClaudeCodeAdapter {
         }
     }
 
+    fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
+        vec![
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::WebSearch,
+                crate::capability::Support::Native,
+                "client-side web_search tool against the messages protocol",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Vision,
+                crate::capability::Support::Native,
+                "image blocks carried by the anthropic messages transport",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::ComputerUse,
+                crate::capability::Support::Native,
+                "computer-use tool loop on the messages protocol",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Mcp,
+                crate::capability::Support::Native,
+                "MCP servers configured in settings.json/.mcp.json",
+            ),
+        ]
+    }
+
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkAll,

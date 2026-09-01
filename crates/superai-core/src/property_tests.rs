@@ -903,6 +903,7 @@ mod tests {
             digest: "a".repeat(64),
             harness_version_req: None,
             provider_protocol: None,
+            replacement: None,
         };
         let mut new_tmpl = old_tmpl.clone();
         new_tmpl.version = "1.1.0".to_owned();

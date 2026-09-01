@@ -622,6 +622,31 @@ impl Adapter for PiAdapter {
         }
     }
 
+    fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
+        vec![
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::WebSearch,
+                crate::capability::Support::Native,
+                "built-in web search tool",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Vision,
+                crate::capability::Support::Native,
+                "image input on the chat transport",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::ComputerUse,
+                crate::capability::Support::Absent,
+                "no computer-use loop in the pi harness",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Mcp,
+                crate::capability::Support::Absent,
+                "no native MCP support; a verified extension may substitute",
+            ),
+        ]
+    }
+
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkAll,

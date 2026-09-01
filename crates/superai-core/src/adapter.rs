@@ -973,6 +973,57 @@ impl PluginAdapterDecl {
 }
 
 // ---------------------------------------------------------------------------
+// Capability declarations (plan 09 CAP-03 source 1)
+// ---------------------------------------------------------------------------
+
+/// Harness-native capability declaration (CAP-03 source 1): what the
+/// harness's own transport can carry, independent of any provider.
+///
+/// The declaration is the TRANSPORT CONSTRAINT in capability resolution: an
+/// `absent` transport claim cannot be overridden by provider or template
+/// data ("provider capability cannot override incompatible harness
+/// transport"). A `native` transport claim is compatible with a provider
+/// that can satisfy the capability; `version_req` narrows the claim to
+/// installed harness versions that match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterCapabilityDecl {
+    /// Capability this declaration concerns.
+    pub capability: crate::capability::Capability,
+    /// What the harness transport supports for it.
+    pub support: crate::capability::Support,
+    /// Optional semver requirement on the installed harness version for the
+    /// claim to hold (CAP-04: native claim must be compatible with the
+    /// harness version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_req: Option<String>,
+    /// Concise explanation (evidence shown in resolution results).
+    pub explanation: String,
+}
+
+impl AdapterCapabilityDecl {
+    /// Declare a transport claim without a version constraint.
+    pub fn new(
+        capability: crate::capability::Capability,
+        support: crate::capability::Support,
+        explanation: impl Into<String>,
+    ) -> Self {
+        Self {
+            capability,
+            support,
+            version_req: None,
+            explanation: explanation.into(),
+        }
+    }
+
+    /// Narrow the claim to harness versions matching `req`.
+    #[must_use]
+    pub fn with_version_req(mut self, req: impl Into<String>) -> Self {
+        self.version_req = Some(req.into());
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adapter trait
 // ---------------------------------------------------------------------------
 
@@ -1053,6 +1104,17 @@ pub trait Adapter: Send + Sync + fmt::Debug {
 
     /// Which skill destination modes this harness supports.
     fn supported_skill_modes(&self) -> Vec<SkillMode> {
+        Vec::new()
+    }
+
+    /// Harness-native capability declarations (plan 09 CAP-03 source 1).
+    ///
+    /// Adapters that have modeled their harness's capability transport
+    /// return one declaration per catalog capability; resolution feeds these
+    /// as the transport constraint. `None`/empty (the default) means the
+    /// adapter has not declared capability transport — resolution treats the
+    /// pair as Unknown rather than guessing.
+    fn capability_declarations(&self) -> Vec<AdapterCapabilityDecl> {
         Vec::new()
     }
 

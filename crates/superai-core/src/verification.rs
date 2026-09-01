@@ -1554,6 +1554,7 @@ mod tests {
                 digest: "a".repeat(64),
                 harness_version_req: None,
                 provider_protocol: None,
+                replacement: None,
             }
         }
         fn patch(sel: &str, v: Value) -> OwnedPatch {

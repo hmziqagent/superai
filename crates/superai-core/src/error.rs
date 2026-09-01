@@ -381,6 +381,16 @@ pub enum CoreError {
         redacted: RedactedString,
     },
 
+    /// OAuth/subscription/keychain login must happen in the harness itself
+    /// (PRV-04): superai never proxies or performs the external login flow.
+    #[error("external auth required for harness `{harness}`: {instructions}")]
+    ExternalAuthRequired {
+        /// Harness identifier.
+        harness: String,
+        /// Harness command/instructions the user must run themselves.
+        instructions: String,
+    },
+
     /// Plugin or MCP operation requires external command execution and caller approval (EXT-06).
     #[error("requires approval for plugin `{plugin}` operation `{operation}`: {reason}")]
     RequiresApproval {

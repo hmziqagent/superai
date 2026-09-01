@@ -877,6 +877,31 @@ impl Adapter for ClineAdapter {
         }
     }
 
+    fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
+        vec![
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::WebSearch,
+                crate::capability::Support::Native,
+                "web search tool against the configured provider",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Vision,
+                crate::capability::Support::Native,
+                "image input on the chat transports",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::ComputerUse,
+                crate::capability::Support::Native,
+                "browser-use actuate loop",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Mcp,
+                crate::capability::Support::Native,
+                "cline_mcp_settings.json server map",
+            ),
+        ]
+    }
+
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![
             crate::adapter::SkillMode::LinkSelected,

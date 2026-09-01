@@ -351,6 +351,7 @@ mod tests {
             digest: "a".repeat(64),
             harness_version_req: None,
             provider_protocol: None,
+            replacement: None,
         };
         let res = tmpl.validate();
         assert!(res.is_err(), "template with sentinel must be rejected");

@@ -31,6 +31,8 @@ pub mod operation;
 pub mod paths;
 /// Provider definitions — data-driven.
 pub mod provider;
+/// Provider-to-harness rendering, effective inspection, lifecycle (PRV-03/05/08).
+pub mod provider_render;
 /// Raw editor backend — harness-aware wrapper.
 pub mod raw_editor;
 mod registry;

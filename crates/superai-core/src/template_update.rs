@@ -233,6 +233,9 @@ pub enum ConflictKind {
     TypeChanged,
     /// Selector cannot be evaluated against local (non-Key or schema mismatch).
     SchemaConflict,
+    /// Major template version drops the selector; requires explicit
+    /// resolution (TPL-08 selector-reset policy).
+    SelectorReset,
 }
 
 impl std::fmt::Display for ConflictKind {
@@ -242,6 +245,7 @@ impl std::fmt::Display for ConflictKind {
             Self::Missing => "missing",
             Self::TypeChanged => "type_changed",
             Self::SchemaConflict => "schema_conflict",
+            Self::SelectorReset => "selector_reset",
         };
         f.write_str(s)
     }
@@ -372,17 +376,17 @@ fn compute_capability_changes(base: &Template, new: &Template) -> CapabilityChan
     let mut changed = Vec::new();
     for (k, bv) in &base.capability_map {
         match new.capability_map.get(k) {
-            None => removed.push((k.clone(), bv.clone())),
+            None => removed.push((k.to_string(), bv.to_string())),
             Some(nv) => {
                 if bv != nv {
-                    changed.push((k.clone(), bv.clone(), nv.clone()));
+                    changed.push((k.to_string(), bv.to_string(), nv.to_string()));
                 }
             }
         }
     }
     for (k, nv) in &new.capability_map {
         if !base.capability_map.contains_key(k) {
-            added.push((k.clone(), nv.clone()));
+            added.push((k.to_string(), nv.to_string()));
         }
     }
     added.sort();
@@ -398,6 +402,33 @@ fn compute_capability_changes(base: &Template, new: &Template) -> CapabilityChan
 // ---------------------------------------------------------------------------
 // Preview struct and core three-way
 // ---------------------------------------------------------------------------
+
+/// Resolver-computed capability delta for an update preview (CAP-06):
+/// support and source BEFORE vs AFTER, from real resolution sources rather
+/// than a string diff of the template's capability map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilitySupportChange {
+    /// Capability whose resolution changed.
+    pub capability: crate::capability::Capability,
+    /// Support before the update.
+    pub before: crate::capability::Support,
+    /// Source before the update.
+    pub before_source: capability_resolver::CapabilitySource,
+    /// Support after the update.
+    pub after: crate::capability::Support,
+    /// Source after the update.
+    pub after_source: capability_resolver::CapabilitySource,
+}
+
+impl CapabilitySupportChange {
+    /// Human description of the delta.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}: {} ({}) -> {} ({})",
+            self.capability, self.before, self.before_source, self.after, self.after_source
+        )
+    }
+}
 
 /// Preview of a three-way template update (TPL-06).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +447,9 @@ pub struct UpdatePreview {
     pub wrapper_changes: WrapperChanges,
     /// Capability map changes.
     pub capability_changes: CapabilityChanges,
+    /// Resolver-computed capability deltas (CAP-06): native/substituted/
+    /// absent BEFORE vs AFTER the update, from real resolution sources.
+    pub resolved_capability_changes: Vec<CapabilitySupportChange>,
     /// Warnings such as migration notes and status changes.
     pub warnings: Vec<String>,
 }
@@ -434,6 +468,7 @@ impl UpdatePreview {
             && self.capability_changes.added.is_empty()
             && self.capability_changes.removed.is_empty()
             && self.capability_changes.changed.is_empty()
+            && self.resolved_capability_changes.is_empty()
     }
 }
 
@@ -470,6 +505,30 @@ pub fn preview_three_way(
             new.version
         ));
     }
+    // TPL-08: deprecated-with-replacement pointer surfaces in the preview.
+    if new.status == crate::template::TemplateStatus::Deprecated {
+        match new.replacement.as_ref() {
+            Some(replacement) => warnings.push(format!(
+                "candidate version {} is deprecated; replacement template `{replacement}`",
+                new.version
+            )),
+            None => warnings.push(format!(
+                "candidate version {} is deprecated without a replacement pointer",
+                new.version
+            )),
+        }
+    }
+    // TPL-08: a major version bump may reset the selector set and cannot
+    // silently reuse or drop old selectors.
+    let major_bump = {
+        let base_major = crate::template::parse_semver(&base.version)
+            .ok()
+            .map(|v| v.major);
+        let new_major = crate::template::parse_semver(&new.version)
+            .ok()
+            .map(|v| v.major);
+        matches!((base_major, new_major), (Some(b), Some(n)) if n > b)
+    };
     for note in &new.migration_notes {
         if !base.migration_notes.contains(note) {
             // Redact secret-like notes similarly to template diff
@@ -579,6 +638,21 @@ pub fn preview_three_way(
             }
         }
 
+        // TPL-08: on a major bump, a selector the new template drops must be
+        // resolved explicitly — it is not silently removed (selector reset).
+        if major_bump && new_val.is_none() {
+            conflicts.push(Conflict {
+                selector: selector.clone(),
+                base: base_val.clone(),
+                local: local_val.clone(),
+                new: None,
+                kind: ConflictKind::SelectorReset,
+                message: format!(
+                    "major version change drops selector `{selector}`; resolve explicitly (remove or migrate)"
+                ),
+            });
+            continue;
+        }
         // Equality branches
         if local_val == base_val {
             if new_val != base_val {
@@ -607,6 +681,12 @@ pub fn preview_three_way(
         }
     }
 
+    if major_bump {
+        warnings.push(format!(
+            "major version change {} -> {}: explicit migration may be required; old selectors are not silently reused",
+            base.version, new.version
+        ));
+    }
     let wrapper_changes = compute_wrapper_changes(base, new);
     let capability_changes = compute_capability_changes(base, new);
 
@@ -622,6 +702,7 @@ pub fn preview_three_way(
         conflicts,
         wrapper_changes,
         capability_changes,
+        resolved_capability_changes: Vec::new(),
         warnings,
     }
 }
@@ -633,6 +714,67 @@ pub fn preview_update(
     local: &Map<String, Value>,
 ) -> UpdatePreview {
     preview_three_way(base, new, local)
+}
+
+/// Compute the resolver-backed capability delta between two templates
+/// (CAP-06): resolves every catalog capability with the adapter's
+/// declarations, the provider's capability data, and each template's own
+/// capability map, then reports support/source changes.
+pub fn compute_resolved_capability_delta(
+    base: &Template,
+    new: &Template,
+    adapter: &dyn Adapter,
+    provider: Option<&crate::provider::ProviderDefinition>,
+) -> Vec<CapabilitySupportChange> {
+    let before_sources = capability_resolver::CapabilitySources::for_adapter(
+        adapter,
+        provider,
+        Some(&base.capability_map),
+    );
+    let after_sources = capability_resolver::CapabilitySources::for_adapter(
+        adapter,
+        provider,
+        Some(&new.capability_map),
+    );
+    let mut deltas = Vec::new();
+    let before_all =
+        capability_resolver::resolve_all_with_sources(&new.harness, &new.provider, &before_sources);
+    let after_all =
+        capability_resolver::resolve_all_with_sources(&new.harness, &new.provider, &after_sources);
+    for (cap, before) in before_all {
+        let after = after_all
+            .iter()
+            .find(|(c, _)| *c == cap)
+            .map(|(_, resolved)| resolved);
+        if let Some(after) = after
+            && (before.support != after.support || before.source != after.source)
+        {
+            deltas.push(CapabilitySupportChange {
+                capability: cap,
+                before: before.support,
+                before_source: before.source,
+                after: after.support,
+                after_source: after.source,
+            });
+        }
+    }
+    deltas
+}
+
+/// [`preview_three_way`] enriched with the resolver-computed capability
+/// delta (CAP-06): capability changes are visible, with sources, BEFORE any
+/// update commit.
+pub fn preview_update_with_capability_resolution(
+    base: &Template,
+    new: &Template,
+    local: &Map<String, Value>,
+    adapter: &dyn Adapter,
+    provider: Option<&crate::provider::ProviderDefinition>,
+) -> UpdatePreview {
+    let mut preview = preview_three_way(base, new, local);
+    preview.resolved_capability_changes =
+        compute_resolved_capability_delta(base, new, adapter, provider);
+    preview
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +1371,7 @@ mod tests {
             digest: "a".repeat(64),
             harness_version_req: None,
             provider_protocol: None,
+            replacement: None,
         }
     }
 
@@ -1237,6 +1380,199 @@ mod tests {
             selector: selector.to_owned(),
             value,
         }
+    }
+
+    // -------------------------------------------------------------------
+    // TPL-08 selector reset + CAP-04 completeness + CAP-06 resolved delta
+    // -------------------------------------------------------------------
+
+    /// Local adapter declaring only ONE capability transport: the CAP-04
+    /// completeness gate must reject templates against it.
+    #[derive(Debug)]
+    struct PartialCapAdapter;
+
+    impl Adapter for PartialCapAdapter {
+        fn id(&self) -> HarnessId {
+            HarnessId::new("partial-cap-harness").unwrap()
+        }
+        fn display_name(&self) -> &'static str {
+            "Partial Cap"
+        }
+        fn product_status(&self) -> crate::adapter::ProductStatus {
+            crate::adapter::ProductStatus::Active
+        }
+        fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+            Vec::new()
+        }
+        fn adapter_revision(&self) -> &'static str {
+            "0.1.0"
+        }
+        fn research_doc_link(&self) -> &'static str {
+            "docs/harness-configs/partial-cap.md"
+        }
+        fn last_verified_date(&self) -> &'static str {
+            "2026-08-25"
+        }
+        fn detection(&self) -> crate::adapter::DetectionResult {
+            crate::adapter::DetectionResult::absent(vec!["test".to_owned()])
+        }
+        fn version_resolution(&self) -> crate::adapter::VersionResolution {
+            crate::adapter::VersionResolution::unknown()
+        }
+        fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+            Vec::new()
+        }
+        fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+            Vec::new()
+        }
+        fn plan_mirror_exclusions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_wrapper(&self, _instance: &Instance) -> Result<crate::adapter::WrapperPlan> {
+            Ok(crate::adapter::WrapperPlan::new("test"))
+        }
+        fn scan_candidates(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn validate_instance(&self, _instance: &Instance) -> Result<()> {
+            Ok(())
+        }
+        fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
+            vec![crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::WebSearch,
+                crate::capability::Support::Native,
+                "only web search",
+            )]
+        }
+    }
+
+    #[test]
+    fn incomplete_capability_coverage_blocks_template_use() {
+        let mut tmpl = minimal_template("1.0.0", vec![]);
+        tmpl.harness = HarnessId::new("partial-cap-harness").unwrap();
+        // The adapter declares only web_search: the other three catalog
+        // capabilities do not resolve -> publication/use is blocked.
+        let err = tmpl
+            .validate_against_adapter(&PartialCapAdapter)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("do not resolve") || err.contains("incomplete capability coverage"),
+            "got: {err}"
+        );
+        // Covering the rest through the template's capability map passes.
+        tmpl.capability_map.insert(
+            crate::capability::Capability::Vision,
+            crate::capability::Support::Absent,
+        );
+        tmpl.capability_map.insert(
+            crate::capability::Capability::ComputerUse,
+            crate::capability::Support::Absent,
+        );
+        tmpl.capability_map.insert(
+            crate::capability::Capability::Mcp,
+            crate::capability::Support::Absent,
+        );
+        tmpl.validate_against_adapter(&PartialCapAdapter).unwrap();
+    }
+
+    #[test]
+    fn major_version_selector_reset_requires_explicit_resolution() {
+        // 1.x -> 2.x that drops a selector: conflict, not silent removal.
+        let base = minimal_template(
+            "1.9.0",
+            vec![
+                patch("key:model", json!("glm-4")),
+                patch("key:legacy", json!(true)),
+            ],
+        );
+        let new = minimal_template("2.0.0", vec![patch("key:model", json!("glm-4.5"))]);
+        let mut local = Map::new();
+        local.insert("model".to_owned(), json!("glm-4"));
+        local.insert("legacy".to_owned(), json!(true));
+        let preview = preview_three_way(&base, &new, &local);
+        let reset = preview
+            .conflicts
+            .iter()
+            .find(|c| c.kind == ConflictKind::SelectorReset);
+        assert!(reset.is_some(), "conflicts: {:?}", preview.conflicts);
+        assert_eq!(
+            reset.map(|c| c.selector.as_str()),
+            Some("key:legacy"),
+            "only the dropped selector conflicts"
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("major version change"))
+        );
+
+        // A minor bump still auto-removes a dropped selector.
+        let minor_new = minimal_template("1.10.0", vec![patch("key:model", json!("glm-4.5"))]);
+        let preview = preview_three_way(&base, &minor_new, &local);
+        assert!(
+            preview
+                .conflicts
+                .iter()
+                .all(|c| c.kind != ConflictKind::SelectorReset)
+        );
+        assert!(
+            preview
+                .auto_applicable
+                .iter()
+                .any(|e| e.selector == "key:legacy" && e.to.is_none())
+        );
+    }
+
+    #[test]
+    fn deprecated_candidate_warning_names_replacement() {
+        let base = minimal_template("1.0.0", vec![patch("key:model", json!("glm-4"))]);
+        let mut new = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4.5"))]);
+        new.status = TemplateStatus::Deprecated;
+        new.replacement = Some(TemplateId::new("claude-glm-next").unwrap());
+        let preview = preview_three_way(&base, &new, &Map::new());
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("deprecated") && w.contains("claude-glm-next"))
+        );
+    }
+
+    #[test]
+    fn resolved_capability_delta_uses_sources_not_string_diff() {
+        // claude-code + glm: template override flips vision absent->native.
+        // The string capability_map diff alone cannot express the
+        // source-attributed before/after the resolver produces.
+        let base = minimal_template("1.0.0", vec![patch("key:model", json!("glm-4"))]);
+        let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
+        new.capability_map.insert(
+            crate::capability::Capability::Vision,
+            crate::capability::Support::Native,
+        );
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let providers = crate::provider::load_bundled_providers().unwrap();
+        let glm = providers.iter().find(|p| p.id.as_str() == "glm").unwrap();
+        let mut local = Map::new();
+        local.insert("model".to_owned(), json!("glm-4"));
+        let preview =
+            preview_update_with_capability_resolution(&base, &new, &local, &adapter, Some(glm));
+        let vision = preview
+            .resolved_capability_changes
+            .iter()
+            .find(|c| c.capability == crate::capability::Capability::Vision)
+            .expect("vision delta present");
+        assert_eq!(vision.before, crate::capability::Support::Absent);
+        assert_eq!(vision.after, crate::capability::Support::Native);
+        assert_eq!(
+            vision.after_source,
+            capability_resolver::CapabilitySource::Template
+        );
+        assert!(vision.describe().contains("vision"));
+        // The plain preview keeps the empty resolved section.
+        let plain = preview_three_way(&base, &new, &local);
+        assert!(plain.resolved_capability_changes.is_empty());
     }
 
     #[test]
@@ -1452,16 +1788,22 @@ mod tests {
     fn preview_wrapper_and_capability_changes() {
         let mut base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         base.wrapper_env.insert("FOO".to_owned(), "bar".to_owned());
-        base.capability_map
-            .insert("web_search".to_owned(), "native".to_owned());
+        base.capability_map.insert(
+            crate::capability::Capability::WebSearch,
+            crate::capability::Support::Native,
+        );
         let mut new = base.clone();
         new.version = "1.2.0".to_owned();
         new.wrapper_env.insert("FOO".to_owned(), "baz".to_owned());
         new.wrapper_env.insert("BAR".to_owned(), "qux".to_owned());
-        new.capability_map
-            .insert("web_search".to_owned(), "substituted".to_owned());
-        new.capability_map
-            .insert("vision".to_owned(), "native".to_owned());
+        new.capability_map.insert(
+            crate::capability::Capability::WebSearch,
+            crate::capability::Support::Substituted,
+        );
+        new.capability_map.insert(
+            crate::capability::Capability::Vision,
+            crate::capability::Support::Native,
+        );
         let local = Map::new();
         let preview = preview_three_way(&base, &new, &local);
         assert!(!preview.wrapper_changes.is_empty());

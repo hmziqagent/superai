@@ -625,6 +625,31 @@ impl Adapter for AiderAdapter {
         }
     }
 
+    fn capability_declarations(&self) -> Vec<crate::adapter::AdapterCapabilityDecl> {
+        vec![
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::WebSearch,
+                crate::capability::Support::Absent,
+                "no web-search tool in the aider harness",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Vision,
+                crate::capability::Support::Absent,
+                "no image input transport in the aider harness",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::ComputerUse,
+                crate::capability::Support::Absent,
+                "no computer-use loop in the aider harness",
+            ),
+            crate::adapter::AdapterCapabilityDecl::new(
+                crate::capability::Capability::Mcp,
+                crate::capability::Support::Absent,
+                "no MCP support in the aider harness",
+            ),
+        ]
+    }
+
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         vec![crate::adapter::SkillMode::CopySelected]
     }

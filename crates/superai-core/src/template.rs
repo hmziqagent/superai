@@ -330,11 +330,36 @@ pub struct TemplateCatalogEntry {
     pub files: Vec<TemplateFileRef>,
     /// Lifecycle status of the template overall.
     pub status: TemplateStatus,
+    /// Replacement template id, required when `status` is `deprecated`
+    /// (TPL-08: deprecated-with-replacement pointer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<TemplateId>,
 }
 
 impl TemplateCatalogEntry {
     /// Validate the entry: latest version must exist in files, no duplicates, etc.
     pub fn validate(&self) -> Result<()> {
+        match self.status {
+            TemplateStatus::Deprecated if self.replacement.is_none() => {
+                return Err(CoreError::Validation {
+                    field: "replacement".to_owned(),
+                    reason: format!(
+                        "deprecated template `{}` must point to its replacement (TPL-08)",
+                        self.id
+                    ),
+                });
+            }
+            TemplateStatus::Active | TemplateStatus::Preview if self.replacement.is_some() => {
+                return Err(CoreError::Validation {
+                    field: "replacement".to_owned(),
+                    reason: format!(
+                        "template `{}` is {} and must not carry a replacement pointer",
+                        self.id, self.status
+                    ),
+                });
+            }
+            _ => {}
+        }
         if self.files.is_empty() {
             return Err(CoreError::Validation {
                 field: "files".to_owned(),
@@ -758,9 +783,10 @@ pub struct Template {
     /// Asset requirements (relative paths).
     #[serde(default)]
     pub assets: Vec<String>,
-    /// Capability map (capability id -> support string).
+    /// Capability map (typed capability -> support; CAP-01: unknown ids fail
+    /// schema validation instead of being silently treated as absent).
     #[serde(default)]
-    pub capability_map: BTreeMap<String, String>,
+    pub capability_map: BTreeMap<crate::capability::Capability, crate::capability::Support>,
     /// Migration notes / warnings.
     #[serde(default)]
     pub migration_notes: Vec<String>,
@@ -772,6 +798,10 @@ pub struct Template {
     /// Optional provider protocol name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_protocol: Option<String>,
+    /// Replacement template id, required when `status` is `deprecated`
+    /// (TPL-08).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<TemplateId>,
 }
 
 impl Template {
@@ -894,6 +924,27 @@ impl Template {
                 field: "harness_version_req".to_owned(),
                 reason: format!("invalid semver req `{req}`: {e}"),
             })?;
+        }
+        match self.status {
+            TemplateStatus::Deprecated if self.replacement.is_none() => {
+                return Err(CoreError::Validation {
+                    field: "replacement".to_owned(),
+                    reason: format!(
+                        "deprecated template `{}` must point to its replacement (TPL-08)",
+                        self.id
+                    ),
+                });
+            }
+            TemplateStatus::Active | TemplateStatus::Preview if self.replacement.is_some() => {
+                return Err(CoreError::Validation {
+                    field: "replacement".to_owned(),
+                    reason: format!(
+                        "template `{}` is {} and must not carry a replacement pointer",
+                        self.id, self.status
+                    ),
+                });
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1018,6 +1069,23 @@ impl Template {
                 ),
             });
         }
+        // CAP-04: incomplete capability coverage blocks template use. When
+        // the adapter has modeled its capability transport, every catalog
+        // capability must resolve from adapter + template data (provider
+        // data is folded in at resolution time); it never defaults to
+        // absent silently. Adapters without declarations are skipped —
+        // coverage is not evaluable for them.
+        if !adapter.capability_declarations().is_empty() {
+            crate::capability_resolver::validate_resolution_completeness(
+                &self.harness,
+                &self.provider,
+                &crate::capability_resolver::CapabilitySources::for_adapter(
+                    adapter,
+                    None,
+                    Some(&self.capability_map),
+                ),
+            )?;
+        }
         Ok(())
     }
 
@@ -1052,6 +1120,11 @@ pub enum UpdateStatus {
     },
     /// The catalog could not be fetched (offline, network error, etc.).
     Offline,
+    /// The template is deprecated; `replacement` names the successor (TPL-08).
+    Deprecated {
+        /// Replacement template id, when the catalog names one.
+        replacement: Option<String>,
+    },
 }
 
 impl UpdateStatus {
@@ -1086,6 +1159,13 @@ pub fn check_update_with_catalog(instance: &Instance, catalog: &Catalog) -> Upda
     // Yanked entries are always reported as yanked.
     if entry.status == TemplateStatus::Yanked {
         return UpdateStatus::Yanked;
+    }
+
+    // Deprecated entries report the replacement pointer (TPL-08).
+    if entry.status == TemplateStatus::Deprecated {
+        return UpdateStatus::Deprecated {
+            replacement: entry.replacement.as_ref().map(ToString::to_string),
+        };
     }
 
     // Current version must exist in the catalog's file list.
@@ -1477,18 +1557,24 @@ pub fn diff_templates(old: &Template, new: &Template) -> TemplateDiff {
     let mut cap_removed = Vec::new();
     let mut cap_changed = Vec::new();
     for (k, old_v) in &old.capability_map {
+        let old_str = old_v.to_string();
         match new.capability_map.get(k) {
-            None => cap_removed.push((k.clone(), redact_string(old_v))),
+            None => cap_removed.push((k.to_string(), redact_string(&old_str))),
             Some(new_v) => {
-                if old_v != new_v {
-                    cap_changed.push((k.clone(), redact_string(old_v), redact_string(new_v)));
+                let new_str = new_v.to_string();
+                if old_str != new_str {
+                    cap_changed.push((
+                        k.to_string(),
+                        redact_string(&old_str),
+                        redact_string(&new_str),
+                    ));
                 }
             }
         }
     }
     for (k, new_v) in &new.capability_map {
         if !old.capability_map.contains_key(k) {
-            cap_added.push((k.clone(), redact_string(new_v)));
+            cap_added.push((k.to_string(), redact_string(&new_v.to_string())));
         }
     }
     let capability_changes = CapabilityChanges {
@@ -1741,6 +1827,7 @@ mod tests {
                     },
                 ],
                 status: TemplateStatus::Active,
+                replacement: None,
             }],
         }
     }
@@ -1771,6 +1858,7 @@ mod tests {
             digest: "c".repeat(64),
             harness_version_req: None,
             provider_protocol: None,
+            replacement: None,
         }
     }
 
@@ -2231,6 +2319,7 @@ mod tests {
                     },
                 ],
                 status: TemplateStatus::Active,
+                replacement: None,
             }],
         };
         let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
@@ -2303,6 +2392,7 @@ mod tests {
                     },
                 ],
                 status: TemplateStatus::Active,
+                replacement: None,
             }],
         };
         std::fs::write(
@@ -2348,8 +2438,10 @@ mod tests {
                 value: json!(0.7),
             },
         ];
-        old.capability_map
-            .insert("web_search".to_owned(), "native".to_owned());
+        old.capability_map.insert(
+            crate::capability::Capability::WebSearch,
+            crate::capability::Support::Native,
+        );
         old.wrapper_env.insert("FOO".to_owned(), "bar".to_owned());
         old.wrapper_args = vec!["--foo".to_owned()];
         old.assets = vec!["asset/a.json".to_owned()];
@@ -2370,10 +2462,14 @@ mod tests {
             },
         ];
         new.capability_map.clear();
-        new.capability_map
-            .insert("web_search".to_owned(), "substituted".to_owned());
-        new.capability_map
-            .insert("vision".to_owned(), "native".to_owned());
+        new.capability_map.insert(
+            crate::capability::Capability::WebSearch,
+            crate::capability::Support::Substituted,
+        );
+        new.capability_map.insert(
+            crate::capability::Capability::Vision,
+            crate::capability::Support::Native,
+        );
         new.wrapper_env.clear();
         new.wrapper_env.insert("FOO".to_owned(), "baz".to_owned());
         new.wrapper_env.insert("BAR".to_owned(), "qux".to_owned());
@@ -2535,6 +2631,120 @@ mod tests {
         }
         let debug2 = format!("{diff2:?}");
         assert!(!debug2.contains("sk-abc") && !debug2.contains("sk-def"));
+    }
+
+    // -------------------------------------------------------------------
+    // TPL-08 — replacement pointers + CAP-01/04 validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn deprecated_template_requires_replacement_pointer() {
+        let mut tmpl = minimal_template();
+        tmpl.status = TemplateStatus::Deprecated;
+        let err = tmpl.validate().unwrap_err().to_string();
+        assert!(err.contains("must point to its replacement"), "got: {err}");
+        tmpl.replacement = Some(TemplateId::new("claude-glm-next").unwrap());
+        tmpl.validate().unwrap();
+
+        // Active templates must not carry a replacement pointer.
+        let mut active = minimal_template();
+        active.replacement = Some(TemplateId::new("claude-glm-next").unwrap());
+        let err = active.validate().unwrap_err().to_string();
+        assert!(err.contains("must not carry a replacement"), "got: {err}");
+    }
+
+    #[test]
+    fn deprecated_catalog_entry_requires_replacement_pointer() {
+        let mut entry = TemplateCatalogEntry {
+            id: TemplateId::new("claude-glm").unwrap(),
+            latest_version: TemplateVersion::new("1.2.0").unwrap(),
+            files: vec![TemplateFileRef {
+                version: TemplateVersion::new("1.2.0").unwrap(),
+                path: "claude-glm/1.2.0.json".to_owned(),
+                digest: "a".repeat(64),
+            }],
+            status: TemplateStatus::Deprecated,
+            replacement: None,
+        };
+        let err = entry.validate().unwrap_err().to_string();
+        assert!(err.contains("must point to its replacement"), "got: {err}");
+        entry.replacement = Some(TemplateId::new("claude-glm-next").unwrap());
+        entry.validate().unwrap();
+    }
+
+    #[test]
+    fn check_update_reports_deprecated_with_replacement() {
+        let entry = TemplateCatalogEntry {
+            id: TemplateId::new("claude-glm").unwrap(),
+            latest_version: TemplateVersion::new("2.0.0").unwrap(),
+            files: vec![
+                TemplateFileRef {
+                    version: TemplateVersion::new("1.2.0").unwrap(),
+                    path: "claude-glm/1.2.0.json".to_owned(),
+                    digest: "a".repeat(64),
+                },
+                TemplateFileRef {
+                    version: TemplateVersion::new("2.0.0").unwrap(),
+                    path: "claude-glm/2.0.0.json".to_owned(),
+                    digest: "b".repeat(64),
+                },
+            ],
+            status: TemplateStatus::Deprecated,
+            replacement: Some(TemplateId::new("claude-glm-next").unwrap()),
+        };
+        entry.validate().unwrap();
+        let catalog = Catalog {
+            version: CATALOG_SCHEMA_VERSION,
+            templates: vec![entry],
+        };
+        let instance = crate::instance::Instance {
+            id: crate::ids::InstanceId::new("tpl-dep").unwrap(),
+            name: crate::ids::InstanceName::new("dep").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            config_root: crate::paths::AbsolutePath::from_path(Path::new("/tmp/none")).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: crate::state::Isolation::RelocatedRoot,
+            origin: crate::state::InstanceOrigin::Created,
+            ownership: crate::state::Ownership::SuperaiCreated,
+            template: Some(crate::instance::TemplateRef {
+                name: TemplateId::new("claude-glm").unwrap(),
+                version: TemplateVersion::new("1.2.0").unwrap(),
+            }),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        match check_update_with_catalog(&instance, &catalog) {
+            UpdateStatus::Deprecated { replacement } => {
+                assert_eq!(replacement.as_deref(), Some("claude-glm-next"));
+            }
+            other => panic!("expected Deprecated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_capability_in_template_fails_validation_not_silently_absent() {
+        let tmpl = minimal_template();
+        // Build the JSON with an unknown capability id; typed parsing must
+        // reject it instead of treating it as absent (CAP-01).
+        let mut value = serde_json::to_value(&tmpl).unwrap();
+        value["capability_map"] = serde_json::json!({"telepathy": "native"});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let err = Template::from_json_bytes(&bytes).unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("unknown") || err.contains("telepathy"),
+            "got: {err}"
+        );
+        // Known ids with unknown support values also fail typed.
+        let mut value2 = serde_json::to_value(&tmpl).unwrap();
+        value2["capability_map"] = serde_json::json!({"web_search": "maybe"});
+        let bytes2 = serde_json::to_vec(&value2).unwrap();
+        Template::from_json_bytes(&bytes2).unwrap_err();
+        // Alias spellings resolve cleanly.
+        let mut value3 = serde_json::to_value(&tmpl).unwrap();
+        value3["capability_map"] = serde_json::json!({"web-search": "native"});
+        let bytes3 = serde_json::to_vec(&value3).unwrap();
+        Template::from_json_bytes(&bytes3).unwrap();
     }
 
     #[test]
