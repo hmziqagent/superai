@@ -943,6 +943,12 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
+    // CAP-04: incomplete capability coverage blocks the template USE path.
+    // Validating the candidate against the adapter that will receive it
+    // enforces both selector ownership (TPL-02) and capability completeness
+    // before any disk mutation.
+    new.validate_against_adapter(adapter)?;
+
     // 2. fresh-read instance config via snapshot (and registry)
     let registry = Registry::load(registry_path)?;
     let fresh_instance =
@@ -1420,7 +1426,15 @@ mod tests {
             crate::adapter::VersionResolution::unknown()
         }
         fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
-            Vec::new()
+            let mut surface = crate::adapter::ConfigSurface::new(
+                "settings.json",
+                crate::adapter::PathResolver::fallback_only("~/.partial/settings.json"),
+                crate::adapter::DocumentKind::Json,
+                crate::adapter::ConfigScope::User,
+                crate::adapter::SurfaceOwnership::UserEditable,
+            );
+            surface.owned_selectors = vec!["model".to_owned()];
+            vec![surface]
         }
         fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
             Vec::new()
@@ -1610,6 +1624,107 @@ mod tests {
     }
 
     #[test]
+    fn apply_update_blocked_on_incomplete_capability_coverage() {
+        // FINDING-2 regression: the CAP-04 completeness gate must fire on the
+        // template USE path — an update whose capability coverage does not
+        // resolve against the target adapter is refused before any disk
+        // mutation, and the registry keeps the old version.
+        let tmp = crate::test_util::temp_dir_unique("tpl-cap04-apply");
+        let registry_path = tmp.join("instances.json");
+        let config_root = tmp.join(".partial-work");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join("settings.json");
+
+        let mut base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
+        let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
+        base.harness = HarnessId::new("partial-cap-harness").unwrap();
+        new.harness = HarnessId::new("partial-cap-harness").unwrap();
+        base.digest = "a".repeat(64);
+        new.digest = "b".repeat(64);
+        let base_bytes = serde_json::to_vec(&base).unwrap();
+        let new_bytes = serde_json::to_vec(&new).unwrap();
+
+        let instance = Instance {
+            id: crate::ids::InstanceId::new("cap04-instance-001").unwrap(),
+            name: crate::ids::InstanceName::new("cap04").unwrap(),
+            harness: HarnessId::new("partial-cap-harness").unwrap(),
+            config_root: AbsolutePath::from_path(&config_root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: Some(TemplateRef {
+                name: TemplateId::new("claude-glm").unwrap(),
+                version: TemplateVersion::new("1.1.0").unwrap(),
+            }),
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        let mut registry = Registry::default();
+        registry.insert(instance.clone()).unwrap();
+        registry.store(&registry_path).unwrap();
+        std::fs::write(&config_path, "{\n  \"model\": \"glm-4\"\n}\n").unwrap();
+
+        // PartialCapAdapter declares only web_search: the candidate template
+        // (empty capability_map) cannot cover the catalog -> apply refused.
+        let err = apply_update(
+            &instance,
+            &registry_path,
+            &base,
+            &new,
+            &base_bytes,
+            &new_bytes,
+            &PartialCapAdapter,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("do not resolve") || err.contains("incomplete capability coverage"),
+            "got: {err}"
+        );
+        // Nothing mutated: old registry version, config bytes unchanged.
+        let registry_after = Registry::load(&registry_path).unwrap();
+        let kept = registry_after.get_by_id("cap04-instance-001").unwrap();
+        assert_eq!(kept.template.as_ref().unwrap().version.as_str(), "1.1.0");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "{\n  \"model\": \"glm-4\"\n}\n"
+        );
+
+        // Covering the gap through the candidate's capability map lets the
+        // same update apply.
+        new.capability_map.insert(
+            crate::capability::Capability::Vision,
+            crate::capability::Support::Absent,
+        );
+        new.capability_map.insert(
+            crate::capability::Capability::ComputerUse,
+            crate::capability::Support::Absent,
+        );
+        new.capability_map.insert(
+            crate::capability::Capability::Mcp,
+            crate::capability::Support::Absent,
+        );
+        let new_bytes = serde_json::to_vec(&new).unwrap();
+        let outcome = apply_update(
+            &instance,
+            &registry_path,
+            &base,
+            &new,
+            &base_bytes,
+            &new_bytes,
+            &PartialCapAdapter,
+        )
+        .unwrap();
+        assert!(outcome.registry_updated, "{:?}", outcome.applied);
+        let registry_final = Registry::load(&registry_path).unwrap();
+        let updated = registry_final.get_by_id("cap04-instance-001").unwrap();
+        assert_eq!(updated.template.as_ref().unwrap().version.as_str(), "1.2.0");
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
     fn apply_nested_selector_creates_parent_and_preserves_foreign() {
         // DOC-02 caller migration: nested patch selectors route through the
         // engine executor, creating intermediate objects while foreign keys
@@ -1626,7 +1741,7 @@ mod tests {
             "1.2.0",
             vec![
                 patch("key:model", json!("glm-4.5")),
-                patch("key:env.MAX_THINKING", json!("high")),
+                patch("key:env.ANTHROPIC_MODEL.fallback", json!("high")),
             ],
         );
         new.digest = "b".repeat(64);
@@ -1678,7 +1793,7 @@ mod tests {
         let after: Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(after["model"], json!("glm-4.5"));
-        assert_eq!(after["env"]["MAX_THINKING"], json!("high"));
+        assert_eq!(after["env"]["ANTHROPIC_MODEL"]["fallback"], json!("high"));
         assert_eq!(after["foreignRoot"], json!("keep"));
         drop(std::fs::remove_dir_all(&tmp));
     }

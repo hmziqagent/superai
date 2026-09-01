@@ -504,6 +504,13 @@ pub fn resolve_all(
 pub struct InstanceCapabilitySources<'a> {
     /// Known provider definitions (bundled + caller-supplied).
     pub providers: &'a [ProviderDefinition],
+    /// Per-instance provider ids, keyed by instance id: the provider each
+    /// instance actually uses (from template metadata or PRV-05 detection).
+    /// Instances without an entry are resolved against the provider FRESHLY
+    /// detected from their config; when detection also finds nothing, no
+    /// capability claim is made — resolution never falls back to an
+    /// arbitrary other provider.
+    pub instance_providers: &'a BTreeMap<InstanceId, ProviderId>,
     /// Per-instance template capability overrides, keyed by instance id.
     pub template_overrides: &'a BTreeMap<InstanceId, BTreeMap<Capability, Support>>,
     /// Per-instance extension state, keyed by instance id.
@@ -513,6 +520,7 @@ pub struct InstanceCapabilitySources<'a> {
 }
 
 static EMPTY_PROVIDERS: Vec<ProviderDefinition> = Vec::new();
+static EMPTY_INSTANCE_PROVIDERS: BTreeMap<InstanceId, ProviderId> = BTreeMap::new();
 static EMPTY_OVERRIDES: BTreeMap<InstanceId, BTreeMap<Capability, Support>> = BTreeMap::new();
 static EMPTY_EXTENSIONS: BTreeMap<InstanceId, ExtensionState> = BTreeMap::new();
 
@@ -520,6 +528,7 @@ impl Default for InstanceCapabilitySources<'_> {
     fn default() -> Self {
         Self {
             providers: &EMPTY_PROVIDERS,
+            instance_providers: &EMPTY_INSTANCE_PROVIDERS,
             template_overrides: &EMPTY_OVERRIDES,
             extensions: &EMPTY_EXTENSIONS,
             policy: Vec::new(),
@@ -535,13 +544,9 @@ pub fn resolve_for_instance(
     instance: &Instance,
     sources: &InstanceCapabilitySources<'_>,
 ) -> Vec<(Capability, ResolvedCapability)> {
-    let providers = if sources.providers.is_empty() {
-        crate::provider::load_bundled_providers().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let bundled = crate::provider::load_bundled_providers().unwrap_or_default();
     let effective: &[ProviderDefinition] = if sources.providers.is_empty() {
-        &providers
+        &bundled
     } else {
         sources.providers
     };
@@ -555,9 +560,27 @@ pub fn resolve_for_instance(
     let adapter = crate::harness_catalog::all_adapters()
         .into_iter()
         .find(|a| a.id().eq_case_fold(&instance.harness));
-    // Without any provider data there is nothing to resolve against:
-    // return the honest empty result rather than inventing a provider.
-    let Some(provider) = effective.first() else {
+
+    // The instance's OWN provider, never an arbitrary one (CAP-05): an
+    // explicit caller-supplied mapping wins (template metadata / PRV-05
+    // detection result); otherwise the provider is detected FRESH from the
+    // instance's current config; if nothing is detected, no capability
+    // claim is made.
+    let provider = sources
+        .instance_providers
+        .get(&instance.id)
+        .and_then(|wanted| effective.iter().find(|p| p.id.eq_case_fold(wanted)))
+        .or_else(|| {
+            let adapter = adapter.as_deref()?;
+            let report =
+                crate::provider_render::inspect_effective_provider(instance, adapter, effective)
+                    .ok()?;
+            let detected = report.detected_provider?.id?;
+            effective
+                .iter()
+                .find(|p| p.id.as_str().eq_ignore_ascii_case(&detected))
+        });
+    let Some(provider) = provider else {
         return Vec::new();
     };
     let cap_sources = CapabilitySources {
@@ -1552,14 +1575,12 @@ mod tests {
 
     #[test]
     fn instance_query_filters_without_harness_identity() {
+        let tmp = crate::test_util::temp_dir_unique("cap-query");
         let make_instance = |harness: &str, name: &str| Instance {
             id: InstanceId::new(&format!("id-{name}")).unwrap(),
             name: crate::ids::InstanceName::new(name).unwrap(),
             harness: hid(harness),
-            config_root: crate::paths::AbsolutePath::from_path(
-                &std::env::temp_dir().join(format!("superai-cap-{name}")),
-            )
-            .unwrap(),
+            config_root: crate::paths::AbsolutePath::from_path(&tmp.join(name)).unwrap(),
             binary: None,
             wrapper: None,
             isolation: crate::state::Isolation::RelocatedRoot,
@@ -1571,8 +1592,17 @@ mod tests {
         };
         let claude = make_instance("claude-code", "claude-inst");
         let aider = make_instance("aider", "aider-inst");
+
+        // Explicit per-instance provider mapping: no harness identity in the
+        // query API, and each instance resolves against ITS provider.
+        let mut instance_providers = BTreeMap::new();
+        instance_providers.insert(claude.id.clone(), pid("anthropic"));
+        instance_providers.insert(aider.id.clone(), pid("openai"));
         let instances = vec![claude, aider];
-        let sources = InstanceCapabilitySources::default();
+        let sources = InstanceCapabilitySources {
+            instance_providers: &instance_providers,
+            ..InstanceCapabilitySources::default()
+        };
         let with_mcp = filter_instances_by_capability(
             &instances,
             Capability::Mcp,
@@ -1592,6 +1622,117 @@ mod tests {
             &sources,
         );
         assert!(none.is_empty());
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn instance_query_resolves_each_instance_against_its_own_provider() {
+        // FINDING-1 regression: two SAME-harness instances with DIFFERENT
+        // providers must resolve (and filter) differently — never against
+        // the first bundled provider.
+        let tmp = crate::test_util::temp_dir_unique("cap-own-provider");
+        let make_instance = |name: &str| Instance {
+            id: InstanceId::new(&format!("id-{name}")).unwrap(),
+            name: crate::ids::InstanceName::new(name).unwrap(),
+            harness: hid("claude-code"),
+            config_root: crate::paths::AbsolutePath::from_path(&tmp.join(name)).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: crate::state::Isolation::RelocatedRoot,
+            origin: crate::state::InstanceOrigin::Created,
+            ownership: crate::state::Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        let on_anthropic = make_instance("on-anthropic");
+        let on_glm = make_instance("on-glm");
+        let unconfigured = make_instance("unconfigured");
+
+        // Explicit mapping: anthropic vs glm.
+        let mut instance_providers = BTreeMap::new();
+        instance_providers.insert(on_anthropic.id.clone(), pid("anthropic"));
+        instance_providers.insert(on_glm.id.clone(), pid("glm"));
+        let instances = vec![on_anthropic, on_glm, unconfigured];
+        let sources = InstanceCapabilitySources {
+            instance_providers: &instance_providers,
+            ..InstanceCapabilitySources::default()
+        };
+
+        // Vision: native on anthropic, absent on glm (provider data).
+        let vision_native = filter_instances_by_capability(
+            &instances,
+            Capability::Vision,
+            Some(Support::Native),
+            &sources,
+        );
+        assert_eq!(vision_native.len(), 1);
+        assert_eq!(vision_native[0].0.as_str(), "id-on-anthropic");
+        let vision_absent = filter_instances_by_capability(
+            &instances,
+            Capability::Vision,
+            Some(Support::Absent),
+            &sources,
+        );
+        assert_eq!(vision_absent.len(), 1);
+        assert_eq!(vision_absent[0].0.as_str(), "id-on-glm");
+        assert_eq!(vision_absent[0].1.source, CapabilitySource::Provider);
+
+        // Web search: native on anthropic (harness tool), substituted on glm
+        // (server-side) — same harness, different provider, different support.
+        let web_substituted = filter_instances_by_capability(
+            &instances,
+            Capability::WebSearch,
+            Some(Support::Substituted),
+            &sources,
+        );
+        assert_eq!(web_substituted.len(), 1);
+        assert_eq!(web_substituted[0].0.as_str(), "id-on-glm");
+
+        // The unconfigured instance makes NO claim either way — it is not
+        // silently resolved against the first bundled provider.
+        let claimed: Vec<&str> = vision_native
+            .iter()
+            .chain(vision_absent.iter())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert!(!claimed.contains(&"id-unconfigured"));
+
+        // Fresh-detection fallback: write a codex config pointing at glm and
+        // resolve WITHOUT the explicit mapping — glm-specific results prove
+        // the provider came from the instance's config, not the bundle order.
+        let codex_root = tmp.join("codex-inst");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        std::fs::write(
+            codex_root.join("config.toml"),
+            "model_provider = \"glm\"\n\n[model_providers.glm]\nname = \"GLM\"\nbase_url = \"https://open.bigmodel.cn/api/paas/v4\"\n",
+        )
+        .unwrap();
+        let codex_instance = Instance {
+            id: InstanceId::new("id-codex-inst").unwrap(),
+            name: crate::ids::InstanceName::new("codex-inst").unwrap(),
+            harness: hid("codex-cli"),
+            config_root: crate::paths::AbsolutePath::from_path(&codex_root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: crate::state::Isolation::RelocatedRoot,
+            origin: crate::state::InstanceOrigin::Created,
+            ownership: crate::state::Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        };
+        let detected = resolve_for_instance(&codex_instance, &InstanceCapabilitySources::default());
+        let vision = detected
+            .iter()
+            .find(|(cap, _)| *cap == Capability::Vision)
+            .map(|(_, res)| res.clone())
+            .expect("codex resolves all capabilities");
+        // glm declares vision absent; the first bundled provider (anthropic)
+        // would have said native — detection must win.
+        assert_eq!(vision.support, Support::Absent);
+        assert_eq!(vision.source, CapabilitySource::Provider);
+        drop(std::fs::remove_dir_all(&tmp));
     }
 
     #[test]
