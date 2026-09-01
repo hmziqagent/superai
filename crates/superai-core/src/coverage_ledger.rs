@@ -65,8 +65,34 @@ pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
             let path = resolve(file);
             let src =
                 std::fs::read_to_string(&path).map_err(|e| format!("evidence file {file}: {e}"))?;
-            if src.contains(&format!("fn {name}(")) {
+            // The cited item must be a TEST, not a production function that
+            // happens to share the name: a `#[test]` attribute must sit in
+            // the attribute lines immediately above the `fn <name>(`
+            // definition (interleaved `#[cfg(...)]`/`#[expect(...)]`
+            // attributes are walked over). Production functions never
+            // satisfy this, so citations cannot silently drift onto
+            // non-test fns.
+            let needle = format!("fn {name}(");
+            let mut attrs_above: Vec<&str> = Vec::new();
+            let mut cited_is_test = false;
+            for line in src.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("#[") {
+                    attrs_above.push(trimmed);
+                    continue;
+                }
+                if trimmed.starts_with(&needle) {
+                    cited_is_test = attrs_above.contains(&"#[test]");
+                    break;
+                }
+                attrs_above.clear();
+            }
+            if cited_is_test {
                 Ok(())
+            } else if src.contains(&needle) {
+                Err(format!(
+                    "`{name}` in {file} is not a #[test] function — cite a test, not a production fn"
+                ))
             } else {
                 Err(format!("test `{name}` not found in {file}"))
             }
@@ -461,19 +487,25 @@ pub const DOD_ITEMS: &[DodItem] = &[
             },
             Evidence::Test {
                 file: "src/skills.rs",
+                name: "link_selected",
+            },
+            Evidence::Test {
+                file: "src/skills.rs",
                 name: "copy_selected",
             },
+            // The update path is covered end-to-end by the git-pinned
+            // revision test (real content change v1→v2, digest advance,
+            // typed SourceFetch on a bad revision); disable/remove by the
+            // distinction test. The production fn names
+            // (update_skill/disable_skill/remove_skill) are NOT tests and
+            // verify_evidence now rejects them.
             Evidence::Test {
                 file: "src/skills.rs",
-                name: "update_skill",
+                name: "git_source_pins_revision_and_checkout_is_verified",
             },
             Evidence::Test {
                 file: "src/skills.rs",
-                name: "disable_skill",
-            },
-            Evidence::Test {
-                file: "src/skills.rs",
-                name: "remove_skill",
+                name: "disable_vs_remove",
             },
         ],
     },

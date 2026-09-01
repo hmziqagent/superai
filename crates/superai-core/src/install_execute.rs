@@ -2525,8 +2525,19 @@ mod tests {
         assert!(plan.blocked);
         let err =
             execute_update_with_runner(&plan, &opts, false, false, &PanickingRunner).unwrap_err();
+        // Discriminating refusal proof: the error must be the typed blocked
+        // guard carrying the PLAN's own blocked_reason verbatim. The runner
+        // PANICS if it is ever reached, so deleting the guard fails this
+        // test at the panic site, and no runner-produced error can satisfy
+        // the verbatim-reason match.
+        let expected_reason = plan.blocked_reason.as_deref();
         assert!(
-            format!("{err}").contains("blocked") || format!("{err}").contains("explicit accept")
+            matches!(
+                &err,
+                CoreError::Validation { field, reason }
+                    if field.as_str() == "update" && Some(reason.as_str()) == expected_reason
+            ),
+            "refused update must surface the plan's own blocked_reason as Validation{{field: \"update\"}}, got: {err}"
         );
 
         // With explicit accept, execution proceeds to the update command.
@@ -2546,22 +2557,29 @@ mod tests {
         drop(fs::remove_dir_all(home));
     }
 
-    /// Runner that must never be reached in the blocked arm.
+    /// Runner that must never be reached: the blocked-plan guard refuses
+    /// before any command runs. Panics on invocation so a deleted guard
+    /// fails the test at the panic site — a returned `Err` could
+    /// accidentally satisfy the blocked-arm assertion (test code may panic
+    /// per project rules).
     #[cfg(unix)]
     struct PanickingRunner;
 
     #[cfg(unix)]
     impl UpdateCommandRunner for PanickingRunner {
+        // Reaching the runner on a refused plan IS the failure; panicking is
+        // the only response that no assertion can accidentally satisfy.
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "test-only runner whose invocation is itself the failure"
+        )]
         fn run(
             &self,
             _executable: &str,
             _args: &[String],
             _redact: bool,
         ) -> Result<ProcessOutput, CoreError> {
-            Err(CoreError::Validation {
-                field: "runner".to_owned(),
-                reason: "command must not execute while blocked".to_owned(),
-            })
+            panic!("update command runner invoked on a refused plan (guard deleted?)");
         }
     }
 
