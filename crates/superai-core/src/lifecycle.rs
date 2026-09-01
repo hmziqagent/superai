@@ -166,6 +166,11 @@ pub struct CreateRequest {
     pub wrapper: Option<WrapperPath>,
     /// Explicit target root, if the caller wants to control the location (e.g. tests).
     pub target_root: Option<AbsolutePath>,
+    /// Daemon port for `DaemonService` isolation, if the caller chose one
+    /// (INS-02). `None` defers allocation to daemon start (probe-and-reserve
+    /// with a fresh conflict check, WRP-07); `Some(port)` is conflict-checked
+    /// during preflight.
+    pub daemon_port: Option<u16>,
 }
 
 impl CreateRequest {
@@ -184,6 +189,7 @@ impl CreateRequest {
             template: None,
             wrapper: None,
             target_root: None,
+            daemon_port: None,
         }
     }
 }
@@ -1441,6 +1447,102 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Preflight helpers (INS-02): disk space
+// ---------------------------------------------------------------------------
+
+/// Sum of the file bytes a mirror plan intends to copy, freshly stated from
+/// disk (INS-02 disk-space input — never a cached number).
+fn planned_copy_bytes(plan: &MirrorPlan) -> u64 {
+    let mut total = 0u64;
+    for entry in &plan.copied {
+        if let Ok(meta) = std::fs::metadata(&entry.source)
+            && meta.is_file()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Nearest existing ancestor of `path` (for filesystem-level probes that
+/// require the path to exist).
+fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    current
+}
+
+/// Outcome of comparing required bytes against measured availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskSpaceStatus {
+    /// Enough space measured.
+    Sufficient {
+        /// Bytes available.
+        available: u64,
+    },
+    /// Not enough space measured.
+    Insufficient {
+        /// Bytes available.
+        available: u64,
+    },
+    /// Availability could not be measured on this platform.
+    Unknown,
+}
+
+/// Classify required-vs-available; pure so both branches are testable on
+/// every platform.
+fn disk_space_status(available: Option<u64>, required: u64) -> DiskSpaceStatus {
+    match available {
+        Some(a) if a >= required => DiskSpaceStatus::Sufficient { available: a },
+        Some(a) => DiskSpaceStatus::Insufficient { available: a },
+        None => DiskSpaceStatus::Unknown,
+    }
+}
+
+/// Measure available bytes on the filesystem containing `path` (INS-02).
+///
+/// Unix: the platform's own `df -k -P <path>` report (argv tokens, no shell).
+/// Other platforms: `None` — std exposes no statvfs, and no number is
+/// invented.
+fn disk_space_available(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let path_str = path.display().to_string();
+        let args = vec!["-k".to_owned(), "-P".to_owned(), path_str];
+        let opts = crate::process::ExecuteOpts {
+            timeout: Some(std::time::Duration::from_secs(5)),
+            ..crate::process::ExecuteOpts::default()
+        };
+        let output = crate::process::run_command("df", &args, &opts).ok()?;
+        parse_df_available_bytes(&output.stdout)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Parse the available-bytes column of `df -k -P` output (4th field, 1 KiB
+/// units). Pure and tolerant: anything unexpected yields `None`.
+fn parse_df_available_bytes(stdout: &str) -> Option<u64> {
+    let mut lines = stdout.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next()?;
+    let data_line = if first.starts_with("Filesystem") {
+        lines.next()?
+    } else {
+        first
+    };
+    let kib = data_line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+    kib.checked_mul(1024)
+}
+
+// ---------------------------------------------------------------------------
 // Preflight for create
 // ---------------------------------------------------------------------------
 
@@ -1450,6 +1552,7 @@ fn preflight_create(
     adapter: &dyn Adapter,
     source_root: &Path,
     target_root: &Path,
+    planned_bytes: u64,
 ) -> Result<(Vec<Precondition>, Vec<Conflict>, Vec<Warning>)> {
     let mut preconditions: Vec<Precondition> = Vec::new();
     let mut conflicts: Vec<Conflict> = Vec::new();
@@ -1658,6 +1761,62 @@ fn preflight_create(
         }
     }
 
+    // Disk space (INS-02): the mirror plan's byte total must fit on the
+    // target filesystem. Availability comes from the platform's own report
+    // (`df -k -P`); when it cannot be measured, surface a typed warning —
+    // never an invented number.
+    let fs_probe_path = nearest_existing_ancestor(target_root);
+    let status = disk_space_status(disk_space_available(&fs_probe_path), planned_bytes);
+    match status {
+        DiskSpaceStatus::Sufficient { available } => preconditions.push(Precondition {
+            kind: PreconditionKind::DiskSpace,
+            description: format!(
+                "{planned_bytes} planned mirror bytes fit in {available} available on {}",
+                fs_probe_path.display()
+            ),
+            path: AbsolutePath::from_path(&fs_probe_path).ok(),
+            satisfied: true,
+        }),
+        DiskSpaceStatus::Insufficient { available } => {
+            preconditions.push(Precondition {
+                kind: PreconditionKind::DiskSpace,
+                description: format!(
+                    "{planned_bytes} planned mirror bytes do not fit in {available} available on {}",
+                    fs_probe_path.display()
+                ),
+                path: AbsolutePath::from_path(&fs_probe_path).ok(),
+                satisfied: false,
+            });
+            conflicts.push(Conflict {
+                code: "disk_space".to_owned(),
+                message: format!(
+                    "target filesystem {} has {available} bytes available but the mirror plan needs {planned_bytes}",
+                    fs_probe_path.display()
+                ),
+                paths: vec![],
+            });
+        }
+        DiskSpaceStatus::Unknown => {
+            preconditions.push(Precondition {
+                kind: PreconditionKind::DiskSpace,
+                description: format!(
+                    "disk space on {} could not be measured on this platform; not enforced",
+                    fs_probe_path.display()
+                ),
+                path: AbsolutePath::from_path(&fs_probe_path).ok(),
+                satisfied: true,
+            });
+            warnings.push(Warning {
+                code: "disk_space_unknown".to_owned(),
+                message: format!(
+                    "disk space for {} could not be measured; preflight does not enforce it",
+                    target_root.display()
+                ),
+                path: None,
+            });
+        }
+    }
+
     // Template/provider compatible: simplified check if template harness matches request harness?
     if let Some(tmpl) = &request.template
         && tmpl.name.as_str() != request.harness.as_str()
@@ -1674,16 +1833,67 @@ fn preflight_create(
         });
     }
 
-    // Secret sink valid: ensure target can hold secrets (is a directory)
-    // Already covered by target checks
+    // Planned secret sink valid (INS-02): resolve the harness-declared sink
+    // for a provider credential against the chosen adapter. A harness with
+    // no writable sink surfaces the typed refusal; hard blocking lands with
+    // the CreateRequest provider-input field (INS-02 remainder) — nothing is
+    // invented here.
+    match crate::provider::resolve_api_key_sink(adapter) {
+        Ok(sink) => preconditions.push(Precondition {
+            kind: PreconditionKind::AuthPresent,
+            description: format!("planned secret sink valid: {}", sink.description),
+            path: None,
+            satisfied: true,
+        }),
+        Err(e) => warnings.push(Warning {
+            code: "secret_sink_unavailable".to_owned(),
+            message: format!("no writable secret sink for {}: {e}", adapter.id()),
+            path: None,
+        }),
+    }
 
-    // No daemon port conflict: simplified, always satisfied
-    preconditions.push(Precondition {
-        kind: PreconditionKind::NoForeignOwner,
-        description: "no foreign manager ownership".to_owned(),
-        path: None,
-        satisfied: true,
-    });
+    // No daemon port conflict (INS-02/WRP-07): real for daemon-service
+    // isolation. An explicitly chosen port must be free now; a deferred port
+    // is allocated probe-and-reserve at daemon start with a fresh conflict
+    // check (never persisted as unquestionably free).
+    if request.isolation == Isolation::DaemonService {
+        let port_check = match request.daemon_port {
+            Some(port) => {
+                let home = home_dir().ok_or(CoreError::NoHomeDir)?;
+                crate::daemon::check_port_free(
+                    crate::daemon::DEFAULT_BIND_ADDR,
+                    port,
+                    &crate::daemon::default_identity_root(&home),
+                    &crate::daemon::SystemProcessProbe,
+                )
+            }
+            None => Ok(()),
+        };
+        match port_check {
+            Ok(()) => preconditions.push(Precondition {
+                kind: PreconditionKind::PortFree,
+                description: match request.daemon_port {
+                    Some(port) => format!("daemon port {port} is free"),
+                    None => "daemon port allocated at start with a fresh conflict check".to_owned(),
+                },
+                path: None,
+                satisfied: true,
+            }),
+            Err(e) => {
+                preconditions.push(Precondition {
+                    kind: PreconditionKind::PortFree,
+                    description: format!("daemon port check failed: {e}"),
+                    path: None,
+                    satisfied: false,
+                });
+                conflicts.push(Conflict {
+                    code: "daemon_port_conflict".to_owned(),
+                    message: format!("{e}"),
+                    paths: vec![],
+                });
+            }
+        }
+    }
 
     // No foreign manager ownership: simplified
     // Check for foreign marker: if source root contains .claude-multi or similar, flag
@@ -1732,12 +1942,21 @@ pub fn preview_create_mirrored(
     adapter: &dyn Adapter,
 ) -> Result<OperationPreview> {
     let (source_root, target_root) = resolve_source_and_target(request, registry, adapter)?;
-    let (preconditions, conflicts, warnings) =
-        preflight_create(request, registry, adapter, &source_root, &target_root)?;
+    // Build the mirror plan first so preflight can check disk space against
+    // the plan's real byte total (fresh stats at preflight time).
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
     let mirror_plan =
         build_mirror_plan(&source_root, &target_root, &exclusions, &credential_names)?;
+    let planned_bytes = planned_copy_bytes(&mirror_plan);
+    let (preconditions, conflicts, warnings) = preflight_create(
+        request,
+        registry,
+        adapter,
+        &source_root,
+        &target_root,
+        planned_bytes,
+    )?;
 
     let preview_id = new_operation_id()?;
     let requested_target = RequestedTarget {
@@ -4013,6 +4232,202 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
+    // -------------------------------------------------------------------
+    // INS-02 preflight: disk space, daemon port, secret sink
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_df_available_bytes_reads_the_available_column() {
+        let stdout = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                      /dev/disk1s1 1000 500 4096 50% /home\n";
+        assert_eq!(parse_df_available_bytes(stdout), Some(4096 * 1024));
+        // Header only / garbage / missing column are None, never invented.
+        assert_eq!(parse_df_available_bytes("Filesystem 1024-blocks\n"), None);
+        assert_eq!(parse_df_available_bytes(""), None);
+        assert_eq!(
+            parse_df_available_bytes("/dev/x 1 2 3 4%\n"),
+            Some(3 * 1024)
+        );
+    }
+
+    #[test]
+    fn disk_space_status_classifies_all_three_branches() {
+        assert_eq!(
+            disk_space_status(Some(100), 100),
+            DiskSpaceStatus::Sufficient { available: 100 }
+        );
+        assert_eq!(
+            disk_space_status(Some(99), 100),
+            DiskSpaceStatus::Insufficient { available: 99 }
+        );
+        assert_eq!(disk_space_status(None, 100), DiskSpaceStatus::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_disk_space_measured_against_the_mirror_plan_bytes() {
+        let tmp = unique_temp("preflight-disk");
+        let adapter = make_adapter("claude-code");
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        // A sparse file claims a 1 TiB length without occupying it — the
+        // mirror plan's stated bytes exceed any CI filesystem.
+        let sparse = std::fs::File::create(source_root.join("big.bin")).unwrap();
+        sparse.set_len(1_u64 << 40).unwrap();
+        drop(sparse);
+
+        let request = CreateRequest {
+            name: InstanceName::new("huge").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source_root).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
+            daemon_port: None,
+        };
+        let registry = Registry::load(&tmp.join("registry.json")).unwrap();
+        let preview = preview_create_mirrored(&request, &registry, &adapter).unwrap();
+
+        let disk = preview
+            .preconditions
+            .iter()
+            .find(|p| p.kind == PreconditionKind::DiskSpace)
+            .expect("disk-space precondition present");
+        assert!(
+            !disk.satisfied,
+            "1 TiB plan must not fit: {}",
+            disk.description
+        );
+        assert!(
+            preview.conflicts.iter().any(|c| c.code == "disk_space"),
+            "conflicts: {:?}",
+            preview.conflicts
+        );
+
+        // A small plan on the same filesystem is satisfied with real numbers.
+        std::fs::remove_file(source_root.join("big.bin")).unwrap();
+        let preview_small = preview_create_mirrored(&request, &registry, &adapter).unwrap();
+        let disk_small = preview_small
+            .preconditions
+            .iter()
+            .find(|p| p.kind == PreconditionKind::DiskSpace)
+            .unwrap();
+        assert!(disk_small.satisfied, "{}", disk_small.description);
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn preflight_daemon_port_conflict_detected_and_recovers() {
+        let tmp = unique_temp("preflight-port");
+        let adapter = make_adapter("claude-code");
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+
+        let mut request = CreateRequest {
+            name: InstanceName::new("daemon").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source_root).unwrap()),
+            isolation: Isolation::DaemonService,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
+            daemon_port: None,
+        };
+        let registry = Registry::load(&tmp.join("registry.json")).unwrap();
+
+        // Deferred port: satisfied, allocation happens at start.
+        let deferred = preview_create_mirrored(&request, &registry, &adapter).unwrap();
+        let port_pre = deferred
+            .preconditions
+            .iter()
+            .find(|p| p.kind == PreconditionKind::PortFree)
+            .expect("port precondition present for daemon isolation");
+        assert!(port_pre.satisfied);
+        assert!(port_pre.description.contains("allocated at start"));
+
+        // Explicit port actually held: precondition unsatisfied + conflict.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let held = listener.local_addr().unwrap().port();
+        request.daemon_port = Some(held);
+        let conflicted = preview_create_mirrored(&request, &registry, &adapter).unwrap();
+        let port_pre = conflicted
+            .preconditions
+            .iter()
+            .find(|p| p.kind == PreconditionKind::PortFree)
+            .unwrap();
+        assert!(!port_pre.satisfied);
+        let conflict = conflicted
+            .conflicts
+            .iter()
+            .find(|c| c.code == "daemon_port_conflict")
+            .expect("port conflict surfaced");
+        assert!(conflict.message.contains("in use"), "{}", conflict.message);
+
+        // Once released the same request passes.
+        drop(listener);
+        let free = preview_create_mirrored(&request, &registry, &adapter).unwrap();
+        assert!(
+            !free
+                .conflicts
+                .iter()
+                .any(|c| c.code == "daemon_port_conflict"),
+            "conflicts: {:?}",
+            free.conflicts
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn preflight_secret_sink_resolved_or_warned() {
+        let tmp = unique_temp("preflight-sink");
+        let registry = Registry::load(&tmp.join("registry.json")).unwrap();
+        let source_root = tmp.join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let request = CreateRequest {
+            name: InstanceName::new("sink").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source_root).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
+            daemon_port: None,
+        };
+
+        // A real adapter with an api-key owned selector resolves a sink.
+        let claude = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let with_sink = preview_create_mirrored(&request, &registry, &claude).unwrap();
+        let sink_pre = with_sink
+            .preconditions
+            .iter()
+            .find(|p| p.kind == PreconditionKind::AuthPresent)
+            .expect("secret-sink precondition present");
+        assert!(sink_pre.satisfied);
+        assert!(
+            sink_pre.description.contains("planned secret sink"),
+            "{}",
+            sink_pre.description
+        );
+
+        // The generic test adapter owns no api-key selector: typed warning,
+        // never an invented sink.
+        let generic = make_adapter("claude-code");
+        let without_sink = preview_create_mirrored(&request, &registry, &generic).unwrap();
+        assert!(
+            without_sink
+                .warnings
+                .iter()
+                .any(|w| w.code == "secret_sink_unavailable"),
+            "warnings: {:?}",
+            without_sink.warnings
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
     #[test]
     fn mirror_source_to_target_isolation_proof() {
         let tmp = unique_temp("mirror_isolation");
@@ -4052,6 +4467,7 @@ mod tests {
             }),
             wrapper: Some(wrapper_path.clone()),
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
+            daemon_port: None,
         };
 
         let registry = Registry::load(&registry_path).unwrap();
@@ -4156,6 +4572,7 @@ mod tests {
             }),
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
+            daemon_port: None,
         };
 
         let result = create_mirrored(request, &registry_path, &adapter);
@@ -4323,6 +4740,7 @@ mod tests {
             template: None,
             wrapper: None,
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
+            daemon_port: None,
         };
         let result = create_mirrored(request, &registry_path, &adapter).unwrap();
         assert!(
@@ -4582,6 +5000,7 @@ mod tests {
             template: None,
             wrapper: Some(wrapper1),
             target_root: Some(AbsolutePath::from_path(&target_root1).unwrap()),
+            daemon_port: None,
         };
         let r = create_mirrored(req1, &registry_path, &adapter).unwrap();
         assert!(r.success);
@@ -4597,6 +5016,7 @@ mod tests {
             template: None,
             wrapper: Some(wrapper2),
             target_root: Some(AbsolutePath::from_path(&target_root2).unwrap()),
+            daemon_port: None,
         };
         let registry = Registry::load(&registry_path).unwrap();
         let preview = preview_create_mirrored(&req2, &registry, &adapter).unwrap();

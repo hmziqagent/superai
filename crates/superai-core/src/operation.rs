@@ -199,6 +199,9 @@ pub enum PreconditionKind {
     NoConcurrentModification,
     /// Authentication is present or not required.
     AuthPresent,
+    /// A daemon port must be free now (explicit choice) or allocatable at
+    /// daemon start with a fresh conflict check (INS-02/WRP-07).
+    PortFree,
 }
 
 /// A single precondition for the operation.

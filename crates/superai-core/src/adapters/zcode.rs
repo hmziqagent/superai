@@ -41,6 +41,11 @@ pub const FIXED_CONFIG_PATH: &str = "~/.zcode/v2/config.json";
 /// Fixed config root (parent of versioned file).
 pub const FIXED_CONFIG_ROOT: &str = "~/.zcode/v2";
 
+/// Harness-owned config tree containing every versioned fixed path
+/// (`~/.zcode`). Superai-owned stores (e.g. the saved-profile store, INS-10)
+/// must never live inside this tree.
+pub const HARNESS_CONFIG_ROOT: &str = "~/.zcode";
+
 /// Application bundle ID hint (macOS).
 pub const BUNDLE_ID: &str = "ai.zcode.app";
 
@@ -52,6 +57,30 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 
 /// Schema version.
 pub const SCHEMA_VERSION_STR: &str = "1";
+
+/// Fixed-path activation layout (INS-10/WRP-06): the single fixed config
+/// file every profile activation swaps, plus the harness-owned tree it lives
+/// in (which superai-owned stores must stay outside of).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedPathLayout {
+    /// The fixed, versioned config file (`<home>/.zcode/v2/config.json`).
+    pub fixed_config: PathBuf,
+    /// Harness-owned root (`<home>/.zcode`); profile stores live outside it.
+    pub harness_root: PathBuf,
+}
+
+/// Resolve the fixed-path activation layout for `home`.
+///
+/// Declaration only: drives [`crate::activation::FixedPathProfileStore`]
+/// generically — the fixed path is the activation target and the harness
+/// root bounds where a profile store may never be placed.
+#[must_use]
+pub fn fixed_path_layout(home: &Path) -> FixedPathLayout {
+    FixedPathLayout {
+        fixed_config: home.join(".zcode").join("v2").join("config.json"),
+        harness_root: home.join(".zcode"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Adapter struct
@@ -660,6 +689,27 @@ mod tests {
         let candidates = a.scan_candidates();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0], FIXED_CONFIG_PATH);
+    }
+
+    #[test]
+    fn fixed_path_layout_declares_activation_target_and_boundary() {
+        let home = std::path::PathBuf::from("/home/tester");
+        let layout = super::fixed_path_layout(&home);
+        // Target matches the declared fixed config path expansion.
+        assert_eq!(
+            layout.fixed_config,
+            home.join(".zcode").join("v2").join("config.json")
+        );
+        assert!(layout.fixed_config.starts_with(&layout.harness_root));
+        // The default superai profile store stays outside the harness tree.
+        let store = crate::activation::default_store_root(&home);
+        assert!(!store.starts_with(&layout.harness_root));
+        crate::activation::FixedPathProfileStore::new(
+            &store,
+            HarnessId::new(HARNESS_ID_STR).unwrap(),
+            &layout.harness_root,
+        )
+        .unwrap();
     }
 
     #[test]

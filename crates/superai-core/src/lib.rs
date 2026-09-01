@@ -79,6 +79,12 @@ pub mod mcp;
 /// Plugin abstraction and lifecycle (EXT-06/07).
 pub mod plugin;
 
+/// Fixed-path profile activation: saved profiles, lock, reconciled swaps (INS-10/WRP-06).
+pub mod activation;
+
+/// Daemon lifecycle: port allocation, identity, readiness, start/stop (WRP-07).
+pub mod daemon;
+
 #[cfg(test)]
 mod test_util;
 

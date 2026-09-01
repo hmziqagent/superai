@@ -64,6 +64,34 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// Research-blocked reason.
 pub const BLOCKED_REASON: &str = "daemon state, gateway/schema incomplete — ports, gateway security, multi-agent, plugin/skill paths unverified; long-running service not per-invocation CLI";
 
+/// Daemon-class facts the current research state allows to be wired (WRP-07).
+///
+/// The generic daemon machinery (`crate::daemon`) is harness-agnostic; this
+/// declaration is what openclaw's research state honestly permits today: no
+/// port/bind facts are verified in the corpus, so superai neither invents a
+/// port range nor drives start/stop for this harness until the gateway
+/// research closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonConstraints {
+    /// Whether the corpus verifies a port range/bind for the gateway.
+    pub ports_verified: bool,
+    /// Why port/bind facts remain unverified.
+    pub ports_note: &'static str,
+    /// Whether superai lifecycle may start/stop this daemon today.
+    pub lifecycle_control: AdapterSupport,
+}
+
+/// The `OpenClaw` daemon constraints as the research state allows (declaration
+/// only; see `docs/harness-configs/openclaw.md`).
+#[must_use]
+pub fn daemon_constraints() -> DaemonConstraints {
+    DaemonConstraints {
+        ports_verified: false,
+        ports_note: "gateway ports/bind addresses are not verified in the corpus (openclaw.md)",
+        lifecycle_control: AdapterSupport::ResearchBlocked,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Adapter struct
 // ---------------------------------------------------------------------------
@@ -595,6 +623,21 @@ mod tests {
         assert_eq!(a.research_doc_link(), RESEARCH_DOC);
         assert!(!a.last_verified_date().is_empty());
         assert!(a.blocked_reason().contains("gateway"));
+    }
+
+    #[test]
+    fn daemon_constraints_report_unverified_ports_and_blocked_lifecycle() {
+        // WRP-07 declaration honesty: the generic daemon machinery exists,
+        // but openclaw's research state does not yet verify ports or permit
+        // lifecycle control — nothing is invented here.
+        let c = super::daemon_constraints();
+        assert!(!c.ports_verified);
+        assert!(
+            c.ports_note.contains("not verified"),
+            "note: {}",
+            c.ports_note
+        );
+        assert_eq!(c.lifecycle_control, AdapterSupport::ResearchBlocked);
     }
 
     #[test]

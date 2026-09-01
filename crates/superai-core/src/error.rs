@@ -396,9 +396,30 @@ pub enum CoreError {
     RequiresApproval {
         /// Plugin or server identifier requesting approval.
         plugin: String,
-        /// Operation that needs approval, e.g., `install`.
+        /// Operation that needs approval, e.g. `install`.
         operation: String,
         /// Human-readable reason approval is required.
+        reason: String,
+    },
+
+    /// A concurrent fixed-path activation holds the profile-store lock (WRP-06).
+    #[error("activation lock held at {path} by pid {holder_pid:?}")]
+    ActivationLockHeld {
+        /// Lockfile path.
+        path: PathBuf,
+        /// Pid recorded in the lockfile, when parseable.
+        holder_pid: Option<u32>,
+    },
+
+    /// A recorded daemon pid cannot be proven to be the process superai
+    /// started (WRP-07: start-time/executable mismatch — pid reuse suspected,
+    /// or the platform offers no identity evidence). Never a signal
+    /// authorization.
+    #[error("process identity mismatch for pid {pid}: {reason}")]
+    ProcessIdentityMismatch {
+        /// Pid that failed identity verification.
+        pid: u32,
+        /// Why the recorded identity could not be re-verified.
         reason: String,
     },
 }
@@ -579,6 +600,16 @@ mod tests {
             CoreError::DaemonNotReady {
                 harness: "openclaw".to_owned(),
                 reason: "health check timed out".to_owned(),
+            },
+            CoreError::ActivationLockHeld {
+                path: PathBuf::from(
+                    "/home/user/.superai/fixed-path-profiles/zcode/activation.lock",
+                ),
+                holder_pid: Some(4242),
+            },
+            CoreError::ProcessIdentityMismatch {
+                pid: 4242,
+                reason: "recorded start time 111 but observed 999 — pid reuse suspected".to_owned(),
             },
         ];
         for err in variants {
