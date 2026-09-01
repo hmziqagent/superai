@@ -1,0 +1,6 @@
+- slug: architect
+  name: Architect
+  roleDefinition: Plan before coding.
+  whenToUse: Planning tasks.
+  groups:
+    - read

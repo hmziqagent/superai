@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "legacy-remote": {
+      "url": "https://mcp.legacy.test/sse"
+    }
+  }
+}

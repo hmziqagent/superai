@@ -1,0 +1,7 @@
+{
+  "name": "reviewer",
+  "model": "claude-sonnet-4",
+  "prompt": "Review the diff for regressions.",
+  "resources": ["file://.amazonq/rules/**/*.md"],
+  "tools": ["fs_read", "fs_write"]
+}

@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "acme/large-chat"
+      }
+    }
+  },
+  "unmodelledKey": "preserve-me"
+}

@@ -1,0 +1,7 @@
+{
+  "defaultAgent": "spec",
+  "autoShare": false,
+  "context": {
+    "includeGitIgnore": true
+  }
+}

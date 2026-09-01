@@ -1,0 +1,9 @@
+{
+  "modelProvider": {
+    "id": "google",
+    "model": "gemini-3-pro"
+  },
+  "sandbox": {
+    "enabled": true
+  }
+}

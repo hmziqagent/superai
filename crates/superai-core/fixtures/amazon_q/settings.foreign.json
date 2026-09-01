@@ -1,0 +1,7 @@
+{
+  "chat": {
+    "defaultModel": "claude-sonnet-4"
+  },
+  "customUserKey": "preserve-me",
+  "telemetryOptIn": false
+}

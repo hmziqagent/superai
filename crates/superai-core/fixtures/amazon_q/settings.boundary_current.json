@@ -1,0 +1,8 @@
+{
+  "chat": {
+    "defaultModel": "claude-sonnet-4"
+  },
+  "mcp": {
+    "initTimeout": 10000
+  }
+}

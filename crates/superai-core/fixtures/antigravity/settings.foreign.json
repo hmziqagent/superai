@@ -1,0 +1,8 @@
+{
+  "modelProvider": {
+    "id": "google",
+    "model": "gemini-3-pro"
+  },
+  "visualStyle": "dark",
+  "unmodelledKey": "preserve-me"
+}

@@ -1,0 +1,8 @@
+[
+  {
+    "context": "AgentPanel",
+    "bindings": {
+      "ctrl-enter": "agent::Continue"
+    }
+  }
+]

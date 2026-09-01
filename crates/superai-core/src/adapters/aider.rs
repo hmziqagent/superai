@@ -11,10 +11,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use superai_config::document::ValueType;
+
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -565,11 +567,61 @@ impl Adapter for AiderAdapter {
         }
         instance.validate()?;
         match instance.isolation {
-            Isolation::ExplicitConfig | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
+            Isolation::ExplicitConfig | Isolation::RelocatedRoot | Isolation::Unknown => {
+                // HAD-03: surface content present under the instance root must
+                // satisfy the declared root shapes / owned-key rules.
+                crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
+            }
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!("aider requires isolation explicit_config, got {other}"),
             }),
+        }
+    }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03: types per the options reference in
+        // docs/harness-configs/aider.md §3 (kebab-case YAML keys typed like
+        // their CLI flags). Deprecated legacy OpenAI switches per §env note.
+        match surface_id {
+            ".aider.conf.yml" | ".aider.model.settings.yml" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Mapping)
+                    .with_owned_key("model", ValueType::String)
+                    .with_owned_key("weak-model", ValueType::String)
+                    .with_owned_key("editor-model", ValueType::String)
+                    .with_owned_key("edit-format", ValueType::String)
+                    .with_owned_key("dark-mode", ValueType::Boolean)
+                    .with_owned_key("auto-commits", ValueType::Boolean)
+                    .with_owned_key("map-tokens", ValueType::Number)
+                    .with_deprecated(
+                        "openai-api-type",
+                        Some("env:OPENAI_API_TYPE via --set-env".to_owned()),
+                    )
+                    .with_deprecated(
+                        "openai-api-version",
+                        Some("env:OPENAI_API_VERSION via --set-env".to_owned()),
+                    )
+                    .with_deprecated(
+                        "openai-api-deployment-id",
+                        Some("env:OPENAI_API_DEPLOYMENT_ID via --set-env".to_owned()),
+                    )
+                    .with_deprecated(
+                        "openai-organization-id",
+                        Some("env:OPENAI_ORGANIZATION via --set-env".to_owned()),
+                    ),
+            ),
+            ".env" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::EnvEntries)
+                    .with_owned_key("OPENAI_API_KEY", ValueType::String)
+                    .with_owned_key("ANTHROPIC_API_KEY", ValueType::String)
+                    .with_owned_key("OPENAI_API_BASE", ValueType::String),
+            ),
+            ".aider.model.metadata.json" => {
+                Some(SurfaceSchema::new().with_root_shape(RootShape::Object))
+            }
+            _ => None,
         }
     }
 
@@ -1239,5 +1291,142 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema (mapping root + owned-key semantics)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_yaml_env_and_metadata_shapes() {
+        let a = adapter();
+        let yml = a.surface_schema(".aider.conf.yml").expect("yml schema");
+        assert_eq!(yml.root_shape, Some(crate::adapter::RootShape::Mapping));
+        assert!(yml.owned_key_rules.iter().any(|r| r.path == "model"));
+        assert_eq!(yml.deprecated_keys.len(), 4);
+        let env = a.surface_schema(".env").expect("env schema");
+        assert_eq!(env.root_shape, Some(crate::adapter::RootShape::EnvEntries));
+        assert!(a.surface_schema(".aider.model.metadata.json").is_some());
+        assert!(a.surface_schema("unknown").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_wrongly_typed_yaml_key() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            ".aider.conf.yml",
+            b"dark-mode: \"yes\"\n",
+            superai_config::document::DocumentKind::Yaml,
+        );
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("`dark-mode` must hold a value of type boolean")),
+            "diags: {diags:?}"
+        );
+        // Absent owned keys stay legal (minimal config).
+        let ok = crate::adapter::validate_surface_content(
+            &adapter(),
+            ".aider.conf.yml",
+            b"other-key: 1\n",
+            superai_config::document::DocumentKind::Yaml,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn schema_flags_deprecated_legacy_openai_switches() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            ".aider.conf.yml",
+            b"model: gpt-4\nopenai-api-type: azure\n",
+            superai_config::document::DocumentKind::Yaml,
+        );
+        let dep = diags
+            .iter()
+            .find(|d| d.severity == superai_config::document::DiagnosticSeverity::Deprecation)
+            .expect("deprecation diagnostic");
+        assert!(dep.message.contains("`openai-api-type` is deprecated"));
+        assert!(dep.message.contains("OPENAI_API_TYPE"));
+    }
+
+    #[test]
+    fn validate_instance_rejects_schema_invalid_config_under_root() {
+        let a = adapter();
+        let dir = crate::test_util::temp_dir_unique("aider-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inst = sample_instance_with_root(dir.to_str().unwrap());
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join(".aider.conf.yml"), b"model: gpt-4\n").unwrap();
+        a.validate_instance(&inst).unwrap();
+        // auto-commits is a boolean flag; a string violates the schema.
+        std::fs::write(dir.join(".aider.conf.yml"), b"auto-commits: \"yes\"\n").unwrap();
+        let err = a.validate_instance(&inst).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { details, .. } => {
+                assert!(details.contains("[aider/.aider.conf.yml]"), "{details}");
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-05/HAD-06 version-boundary fixtures (model-metadata era)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn boundary_fixtures_split_model_metadata_eras() {
+        let legacy = fixture_path("model.metadata.boundary_legacy.json");
+        let current = fixture_path("model.metadata.boundary_current.json");
+        assert!(legacy.exists(), "missing {}", legacy.display());
+        assert!(current.exists(), "missing {}", current.display());
+
+        let legacy_map = superai_config::json::load(&legacy).unwrap();
+        let current_map = superai_config::json::load(&current).unwrap();
+        // Legacy era: bare-OpenAI gpt-4 entries only.
+        assert!(legacy_map.contains_key("openai/gpt-4"));
+        assert!(!legacy_map.contains_key("openrouter/anthropic/claude-sonnet-4"));
+        // Current era: routed providers (openrouter) present.
+        assert!(current_map.contains_key("openrouter/anthropic/claude-sonnet-4"));
+
+        // Both eras satisfy the declared object-root schema on read.
+        for path in [&legacy, &current] {
+            let content = std::fs::read(path).unwrap();
+            let diags = crate::adapter::validate_surface_content(
+                &adapter(),
+                ".aider.model.metadata.json",
+                &content,
+                superai_config::document::DocumentKind::StrictJson,
+            );
+            assert!(
+                diags
+                    .iter()
+                    .all(|d| d.severity != superai_config::document::DiagnosticSeverity::Error),
+                "boundary fixture must satisfy the declared schema: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_version_resolution_is_compatible_for_recorded_detection() {
+        // version.txt records `aider 0.84.0`; the documented compatible range
+        // (current schema) accepts it.
+        let version_text = std::fs::read_to_string(fixture_path("version.txt"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let parsed = AiderAdapter::parse_version_output(&version_text);
+        assert_eq!(parsed.as_deref(), Some("0.84.0"));
+        let res = adapter().version_resolution();
+        if res.detected_version.as_deref() == parsed.as_deref() {
+            assert!(res.compatible);
+            assert_eq!(
+                res.schema_version.as_deref(),
+                Some(super::SCHEMA_VERSION_STR)
+            );
+        } else {
+            assert!(!res.compatible, "unknown versions must block writes");
+        }
     }
 }

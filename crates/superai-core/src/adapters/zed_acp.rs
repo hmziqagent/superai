@@ -727,4 +727,24 @@ mod tests {
         let boxed: Box<dyn Adapter> = Box::new(a);
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: on-disk fixture corpus (writable-state surface)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_populated_loads_with_documented_keys() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/zed_acp")
+            .join("settings.populated.json");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+        let value = superai_config::json::load(&path).unwrap();
+        assert!(
+            value.contains_key("context_servers"),
+            "fixture must document `context_servers`"
+        );
+        let report = crate::verification::fixture_report(path.parent().unwrap());
+        assert!(report.validity_pass, "zed_acp corpus validity");
+        assert!(report.secret_free_pass, "zed_acp corpus secret-free");
+    }
 }

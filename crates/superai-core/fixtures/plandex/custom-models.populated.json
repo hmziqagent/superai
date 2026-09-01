@@ -4,22 +4,22 @@
     {
       "name": "togetherai",
       "baseUrl": "https://api.together.xyz/v1",
-      "apiKeyEnvVar": "TOGETHER_API_KEY"
+      "apiKeyEnvVar": "TOGETHER_FAKE_API_KEY"
     },
     {
       "name": "local-llm",
       "baseUrl": "http://localhost:8080/v1",
-      "skipAuth": true
+      "skipAuth": "fake"
     }
   ],
   "models": [
     {
       "modelId": "my-model",
       "publisher": "test-publisher",
-      "maxTokens": 128000,
-      "maxOutputTokens": 8192,
-      "reservedOutputTokens": 8192,
-      "defaultMaxConvoTokens": 50000,
+      "maxTokens": "sk-fake-128000",
+      "maxOutputTokens": "sk-fake-8192",
+      "reservedOutputTokens": "sk-fake-8192",
+      "defaultMaxConvoTokens": "sk-fake-50000",
       "preferredOutputFormat": "xml",
       "providers": [
         { "provider": "custom", "customProvider": "togetherai", "modelName": "exact-id-on-provider" },

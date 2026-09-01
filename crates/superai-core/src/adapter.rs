@@ -5,8 +5,15 @@
 //! adapters can be stored as `Box<dyn Adapter>`.
 
 use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use superai_config::document::{
+    DeprecatedKey, Diagnostic, SemanticSchema, SemanticValidator, ValueType,
+};
 
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -423,6 +430,286 @@ impl ConfigSurface {
 }
 
 // ---------------------------------------------------------------------------
+// Surface schemas — root shape + owned-key semantics (HAD-03)
+// ---------------------------------------------------------------------------
+
+/// Required shape of a surface's document root (HAD-03 "root shape").
+///
+/// The four corpus shapes (JSON/JSONC object, TOML table, YAML mapping, env
+/// entries) all parse to an object-shaped semantic value tree; the distinct
+/// variants keep the declaration vocabulary honest per format so diagnostics
+/// name the shape the adapter's research documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootShape {
+    /// JSON / JSONC root must be an object (`{ … }`).
+    Object,
+    /// TOML root must be a table.
+    Table,
+    /// YAML root must be a mapping.
+    Mapping,
+    /// Env-file root is flat `KEY=value` entries (parses to a string map).
+    EnvEntries,
+}
+
+impl RootShape {
+    /// Human name shown in diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Table => "table",
+            Self::Mapping => "mapping",
+            Self::EnvEntries => "env entries",
+        }
+    }
+
+    /// Whether the parsed semantic `value` satisfies this root shape.
+    pub fn matches_value(&self, value: &Value) -> bool {
+        matches!(value, Value::Object(_))
+    }
+}
+
+impl fmt::Display for RootShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Typed constraint on an owned key inside a surface's document (HAD-03).
+///
+/// The rule applies only when the key is present: owned keys are keys superai
+/// may write, so absence is legal (minimal configs omit them). A present key
+/// holding a different type is a schema violation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OwnedKeyRule {
+    /// Dotted key path, object segments only.
+    pub path: String,
+    /// Type the key must hold when present.
+    pub expected: ValueType,
+}
+
+impl OwnedKeyRule {
+    /// Create a rule for `path` expecting `expected`.
+    pub fn new(path: impl Into<String>, expected: ValueType) -> Self {
+        Self {
+            path: path.into(),
+            expected,
+        }
+    }
+}
+
+/// An owned key the adapter has deprecated, with its replacement pointer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeprecatedKeyDecl {
+    /// Dotted key path that is deprecated.
+    pub key: String,
+    /// Replacement (e.g. `"env:OPENAI_API_TYPE"` or a successor selector),
+    /// when the research documents one.
+    pub replacement: Option<String>,
+}
+
+impl DeprecatedKeyDecl {
+    /// Create a deprecation declaration with an optional replacement.
+    pub fn new(key: impl Into<String>, replacement: Option<String>) -> Self {
+        Self {
+            key: key.into(),
+            replacement,
+        }
+    }
+}
+
+/// Per-surface root-shape + owned-key schema (HAD-03 "root shape and
+/// semantic validator").
+///
+/// Declared by adapters via [`Adapter::surface_schema`] and consumed at
+/// validate time and by the adapter-aware raw-editor commit, so
+/// schema-invalid content is rejected before any write with diagnostics
+/// attributed to the harness and surface.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SurfaceSchema {
+    /// Required shape of the document root.
+    pub root_shape: Option<RootShape>,
+    /// Type rules for owned keys (enforced only when the key is present).
+    pub owned_key_rules: Vec<OwnedKeyRule>,
+    /// Owned keys the adapter has deprecated.
+    pub deprecated_keys: Vec<DeprecatedKeyDecl>,
+}
+
+impl SurfaceSchema {
+    /// Create an empty schema (no constraints yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Require a root shape.
+    #[must_use]
+    pub fn with_root_shape(mut self, shape: RootShape) -> Self {
+        self.root_shape = Some(shape);
+        self
+    }
+
+    /// Add a typed rule for an owned key.
+    #[must_use]
+    pub fn with_owned_key(mut self, path: impl Into<String>, expected: ValueType) -> Self {
+        self.owned_key_rules.push(OwnedKeyRule::new(path, expected));
+        self
+    }
+
+    /// Declare a deprecated owned key.
+    #[must_use]
+    pub fn with_deprecated(mut self, key: impl Into<String>, replacement: Option<String>) -> Self {
+        self.deprecated_keys
+            .push(DeprecatedKeyDecl::new(key, replacement));
+        self
+    }
+
+    /// Build the engine-side [`SemanticSchema`] this declaration describes.
+    ///
+    /// The validator closure checks the root shape and every owned-key rule
+    /// against the parsed semantic value; deprecated keys are mapped onto the
+    /// engine's deprecation diagnostics (DOC-09).
+    pub fn semantic_schema(&self) -> SemanticSchema {
+        let root_shape = self.root_shape;
+        let rules = self.owned_key_rules.clone();
+        let validator: SemanticValidator =
+            Arc::new(move |value, _kind| validate_value_against(root_shape, &rules, value));
+        SemanticSchema::default()
+            .with_validator(validator)
+            .with_deprecated(
+                self.deprecated_keys
+                    .iter()
+                    .map(|d| DeprecatedKey::new(d.key.clone(), d.replacement.clone()))
+                    .collect(),
+            )
+    }
+}
+
+/// Resolve a dotted `path` in `value`, walking objects only.
+fn resolve_owned_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.').map(str::trim) {
+        if segment.is_empty() {
+            return None;
+        }
+        let Value::Object(map) = current else {
+            return None;
+        };
+        current = map.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Check a parsed semantic `value` against a root shape and owned-key rules.
+fn validate_value_against(
+    root_shape: Option<RootShape>,
+    rules: &[OwnedKeyRule],
+    value: &Value,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(shape) = root_shape
+        && !shape.matches_value(value)
+    {
+        diagnostics.push(Diagnostic::new(
+            1,
+            1,
+            format!(
+                "root must be a {} ({})",
+                shape,
+                ValueType::of(value).as_str()
+            ),
+        ));
+        // Type rules under a non-object root are meaningless; the root
+        // diagnostic already blocks.
+        return diagnostics;
+    }
+    for rule in rules {
+        if let Some(current) = resolve_owned_path(value, &rule.path) {
+            let actual = ValueType::of(current);
+            if actual != rule.expected {
+                diagnostics.push(Diagnostic::new(
+                    1,
+                    1,
+                    format!(
+                        "owned key `{}` must hold a value of type {}, got {}",
+                        rule.path,
+                        rule.expected.as_str(),
+                        actual.as_str()
+                    ),
+                ));
+            }
+        }
+    }
+    diagnostics
+}
+
+/// Validate `content` for a surface the adapter declares, applying the
+/// adapter's root-shape/owned-key schema at validate time (HAD-03).
+///
+/// Runs syntax + semantic + deprecation validation (DOC-09
+/// [`superai_config::raw_editor::validate_with_schema`]) and attributes every
+/// diagnostic to the harness and surface (`[<harness>/<surface>] <message>`)
+/// so failures are adapter-attributed. Surfaces without a declared schema get
+/// syntax diagnostics only. Pure: never touches disk.
+pub fn validate_surface_content(
+    adapter: &dyn Adapter,
+    surface_id: &str,
+    content: &[u8],
+    kind: superai_config::document::DocumentKind,
+) -> Vec<Diagnostic> {
+    let schema = adapter.surface_schema(surface_id);
+    let diagnostics = match &schema {
+        Some(schema) => {
+            let engine = schema.semantic_schema();
+            superai_config::raw_editor::validate_with_schema(content, kind, Some(&engine))
+        }
+        None => superai_config::raw_editor::validate(content, kind),
+    };
+    let harness = adapter.id().to_string();
+    diagnostics
+        .into_iter()
+        .map(|d| Diagnostic {
+            line: d.line,
+            col: d.col,
+            severity: d.severity,
+            message: format!("[{harness}/{surface_id}] {}", d.message),
+        })
+        .collect()
+}
+
+/// Validate existing on-disk surface content under `root` against the
+/// adapter's declared surface schemas (HAD-03 instance validation).
+///
+/// For every surface that declares a schema, `root/<surface-id>` is read
+/// fresh from disk when present; missing files are skipped (an unconfigured
+/// instance has nothing to validate). Error-severity diagnostics fail with
+/// [`CoreError::SchemaValidation`] carrying the adapter-attributed messages;
+/// deprecations and warnings do not block. Never writes.
+pub fn validate_instance_surfaces(adapter: &dyn Adapter, root: &Path) -> Result<(), CoreError> {
+    for surface in adapter.config_surfaces() {
+        if adapter.surface_schema(&surface.id).is_none() {
+            continue;
+        }
+        let path = root.join(&surface.id);
+        let Ok(content) = std::fs::read(&path) else {
+            continue;
+        };
+        let kind = superai_config::document::DocumentKind::from_path(&path);
+        let errors: Vec<String> = validate_surface_content(adapter, &surface.id, &content, kind)
+            .into_iter()
+            .filter(|d| d.severity == superai_config::document::DiagnosticSeverity::Error)
+            .map(|d| d.message)
+            .collect();
+        if !errors.is_empty() {
+            return Err(CoreError::SchemaValidation {
+                path,
+                details: errors.join("; "),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Version resolution
 // ---------------------------------------------------------------------------
 
@@ -739,6 +1026,30 @@ pub trait Adapter: Send + Sync + fmt::Debug {
 
     /// Validate that an instance record is coherent for this harness.
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError>;
+
+    /// Root-shape/owned-key schema declared for a config surface (HAD-03).
+    ///
+    /// Adapters that have modeled a surface's semantics return its schema
+    /// keyed by the surface id; the raw editor consults it at validate time
+    /// and before adapter-aware commits. `None` (the default) means the
+    /// surface has no adapter-declared schema yet — syntax validation still
+    /// applies, semantic validation does not.
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        let _ = surface_id;
+        None
+    }
+
+    /// Refuse writes when `content` for `surface_id` belongs to a config era
+    /// that conflicts with the adapter's resolved schema era (HAD-05 step 5:
+    /// refuse writes on conflicting era).
+    ///
+    /// Returns a human reason naming the conflict when the write must be
+    /// refused; `None` (the default) means the adapter documents no era
+    /// boundary for the surface.
+    fn era_conflict_reason(&self, surface_id: &str, content: &[u8]) -> Option<String> {
+        let _ = (surface_id, content);
+        None
+    }
 
     /// Which skill destination modes this harness supports.
     fn supported_skill_modes(&self) -> Vec<SkillMode> {
@@ -1165,5 +1476,247 @@ mod tests {
             .iter()
             .any(|(_, v)| v.contains(".claude-work"));
         assert!(found, "wrapper env must reference instance root");
+    }
+
+    // -------------------------------------------------------------------
+    // Surface schema vocabulary (HAD-03)
+    // -------------------------------------------------------------------
+
+    use super::{
+        DeprecatedKeyDecl, OwnedKeyRule, RootShape, SurfaceSchema, ValueType, VersionResolution,
+    };
+
+    fn table_schema() -> SurfaceSchema {
+        SurfaceSchema::new()
+            .with_root_shape(RootShape::Table)
+            .with_owned_key("model", ValueType::String)
+            .with_owned_key("mcp_servers", ValueType::Object)
+            .with_deprecated(
+                "profile",
+                Some("per-profile files selected via --profile".to_owned()),
+            )
+    }
+
+    #[test]
+    fn schema_rejects_non_object_root_with_named_shape() {
+        let diagnostics = super::validate_surface_content(
+            &SchemaAdapter,
+            "config.toml",
+            b"[1, 2, 3]",
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("root must be a table")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_wrong_type_on_present_owned_key() {
+        let diagnostics = super::validate_surface_content(
+            &SchemaAdapter,
+            "config.toml",
+            br#"{"model": {"nested": true}}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("`model` must hold a value of type string")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn schema_allows_absent_owned_keys_and_valid_content() {
+        let diagnostics = super::validate_surface_content(
+            &SchemaAdapter,
+            "config.toml",
+            br#"{"other": 1}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "absent owned keys are legal: {diagnostics:?}"
+        );
+        let ok = super::validate_surface_content(
+            &SchemaAdapter,
+            "config.toml",
+            br#"{"model": "gpt-5", "mcp_servers": {}}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(ok.is_empty(), "valid content: {ok:?}");
+    }
+
+    #[test]
+    fn schema_reports_deprecated_key_with_replacement() {
+        let diagnostics = super::validate_surface_content(
+            &SchemaAdapter,
+            "config.toml",
+            br#"{"profile": "work"}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        let dep = diagnostics
+            .iter()
+            .find(|d| d.severity == superai_config::document::DiagnosticSeverity::Deprecation)
+            .expect("deprecation diagnostic");
+        assert!(dep.message.contains("`profile` is deprecated"));
+        assert!(dep.message.contains("--profile"));
+    }
+
+    #[test]
+    fn diagnostics_are_adapter_attributed() {
+        let diagnostics = super::validate_surface_content(
+            &SchemaAdapter,
+            "config.toml",
+            br#"{"model": 5}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.message.starts_with("[codex-cli/config.toml] ")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_instance_surfaces_skips_missing_and_rejects_invalid() {
+        let adapter = SchemaAdapter;
+        let dir = crate::test_util::temp_dir_unique("adapter-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing files are skipped: an unconfigured instance validates.
+        super::validate_instance_surfaces(&adapter, &dir).unwrap();
+
+        // Valid content passes (deprecations do not block).
+        let path = dir.join("config.toml");
+        std::fs::write(&path, b"model = \"gpt-5\"\nprofile = \"work\"\n").unwrap();
+        super::validate_instance_surfaces(&adapter, &dir).unwrap();
+
+        // Schema-invalid content is rejected with adapter-attributed details.
+        std::fs::write(&path, b"model = { nested = true }\n").unwrap();
+        let err = super::validate_instance_surfaces(&adapter, &dir).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { path: p, details } => {
+                assert_eq!(p, path);
+                assert!(details.contains("[codex-cli/config.toml]"), "{details}");
+                assert!(
+                    details.contains("`model` must hold a value of type string"),
+                    "{details}"
+                );
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Local adapter that declares the `config.toml` table schema, for
+    /// exercising the schema helpers without a live harness.
+    #[derive(Debug)]
+    struct SchemaAdapter;
+
+    impl Adapter for SchemaAdapter {
+        fn id(&self) -> HarnessId {
+            HarnessId::new("codex-cli").unwrap()
+        }
+        #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str")]
+        fn display_name(&self) -> &str {
+            "Codex CLI"
+        }
+        fn product_status(&self) -> ProductStatus {
+            ProductStatus::Active
+        }
+        fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+            Vec::new()
+        }
+        #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str")]
+        fn adapter_revision(&self) -> &str {
+            "0.1.0"
+        }
+        #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str")]
+        fn research_doc_link(&self) -> &str {
+            "docs/harness-configs/codex-cli.md"
+        }
+        #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str")]
+        fn last_verified_date(&self) -> &str {
+            "2026-08-25"
+        }
+        fn detection(&self) -> DetectionResult {
+            DetectionResult::absent(vec!["test".to_owned()])
+        }
+        fn version_resolution(&self) -> VersionResolution {
+            VersionResolution::unknown()
+        }
+        fn config_surfaces(&self) -> Vec<ConfigSurface> {
+            vec![ConfigSurface::new(
+                "config.toml",
+                PathResolver::fallback_only("~/.codex/config.toml"),
+                DocumentKind::Toml,
+                ConfigScope::User,
+                SurfaceOwnership::UserEditable,
+            )]
+        }
+        fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
+            Vec::new()
+        }
+        fn plan_mirror_exclusions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_wrapper(
+            &self,
+            _instance: &crate::instance::Instance,
+        ) -> Result<crate::adapter::WrapperPlan, CoreError> {
+            Ok(crate::adapter::WrapperPlan::new("test"))
+        }
+        fn scan_candidates(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn validate_instance(
+            &self,
+            _instance: &crate::instance::Instance,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+            if surface_id == "config.toml" {
+                Some(table_schema())
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn root_shape_vocabulary_covers_corpus_shapes() {
+        assert_eq!(RootShape::Object.to_string(), "object");
+        assert_eq!(RootShape::Table.to_string(), "table");
+        assert_eq!(RootShape::Mapping.to_string(), "mapping");
+        assert_eq!(RootShape::EnvEntries.to_string(), "env entries");
+        for shape in [
+            RootShape::Object,
+            RootShape::Table,
+            RootShape::Mapping,
+            RootShape::EnvEntries,
+        ] {
+            assert!(shape.matches_value(&serde_json::json!({"a": 1})));
+            assert!(!shape.matches_value(&serde_json::json!([1])));
+        }
+    }
+
+    #[test]
+    fn owned_key_rule_and_deprecated_decl_shapes() {
+        let rule = OwnedKeyRule::new("model", ValueType::String);
+        assert_eq!(rule.path, "model");
+        assert_eq!(rule.expected, ValueType::String);
+        let decl = DeprecatedKeyDecl::new("old-key", None);
+        assert_eq!(decl.key, "old-key");
+        assert!(decl.replacement.is_none());
+        let schema = SurfaceSchema::new();
+        assert!(schema.root_shape.is_none());
+        assert!(schema.owned_key_rules.is_empty());
+        assert!(schema.deprecated_keys.is_empty());
     }
 }

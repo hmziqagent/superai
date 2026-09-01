@@ -904,4 +904,43 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the on-disk fixture corpus into tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_corpus_validates_secret_free_and_flags_malformed() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/sculptor");
+        let report = crate::verification::fixture_report(&dir);
+        assert!(!report.outcomes.is_empty(), "sculptor corpus must load");
+        assert!(
+            report.validity_pass,
+            "validity: {:?}",
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                .map(|o| o.path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report.secret_free_pass,
+            "sculptor fixtures must be secret-free"
+        );
+        assert!(report.malformed_count >= 1);
+    }
+
+    #[test]
+    fn fixture_env_and_harnesses_load() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/sculptor");
+        let env = superai_config::env_file::load(&dir.join("global.populated.env")).unwrap();
+        assert!(!env.is_empty());
+        let harnesses = superai_config::json::load(&dir.join("harnesses.populated.json")).unwrap();
+        assert!(harnesses.contains_key("claude_code") || !harnesses.is_empty());
+        assert!(
+            superai_config::json::load(&dir.join("harnesses.malformed.json")).is_err(),
+            "malformed harnesses must fail to parse"
+        );
+    }
 }

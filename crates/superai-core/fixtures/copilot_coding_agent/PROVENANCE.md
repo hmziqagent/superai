@@ -2,7 +2,7 @@
 
 Source: `docs/harness-configs/copilot-cli.md` annex last_verified=2026-08-25
 Generated: 2026-08-27
-Sanitized: no secrets (cloud-owned, no credentials)
+Sanitized: no credentials (cloud-owned; fake markers where key names appear)
 Generator: superai QAL-02 fixture corpus
 
 | Fixture | Kind | Description |
@@ -14,4 +14,4 @@ Generator: superai QAL-02 fixture corpus
 | wrapper.sh | TextFragment | Unsupported placeholder, exit 69 |
 | version.txt | TextFragment | helper version `gh version 2.80.0` (cloud agent has no local version) |
 
-All fixtures pass `superai_config` parser without panic and are sanitized per verification (no secrets).
+All fixtures pass `superai_config` parser without panic and are sanitized per verification (no secrets, fake markers only).

@@ -1,0 +1,2 @@
+default_model = "kimi-k2-0905-preview"
+custom_user_key = "preserve-me" # foreign key round-trips

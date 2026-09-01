@@ -1,0 +1,5 @@
+{
+  // auto-update disabled for CI pinning (docs.augmentcode.com/cli/autoupgrade)
+  "autoUpdate": false,
+  "defaultProfile": "work", // trailing comma follows below
+}

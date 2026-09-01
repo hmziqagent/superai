@@ -1,0 +1,9 @@
+{
+  "provider": {
+    "options": {
+      "apiKey": "sk-fake-zcode-foreign",
+      "baseURL": "https://api.acme.test/v1"
+    },
+    "unmodelledKey": "preserve-me"
+  }
+}

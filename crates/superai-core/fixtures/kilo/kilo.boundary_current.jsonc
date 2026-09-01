@@ -1,0 +1,11 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "provider": {
+    "acme": {
+      "options": {
+        "apiKey": "{env:ACME_FAKE_API_KEY}"
+      }
+    }
+  }
+}

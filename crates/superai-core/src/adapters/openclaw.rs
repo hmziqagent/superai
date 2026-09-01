@@ -16,12 +16,13 @@ use std::time::Duration;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
+use superai_config::document::ValueType;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -518,6 +519,23 @@ impl Adapter for OpenClawAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03 (read side; writes are ResearchBlocked until gateway/schema
+        // complete): root shapes + the provider-tree keys documented in
+        // docs/harness-configs/openclaw.md §3 (agents.defaults.model,
+        // models.providers).
+        match surface_id {
+            "openclaw.json" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("agents", ValueType::Object)
+                    .with_owned_key("models", ValueType::Object),
+            ),
+            ".env" => Some(SurfaceSchema::new().with_root_shape(RootShape::EnvEntries)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,5 +704,60 @@ mod tests {
     fn supported_skill_modes_is_empty() {
         let a = adapter();
         assert!(a.supported_skill_modes().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema (read side; writes ResearchBlocked)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_config_and_env_shapes() {
+        let a = adapter();
+        let config = a
+            .surface_schema("openclaw.json")
+            .expect("openclaw.json schema");
+        assert_eq!(config.root_shape, Some(crate::adapter::RootShape::Object));
+        assert!(config.owned_key_rules.iter().any(|r| r.path == "models"));
+        assert!(config.owned_key_rules.iter().any(|r| r.path == "agents"));
+        let env = a.surface_schema(".env").expect("env schema");
+        assert_eq!(env.root_shape, Some(crate::adapter::RootShape::EnvEntries));
+        assert!(a.surface_schema("daemon-state").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_non_object_openclaw_root() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "openclaw.json",
+            b"[1]",
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("root must be a object")
+                    && d.message.starts_with("[openclaw/openclaw.json]")),
+            "diags: {diags:?}"
+        );
+        // Provider tree per docs §3: agents/models are objects.
+        let bad = crate::adapter::validate_surface_content(
+            &adapter(),
+            "openclaw.json",
+            br#"{"models": ["acme"]}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            bad.iter().any(|d| d
+                .message
+                .contains("`models` must hold a value of type object")),
+            "diags: {bad:?}"
+        );
+        let ok = crate::adapter::validate_surface_content(
+            &adapter(),
+            "openclaw.json",
+            br#"{"agents": {"defaults": {"model": {"primary": "p/m"}}}, "models": {"providers": {}}}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
     }
 }

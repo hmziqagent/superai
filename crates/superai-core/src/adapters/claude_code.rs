@@ -10,10 +10,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use superai_config::document::ValueType;
+
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -594,11 +596,39 @@ impl Adapter for ClaudeCodeAdapter {
         instance.validate()?;
         // Enforce relocated-root isolation for Claude Code; allow Unknown for legacy adoption.
         match instance.isolation {
-            Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
+            Isolation::RelocatedRoot | Isolation::Unknown => {
+                // HAD-03: surface content present under the instance root must
+                // satisfy the declared root shapes / owned-key rules.
+                crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
+            }
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!("claude-code requires isolation relocated_root, got {other}"),
             }),
+        }
+    }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03 root shape + owned-key semantics per the settings-reference
+        // types in docs/harness-configs/claude-code.md §1.2. Rules fire only
+        // when the key is present; foreign keys are untouched by design.
+        match surface_id {
+            "settings.json" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("model", ValueType::String)
+                    .with_owned_key("fallbackModel", ValueType::String)
+                    .with_owned_key("env", ValueType::Object)
+                    .with_owned_key("permissions", ValueType::Object)
+                    .with_owned_key("hooks", ValueType::Object)
+                    .with_owned_key("enabledPlugins", ValueType::Array),
+            ),
+            ".mcp.json" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("mcpServers", ValueType::Object),
+            ),
+            _ => None,
         }
     }
 
@@ -1270,5 +1300,163 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema (root shape + owned-key semantics)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_settings_and_mcp_shapes() {
+        let a = adapter();
+        let settings = a.surface_schema("settings.json").expect("settings schema");
+        assert_eq!(settings.root_shape, Some(crate::adapter::RootShape::Object));
+        assert!(settings.owned_key_rules.iter().any(|r| r.path == "env"));
+        let mcp = a.surface_schema(".mcp.json").expect("mcp schema");
+        assert_eq!(mcp.root_shape, Some(crate::adapter::RootShape::Object));
+        assert!(a.surface_schema("unknown-surface").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_non_object_settings_root() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "settings.json",
+            b"[1, 2, 3]",
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("root must be a object")
+                    && d.message.starts_with("[claude-code/settings.json]")),
+            "diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_wrongly_typed_env_block() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "settings.json",
+            br#"{"env": "https://api.anthropic.com"}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`env` must hold a value of type object")),
+            "diags: {diags:?}"
+        );
+        // Absent owned keys stay legal.
+        let ok = crate::adapter::validate_surface_content(
+            &adapter(),
+            "settings.json",
+            br#"{"other": true}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn validate_instance_rejects_schema_invalid_settings_under_root() {
+        let a = adapter();
+        let dir = crate::test_util::temp_dir_unique("claude-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing surfaces: fresh instance validates.
+        let inst = sample_instance_with_root(dir.to_str().unwrap());
+        a.validate_instance(&inst).unwrap();
+        // Valid settings.json passes.
+        std::fs::write(dir.join("settings.json"), br#"{"model": "sonnet"}"#).unwrap();
+        a.validate_instance(&inst).unwrap();
+        // env must be an object; a string violates the declared schema.
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"env": "https://api.anthropic.com"}"#,
+        )
+        .unwrap();
+        let err = a.validate_instance(&inst).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { details, .. } => {
+                assert!(details.contains("[claude-code/settings.json]"), "{details}");
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-05/HAD-06 version-boundary fixtures (settings-era)
+    // -------------------------------------------------------------------
+
+    /// The fixture pair documents the settings-era boundary: the legacy file
+    /// carries the pre-2.0 minimal shape (env + permissions only), the
+    /// current file carries the 2.x shape (hooks, statusLine, enabledPlugins,
+    /// fallbackModel). Version resolution classifies 2.x as the compatible
+    /// schema range for the current-era file.
+    #[test]
+    fn boundary_fixtures_split_settings_eras() {
+        let legacy = fixture_path("settings.boundary_legacy.json");
+        let current = fixture_path("settings.boundary_current.json");
+        assert!(legacy.exists(), "missing {}", legacy.display());
+        assert!(current.exists(), "missing {}", current.display());
+
+        let legacy_value = std::fs::read(&legacy).unwrap();
+        let current_value = std::fs::read(&current).unwrap();
+        let legacy_map = superai_config::json::load_value(&legacy).unwrap();
+        let current_map = superai_config::json::load_value(&current).unwrap();
+        // Legacy era: no 2.x-only keys.
+        assert!(legacy_map.get("hooks").is_none());
+        assert!(legacy_map.get("enabledPlugins").is_none());
+        assert!(legacy_map.get("fallbackModel").is_none());
+        // Current era: 2.x keys present.
+        assert!(current_map.get("hooks").is_some());
+        assert!(current_map.get("enabledPlugins").is_some());
+        assert!(current_map.get("fallbackModel").is_some());
+
+        // Both eras satisfy the declared schema (root object + typed keys):
+        // reading legacy settings never blocks on era alone.
+        for content in [&legacy_value, &current_value] {
+            let diags = crate::adapter::validate_surface_content(
+                &adapter(),
+                "settings.json",
+                content,
+                superai_config::document::DocumentKind::StrictJson,
+            );
+            assert!(
+                diags
+                    .iter()
+                    .all(|d| d.severity != superai_config::document::DiagnosticSeverity::Error),
+                "boundary fixture must satisfy the declared schema: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_era_matches_version_resolution_range() {
+        // version.txt records a 2.x detection; the adapter maps it to the
+        // current schema (compatible). Pre-2.0 detections map legacy-era but
+        // still resolve through the same schema version per the research doc.
+        let version_text = std::fs::read_to_string(fixture_path("version.txt"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let parsed = ClaudeCodeAdapter::parse_version_output(&version_text);
+        assert!(parsed.is_some(), "version.txt must parse: {version_text}");
+        let major = parsed
+            .as_deref()
+            .and_then(|v| v.split('.').next())
+            .and_then(|m| m.parse::<u64>().ok());
+        assert_eq!(
+            major,
+            Some(2),
+            "fixture version must be 2.x: {version_text}"
+        );
+        // 2.x is inside the documented compatible range for the current-era
+        // settings fixture.
+        let res = adapter().version_resolution();
+        if res.detected_version.as_deref() == parsed.as_deref() {
+            assert!(res.compatible);
+        }
     }
 }

@@ -1,0 +1,15 @@
+default_model = "kimi-k2-0905-preview"
+default_thinking = true
+default_yolo = false
+theme = "dark"
+show_thinking_stream = true
+
+[loop_control]
+max_ralph_iterations = 5
+compaction_trigger_ratio = 0.3
+
+[background]
+agent_task_timeout_s = 600
+
+[mcp.client]
+tool_call_timeout_ms = 30000

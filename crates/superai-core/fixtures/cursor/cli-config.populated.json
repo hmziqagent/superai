@@ -1,0 +1,9 @@
+{
+  "model": "claude-sonnet-4",
+  "autoApprove": {
+    "edits": "allow"
+  },
+  "mcp": {
+    "autoStart": true
+  }
+}

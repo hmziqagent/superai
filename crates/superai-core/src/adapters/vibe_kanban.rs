@@ -779,4 +779,41 @@ mod tests {
         let a = adapter();
         assert!(a.supported_skill_modes().is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the on-disk fixture corpus into tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_corpus_validates_secret_free_and_flags_malformed() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/vibe_kanban");
+        let report = crate::verification::fixture_report(&dir);
+        assert!(!report.outcomes.is_empty(), "vibe_kanban corpus must load");
+        assert!(
+            report.validity_pass,
+            "validity: {:?}",
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                .map(|o| o.path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report.secret_free_pass,
+            "vibe_kanban fixtures must be secret-free"
+        );
+        assert!(report.malformed_count >= 2);
+    }
+
+    #[test]
+    fn fixture_profiles_load_with_harness_entries() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/vibe_kanban");
+        let profiles = superai_config::json::load(&dir.join("profiles.populated.json")).unwrap();
+        assert!(profiles.contains_key("profiles"));
+        assert!(
+            superai_config::json::load(&dir.join("profiles.malformed.json")).is_err(),
+            "malformed profiles must fail to parse"
+        );
+    }
 }

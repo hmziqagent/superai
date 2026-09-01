@@ -1,0 +1,28 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "acme/large-chat"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "acme": {
+        "api": "anthropic-messages",
+        "baseUrl": "https://api.acme.test",
+        "apiKey": "{env:ACME_FAKE_API_KEY}",
+        "models": [
+          {
+            "id": "large-chat",
+            "contextWindow": 200000
+          }
+        ],
+        "request": {
+          "allowPrivateNetwork": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "provider": {
+    "options": {
+      "apiKey": "sk-fake-zcode-populated",
+      "baseURL": "https://api.deepseek.com/anthropic"
+    }
+  }
+}

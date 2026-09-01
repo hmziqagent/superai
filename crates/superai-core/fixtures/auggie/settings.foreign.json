@@ -1,0 +1,7 @@
+{
+  "autoUpdate": false,
+  "teamPolicyKey": "preserve-me",
+  "notifications": {
+    "onTaskComplete": true
+  }
+}

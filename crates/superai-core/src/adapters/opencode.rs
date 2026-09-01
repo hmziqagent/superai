@@ -14,8 +14,10 @@ use std::time::Duration;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
+use superai_config::document::ValueType;
+
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
@@ -710,11 +712,34 @@ impl Adapter for OpenCodeAdapter {
             Isolation::RelocatedRoot
             | Isolation::ExplicitConfig
             | Isolation::EnvOnly
-            | Isolation::Unknown => Ok(()),
+            | Isolation::Unknown => {
+                // HAD-03: surface content present under the instance root must
+                // satisfy the declared root shapes / owned-key rules.
+                crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
+            }
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!("opencode requires isolation relocated_root, got {other}"),
             }),
+        }
+    }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03: types per the schema top-level keys table in
+        // docs/harness-configs/opencode.md §1. `model` is omitted on purpose:
+        // the documented example uses a string, but model-object forms exist.
+        match surface_id {
+            "opencode.json" | "opencode.jsonc" | "project opencode.json" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("provider", ValueType::Object)
+                    .with_owned_key("mcp", ValueType::Object)
+                    .with_owned_key("agent", ValueType::Object)
+                    .with_owned_key("command", ValueType::Object)
+                    .with_owned_key("small_model", ValueType::String),
+            ),
+            "tui.json" => Some(SurfaceSchema::new().with_root_shape(RootShape::Object)),
+            _ => None,
         }
     }
 
@@ -1345,5 +1370,75 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_object_root_and_typed_maps() {
+        let a = adapter();
+        let schema = a
+            .surface_schema("opencode.json")
+            .expect("opencode.json schema");
+        assert_eq!(schema.root_shape, Some(crate::adapter::RootShape::Object));
+        for path in ["provider", "mcp", "agent"] {
+            assert!(
+                schema.owned_key_rules.iter().any(|r| r.path == path),
+                "missing rule for {path}"
+            );
+        }
+        assert!(a.surface_schema("opencode.jsonc").is_some());
+        assert!(a.surface_schema("tui.json").is_some());
+        assert!(a.surface_schema("unknown").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_non_object_root_and_wrongly_typed_map() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "opencode.json",
+            b"[{\"a\": 1}]",
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("root must be a object")),
+            "diags: {diags:?}"
+        );
+        let typed = crate::adapter::validate_surface_content(
+            &adapter(),
+            "opencode.json",
+            br#"{"provider": ["acme"]}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            typed.iter().any(|d| d
+                .message
+                .contains("`provider` must hold a value of type object")),
+            "diags: {typed:?}"
+        );
+    }
+
+    #[test]
+    fn validate_instance_rejects_schema_invalid_config_under_root() {
+        let a = adapter();
+        let dir = crate::test_util::temp_dir_unique("opencode-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inst = sample_instance_with_root(dir.to_str().unwrap());
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join("opencode.json"), br#"{"theme": "dark"}"#).unwrap();
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join("opencode.json"), br#"{"mcp": "not-a-map"}"#).unwrap();
+        let err = a.validate_instance(&inst).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { details, .. } => {
+                assert!(details.contains("[opencode/opencode.json]"), "{details}");
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

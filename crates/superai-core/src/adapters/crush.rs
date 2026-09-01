@@ -17,8 +17,10 @@ use std::time::Duration;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
+use superai_config::document::ValueType;
+
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
@@ -624,6 +626,24 @@ impl Adapter for CrushAdapter {
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
         Vec::new()
     }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03 (read side; writes are ResearchBlocked): shapes for the
+        // deprecated legacy crush.json per docs/harness-configs/crush.md §1
+        // schema table. The executable crushrc has no value schema.
+        match surface_id {
+            "crush.json (global)" | "crush.json (project)" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("models", ValueType::Object)
+                    .with_owned_key("providers", ValueType::Object)
+                    .with_owned_key("mcp", ValueType::Object)
+                    .with_owned_key("options", ValueType::Object)
+                    .with_owned_key("permissions", ValueType::Object),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -971,5 +991,51 @@ mod tests {
     fn research_blocked_reason_contains_gaps() {
         assert!(BLOCKED_REASON.contains("crushrc"));
         assert!(BLOCKED_REASON.contains("ResearchBlocked") || BLOCKED_REASON.contains("command"));
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema (read side; writes ResearchBlocked)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_legacy_json_shapes() {
+        let a = adapter();
+        let global = a
+            .surface_schema("crush.json (global)")
+            .expect("global schema");
+        assert_eq!(global.root_shape, Some(crate::adapter::RootShape::Object));
+        for path in ["models", "providers", "mcp", "options", "permissions"] {
+            assert!(
+                global.owned_key_rules.iter().any(|r| r.path == path),
+                "missing rule for {path}"
+            );
+        }
+        assert!(a.surface_schema("crush.json (project)").is_some());
+        // The executable crushrc has no value schema.
+        assert!(a.surface_schema("crushrc (global)").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_wrongly_typed_legacy_json_keys() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "crush.json (global)",
+            br#"{"providers": ["acme"]}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("`providers` must hold a value of type object")
+                && d.message.starts_with("[crush/crush.json (global)]")),
+            "diags: {diags:?}"
+        );
+        let ok = crate::adapter::validate_surface_content(
+            &adapter(),
+            "crush.json (global)",
+            br#"{"models": {"large": {"model_id": "m"}}}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
     }
 }

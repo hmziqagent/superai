@@ -1,0 +1,7 @@
+rules:
+  - name: allow-read
+    permissions:
+      - read:/**
+  - name: deny-env
+    permissions:
+      - deny:./.env

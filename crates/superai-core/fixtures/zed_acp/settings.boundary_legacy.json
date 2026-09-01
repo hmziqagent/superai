@@ -1,0 +1,6 @@
+{
+  "assistant": {
+    "default_model": "acme-large",
+    "version": "1"
+  }
+}

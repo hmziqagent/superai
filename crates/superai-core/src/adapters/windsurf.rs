@@ -760,4 +760,24 @@ mod tests {
         let boxed: Box<dyn Adapter> = Box::new(a);
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: on-disk fixture corpus (writable-state surface)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_populated_loads_with_documented_keys() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/windsurf")
+            .join("mcp_config.populated.json");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+        let value = superai_config::json::load(&path).unwrap();
+        assert!(
+            value.contains_key("mcpServers"),
+            "fixture must document `mcpServers`"
+        );
+        let report = crate::verification::fixture_report(path.parent().unwrap());
+        assert!(report.validity_pass, "windsurf corpus validity");
+        assert!(report.secret_free_pass, "windsurf corpus secret-free");
+    }
 }

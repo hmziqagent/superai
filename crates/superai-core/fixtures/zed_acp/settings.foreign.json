@@ -1,0 +1,11 @@
+{
+  "context_servers": {
+    "fetch": {
+      "command": {
+        "path": "uvx",
+        "args": ["mcp-server-fetch"]
+      }
+    }
+  },
+  "unmodelledKey": "preserve-me"
+}

@@ -18,7 +18,7 @@ Generator: superai QAL-02 fixture corpus
 | workflow.minimal.yaml | Yaml | minimal workflow name+command |
 | workflow.populated.yaml | Yaml | populated with tags/shells/arguments |
 | workflow.malformed.yaml | Yaml | malformed unclosed bracket |
-| wrapper.sh | TextFragment | sanitized wrapper, XDG_CONFIG_HOME/XDG_DATA_HOME + WARP_API_KEY, Linux XDG constrained |
+| wrapper.sh | TextFragment | sanitized wrapper, XDG_CONFIG_HOME/XDG_DATA_HOME + WARP_API_KEY (fake), Linux XDG constrained |
 | version.txt | TextFragment | detection version `warp 1.2.3` |
 
 All fixtures pass `superai_config` parser without panic and are sanitized per verification (fake sk-fake-).

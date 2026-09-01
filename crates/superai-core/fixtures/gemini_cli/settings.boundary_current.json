@@ -1,0 +1,8 @@
+{
+  "general": {
+    "vimMode": true
+  },
+  "advanced": {
+    "excludedEnvVars": ["DEBUG"]
+  }
+}

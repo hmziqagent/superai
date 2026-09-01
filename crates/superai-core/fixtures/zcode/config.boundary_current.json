@@ -1,0 +1,11 @@
+{
+  "provider": {
+    "options": {
+      "apiKey": "sk-fake-zcode-current",
+      "baseURL": "https://api.deepseek.com/anthropic",
+      "headers": {
+        "X-Org": "acme"
+      }
+    }
+  }
+}

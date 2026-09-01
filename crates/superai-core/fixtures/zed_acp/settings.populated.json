@@ -1,0 +1,24 @@
+{
+  "language_models": {
+    "anthropic": {
+      "api_url": "https://api.acme.test"
+    },
+    "openai": {
+      "available_models": [
+        {
+          "name": "acme-large",
+          "display_name": "Acme Large",
+          "max_tokens": "sk-fake-128000"
+        }
+      ]
+    }
+  },
+  "context_servers": {
+    "fetch": {
+      "command": {
+        "path": "uvx",
+        "args": ["mcp-server-fetch"]
+      }
+    }
+  }
+}

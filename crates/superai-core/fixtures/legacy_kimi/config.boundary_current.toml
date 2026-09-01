@@ -1,0 +1,6 @@
+# Final legacy-era shape before the wind-down (kimi migrate target).
+default_model = "kimi-k2-0905-preview"
+default_thinking = true
+
+[loop_control]
+max_ralph_iterations = 5

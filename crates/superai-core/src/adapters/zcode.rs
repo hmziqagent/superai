@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SkillMode, SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SkillMode, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -469,13 +469,27 @@ impl Adapter for ZcodeAdapter {
         }
         instance.validate()?;
         match instance.isolation {
-            Isolation::FixedPathSingle | Isolation::Unknown | Isolation::RelocatedRoot => Ok(()),
+            Isolation::FixedPathSingle | Isolation::Unknown | Isolation::RelocatedRoot => {
+                // HAD-03: config content present under the root must satisfy
+                // the declared root shape (full schema still research-gated).
+                crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
+            }
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
                     "zcode requires isolation fixed_path_single (fixed path {FIXED_CONFIG_PATH}), got {other}"
                 ),
             }),
+        }
+    }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03: only the object root is verified today — the research doc
+        // marks the full config.json schema Unverified (schema research gate
+        // for the SingleInstance ledger row).
+        match surface_id {
+            "config.json" => Some(SurfaceSchema::new().with_root_shape(RootShape::Object)),
+            _ => None,
         }
     }
 
@@ -494,6 +508,7 @@ mod tests {
     use crate::adapter::{
         Adapter, ConfigScope, DocumentKind, ProductStatus, SkillMode, SurfaceOwnership,
     };
+    use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
     use crate::paths::AbsolutePath;
@@ -624,7 +639,7 @@ mod tests {
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
-            crate::error::CoreError::Validation { field, .. } => assert_eq!(field, "harness"),
+            CoreError::Validation { field, .. } => assert_eq!(field, "harness"),
             other => panic!("unexpected error {other:?}"),
         }
     }
@@ -654,7 +669,7 @@ mod tests {
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
-            crate::error::CoreError::Validation { field, .. } => assert_eq!(field, "isolation"),
+            CoreError::Validation { field, .. } => assert_eq!(field, "isolation"),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -664,5 +679,100 @@ mod tests {
         let a = adapter();
         let modes = a.supported_skill_modes();
         assert_eq!(modes, vec![SkillMode::CopySelected]);
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema (object root; full schema research-gated)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_object_root_only() {
+        let a = adapter();
+        let schema = a.surface_schema("config.json").expect("config schema");
+        assert_eq!(schema.root_shape, Some(crate::adapter::RootShape::Object));
+        // The research doc marks the full schema Unverified: no owned-key
+        // rules are declared beyond the root shape.
+        assert!(schema.owned_key_rules.is_empty());
+        assert!(schema.deprecated_keys.is_empty());
+        assert!(a.surface_schema("unknown").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_non_object_config_root() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "config.json",
+            b"[]",
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("root must be a object")
+                    && d.message.starts_with("[zcode/config.json]")),
+            "diags: {diags:?}"
+        );
+        let ok = crate::adapter::validate_surface_content(
+            &adapter(),
+            "config.json",
+            br#"{"provider": {"options": {}}}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn validate_instance_rejects_non_object_config_under_root() {
+        let a = adapter();
+        let dir = crate::test_util::temp_dir_unique("zcode-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inst = sample_instance_with_root(dir.to_str().unwrap());
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join("config.json"), br#"{"options": {}}"#).unwrap();
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join("config.json"), b"[1, 2]").unwrap();
+        let err = a.validate_instance(&inst).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { details, .. } => {
+                assert!(details.contains("[zcode/config.json]"), "{details}");
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn fixture_boundary_pair_loads_and_splits_options_eras() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/zcode");
+        let legacy = std::fs::read(dir.join("config.boundary_legacy.json")).unwrap();
+        let current = std::fs::read(dir.join("config.boundary_current.json")).unwrap();
+        // Both eras satisfy the object-root schema (v2 path segment is the
+        // documented boundary; the version lives in the path, not the file).
+        for content in [&legacy, &current] {
+            let diags = crate::adapter::validate_surface_content(
+                &adapter(),
+                "config.json",
+                content,
+                superai_config::document::DocumentKind::StrictJson,
+            );
+            assert!(diags.is_empty(), "{diags:?}");
+        }
+        let legacy_value: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        let current_value: serde_json::Value = serde_json::from_slice(&current).unwrap();
+        // Current era: headers recognized in provider options; legacy era:
+        // extra params that the current schema does not accept.
+        assert!(
+            legacy_value["provider"]["options"]
+                .get("extraParams")
+                .is_some()
+        );
+        assert!(
+            current_value["provider"]["options"]
+                .get("headers")
+                .is_some()
+        );
+        let report = crate::verification::fixture_report(&dir);
+        assert!(report.validity_pass, "zcode corpus validity");
+        assert!(report.secret_free_pass, "zcode corpus secret-free");
     }
 }

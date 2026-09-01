@@ -1,0 +1,13 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "acme/large-chat"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {}
+  }
+}

@@ -1043,4 +1043,43 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the on-disk fixture corpus into tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_corpus_validates_secret_free_and_flags_malformed() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/openhands");
+        let report = crate::verification::fixture_report(&dir);
+        assert!(!report.outcomes.is_empty(), "openhands corpus must load");
+        assert!(
+            report.validity_pass,
+            "validity: {:?}",
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                .map(|o| o.path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report.secret_free_pass,
+            "openhands fixtures must be secret-free"
+        );
+        assert!(report.malformed_count >= 2);
+    }
+
+    #[test]
+    fn fixture_config_toml_and_agent_settings_load() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/openhands");
+        let config = superai_config::toml_file::load(&dir.join("config.populated.toml")).unwrap();
+        assert!(config.contains_key("core") || config.contains_key("llm"));
+        let agent = superai_config::json::load(&dir.join("agent_settings.populated.json")).unwrap();
+        assert!(!agent.is_empty());
+        assert!(
+            superai_config::toml_file::load(&dir.join("config.malformed.toml")).is_err(),
+            "malformed config must fail to parse"
+        );
+    }
 }

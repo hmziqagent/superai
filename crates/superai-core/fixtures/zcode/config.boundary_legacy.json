@@ -1,0 +1,9 @@
+{
+  "provider": {
+    "options": {
+      "apiKey": "sk-fake-zcode-legacy",
+      "baseURL": "https://api.acme.test/v1",
+      "extraParams": true
+    }
+  }
+}

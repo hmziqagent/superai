@@ -1111,4 +1111,44 @@ mod tests {
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the alias corpus dir (kimi_code_cli byte-copy)
+    // -------------------------------------------------------------------
+
+    /// `fixtures/kimi_code_cli` duplicates this corpus for the
+    /// `kimi-code-cli` catalog id; the adapter reads `fixtures/kimi_code`.
+    /// The guard keeps the alias a faithful byte-copy instead of a silently
+    /// drifting duplicate.
+    #[test]
+    fn alias_corpus_dir_stays_in_sync_with_kimi_code() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let primary = root.join("kimi_code");
+        let alias = root.join("kimi_code_cli");
+        let primary_names: Vec<String> = std::fs::read_dir(&primary)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let alias_names: Vec<String> = std::fs::read_dir(&alias)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(primary_names, alias_names, "alias must mirror the file set");
+        for name in primary_names {
+            let from = primary.join(&name);
+            let to = alias.join(&name);
+            if !from.is_file() {
+                assert!(to.is_dir(), "alias entry {name} must mirror the kind");
+                continue;
+            }
+            let a = std::fs::read(&from).unwrap();
+            let b = std::fs::read(&to).unwrap();
+            assert_eq!(a, b, "alias file {name} drifted from kimi_code");
+        }
+        let report = crate::verification::fixture_report(&alias);
+        assert!(report.validity_pass, "alias corpus validity");
+        assert!(report.secret_free_pass, "alias corpus secret-free");
+    }
 }

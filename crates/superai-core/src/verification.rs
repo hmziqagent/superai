@@ -386,13 +386,26 @@ pub fn catalog_platform_gates() -> Vec<PlatformGate> {
 // ---------------------------------------------------------------------------
 
 /// Whether every harness entry has a fixture directory (best-effort check).
+///
+/// Fixture dirs follow adapter module names: the catalog id with `-`
+/// replaced by `_` (`roo-code` -> `roo_code`), with the product-suffix
+/// variants (`-cli`, `-agent`, `-code`) also tried stripped (`junie-cli` ->
+/// `junie`, `kilo-code` -> `kilo`), matching the adapters' own
+/// `fixtures/<module>` references.
 pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
     let mut coverage = Vec::new();
     for entry in harness_catalog::ENTRIES {
-        let dir = fixtures_root.join(entry.id.replace('-', "_"));
-        // Also try hyphen vs underscore variants and original id
-        let alt = fixtures_root.join(entry.id);
-        let exists = dir.exists() || alt.exists();
+        let underscore = entry.id.replace('-', "_");
+        let mut exists =
+            fixtures_root.join(&underscore).exists() || fixtures_root.join(entry.id).exists();
+        if !exists {
+            // Product-suffix ids whose adapter modules drop the suffix.
+            exists = ["_cli", "_agent", "_code"].iter().any(|suffix| {
+                underscore
+                    .strip_suffix(suffix)
+                    .is_some_and(|stripped| fixtures_root.join(stripped).exists())
+            });
+        }
         coverage.push((entry.id.to_owned(), exists));
     }
     coverage
@@ -862,10 +875,90 @@ mod tests {
         let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let coverage = ledger_fixture_coverage(&fixtures_root);
         assert_eq!(coverage.len(), harness_catalog::ENTRIES.len());
-        // claude_code should have fixtures
-        let claude = coverage.iter().find(|(id, _)| *id == "claude-code");
-        assert!(claude.is_some());
-        assert!(claude.unwrap().1, "claude-code should have fixture dir");
+        // QAL-02: EVERY catalog id must have an on-disk fixture corpus dir;
+        // this fails when a surface loses (or never gets) its corpus.
+        let uncovered: Vec<&str> = coverage
+            .iter()
+            .filter(|(_, covered)| !covered)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "catalog entries without fixture corpora: {uncovered:?}"
+        );
+    }
+
+    // ---- corpus-less surface corpora (HAD-06 / QAL-02) ----
+
+    /// Whether any file in `dir` carries the `.<variant>.` name segment.
+    fn dir_has_variant(dir: &Path, variant: &str) -> bool {
+        let needle = format!(".{variant}.");
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().contains(&needle))
+        })
+    }
+
+    /// The 13 surfaces that had no on-disk corpus before this area; each dir
+    /// must carry the standard variant set and pass fixture validation.
+    #[test]
+    fn corpus_less_surfaces_have_validating_fixture_corpora() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let corpora = [
+            ("amazon_q", 1),
+            ("antigravity", 1),
+            ("auggie", 1),
+            ("cursor", 2),
+            ("gemini_cli", 2),
+            ("kilo", 1),
+            ("kiro", 2),
+            ("legacy_kimi", 1),
+            ("openclaw", 1),
+            ("roo_code", 2),
+            ("windsurf", 1),
+            ("zcode", 1),
+            ("zed_acp", 1),
+        ];
+        for (dir, malformed_expected) in corpora {
+            let dir_path = root.join(dir);
+            assert!(dir_path.join("PROVENANCE.md").exists(), "{dir} provenance");
+            for variant in [
+                "minimal",
+                "populated",
+                "foreign",
+                "malformed",
+                "boundary_legacy",
+                "boundary_current",
+            ] {
+                let has = dir_has_variant(&dir_path, variant);
+                assert!(has, "{dir} is missing a `{variant}` fixture variant");
+            }
+            let report = fixture_report(&dir_path);
+            assert!(
+                !report.outcomes.is_empty(),
+                "{dir} fixture dir produced no outcomes"
+            );
+            assert!(
+                report.validity_pass,
+                "{dir} validity: {:?}",
+                report
+                    .outcomes
+                    .iter()
+                    .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                    .map(|o| o.path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                report.secret_free_pass,
+                "{dir} fixtures must be secret-free"
+            );
+            assert!(
+                report.malformed_count >= malformed_expected,
+                "{dir} must flag its malformed fixtures (got {})",
+                report.malformed_count
+            );
+        }
     }
 
     // ---- isolated temp dir ----

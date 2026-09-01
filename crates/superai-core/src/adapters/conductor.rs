@@ -957,4 +957,45 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the on-disk fixture corpus into tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_corpus_validates_secret_free_and_flags_malformed() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/conductor");
+        let report = crate::verification::fixture_report(&dir);
+        assert!(!report.outcomes.is_empty(), "conductor corpus must load");
+        assert!(
+            report.validity_pass,
+            "validity: {:?}",
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                .map(|o| o.path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report.secret_free_pass,
+            "conductor fixtures must be secret-free"
+        );
+        assert!(report.malformed_count >= 1);
+    }
+
+    #[test]
+    fn fixture_settings_toml_loads_with_documented_keys() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/conductor");
+        let settings =
+            superai_config::toml_file::load(&dir.join("settings.populated.toml")).unwrap();
+        assert!(settings.contains_key("models"));
+        let repo =
+            superai_config::toml_file::load(&dir.join("repo-settings.populated.toml")).unwrap();
+        assert!(!repo.is_empty() || repo.contains_key("name"));
+        assert!(
+            superai_config::toml_file::load(&dir.join("settings.malformed.toml")).is_err(),
+            "malformed settings must fail to parse"
+        );
+    }
 }

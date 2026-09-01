@@ -850,4 +850,21 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: on-disk fixture corpus (writable-state surface)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_populated_loads_with_documented_keys() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/cursor")
+            .join("cli-config.populated.json");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+        let value = superai_config::json::load(&path).unwrap();
+        assert!(value.contains_key("model"), "fixture must document `model`");
+        let report = crate::verification::fixture_report(path.parent().unwrap());
+        assert!(report.validity_pass, "cursor corpus validity");
+        assert!(report.secret_free_pass, "cursor corpus secret-free");
+    }
 }

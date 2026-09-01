@@ -1,0 +1,15 @@
+{
+  "language_models": {
+    "anthropic": {
+      "api_url": "https://api.acme.test"
+    }
+  },
+  "context_servers": {
+    "fetch": {
+      "command": {
+        "path": "uvx",
+        "args": ["mcp-server-fetch"]
+      }
+    }
+  }
+}

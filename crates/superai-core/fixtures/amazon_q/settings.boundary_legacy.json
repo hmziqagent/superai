@@ -1,0 +1,5 @@
+{
+  "chat": {
+    "defaultModel": "claude-3-sonnet"
+  }
+}

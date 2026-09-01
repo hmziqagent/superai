@@ -13,10 +13,12 @@ use std::time::Duration;
 
 use toml_edit as _;
 
+use superai_config::document::ValueType;
+
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -598,12 +600,57 @@ impl Adapter for CodexCliAdapter {
         }
         instance.validate()?;
         match instance.isolation {
-            Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
+            Isolation::RelocatedRoot | Isolation::Unknown => {
+                // HAD-03: surface content present under the instance root must
+                // satisfy the declared root shape / owned-key rules.
+                crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
+            }
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!("codex-cli requires isolation relocated_root, got {other}"),
             }),
         }
+    }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03: `config.toml` and the >=0.134 per-profile files share the
+        // same top-level shape (docs/harness-configs/codex-cli.md §profiles:
+        // "Use top-level keys in the profile file; do NOT nest under
+        // [profiles.<name>]").
+        match surface_id {
+            "config.toml" | "profile.config.toml" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Table)
+                    .with_owned_key("model", ValueType::String)
+                    .with_owned_key("model_provider", ValueType::String)
+                    .with_owned_key("openai_base_url", ValueType::String)
+                    .with_owned_key("model_reasoning_effort", ValueType::String)
+                    .with_owned_key("model_verbosity", ValueType::String)
+                    .with_owned_key("approval_policy", ValueType::String)
+                    .with_owned_key("sandbox_mode", ValueType::String)
+                    .with_owned_key("model_providers", ValueType::Object)
+                    .with_owned_key("mcp_servers", ValueType::Object)
+                    // Legacy top-level profile selector: no longer supported
+                    // in the >=0.134 profile-file era (research doc §profiles).
+                    .with_deprecated(
+                        "profile",
+                        Some("per-profile $CODEX_HOME/<name>.config.toml via --profile".to_owned()),
+                    ),
+            ),
+            _ => None,
+        }
+    }
+
+    fn era_conflict_reason(&self, surface_id: &str, content: &[u8]) -> Option<String> {
+        if surface_id != "config.toml" {
+            return None;
+        }
+        let resolution = self.version_resolution();
+        let Some(version) = resolution.detected_version.as_deref() else {
+            // Unknown era already blocks via the version gate.
+            return None;
+        };
+        profile_era_conflict(version, content)
     }
 
     fn supported_skill_modes(&self) -> Vec<crate::adapter::SkillMode> {
@@ -612,6 +659,46 @@ impl Adapter for CodexCliAdapter {
             crate::adapter::SkillMode::CopySelected,
         ]
     }
+}
+
+/// Config era of codex `config.toml` content (HAD-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigEra {
+    /// >=0.134: profiles are separate `$CODEX_HOME/<name>.config.toml` files.
+    ProfileFile,
+    /// <0.134: inline `[profiles.*]` tables inside `config.toml`.
+    InlineProfiles,
+    /// Content carries no era marker.
+    Unknown,
+}
+
+/// Classify the config era of raw `config.toml` content.
+///
+/// The documented marker is the legacy inline `[profiles.<name>]` table
+/// (research doc §profiles: legacy (<0.134) uses inline tables; >=0.134 uses
+/// separate files, so current-era configs never contain `[profiles.`).
+pub fn config_era(content: &[u8]) -> ConfigEra {
+    let text = String::from_utf8_lossy(content);
+    if text.contains("[profiles.") {
+        ConfigEra::InlineProfiles
+    } else {
+        ConfigEra::Unknown
+    }
+}
+
+/// Pure era-conflict check for `config.toml` content against a detected
+/// version (HAD-05 step 5).
+///
+/// The documented era marker is the legacy-only inline `[profiles.*]` table;
+/// current-era configs carry no marker, so the detectable conflict is a
+/// profile-file-era version (>=0.134) paired with legacy inline content.
+pub fn profile_era_conflict(version: &str, content: &[u8]) -> Option<String> {
+    if is_profile_era(version) && config_era(content) == ConfigEra::InlineProfiles {
+        return Some(format!(
+            "detected codex {version} uses the >=0.134 profile-file era but the config carries legacy inline [profiles.*] tables; migrate before writing"
+        ));
+    }
+    None
 }
 
 /// Determine if version is in profile era (>=0.134.0).
@@ -652,8 +739,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CONFIG_ENV_VAR, CodexCliAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS,
-        RESEARCH_DOC, is_profile_era,
+        CONFIG_ENV_VAR, CodexCliAdapter, ConfigEra, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
+        LAST_VERIFIED, OWNED_SELECTORS, RESEARCH_DOC, SCHEMA_VERSION_STR, config_era,
+        is_profile_era, profile_era_conflict,
     };
     use toml_edit as _;
 
@@ -737,10 +825,7 @@ mod tests {
         let a = adapter();
         let res = a.version_resolution();
         if res.detected_version.is_some() {
-            assert_eq!(
-                res.schema_version.as_deref(),
-                Some(super::SCHEMA_VERSION_STR)
-            );
+            assert_eq!(res.schema_version.as_deref(), Some(SCHEMA_VERSION_STR));
             assert!(res.compatible);
         } else {
             assert!(!res.compatible);
@@ -1202,5 +1287,242 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema (table root + owned-key semantics)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_table_root_and_typed_keys() {
+        let a = adapter();
+        let schema = a.surface_schema("config.toml").expect("config schema");
+        assert_eq!(schema.root_shape, Some(crate::adapter::RootShape::Table));
+        for path in ["model", "model_provider", "model_providers", "mcp_servers"] {
+            assert!(
+                schema.owned_key_rules.iter().any(|r| r.path == path),
+                "missing rule for {path}"
+            );
+        }
+        // Profile files share the same top-level schema.
+        assert!(a.surface_schema("profile.config.toml").is_some());
+        assert!(a.surface_schema("unknown").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_wrongly_typed_owned_key() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "config.toml",
+            b"model = { nested = true }\n",
+            superai_config::document::DocumentKind::Toml,
+        );
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("owned key `model` must hold a value of type string")
+                && d.message.starts_with("[codex-cli/config.toml]")),
+            "diags: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn schema_flags_deprecated_profile_selector() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "config.toml",
+            b"profile = \"work\"\n",
+            superai_config::document::DocumentKind::Toml,
+        );
+        let dep = diags
+            .iter()
+            .find(|d| d.severity == superai_config::document::DiagnosticSeverity::Deprecation)
+            .expect("deprecation diagnostic for legacy profile selector");
+        assert!(dep.message.contains("`profile` is deprecated"));
+        assert!(dep.message.contains("--profile"));
+    }
+
+    #[test]
+    fn validate_instance_rejects_schema_invalid_config_under_root() {
+        let a = adapter();
+        let dir = crate::test_util::temp_dir_unique("codex-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inst = sample_instance_with_root(dir.to_str().unwrap());
+        // Missing config: fresh instance validates.
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(dir.join("config.toml"), b"model = 123\n").unwrap();
+        let err = a.validate_instance(&inst).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { details, .. } => {
+                assert!(details.contains("[codex-cli/config.toml]"), "{details}");
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-05/HAD-06 version-boundary fixtures (profile era vs pre-profile)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn boundary_fixtures_split_profile_eras_per_documented_boundary() {
+        let legacy = fixture_path("config.boundary_legacy.toml");
+        let current = fixture_path("config.boundary_current.toml");
+        assert!(legacy.exists(), "missing {}", legacy.display());
+        assert!(current.exists(), "missing {}", current.display());
+
+        let legacy_bytes = std::fs::read(&legacy).unwrap();
+        let current_bytes = std::fs::read(&current).unwrap();
+
+        // Era markers per docs/harness-configs/codex-cli.md §profiles.
+        assert_eq!(config_era(&legacy_bytes), ConfigEra::InlineProfiles);
+        assert_eq!(config_era(&current_bytes), ConfigEra::Unknown);
+        // The documented version boundary classifies the paired versions.
+        assert!(!is_profile_era("0.133.9"));
+        assert!(is_profile_era("0.134.0"));
+
+        // Both eras parse and satisfy the declared schema on read.
+        for content in [&legacy_bytes, &current_bytes] {
+            let diags = crate::adapter::validate_surface_content(
+                &adapter(),
+                "config.toml",
+                content,
+                superai_config::document::DocumentKind::Toml,
+            );
+            assert!(
+                diags
+                    .iter()
+                    .all(|d| d.severity != superai_config::document::DiagnosticSeverity::Error),
+                "boundary fixture must satisfy the declared schema: {diags:?}"
+            );
+        }
+
+        // The version.txt fixture records a >=0.134 detection: the current
+        // fixture is in-range, the legacy fixture would be era-conflicting.
+        let version_text = std::fs::read_to_string(fixture_path("version.txt"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let parsed = CodexCliAdapter::parse_version_output(&version_text);
+        assert_eq!(parsed.as_deref(), Some("0.134.0"));
+        assert!(is_profile_era(parsed.as_deref().unwrap_or("")));
+    }
+
+    #[test]
+    fn era_classifier_markers_and_negatives() {
+        assert_eq!(config_era(b"model = \"gpt-5\"\n"), ConfigEra::Unknown);
+        assert_eq!(
+            config_era(b"[profiles.o3]\nmodel = \"o3\"\n"),
+            ConfigEra::InlineProfiles
+        );
+        // A comment mentioning the marker is still a marker-bearing file;
+        // the classifier is lexical by design and errs toward legacy.
+        assert_eq!(
+            config_era(b"# see [profiles.*] docs\n"),
+            ConfigEra::InlineProfiles
+        );
+    }
+
+    /// Era-conflict refusal through the shared raw-editor boundary: a
+    /// profile-era adapter refuses to write legacy inline-profile content,
+    /// leaving the file untouched (HAD-05 step 5).
+    #[test]
+    fn commit_refuses_era_conflicting_content() {
+        #[derive(Debug)]
+        struct ProfileEraCodex;
+
+        impl Adapter for ProfileEraCodex {
+            fn id(&self) -> HarnessId {
+                HarnessId::new("codex-cli").unwrap()
+            }
+            #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str")]
+            fn display_name(&self) -> &str {
+                "Codex CLI"
+            }
+            fn product_status(&self) -> ProductStatus {
+                ProductStatus::Active
+            }
+            fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+                Vec::new()
+            }
+            #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str")]
+            fn adapter_revision(&self) -> &str {
+                "0.1.0"
+            }
+            fn research_doc_link(&self) -> &str {
+                RESEARCH_DOC
+            }
+            fn last_verified_date(&self) -> &str {
+                LAST_VERIFIED
+            }
+            fn detection(&self) -> crate::adapter::DetectionResult {
+                crate::adapter::DetectionResult::absent(vec!["test".to_owned()])
+            }
+            fn version_resolution(&self) -> crate::adapter::VersionResolution {
+                crate::adapter::VersionResolution::new(
+                    Some("0.134.0".to_owned()),
+                    Some(SCHEMA_VERSION_STR.to_owned()),
+                    true,
+                )
+            }
+            fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+                vec![crate::adapter::ConfigSurface::new(
+                    "config.toml",
+                    crate::adapter::PathResolver::fallback_only("~/.codex/config.toml"),
+                    DocumentKind::Toml,
+                    ConfigScope::User,
+                    SurfaceOwnership::UserEditable,
+                )]
+            }
+            fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
+                Vec::new()
+            }
+            fn plan_mirror_exclusions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn plan_wrapper(
+                &self,
+                _instance: &Instance,
+            ) -> Result<crate::adapter::WrapperPlan, CoreError> {
+                Ok(crate::adapter::WrapperPlan::new("test"))
+            }
+            fn scan_candidates(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn validate_instance(&self, _instance: &Instance) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn era_conflict_reason(&self, surface_id: &str, content: &[u8]) -> Option<String> {
+                (surface_id == "config.toml")
+                    .then(|| profile_era_conflict("0.134.0", content))
+                    .flatten()
+            }
+        }
+
+        let dir = crate::test_util::temp_dir_unique("codex-era");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original: &[u8] = b"model = \"gpt-5\"\n";
+        std::fs::write(&path, original).unwrap();
+        let adapter = ProfileEraCodex;
+        let legacy: Vec<u8> = std::fs::read(fixture_path("config.boundary_legacy.toml")).unwrap();
+        let err =
+            crate::raw_editor::commit_for_adapter(&path, &legacy, None, &adapter).unwrap_err();
+        match err {
+            CoreError::UnsupportedVersion { reason, .. } => {
+                assert!(reason.contains("[profiles.*]"), "{reason}");
+                assert!(reason.contains("0.134"), "{reason}");
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        // Consistent-era content commits through the same boundary.
+        let current: Vec<u8> = std::fs::read(fixture_path("config.boundary_current.toml")).unwrap();
+        crate::raw_editor::commit_for_adapter(&path, &current, None, &adapter).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), current);
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

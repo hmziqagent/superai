@@ -695,4 +695,44 @@ mod tests {
         let a = adapter();
         assert!(a.supported_skill_modes().is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the on-disk fixture corpus into tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_corpus_validates_secret_free() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/copilot_coding_agent");
+        let report = crate::verification::fixture_report(&dir);
+        assert!(
+            !report.outcomes.is_empty(),
+            "copilot_coding_agent corpus must load"
+        );
+        assert!(
+            report.validity_pass,
+            "validity: {:?}",
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                .map(|o| o.path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report.secret_free_pass,
+            "copilot_coding_agent fixtures must be secret-free"
+        );
+    }
+
+    #[test]
+    fn fixture_setup_steps_and_instructions_load() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/copilot_coding_agent");
+        let steps = superai_config::yaml::load(&dir.join("setup-steps.populated.yml")).unwrap();
+        assert!(steps.contains_key("jobs") || steps.contains_key("name"));
+        let instructions =
+            std::fs::read_to_string(dir.join("copilot-instructions.populated.md")).unwrap();
+        assert!(!instructions.trim().is_empty());
+    }
 }

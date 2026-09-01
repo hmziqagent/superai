@@ -1,0 +1,16 @@
+{
+  "general": {
+    "vimMode": true
+  },
+  "advanced": {
+    "excludedEnvVars": ["DEBUG"]
+  },
+  "mcp": {
+    "servers": {
+      "fetch": {
+        "command": "uvx",
+        "args": ["mcp-server-fetch"]
+      }
+    }
+  }
+}

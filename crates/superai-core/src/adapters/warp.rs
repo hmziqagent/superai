@@ -1104,4 +1104,44 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
+
+    // -------------------------------------------------------------------
+    // HAD-06: adopt the on-disk fixture corpus into tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fixture_corpus_validates_secret_free_and_flags_malformed() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/warp");
+        let report = crate::verification::fixture_report(&dir);
+        assert!(!report.outcomes.is_empty(), "warp corpus must load");
+        assert!(
+            report.validity_pass,
+            "validity: {:?}",
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.exists && o.is_valid != o.expected_valid)
+                .map(|o| o.path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(report.secret_free_pass, "warp fixtures must be secret-free");
+        assert!(
+            report.malformed_count >= 3,
+            "toml+json+yaml malformed variants"
+        );
+    }
+
+    #[test]
+    fn fixture_populated_toml_and_mcp_load_with_documented_keys() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/warp");
+        let settings =
+            superai_config::toml_file::load(&dir.join("settings.populated.toml")).unwrap();
+        assert!(settings.contains_key("appearance") || settings.contains_key("general"));
+        let mcp = superai_config::json::load(&dir.join("mcp.populated.json")).unwrap();
+        assert!(mcp.contains_key("mcpServers"));
+        assert!(
+            superai_config::toml_file::load(&dir.join("settings.malformed.toml")).is_err(),
+            "malformed toml must fail to parse"
+        );
+    }
 }

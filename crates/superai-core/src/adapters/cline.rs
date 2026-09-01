@@ -15,8 +15,10 @@ use std::time::Duration;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
-    SurfaceOwnership, VersionResolution, WrapperPlan,
+    RootShape, SurfaceOwnership, SurfaceSchema, VersionResolution, WrapperPlan,
 };
+use superai_config::document::ValueType;
+
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
@@ -840,11 +842,38 @@ impl Adapter for ClineAdapter {
         }
         instance.validate()?;
         match instance.isolation {
-            Isolation::IdeUserData | Isolation::RelocatedRoot | Isolation::Unknown => Ok(()),
+            Isolation::IdeUserData | Isolation::RelocatedRoot | Isolation::Unknown => {
+                // HAD-03: surface content present under the instance root must
+                // satisfy the declared root shapes / owned-key rules.
+                crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
+            }
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!("cline requires isolation ide_user_data, got {other}"),
             }),
+        }
+    }
+
+    fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
+        // HAD-03: provider-profile + MCP shapes per
+        // docs/harness-configs/cline.md §config (providers.json holds
+        // provider config metadata; cline_mcp_settings.json holds mcpServers).
+        match surface_id {
+            "providers.json" | "global-settings.json" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("apiProvider", ValueType::String)
+                    .with_owned_key("openAiBaseUrl", ValueType::String)
+                    .with_owned_key("openAiModelId", ValueType::String)
+                    .with_owned_key("preferredLanguage", ValueType::String),
+            ),
+            "cline_mcp_settings.json" | "vscode cline_mcp_settings.json" => Some(
+                SurfaceSchema::new()
+                    .with_root_shape(RootShape::Object)
+                    .with_owned_key("mcpServers", ValueType::Object),
+            ),
+            "vscode settings.json" => Some(SurfaceSchema::new().with_root_shape(RootShape::Object)),
+            _ => None,
         }
     }
 
@@ -871,6 +900,7 @@ mod tests {
     use crate::instance::Instance;
     use crate::paths::AbsolutePath;
     use crate::state::{AdapterSupport, InstallPresence, InstanceOrigin, Isolation, Ownership};
+    use superai_config::document::ValueType;
 
     fn adapter() -> super::ClineAdapter {
         super::ClineAdapter::new().unwrap()
@@ -1533,5 +1563,90 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // HAD-03 surface schema
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn surface_schema_declares_provider_and_mcp_shapes() {
+        let a = adapter();
+        let providers = a
+            .surface_schema("providers.json")
+            .expect("providers schema");
+        assert_eq!(
+            providers.root_shape,
+            Some(crate::adapter::RootShape::Object)
+        );
+        assert!(
+            providers
+                .owned_key_rules
+                .iter()
+                .any(|r| r.path == "apiProvider")
+        );
+        let mcp = a
+            .surface_schema("cline_mcp_settings.json")
+            .expect("mcp schema");
+        assert!(
+            mcp.owned_key_rules
+                .iter()
+                .any(|r| r.path == "mcpServers" && r.expected == ValueType::Object)
+        );
+        assert!(a.surface_schema("unknown").is_none());
+    }
+
+    #[test]
+    fn schema_rejects_wrongly_typed_mcp_servers() {
+        let diags = crate::adapter::validate_surface_content(
+            &adapter(),
+            "cline_mcp_settings.json",
+            br#"{"mcpServers": []}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("`mcpServers` must hold a value of type object")),
+            "diags: {diags:?}"
+        );
+        let ok = crate::adapter::validate_surface_content(
+            &adapter(),
+            "cline_mcp_settings.json",
+            br#"{"mcpServers": {}}"#,
+            superai_config::document::DocumentKind::StrictJson,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn validate_instance_rejects_schema_invalid_settings_under_root() {
+        let a = adapter();
+        let dir = crate::test_util::temp_dir_unique("cline-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inst = sample_instance_with_root(dir.to_str().unwrap());
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(
+            dir.join("cline_mcp_settings.json"),
+            br#"{"mcpServers": {"fetch": {"command": "uvx"}}}"#,
+        )
+        .unwrap();
+        a.validate_instance(&inst).unwrap();
+        std::fs::write(
+            dir.join("cline_mcp_settings.json"),
+            br#"{"mcpServers": 42}"#,
+        )
+        .unwrap();
+        let err = a.validate_instance(&inst).unwrap_err();
+        match err {
+            CoreError::SchemaValidation { details, .. } => {
+                assert!(
+                    details.contains("[cline/cline_mcp_settings.json]"),
+                    "{details}"
+                );
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
     }
 }
