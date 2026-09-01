@@ -933,6 +933,20 @@ pub fn install_directory_bundle(
         });
     }
 
+    // Harness-discovery pre-check (EXT-07 step 6, fail-fast leg): where the
+    // adapter declares a required manifest, a source bundle that does not
+    // even contain it can never be discovered — refuse BEFORE anything is
+    // staged, so nothing lands on disk and no cleanup is needed.
+    if let Some(manifest) = decl.discovery_manifest.as_deref()
+        && !files.iter().any(|f| f.rel_path == manifest)
+    {
+        return Err(CoreError::Verification {
+            path: source_dir.join(manifest),
+            kind: "discovery".to_owned(),
+            reason: format!("source bundle lacks the harness discovery manifest `{manifest}`"),
+        });
+    }
+
     // Commit through the transaction: foreign destinations are backed up by
     // the Write actions themselves.
     let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
@@ -983,33 +997,27 @@ pub fn install_directory_bundle(
             ),
         });
     }
-    // A re-stage over owned files leaves prepare-phase backups of the old
-    // superai-owned content inside the harness plugin directory; once the
-    // staging is verified they are dead weight — remove them.
-    if let Some(commit) = &outcome.commit {
-        for backup in &commit.backups {
-            let path = backup.backup_path.as_path();
-            if path.exists()
-                && let Err(e) = std::fs::remove_file(path)
-            {
-                return Err(CoreError::Commit {
-                    path: path.to_path_buf(),
-                    reason: format!("cannot clean up owned-file backup: {e}"),
-                });
-            }
-        }
-    }
 
     // Harness-discovery verification (EXT-07 step 6): where the adapter
     // declares a required manifest, the harness cannot discover the plugin
-    // without it — a staged bundle missing it is a failed install.
+    // without it — a staged bundle missing it is a failed install. This runs
+    // BEFORE any cleanup: on failure the staged files and the prepare-phase
+    // recovery backups are still in place, and the error names both so the
+    // caller can recover instead of guessing (recovery backups live beside
+    // the staged files as `<name>.bak.<millis>.<suffix>`).
     if let Some(manifest) = decl.discovery_manifest.as_deref()
         && !dest_bundle.join(manifest).is_file()
     {
         return Err(CoreError::Verification {
             path: dest_bundle.join(manifest),
             kind: "discovery".to_owned(),
-            reason: format!("harness discovery manifest `{manifest}` missing after staging"),
+            reason: format!(
+                "harness discovery manifest `{manifest}` missing after staging; \
+                 {} staged file(s) left in place under `{}` with prepare-phase \
+                 recovery backups retained (no registry record written)",
+                staged_rel.len(),
+                dest_bundle.display()
+            ),
         });
     }
 
@@ -1032,6 +1040,25 @@ pub fn install_directory_bundle(
                 kind: "readback".to_owned(),
                 reason: "staged bundle file bytes differ from the staged content".to_owned(),
             });
+        }
+    }
+
+    // A re-stage over owned files leaves prepare-phase backups of the old
+    // superai-owned content inside the harness plugin directory. Only now —
+    // with discovery verification and read-back complete — are they dead
+    // weight; remove them so the harness sees a clean directory. Every
+    // earlier failure path deliberately retains them for recovery.
+    if let Some(commit) = &outcome.commit {
+        for backup in &commit.backups {
+            let path = backup.backup_path.as_path();
+            if path.exists()
+                && let Err(e) = std::fs::remove_file(path)
+            {
+                return Err(CoreError::Commit {
+                    path: path.to_path_buf(),
+                    reason: format!("cannot clean up owned-file backup: {e}"),
+                });
+            }
         }
     }
 
@@ -1916,8 +1943,86 @@ mod tests {
             }
             other => panic!("expected discovery Verification, got {other:?}"),
         }
-        // No registry record for a failed install.
+        // No registry record for a failed install, and (fail-fast pre-check)
+        // nothing staged on disk either — no cleanup needed.
         assert!(reg.get(&PluginId::new("manifestless").unwrap()).is_none());
+        assert!(
+            !instance_root.join("plugins").join("manifestless").exists(),
+            "a bundle lacking the discovery manifest must not be staged"
+        );
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn restage_over_owned_install_cleans_backups_only_after_verification() {
+        // FINDING-2 (round 1): backup cleanup is ordered AFTER the
+        // harness-discovery verification and the read-back verify. A
+        // successful re-stage over an owned install creates prepare-phase
+        // backups of the old owned files (the Write targets exist); the
+        // cleaned-up end state proves cleanup ran — and only ran — once
+        // verification completed.
+        let home = tmp_root("bundle-restage");
+        let instance_root = home.join("instance");
+        let source_dir = home.join("bundle-src");
+        make_bundle(&source_dir, true);
+        let mut reg = PluginRegistry::load(&home.join("registry-root")).unwrap();
+        let decl = PluginAdapterDecl::directory_bundle(
+            "plugins",
+            Some("plugin.json"),
+            RestartBehavior::Restart,
+        );
+        let src = PluginSource {
+            id: PluginId::new("owned-plugin").unwrap(),
+            kind: PluginKind::DirectoryBundle,
+            locator: source_dir.display().to_string(),
+            version: Some("1.0.0".to_owned()),
+            digest: None,
+        };
+        install_directory_bundle(&mut reg, &src, &decl, &instance_root).unwrap();
+        let bundle_dir = instance_root.join("plugins").join("owned-plugin");
+        assert!(bundle_dir.join("plugin.json").is_file());
+
+        // Re-stage over the owned install (prepare phase backs up the
+        // existing owned files, then the verified commit replaces them).
+        let record = install_directory_bundle(&mut reg, &src, &decl, &instance_root).unwrap();
+        assert!(record.staged_files.is_some_and(|f| !f.is_empty()));
+        assert!(bundle_dir.join("plugin.json").is_file());
+
+        // After the verified re-stage no recovery backups may remain in the
+        // harness plugin directory (cleanup runs post-verification), and no
+        // `.bak.` sibling may linger anywhere under the destination root.
+        fn has_backup(path: &Path) -> bool {
+            if path.is_file() {
+                return path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".bak."));
+            }
+            path.read_dir()
+                .map(|entries| {
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .any(|e| has_backup(&e.path()))
+                })
+                .unwrap_or(false)
+        }
+        let dest_root = instance_root.join("plugins");
+        assert!(
+            !has_backup(&dest_root),
+            "post-verification cleanup must remove owned-file backups under {}",
+            dest_root.display()
+        );
+
+        // A refused re-stage (digest mismatch) must not touch the verified
+        // install: backups are only created by a prepare phase that runs,
+        // and the refused path stops before staging.
+        let mut bad = src.clone();
+        bad.digest = Some("0".repeat(64));
+        assert!(matches!(
+            install_directory_bundle(&mut reg, &bad, &decl, &instance_root),
+            Err(CoreError::Verification { kind, .. }) if kind == "digest"
+        ));
+        assert!(bundle_dir.join("plugin.json").is_file());
+        assert!(!has_backup(&dest_root));
         drop(std::fs::remove_dir_all(&home));
     }
 

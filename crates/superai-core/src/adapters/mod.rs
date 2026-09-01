@@ -236,11 +236,19 @@ mod decl_tests {
         }
     }
 
+    /// Verified corpus partition of the 48 MCP declarations (round-1 judge
+    /// recount): pins the exact writable/read-only/absence split so any
+    /// drift in either direction fails with the real numbers.
+    const EXPECTED_MCP_WRITABLE: usize = 15;
+    const EXPECTED_MCP_READ_ONLY: usize = 18;
+    const EXPECTED_MCP_ABSENT: usize = 15;
+
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
         let adapters = harness_catalog::all_adapters();
         assert_eq!(adapters.len(), 48, "catalog must list 48 adapters");
-        let mut declared = 0;
+        let mut writable = 0;
+        let mut read_only = 0;
         let mut absent = 0;
         for adapter in &adapters {
             let id = adapter.id().as_str().to_owned();
@@ -266,12 +274,35 @@ mod decl_tests {
                 assert_eq!(decl.dest_file, expected.1, "{id} dest file");
                 assert_eq!(decl.dest_key, expected.2, "{id} dest key");
                 assert!(!decl.dest_key.is_empty());
-                declared += 1;
+                let is_read_only = decl.read_only.is_some();
+                read_only += usize::from(is_read_only);
+                writable += usize::from(!is_read_only);
             }
         }
-        assert_eq!(declared + absent, 48);
+        // The exact partition: sums to 48 AND matches the verified counts.
+        assert_eq!(
+            writable + read_only + absent,
+            48,
+            "writable {writable} + read-only {read_only} + absence {absent} must cover all 48"
+        );
+        assert_eq!(
+            writable, EXPECTED_MCP_WRITABLE,
+            "writable MCP dest count drifted (was {writable}, expected {EXPECTED_MCP_WRITABLE})"
+        );
+        assert_eq!(
+            read_only, EXPECTED_MCP_READ_ONLY,
+            "read-only MCP dest count drifted (was {read_only}, expected {EXPECTED_MCP_READ_ONLY})"
+        );
+        assert_eq!(
+            absent, EXPECTED_MCP_ABSENT,
+            "explicit-absence count drifted (was {absent}, expected {EXPECTED_MCP_ABSENT})"
+        );
         // Every table row is exercised (no stale expectations).
-        assert_eq!(declared, MCP_DESTS.len(), "MCP_DESTS rows must all match");
+        assert_eq!(
+            writable + read_only,
+            MCP_DESTS.len(),
+            "MCP_DESTS rows must all match"
+        );
         assert_eq!(absent, MCP_ABSENT.len(), "MCP_ABSENT rows must all match");
     }
 
