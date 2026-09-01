@@ -3470,6 +3470,18 @@ pub enum ReconfigureAction {
     /// Re-apply the instance's skill links (idempotent relink of the
     /// adapter-declared skills destination).
     RelinkSkills,
+    /// Enable or disable an INSTALLED plugin on the adapter-declared
+    /// destination (INS-06 plugin kind): the plugin lifecycle from plan 10
+    /// (`plugin::set_plugin_enabled`) — registry flag first, then the
+    /// destination mutation (config-entry toggle or bundle stage/unstage),
+    /// foreign entries/files preserved. Execution-backed plugin kinds are
+    /// refused here; they need the harness's own command.
+    SetPluginEnabled {
+        /// Plugin id, exactly as recorded in the plugin registry.
+        plugin: String,
+        /// Target state.
+        enabled: bool,
+    },
 }
 
 /// A reconfigure request: which real mutations to apply (INS-06).
@@ -3626,19 +3638,61 @@ fn mcp_dest_path(
     Ok((instance.config_root.as_path().join(&decl.dest_file), decl))
 }
 
+/// The superai-owned plugin registry root for a home (INS-06 plugin kind):
+/// `<home>/.superai/plugins` — outside every harness tree, the same
+/// placement discipline as the skills root.
+fn plugin_registry_root(home: &Path) -> PathBuf {
+    home.join(".superai").join("plugins")
+}
+
+/// Destination path a plugin declaration mutates for `instance`: the config
+/// FILE for config-entry plugins, the bundle DIRECTORY otherwise (its parent
+/// is the instance root, which is what `plugin::set_plugin_enabled` expects).
+fn plugin_dest_path(instance: &Instance, decl: &crate::adapter::PluginAdapterDecl) -> PathBuf {
+    if decl.kind == crate::adapter::PluginKind::DirectoryBundle
+        && let Some(dir) = decl.dest_dir.as_deref()
+    {
+        instance.config_root.as_path().join(dir)
+    } else {
+        instance.config_root.as_path().join(&decl.dest_file)
+    }
+}
+
+/// Resolve the plugin registry record for `plugin` FRESH from the registry at
+/// `home` (disk is truth). `Err` carries the typed load failure; `Ok(None)`
+/// means the id is unknown (or invalid) — never guessed at.
+fn plugin_record_for(home: &Path, plugin: &str) -> Result<Option<crate::plugin::PluginRecord>> {
+    let registry = crate::plugin::PluginRegistry::load(&plugin_registry_root(home))?;
+    Ok(crate::ids::PluginId::new(plugin)
+        .ok()
+        .and_then(|id| registry.get(&id).cloned()))
+}
+
 /// Preview reconfigure of provider/template/skills/MCP for an instance
 /// (INS-06): loads the record, re-inspects harness files FRESH, builds the
 /// real adapter mutations, and previews semantic + lexical redacted diffs.
 /// No file is written.
-#[expect(
-    clippy::too_many_lines,
-    reason = "preview covers every reconfigure action kind"
-)]
 pub fn preview_reconfigure(
     registry: &Registry,
     name: &str,
     adapter: &dyn Adapter,
     request: &ReconfigureRequest,
+) -> Result<OperationPreview> {
+    preview_reconfigure_with_home(registry, name, adapter, request, home_dir().as_deref())
+}
+
+/// [`preview_reconfigure`] with an explicit home scope, so plugin/skills
+/// resolution (and tests) stay hermetic. Read-only regardless.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preview covers every reconfigure action kind"
+)]
+pub fn preview_reconfigure_with_home(
+    registry: &Registry,
+    name: &str,
+    adapter: &dyn Adapter,
+    request: &ReconfigureRequest,
+    home: Option<&Path>,
 ) -> Result<OperationPreview> {
     let preview_id = new_operation_id()?;
     let instance = registry.get(name).ok_or_else(|| CoreError::Validation {
@@ -3882,6 +3936,112 @@ pub fn preview_reconfigure(
                     paths: vec![],
                 }),
             },
+            ReconfigureAction::SetPluginEnabled { plugin, enabled } => {
+                let Some(decl) = adapter.plugin_decl() else {
+                    conflicts.push(Conflict {
+                        code: "plugin_unsupported".to_owned(),
+                        message: format!("harness {} declares no plugin destination", adapter.id()),
+                        paths: vec![],
+                    });
+                    continue;
+                };
+                if decl.requires_execution
+                    || !matches!(
+                        decl.kind,
+                        crate::adapter::PluginKind::ConfigEntry
+                            | crate::adapter::PluginKind::DirectoryBundle
+                    )
+                {
+                    conflicts.push(Conflict {
+                        code: "plugin_requires_approval".to_owned(),
+                        message: format!(
+                            "plugin enable/disable for harness {} needs the harness's own \
+                             command; reconfigure only performs file-backed plugin mutations",
+                            adapter.id()
+                        ),
+                        paths: vec![],
+                    });
+                    continue;
+                }
+                let record = match home {
+                    None => {
+                        conflicts.push(Conflict {
+                            code: "plugin_registry_unavailable".to_owned(),
+                            message: "no home to resolve the plugin registry from".to_owned(),
+                            paths: vec![],
+                        });
+                        continue;
+                    }
+                    Some(home) => match plugin_record_for(home, plugin) {
+                        Err(e) => {
+                            conflicts.push(Conflict {
+                                code: "plugin_registry_unavailable".to_owned(),
+                                message: format!("cannot load plugin registry: {e}"),
+                                paths: vec![],
+                            });
+                            continue;
+                        }
+                        Ok(None) => {
+                            conflicts.push(Conflict {
+                                code: "plugin_unknown".to_owned(),
+                                message: format!(
+                                    "plugin `{plugin}` is not installed (no registry record)"
+                                ),
+                                paths: vec![],
+                            });
+                            continue;
+                        }
+                        Ok(Some(record)) => record,
+                    },
+                };
+                if record.enabled == *enabled {
+                    warnings.push(Warning {
+                        code: "plugin_noop".to_owned(),
+                        message: format!(
+                            "plugin `{plugin}` is already {}",
+                            if *enabled { "enabled" } else { "disabled" }
+                        ),
+                        path: None,
+                    });
+                }
+                let dest = plugin_dest_path(instance, &decl);
+                let surface = match decl.dest_dir.as_deref() {
+                    Some(dir) if decl.kind == crate::adapter::PluginKind::DirectoryBundle => {
+                        dir.to_owned()
+                    }
+                    _ => decl.dest_file.clone(),
+                };
+                diffs.push(RedactedDiff {
+                    path: AbsolutePath::from_path(&dest)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    surface,
+                    lexical_redacted: format!(
+                        "plugin `{plugin}` {}",
+                        if *enabled { "enable" } else { "disable" }
+                    ),
+                    semantic_redacted: format!(
+                        "plugin lifecycle toggle `{plugin}` -> {enabled} (registry record kept \
+                         reversible; foreign entries preserved; restart {:?})",
+                        decl.restart
+                    ),
+                    redacted_fields: Vec::new(),
+                });
+                actions.push(PlannedAction {
+                    order,
+                    kind: if matches!(decl.kind, crate::adapter::PluginKind::ConfigEntry) {
+                        ActionKind::WriteFile
+                    } else {
+                        ActionKind::CreateDir
+                    },
+                    target: AbsolutePath::from_path(&dest)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    description: format!(
+                        "{} plugin `{plugin}` through the plugin lifecycle",
+                        if *enabled { "enable" } else { "disable" }
+                    ),
+                    requires_backup: true,
+                });
+            }
         }
     }
 
@@ -3931,15 +4091,29 @@ pub fn preview_reconfigure(
 /// relink) through their transaction layers, then re-resolve capabilities
 /// and health WITHOUT persisting mirrors. Registry changes only for
 /// superai-owned provenance/version facts after file verification.
-#[expect(
-    clippy::too_many_lines,
-    reason = "commit applies every reconfigure action kind"
-)]
 pub fn reconfigure(
     registry_path: &Path,
     name: &str,
     adapter: &dyn Adapter,
     request: &ReconfigureRequest,
+) -> Result<OperationResult> {
+    reconfigure_with_home(registry_path, name, adapter, request, home_dir().as_deref())
+}
+
+/// [`reconfigure`] with an explicit home scope: the crash-journal root, the
+/// skills registry root, and the plugin registry root all resolve under the
+/// caller's home (tests stay hermetic; callers handling a non-ambient home
+/// should prefer this variant).
+#[expect(
+    clippy::too_many_lines,
+    reason = "commit applies every reconfigure action kind"
+)]
+pub fn reconfigure_with_home(
+    registry_path: &Path,
+    name: &str,
+    adapter: &dyn Adapter,
+    request: &ReconfigureRequest,
+    home: Option<&Path>,
 ) -> Result<OperationResult> {
     let preview_id = new_operation_id()?;
     let mut registry = Registry::load(registry_path)?;
@@ -3952,7 +4126,7 @@ pub fn reconfigure(
         .clone();
 
     // Fresh preview: every conflict the preview sees blocks the commit.
-    let preview = preview_reconfigure(&registry, name, adapter, request)?;
+    let preview = preview_reconfigure_with_home(&registry, name, adapter, request, home)?;
     if !preview.conflicts.is_empty() {
         return Err(CoreError::Validation {
             field: "preview".to_owned(),
@@ -3960,7 +4134,7 @@ pub fn reconfigure(
         });
     }
 
-    let journal_root = home_dir().map(|home| superai_config::journal::journal_dir(&home));
+    let journal_root = home.map(|h| superai_config::journal::journal_dir(h));
     let mut applied: Vec<String> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
     let mut verification: Vec<VerificationResult> = Vec::new();
@@ -4103,7 +4277,11 @@ pub fn reconfigure(
                         operation: "relink_skills".to_owned(),
                         reason: "harness supports no skill modes".to_owned(),
                     })?;
-                let root = crate::skills::default_skills_root()?;
+                // Home-scoped skills root (same placement as
+                // `skills::default_skills_root`, resolved under the caller's
+                // home so the operation is hermetic and replayable).
+                let skills_home = home.ok_or(CoreError::NoHomeDir)?;
+                let root = skills_home.join(".superai").join("skills");
                 let skill_registry = crate::skills::SkillRegistry::load(&root)?;
                 let provenance = crate::skills::apply_skill_mode(
                     &skill_registry,
@@ -4123,6 +4301,68 @@ pub fn reconfigure(
                     passed: true,
                     message: "skill links re-applied".to_owned(),
                 });
+            }
+            ReconfigureAction::SetPluginEnabled { plugin, enabled } => {
+                // INS-06 plugin kind: the plan-10 plugin lifecycle — registry
+                // flag first (reversible), then the destination mutation with
+                // foreign entries/files preserved.
+                let decl =
+                    adapter
+                        .plugin_decl()
+                        .ok_or_else(|| CoreError::UnsupportedOperation {
+                            harness: adapter.id().to_string(),
+                            operation: "reconfigure_plugin".to_owned(),
+                            reason: "harness declares no plugin destination".to_owned(),
+                        })?;
+                let plugin_home = home.ok_or(CoreError::NoHomeDir)?;
+                let mut plugin_registry =
+                    crate::plugin::PluginRegistry::load(&plugin_registry_root(plugin_home))?;
+                let plugin_id =
+                    crate::ids::PluginId::new(plugin).map_err(|e| CoreError::Validation {
+                        field: "plugin.id".to_owned(),
+                        reason: format!("plugin id `{plugin}` invalid: {e}"),
+                    })?;
+                let record = plugin_registry.get(&plugin_id).cloned().ok_or_else(|| {
+                    CoreError::Validation {
+                        field: "plugin.id".to_owned(),
+                        reason: format!("plugin `{plugin}` is not installed (no registry record)"),
+                    }
+                })?;
+                let source = crate::plugin::PluginSource {
+                    id: plugin_id,
+                    kind: record.kind,
+                    locator: record.source_locator.clone(),
+                    version: record.version.clone(),
+                    digest: record.digest.clone(),
+                };
+                let dest = plugin_dest_path(&instance, &decl);
+                crate::plugin::set_plugin_enabled(
+                    &mut plugin_registry,
+                    &decl,
+                    &dest,
+                    &source,
+                    *enabled,
+                )?;
+                applied.push(format!(
+                    "plugin `{plugin}` {}",
+                    if *enabled { "enabled" } else { "disabled" }
+                ));
+                verification.push(VerificationResult {
+                    path: AbsolutePath::from_path(&dest)
+                        .unwrap_or_else(|_| instance.config_root.clone()),
+                    kind: VerificationKind::Parse,
+                    passed: true,
+                    message: format!(
+                        "plugin `{plugin}` destination consistent after {}",
+                        if *enabled { "enable" } else { "disable" }
+                    ),
+                });
+                if decl.restart != crate::adapter::RestartBehavior::None {
+                    diagnostics.push(format!(
+                        "restart required after plugin toggle: {:?}",
+                        decl.restart
+                    ));
+                }
             }
         }
     }
@@ -7028,6 +7268,315 @@ mod tests {
             1,
             "refused reconfigure must not create backups"
         );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-06: SetMcpEnabled mutates the adapter-declared MCP destination
+    /// through the mcp transaction layer — the owned server is disabled in
+    /// place while foreign servers and foreign top-level keys survive — and
+    /// an unknown server is a preview conflict that blocks the commit.
+    #[test]
+    fn reconfigure_toggles_mcp_server_and_preserves_foreign() {
+        let tmp = unique_temp("reconfigure_mcp");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        let mcp_path = root.join(".mcp.json");
+        std::fs::write(
+            &mcp_path,
+            r#"{
+  "mcpServers": {
+    "owned-server": {"command": "npx", "args": ["-y", "owned-server"]},
+    "foreign-server": {"url": "https://foreign.example/sse", "transport": "http"}
+  },
+  "note": "keep me"
+}
+"#,
+        )
+        .unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry
+            .insert(Instance {
+                id: InstanceId::new("id-reconf-mcp").unwrap(),
+                name: InstanceName::new("work").unwrap(),
+                harness: HarnessId::new("claude-code").unwrap(),
+                config_root: AbsolutePath::from_path(&root).unwrap(),
+                binary: None,
+                wrapper: None,
+                isolation: Isolation::RelocatedRoot,
+                origin: InstanceOrigin::Created,
+                ownership: Ownership::SuperaiCreated,
+                template: None,
+                created_at: now_iso8601(),
+                adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+            })
+            .unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let request = ReconfigureRequest::new(vec![ReconfigureAction::SetMcpEnabled {
+            server: "owned-server".to_owned(),
+            enabled: false,
+        }]);
+
+        // Preview plans the toggle on the adapter-declared destination.
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview = preview_reconfigure(&loaded, "work", &adapter, &request).unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+        assert!(
+            preview
+                .diffs
+                .iter()
+                .any(|d| d.surface == ".mcp.json" && d.lexical_redacted.contains("owned-server")),
+            "diffs: {:?}",
+            preview.diffs
+        );
+
+        // Commit disables the owned server IN PLACE.
+        let result = reconfigure(&registry_path, "work", &adapter, &request).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        let servers = after.get("mcpServers").expect("mcpServers preserved");
+        let owned = servers.get("owned-server").expect("owned entry kept");
+        assert_eq!(
+            owned.get("disabled").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "owned server disabled in place: {owned}"
+        );
+        // Foreign server untouched (still has no disabled flag) and the
+        // foreign top-level key survived the per-entry write.
+        let foreign = servers.get("foreign-server").expect("foreign server kept");
+        assert!(
+            foreign.get("disabled").is_none(),
+            "foreign server must not be touched: {foreign}"
+        );
+        assert_eq!(
+            after.get("note").and_then(serde_json::Value::as_str),
+            Some("keep me"),
+            "foreign top-level key preserved"
+        );
+
+        // An unknown server is a preview conflict that blocks the commit,
+        // leaving the destination bytes untouched.
+        let bytes_before = std::fs::read(&mcp_path).unwrap();
+        let ghost = ReconfigureRequest::new(vec![ReconfigureAction::SetMcpEnabled {
+            server: "ghost-server".to_owned(),
+            enabled: true,
+        }]);
+        let ghost_preview = preview_reconfigure(&loaded, "work", &adapter, &ghost).unwrap();
+        assert!(
+            ghost_preview
+                .conflicts
+                .iter()
+                .any(|c| c.code == "mcp_unknown_server"),
+            "{:?}",
+            ghost_preview.conflicts
+        );
+        reconfigure(&registry_path, "work", &adapter, &ghost).unwrap_err();
+        assert_eq!(
+            std::fs::read(&mcp_path).unwrap(),
+            bytes_before,
+            "blocked commit must not touch the destination"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-06: RelinkSkills re-applies the skill mode link against the
+    /// home-scoped skills registry; a harness without a skills surface is a
+    /// preview conflict that blocks the commit.
+    #[test]
+    fn reconfigure_relinks_skills_against_home_scoped_registry() {
+        let tmp = unique_temp("reconfigure_skills");
+        let home = tmp.join("home");
+        let skills_root = home.join(".superai").join("skills");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry
+            .insert(Instance {
+                id: InstanceId::new("id-reconf-skills").unwrap(),
+                name: InstanceName::new("work").unwrap(),
+                harness: HarnessId::new("claude-code").unwrap(),
+                config_root: AbsolutePath::from_path(&root).unwrap(),
+                binary: None,
+                wrapper: None,
+                isolation: Isolation::RelocatedRoot,
+                origin: InstanceOrigin::Created,
+                ownership: Ownership::SuperaiCreated,
+                template: None,
+                created_at: now_iso8601(),
+                adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+            })
+            .unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let request = ReconfigureRequest::new(vec![ReconfigureAction::RelinkSkills]);
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview =
+            preview_reconfigure_with_home(&loaded, "work", &adapter, &request, Some(&home))
+                .unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+
+        // Commit links the instance skills surface at superai's registry root.
+        let result =
+            reconfigure_with_home(&registry_path, "work", &adapter, &request, Some(&home)).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        let skills_link = root.join("skills");
+        let meta = std::fs::symlink_metadata(&skills_link)
+            .expect("skills surface linked (LinkAll is claude-code's first mode)");
+        assert!(
+            meta.file_type().is_symlink(),
+            "LinkAll creates a symlink, got {meta:?}"
+        );
+        assert_eq!(std::fs::read_link(&skills_link).unwrap(), skills_root);
+
+        // A harness without a skills surface: preview conflict, commit refuses.
+        let generic = make_adapter("other-harness");
+        let refusal =
+            preview_reconfigure_with_home(&loaded, "work", &generic, &request, Some(&home))
+                .unwrap();
+        assert!(
+            refusal
+                .conflicts
+                .iter()
+                .any(|c| c.code == "skills_unsupported"),
+            "{:?}",
+            refusal.conflicts
+        );
+        reconfigure_with_home(&registry_path, "work", &generic, &request, Some(&home)).unwrap_err();
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-06 (plugin kind): SetPluginEnabled drives the plan-10 plugin
+    /// lifecycle on the adapter-declared destination — disable unstages the
+    /// owned bundle while foreign files in the shared dir survive, enable
+    /// re-stages from the recorded source, and an uninstalled plugin is a
+    /// preview conflict that blocks the commit.
+    #[test]
+    fn reconfigure_toggles_plugin_through_plugin_lifecycle() {
+        let tmp = unique_temp("reconfigure_plugin");
+        let home = tmp.join("home");
+        let plugin_root = home.join(".superai").join("plugins");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry
+            .insert(Instance {
+                id: InstanceId::new("id-reconf-plugin").unwrap(),
+                name: InstanceName::new("work").unwrap(),
+                harness: HarnessId::new("claude-code").unwrap(),
+                config_root: AbsolutePath::from_path(&root).unwrap(),
+                binary: None,
+                wrapper: None,
+                isolation: Isolation::RelocatedRoot,
+                origin: InstanceOrigin::Created,
+                ownership: Ownership::SuperaiCreated,
+                template: None,
+                created_at: now_iso8601(),
+                adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+            })
+            .unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let decl = adapter.plugin_decl().expect("claude-code declares plugins");
+
+        // Install a real DirectoryBundle plugin through the plugin lifecycle.
+        let bundle_src = tmp.join("bundle-src");
+        std::fs::create_dir_all(&bundle_src).unwrap();
+        std::fs::write(
+            bundle_src.join("plugin.toml"),
+            "[plugin]\nname = \"mine\"\n",
+        )
+        .unwrap();
+        let mut plugin_registry = crate::plugin::PluginRegistry::load(&plugin_root).unwrap();
+        let source = crate::plugin::PluginSource {
+            id: crate::ids::PluginId::new("mine").unwrap(),
+            kind: crate::adapter::PluginKind::DirectoryBundle,
+            locator: bundle_src.display().to_string(),
+            version: Some("1.0.0".to_owned()),
+            digest: None,
+        };
+        crate::plugin::install_directory_bundle(&mut plugin_registry, &source, &decl, &root)
+            .unwrap();
+        let owned_bundle = root.join("plugins").join("mine").join("plugin.toml");
+        assert!(owned_bundle.is_file(), "bundle staged");
+        // A foreign file in the shared plugins dir must survive toggles.
+        let foreign = root.join("plugins").join("foreign.txt");
+        std::fs::write(&foreign, "user file\n").unwrap();
+
+        // Disable through reconfigure: unstaged, foreign preserved, record
+        // kept disabled (reversible).
+        let disable = ReconfigureRequest::new(vec![ReconfigureAction::SetPluginEnabled {
+            plugin: "mine".to_owned(),
+            enabled: false,
+        }]);
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview =
+            preview_reconfigure_with_home(&loaded, "work", &adapter, &disable, Some(&home))
+                .unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+        assert!(
+            preview
+                .diffs
+                .iter()
+                .any(|d| d.surface == "plugins" && d.semantic_redacted.contains("mine")),
+            "diffs: {:?}",
+            preview.diffs
+        );
+        let result =
+            reconfigure_with_home(&registry_path, "work", &adapter, &disable, Some(&home)).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+        assert!(
+            !root.join("plugins").join("mine").exists(),
+            "disabled bundle is unstaged"
+        );
+        assert!(foreign.is_file(), "foreign file in shared dir preserved");
+        let reloaded = crate::plugin::PluginRegistry::load(&plugin_root).unwrap();
+        let record = reloaded
+            .get(&crate::ids::PluginId::new("mine").unwrap())
+            .expect("record kept (disable is reversible)");
+        assert!(!record.enabled);
+
+        // Enable re-stages the bundle from the recorded source.
+        let enable = ReconfigureRequest::new(vec![ReconfigureAction::SetPluginEnabled {
+            plugin: "mine".to_owned(),
+            enabled: true,
+        }]);
+        let result2 =
+            reconfigure_with_home(&registry_path, "work", &adapter, &enable, Some(&home)).unwrap();
+        assert!(result2.success, "{:?}", result2.diagnostics_redacted);
+        assert!(owned_bundle.is_file(), "bundle re-staged on enable");
+        assert!(foreign.is_file(), "foreign file still preserved");
+
+        // An uninstalled plugin is a preview conflict that blocks the commit.
+        let ghost = ReconfigureRequest::new(vec![ReconfigureAction::SetPluginEnabled {
+            plugin: "ghost".to_owned(),
+            enabled: true,
+        }]);
+        let ghost_preview =
+            preview_reconfigure_with_home(&loaded, "work", &adapter, &ghost, Some(&home)).unwrap();
+        assert!(
+            ghost_preview
+                .conflicts
+                .iter()
+                .any(|c| c.code == "plugin_unknown"),
+            "{:?}",
+            ghost_preview.conflicts
+        );
+        reconfigure_with_home(&registry_path, "work", &adapter, &ghost, Some(&home)).unwrap_err();
         drop(std::fs::remove_dir_all(&tmp));
     }
 
