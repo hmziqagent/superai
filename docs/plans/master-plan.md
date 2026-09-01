@@ -128,7 +128,7 @@ Estimate uses reviewable change sets, not calendar promises.
 |---:|---|---|---|---:|---|
 | 00 | [Domain foundation](00-domain-foundation.md) | IDs, records schema, validation, transactions, ports | — | 5–7 | 5/5 |
 | 01 | [Document engine](01-document-engine.md) | Loss-minimizing codecs and typed path edits | 00 | 8–12 | 5/5 |
-| 02 | [Safe mutation and backups](02-safe-mutation-and-backups.md) | Conflict-safe atomic commits, backup/restore, rollback | 00, 01 | 8–11 | 6/7 |
+| 02 | [Safe mutation and backups](02-safe-mutation-and-backups.md) | Conflict-safe atomic commits, backup/restore, rollback | 00, 01 | 8–11 | 7/7 |
 | 03 | [Harness adapters](03-harness-adapters.md) | Version-aware adapter contract and all 48 planned surfaces | 00–02 | 50–70 | 7/7 |
 | 04 | [Instance lifecycle](04-instance-lifecycle.md) | Create/mirror/adopt/update/remove orchestration | 00–03 | 8–12 | 6/6 |
 | 05 | [Discovery, adoption, drift](05-discovery-adoption-drift.md) | Install/config/wrapper scans and ownership classification | 00, 03, 04 | 7–10 | 5/5 |
@@ -139,7 +139,7 @@ Estimate uses reviewable change sets, not calendar promises.
 | 10 | [Skills, plugins, MCP](10-skills-plugins-mcp.md) | Registry plus per-instance link/copy/config workflows | 00–06 | 10–14 | 7/7 |
 | 11 | [Harness installation](11-harness-installation.md) | Detect/install/update/uninstall with mise/duct-backed execution | 00, 03–06 | 8–12 | 6/6 |
 | 12 | [Raw editor backend](12-raw-editor-backend.md) | Read/validate/diff/commit API for future editors | 01–03 | 4–6 | 6/6 |
-| 13 | [Verification and release](13-verification-and-release.md) | Fixtures, fault tests, platform gates, non-UI release criteria | all | 10–16 | 6/7 |
+| 13 | [Verification and release](13-verification-and-release.md) | Fixtures, fault tests, platform gates, non-UI release criteria | all | 10–16 | 7/7 |
 
 Exit-gate column = subplan exit-gate checkboxes closed as of run 3 (commit c164204) plus the
 final-gate-fix round; each plan's Exit gate section carries the evidence citations and the

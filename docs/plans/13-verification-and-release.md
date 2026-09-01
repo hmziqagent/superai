@@ -317,8 +317,8 @@ Fuzz/mutation commands use pinned documented tool versions in CI once added.
 > (SUPERAI_TEST_KEEP retain-on-failure), QAL-02 (48/48 fixture corpora; the
 > layout.default/isolated fixture kind covers the 3 flagship relocated-root
 > surfaces — claude_code, codex_cli, gemini_cli — machine-checked against the
-> adapters' own constants; 16 RelocatedRoot surfaces exist in the catalog, the
-> other 13 carry the standard minimal/populated/foreign/malformed kinds),
+> adapters' own constants; 20 RelocatedRoot surfaces exist in the catalog, the
+> other 17 carry the standard minimal/populated/foreign/malformed kinds),
 > QAL-04 (executor + span-codec fuzz targets over the new engine surfaces plus
 > the adapter version/schema detection family — version-output fixtures,
 > PATH-shaped strings, and catalog entries driven through the real detect path
