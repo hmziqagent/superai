@@ -30,7 +30,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::backup::backup;
 use crate::error::{ConfigError, Result};
 
 /// Quoting style for a value.
@@ -610,19 +609,16 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
 
 /// Back up, then write `vars` to `path`, creating parent directories as needed.
 ///
+/// Plan-02 fold: the write goes through the crate's one mutation boundary
+/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
+/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
+/// replacement, read-back verify.
+///
 /// The file is written as normalized `KEY=value` lines with quoting only when
 /// required (double quotes). No `export` prefix, comments, or blank lines are
 /// emitted — they are preserved only via [`edit`] on existing files. The output
 /// uses LF newlines and a trailing newline.
 pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
-    backup(path)?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-
     let mut text = String::new();
     for (k, v) in vars {
         let formatted = format_value_normalized(v);
@@ -632,7 +628,13 @@ pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
         text.push('\n');
     }
 
-    crate::atomic::atomic_write(path, text.as_bytes())
+    crate::transaction::commit_file(
+        "env-store",
+        path,
+        text.as_bytes(),
+        crate::document::DocumentKind::Env,
+    )?;
+    Ok(())
 }
 
 /// Read fresh, apply `edit`, write back only if the effective map changed.
@@ -810,15 +812,16 @@ where
     // If original file ended without newline, we still add one (normalized trailing newline)
     // This matches `store` behaviour and is acceptable.
 
-    backup(path)?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-
-    crate::atomic::atomic_write(path, out.as_bytes())
+    // Plan-02 fold: the mutation goes through the one boundary — backup of
+    // the existing contents, staged parse-validation, §4.2 conflict recheck,
+    // atomic replacement, read-back verify.
+    crate::transaction::commit_file(
+        "env-edit",
+        path,
+        out.as_bytes(),
+        crate::document::DocumentKind::Env,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

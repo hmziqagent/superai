@@ -49,7 +49,6 @@ use std::path::Path;
 use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
-use crate::backup::backup;
 use crate::error::{ConfigError, Result};
 
 // ---------------------------------------------------------------------------
@@ -296,18 +295,17 @@ pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
 
 /// Write an arbitrary YAML `value` to `path` as normalized YAML.
 ///
+/// Plan-02 fold: the write goes through the crate's one mutation boundary
+/// ([`crate::transaction::commit_file`]) — fresh snapshot, staged
+/// parse-validation, §4.2 conflict recheck, atomic replacement, read-back
+/// verify (the DOC-06 gate below guarantees the target is missing, so there
+/// is no prior content to back up).
+///
 /// See [`store`] for the unconditional write gate (DOC-06): an existing
 /// target refuses, a missing target is created. This entry point preserves a
 /// non-object root (array, string, number, bool, null) for raw-editor use.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     ensure_lossless_write(path)?;
-    backup(path)?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
 
     let mut text = yaml_serde::to_string(value).map_err(|source| ConfigError::Yaml {
         path: path.to_path_buf(),
@@ -317,7 +315,13 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
         text.push('\n');
     }
 
-    crate::atomic::atomic_write(path, text.as_bytes())
+    crate::transaction::commit_file(
+        "yaml-store",
+        path,
+        text.as_bytes(),
+        crate::document::DocumentKind::Yaml,
+    )?;
+    Ok(())
 }
 
 /// Read fresh, apply `edit`, write back only if the value changed.

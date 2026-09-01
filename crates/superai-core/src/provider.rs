@@ -1716,8 +1716,17 @@ fn write_env_file(dest: &Path, var: &str, secret: &str) -> Result<()> {
             reason: format!("cannot create parent: {e}"),
         })?;
     }
-    superai_config::atomic::atomic_write(dest, new_content.as_bytes())
-        .map_err(CoreError::Config)?;
+    // Plan-02 fold: provider env writes go through the config crate's ONE
+    // mutation boundary (snapshot → backup → §4.2 recheck → atomic replace →
+    // verify); the boundary's env staged-validation skips comment/blank lines
+    // so preserved lexical material is never refused.
+    superai_config::transaction::commit_file(
+        "provider-env",
+        dest,
+        new_content.as_bytes(),
+        superai_config::document::DocumentKind::Env,
+    )
+    .map_err(CoreError::Config)?;
     Ok(())
 }
 

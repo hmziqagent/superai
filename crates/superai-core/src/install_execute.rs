@@ -350,7 +350,17 @@ pub fn persist_receipt(
         field: "receipt".to_owned(),
         reason: format!("serialize receipt failed: {e}"),
     })?;
-    superai_config::atomic::atomic_write(&path, &bytes).map_err(CoreError::Config)?;
+    // Plan-02 fold: receipts persist through the config crate's ONE mutation
+    // boundary (snapshot → backup → §4.2 recheck → atomic replace → verify);
+    // the payload is pretty JSON, so the boundary's staged parse-validation
+    // also guards the receipt's syntax before it lands.
+    superai_config::transaction::commit_file(
+        "persist-receipt",
+        &path,
+        &bytes,
+        superai_config::document::DocumentKind::StrictJson,
+    )
+    .map_err(CoreError::Config)?;
     Ok(path)
 }
 

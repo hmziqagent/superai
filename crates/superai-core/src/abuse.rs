@@ -488,10 +488,12 @@ mod tests {
             let snap_after = superai_config::snapshot::snapshot(&link);
             assert!(superai_config::snapshot::is_modified(&snap, &snap_after));
 
-            // Also test via atomic write as before
-            let res = superai_config::atomic::atomic_write_with_snapshot(
+            // Also test via the mutation boundary with the pre-swap token
+            let res = superai_config::transaction::commit_file_expecting(
+                "core-symlink-race",
                 &link,
                 br#"{"new":1}"#,
+                superai_config::document::DocumentKind::StrictJson,
                 Some(&snap),
             );
             assert!(res.is_err());
@@ -1019,14 +1021,21 @@ description: test skill
             assert!(!msg.contains(SENTINEL));
             assert!(msg.len() <= 4096);
         }
-        // Long path
+        // Long path — through the mutation boundary: no panic, and either a
+        // verified commit or a typed refusal (never a partial write).
         let long = "a".repeat(300);
         let long_path = dir.join(format!("{long}.json"));
         let long_res = std::panic::catch_unwind(|| {
-            superai_config::atomic::atomic_write(&long_path, br#"{"a":1}"#)
+            superai_config::transaction::commit_file(
+                "core-abuse-long-path",
+                &long_path,
+                br#"{"a":1}"#,
+                superai_config::document::DocumentKind::StrictJson,
+            )
         });
         assert!(long_res.is_ok(), "long path must not panic");
-        if let Ok(Ok(())) = long_res {
+        if let Ok(Ok(report)) = long_res {
+            let _ = report;
             drop(std::fs::remove_file(&long_path));
         }
         // Case-insensitive collision via registry
@@ -1106,10 +1115,16 @@ description: test skill
         ] {
             let path = dir.join(format!("{seg}.json"));
             let res = std::panic::catch_unwind(|| {
-                superai_config::atomic::atomic_write(&path, br#"{"a":1}"#)
+                superai_config::transaction::commit_file(
+                    "core-abuse-metachars",
+                    &path,
+                    br#"{"a":1}"#,
+                    superai_config::document::DocumentKind::StrictJson,
+                )
             });
             assert!(res.is_ok(), "shell metachars {seg:?} must not panic");
-            if let Ok(Ok(())) = res {
+            if let Ok(Ok(report)) = res {
+                let _ = report;
                 let b = std::fs::read(&path).unwrap();
                 assert!(!contains_sentinel(&b));
                 drop(std::fs::remove_file(&path));

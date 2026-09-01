@@ -2,7 +2,6 @@ use std::path::Path;
 
 use toml_edit::DocumentMut;
 
-use crate::backup::backup;
 use crate::error::{ConfigError, Result};
 
 /// Read a TOML config fresh from disk. A missing file reads as an empty document.
@@ -27,19 +26,23 @@ pub fn load(path: &Path) -> Result<DocumentMut> {
 
 /// Back up, then write `doc` to `path`, creating parent directories as needed.
 ///
+/// Plan-02 fold: the write goes through the crate's one mutation boundary
+/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
+/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
+/// replacement, read-back verify.
+///
 /// The file is serialized via `toml_edit::DocumentMut::to_string`, which
 /// preserves comments and formatting for unchanged regions. No typed struct is
 /// ever serialized over the source document (DOC-04).
 pub fn store(path: &Path, doc: &DocumentMut) -> Result<()> {
-    backup(path)?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-
-    crate::atomic::atomic_write(path, doc.to_string().as_bytes())
+    let text = doc.to_string();
+    crate::transaction::commit_file(
+        "toml-store",
+        path,
+        text.as_bytes(),
+        crate::document::DocumentKind::Toml,
+    )?;
+    Ok(())
 }
 
 /// Read fresh, apply `edit`, write back only if the document changed.

@@ -288,11 +288,24 @@ Fuzz/mutation commands use pinned documented tool versions in CI once added.
 
 ## Exit gate
 
-- [ ] Tests cover every supported adapter/platform state.
-      > open: macOS application-path cases and Windows adversarial long-path/locked-file
-      > cases remain uncovered (area-8 reasoned-not-executed list; cfg(windows) semantics
-      > are cross-compiled clean and pure-helper tested with the windows CI runner as
-      > executor of record, but those two platform-state families have no dedicated tests).
+- [x] Tests cover every supported adapter/platform state.
+      > Closed (area 9b): dedicated platform-adversarial tests added in superai-config
+      > transaction.rs — cfg(windows) `windows_locked_target_commit_is_typed_error_
+      > never_corrupting` (target held open without FILE_SHARE_DELETE through the
+      > mutation boundary: typed `ConfigError::Io`, contents never corrupted, no leaked
+      > staged temp), `windows_reserved_device_paths_rejected_live` (CON/PRN/AUX/NUL/
+      > COM1/LPT1 write targets refused before any disk work, backed by the
+      > host-independent `windows_reserved_device_names_are_refused_as_write_targets`
+      > helper table wired into path validation), and `windows_long_path_commit_is_
+      > verified_or_typed_never_partial` (>MAX_PATH depth: verified read-back or typed
+      > refusal, never a partial file); cfg(target_os="macos")
+      > `macos_case_insensitive_collision_write_is_typed_never_corrupting` (real
+      > case-insensitive APFS volume: case-variant creation refused, exact-name
+      > overwrite still verified) and `macos_application_support_paths_commit_
+      > through_the_boundary` (`~/Library/Application Support/...` shaped writes).
+      > Cross-clippy x86_64-pc-windows-msvc and aarch64-apple-darwin PASS for
+      > superai-config (the platform-gated code lives there); execution is by the
+      > windows/macos CI runners — reasoned-not-executed on this linux host.
 - [x] Fault/crash recovery evidence exists.
 - [x] Fuzzing and mutation testing guard parsers/safety branches.
 - [x] Secret/path/process/network abuse suites pass.
@@ -311,4 +324,7 @@ Fuzz/mutation commands use pinned documented tool versions in CI once added.
 > machine-verified ledgers + research-file coverage + freshness window), QAL-15 (README
 > backup/recovery, data locations, security posture, template-repo sections) closed by
 > area 8, judge-verified round 2. docs/dependency-review.md carries the per-crate
-> dependency evidence (QAL-12).
+> dependency evidence (QAL-12). QAL-09's platform-state families (macOS
+> application paths, macOS case-insensitive collisions, Windows locked-file,
+> reserved-device-name, and long-path adversarial cases) were closed by area 9b
+> with cfg-gated tests executed by the platform CI runners.

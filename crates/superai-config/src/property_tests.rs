@@ -14,7 +14,6 @@ mod tests {
 
     use serde_json::{Map, Number, Value};
 
-    use crate::atomic::atomic_write_with_snapshot;
     use crate::backup::{backup, list_backups, restore_entry, verify_backup};
     use crate::document::Selector;
     use crate::quarantine::validate_quarantine_target;
@@ -662,9 +661,18 @@ mod tests {
                 assert!(!dbg.contains("sk-superai-test-sentinel"));
                 assert!(b.backup_path.exists());
             }
-            // Now commit via atomic_write_with_snapshot which internally verifies snapshot digest — mutant skipping is_modified would let stale write through
+            // Now commit through the mutation boundary, which internally
+            // verifies the snapshot token — a mutant skipping is_modified
+            // would let a stale write through.
             let new_content = format!(r#"{{"a":{}}}"#, iter + 1000).into_bytes();
-            let ok = atomic_write_with_snapshot(&path, &new_content, Some(&snap)).unwrap();
+            let ok = crate::transaction::commit_file_expecting(
+                "prop-backup-mutant",
+                &path,
+                &new_content,
+                crate::document::DocumentKind::StrictJson,
+                Some(&snap),
+            )
+            .unwrap();
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 new_content,
@@ -680,7 +688,13 @@ mod tests {
                 is_modified(&snap2, &snap3),
                 "is_modified must detect external edit at {iter} (mutant would return false)"
             );
-            let stale_res = atomic_write_with_snapshot(&path, &new_content, Some(&snap2));
+            let stale_res = crate::transaction::commit_file_expecting(
+                "prop-backup-mutant",
+                &path,
+                &new_content,
+                crate::document::DocumentKind::StrictJson,
+                Some(&snap2),
+            );
             assert!(stale_res.is_err(), "stale snapshot must abort at {iter}");
             drop(std::fs::remove_dir_all(path.parent().unwrap()));
         }

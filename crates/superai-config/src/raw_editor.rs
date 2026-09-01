@@ -2059,24 +2059,19 @@ fn commit_inner(
         None
     };
 
-    // Ensure parent exists (atomic handles but do explicitly for clarity)
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
+    // Plan-02 fold: the replacement itself goes through the shared
+    // transaction commit core — `stage_temp_file` + `commit_staged_file`, the
+    // exact primitives [`crate::transaction::Transaction::commit_write`]
+    // commits through. The §4.2 token is the caller's expected snapshot when
+    // supplied (guarding the full read→commit window); otherwise the fresh
+    // snapshot taken above, whose pre-rename recheck is the same mid-window
+    // conflict detection the previous expected-digest layer performed.
+    let token = expected_snapshot.unwrap_or(&current_snapshot);
+    let staged = crate::transaction::stage_temp_file(path, new_content, None)?;
+    if let Err(e) = crate::transaction::commit_staged_file(path, &staged, Some(token), None) {
+        drop(std::fs::remove_file(&staged));
+        return Err(e);
     }
-
-    // Atomic replace with verification (also checks concurrent mod between snapshot and rename)
-    // Use the expected digest for the atomic layer if provided.
-    let atomic_res = if expected_digest.is_some() || expected_snapshot.is_some() {
-        let digest_for_atomic =
-            expected_digest.or_else(|| expected_snapshot.and_then(|s| s.digest.as_deref()));
-        crate::atomic::atomic_write_with_expected_digest(path, new_content, digest_for_atomic)
-    } else {
-        crate::atomic::atomic_write(path, new_content)
-    };
-
-    atomic_res?;
 
     // Read-back verification: fresh read and parse, plus digest check.
     let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;

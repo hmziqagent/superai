@@ -369,6 +369,41 @@ pub(crate) fn windows_shaped_broad_root(path: &Path) -> bool {
     unc_shaped && trimmed.matches('/').count() <= 3
 }
 
+/// Whether the final component of `path` is a Windows reserved device name
+/// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, `CONIN$`,
+/// `CONOUT$`), matched on the stem before the first extension dot and
+/// ASCII-case-folded — exactly the Windows rule (`CON.txt` and `con` are
+/// devices, not files).
+///
+/// Pure string semantics, so the guard holds on every host: a plan that
+/// names a reserved device can never become a real file on Windows, and the
+/// plan layer surfaces that before any staging (QAL-09 reserved-name case).
+pub(crate) fn windows_reserved_device_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let stem = name.split('.').next().unwrap_or(name);
+    let folded = stem.to_ascii_uppercase();
+    if matches!(
+        folded.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    for prefix in ["COM", "LPT"] {
+        if let Some(digits) = folded.strip_prefix(prefix)
+            && digits.len() == 1
+            && digits
+                .as_bytes()
+                .first()
+                .is_some_and(|b| (b'1'..=b'9').contains(b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Path equality with platform-correct case rules: byte equality first;
 /// when either side is windows-shaped, compare normalized and
 /// ASCII-case-folded (Windows filesystems match case-insensitively).
@@ -656,19 +691,29 @@ pub fn stage_temp_file(
         .write(true)
         .truncate(true)
         .open(&final_temp)
-        .map_err(|e| ConfigError::io(&final_temp, e))?;
+        .map_err(|e| {
+            drop(std::fs::remove_file(&final_temp));
+            ConfigError::io(&final_temp, e)
+        })?;
     {
         use std::io::Write;
-        if let Some(injector) = injector {
-            injector.inject(Point::TempWrite)?;
+        let write_result = (|| {
+            if let Some(injector) = injector {
+                injector.inject(Point::TempWrite)?;
+            }
+            f.write_all(content)
+                .map_err(|e| ConfigError::io(&final_temp, e))?;
+            f.flush().map_err(|e| ConfigError::io(&final_temp, e))?;
+            if let Some(injector) = injector {
+                injector.inject(Point::TempFlush)?;
+            }
+            f.sync_all().map_err(|e| ConfigError::io(&final_temp, e))
+        })();
+        if let Err(e) = write_result {
+            // A staging failure must never leak its half-written temp.
+            drop(std::fs::remove_file(&final_temp));
+            return Err(e);
         }
-        f.write_all(content)
-            .map_err(|e| ConfigError::io(&final_temp, e))?;
-        f.flush().map_err(|e| ConfigError::io(&final_temp, e))?;
-        if let Some(injector) = injector {
-            injector.inject(Point::TempFlush)?;
-        }
-        f.sync_all().map_err(|e| ConfigError::io(&final_temp, e))?;
     }
     drop(f);
     Ok(final_temp)
@@ -778,6 +823,173 @@ pub fn commit_staged_file(
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Single-file mutation boundary (plan-02 fold)
+// ---------------------------------------------------------------------------
+
+/// Report from a single-file commit through the mutation boundary.
+#[derive(Debug, Clone)]
+pub struct FileCommitReport {
+    /// Backup of the previous contents taken before the replacement landed
+    /// (`None` when the commit created a new file).
+    pub backup: Option<BackupEntry>,
+    /// Hex digest of the committed bytes (read back and verified on disk).
+    pub digest: String,
+}
+
+/// Detect a case-insensitive collision for `target` inside its directory: an
+/// existing sibling whose name ASCII-folds to the same name but is not the
+/// exact name (QAL-09). On a case-insensitive filesystem (Windows, default
+/// macOS APFS) such a write would silently land over the sibling; on a
+/// case-sensitive filesystem it is surfaced as risk, mirroring the in-plan
+/// case-fold rejection in [`Transaction::validate_plan`].
+pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
+    let dir = target.parent()?;
+    let target_name = target.file_name()?.to_string_lossy().into_owned();
+    let wanted = target_name.to_ascii_lowercase();
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == target_name {
+            // The target's exact directory entry is not a collision.
+            continue;
+        }
+        if name_str.to_ascii_lowercase() == wanted {
+            let variant = dir.join(&name);
+            match &best {
+                Some(current) if current <= &variant => {}
+                _ => best = Some(variant),
+            }
+        }
+    }
+    best
+}
+
+/// Commit `content` to `target` through the ONE mutation boundary of this
+/// crate (plan-02 fold): a single-step [`Transaction`] whose prepare/commit
+/// core performs the full discipline — path validation → fresh snapshot →
+/// backup of existing contents → staged parse-validation → §4.2 conflict
+/// recheck → atomic replacement → read-back verify.
+///
+/// Every codec store (`json`/`jsonc`/`toml_file`/`yaml`/`env_file`), the raw
+/// editor commit core, and every superai-core production write go through
+/// this function or through [`stage_temp_file`] + [`commit_staged_file`]
+/// (the same core the multi-step [`Transaction`] commits through); the raw
+/// `atomic_write` family is crate-internal.
+///
+/// `id` attributes the operation in backup entries and journals. Errors are
+/// the transaction's typed errors; a failed commit leaves the target
+/// untouched and removes its staged temp.
+pub fn commit_file(
+    id: &str,
+    target: &Path,
+    content: &[u8],
+    kind: DocumentKind,
+) -> Result<FileCommitReport> {
+    commit_file_expecting(id, target, content, kind, None)
+}
+
+/// [`commit_file`] with a caller-supplied §4.2 conflict token.
+///
+/// `expected` is a snapshot the caller took when it read the document (the
+/// raw-editor read→commit contract): when supplied it overrides the
+/// boundary's own prepare-time token, so any foreign change since the
+/// caller's read — not just since prepare — aborts with
+/// `ConcurrentModification` before the replacement.
+pub fn commit_file_expecting(
+    id: &str,
+    target: &Path,
+    content: &[u8],
+    kind: DocumentKind,
+    expected: Option<&Snapshot>,
+) -> Result<FileCommitReport> {
+    // Keep the directory-target contract of the former atomic_write path: a
+    // typed refusal before any staging work.
+    if std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+        return Err(ConfigError::io(
+            target,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "is a directory"),
+        ));
+    }
+    // QAL-09 case-insensitive collision guard: creating `File.json` next to
+    // an existing `file.json` would silently land over it on case-insensitive
+    // filesystems.
+    if let Some(variant) = case_fold_collision_in_dir(target) {
+        return Err(ConfigError::io(
+            target,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "case-insensitive collision with {} in the same directory",
+                    variant.display()
+                ),
+            ),
+        ));
+    }
+
+    let operation = OperationId::new(id)?;
+    let mut transaction = Transaction::new(
+        operation,
+        vec![FileAction::Write {
+            path: target.to_path_buf(),
+            content: content.to_vec(),
+            kind,
+        }],
+    );
+    // prepare: path safety, hard-link warning, backup-before-foreign-write,
+    // staged parse-validation, §4.2 token.
+    if let Err(e) = transaction.prepare() {
+        cleanup_staged_temps(&transaction.staged_temps);
+        return Err(e);
+    }
+    // The caller's older token (when supplied) guards its full read→commit
+    // window instead of just prepare→commit.
+    if let Some(expected) = expected {
+        transaction
+            .expected_states
+            .insert(target.to_path_buf(), expected.clone());
+    }
+    // commit: §4.2 recheck immediately before the rename, atomic replace,
+    // parent sync, read-back digest/size verify. A single-step commit that
+    // fails has landed nothing else; the staged temp is ours to remove.
+    let commit_outcome = match transaction.commit() {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            cleanup_staged_temps(&transaction.staged_temps);
+            return Err(e);
+        }
+    };
+    // Post-commit parse verification (the multi-file discipline's verify
+    // step): on failure roll back to the backup (or remove the creation) and
+    // surface a typed verification error.
+    let verification = transaction.verify()?;
+    if let Some(failed) = verification.iter().find(|v| !v.digest_ok || !v.parse_ok) {
+        let message = failed.message.clone();
+        // A single step's rollback either restores the backup or removes the
+        // creation; its typed outcome is not observable here, so the caller
+        // sees the verification error that caused it.
+        drop(transaction.rollback());
+        cleanup_staged_temps(&transaction.staged_temps);
+        return Err(ConfigError::verification(target, message));
+    }
+    let backup = commit_outcome.backups.into_iter().next();
+    Ok(FileCommitReport {
+        backup,
+        digest: compute_digest(content),
+    })
+}
+
+/// Best-effort removal of staged temps left by a failed boundary commit.
+fn cleanup_staged_temps(temps: &[PathBuf]) {
+    for temp in temps {
+        if temp.exists() {
+            drop(std::fs::remove_file(temp));
+        }
+    }
 }
 
 fn validate_staged_content(content: &[u8], kind: DocumentKind, path: &Path) -> Result<()> {
@@ -1292,6 +1504,19 @@ fn validate_path_safety(path: &Path) -> Result<()> {
             ));
         }
     }
+    // QAL-09: Windows reserved device names can never become real files on
+    // Windows; reject them at plan time on every host — the same
+    // surface-the-risk philosophy as the case-fold collision check in
+    // `validate_plan`.
+    if windows_reserved_device_name(path) {
+        return Err(ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "windows reserved device name",
+            ),
+        ));
+    }
     // Reject unsupported special files if they exist
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         let ft = meta.file_type();
@@ -1724,27 +1949,43 @@ impl Transaction {
     fn stage_all_writes(&mut self) -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut staged: Vec<PathBuf> = Vec::new();
         let mut staged_map: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, temp)
-        for step in &self.steps {
-            let FileAction::Write {
-                path,
-                content,
-                kind,
-            } = step
-            else {
-                continue;
-            };
-            self.inject(Point::ParseStaged)?;
-            validate_staged_content(content, *kind, path)?;
-            let temp_path = self.stage_write(path, content)?;
-            // Validate the staged file parses as well (read fresh from staged temp).
-            let staged_bytes =
-                std::fs::read(&temp_path).map_err(|e| ConfigError::io(&temp_path, e))?;
-            validate_staged_content(&staged_bytes, *kind, &temp_path)?;
-            staged.push(temp_path.clone());
-            staged_map.push((path.clone(), temp_path));
+        let result = (|| {
+            for step in &self.steps {
+                let FileAction::Write {
+                    path,
+                    content,
+                    kind,
+                } = step
+                else {
+                    continue;
+                };
+                self.inject(Point::ParseStaged)?;
+                validate_staged_content(content, *kind, path)?;
+                let temp_path = self.stage_write(path, content)?;
+                // Validate the staged file parses as well (read fresh from staged temp).
+                let staged_bytes =
+                    std::fs::read(&temp_path).map_err(|e| ConfigError::io(&temp_path, e))?;
+                validate_staged_content(&staged_bytes, *kind, &temp_path)?;
+                staged.push(temp_path.clone());
+                staged_map.push((path.clone(), temp_path));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.staged_temps = staged;
+                Ok(staged_map)
+            }
+            Err(e) => {
+                // A prepare that fails mid-staging must not leak the temps it
+                // already created (non-journaled callers have no recovery
+                // sweep to clean them later).
+                for temp in &staged {
+                    drop(std::fs::remove_file(temp));
+                }
+                Err(e)
+            }
         }
-        self.staged_temps = staged;
-        Ok(staged_map)
     }
 
     fn stage_write(&self, target: &Path, content: &[u8]) -> Result<PathBuf> {
@@ -3677,5 +3918,455 @@ mod tests {
             "injected rollback-verify failure must surface as residual: {rb:?}"
         );
         drop(std::fs::remove_dir_all(&root2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan-02 fold: the single-file mutation boundary
+    // -----------------------------------------------------------------------
+
+    fn boundary_scratch(tag: &str) -> PathBuf {
+        let dir = crate::test_util::temp_dir_unique(&format!("tx-boundary-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn commit_file_creates_missing_and_backs_up_existing() {
+        let dir = boundary_scratch("create");
+        let path = dir.join("settings.json");
+        let created = commit_file(
+            "boundary-create",
+            &path,
+            br#"{"v":1}"#,
+            DocumentKind::StrictJson,
+        )
+        .unwrap();
+        assert!(
+            created.backup.is_none(),
+            "a creation has nothing to back up"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"v":1}"#);
+
+        let replaced = commit_file(
+            "boundary-replace",
+            &path,
+            br#"{"v":2}"#,
+            DocumentKind::StrictJson,
+        )
+        .unwrap();
+        let backup = replaced
+            .backup
+            .expect("an overwrite must back the target up first");
+        assert_eq!(
+            std::fs::read(&backup.backup_path).unwrap(),
+            br#"{"v":1}"#,
+            "the backup carries the pre-write bytes"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"v":2}"#);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_file_expecting_aborts_on_foreign_edit_and_cleans_temp() {
+        let dir = boundary_scratch("stale");
+        let path = dir.join("cfg.toml");
+        std::fs::write(&path, "a = 1\n").unwrap();
+        let token = snapshot(&path);
+        std::fs::write(&path, "a = 2\n").unwrap(); // foreign edit after the read
+        let res = commit_file_expecting(
+            "boundary-stale",
+            &path,
+            b"a = 3\n",
+            DocumentKind::Toml,
+            Some(&token),
+        );
+        match res {
+            Err(ConfigError::ConcurrentModification { .. }) => {}
+            other => panic!("expected ConcurrentModification, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"a = 2\n",
+            "the foreign edit is never overwritten"
+        );
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".tmp."),
+                "aborted commit leaked staged temp {name}"
+            );
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn commit_file_rejects_directory_target() {
+        let dir = boundary_scratch("dir-target");
+        let res = commit_file("boundary-dir", &dir, b"data", DocumentKind::Opaque);
+        assert!(res.is_err(), "a directory target must be refused");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn case_fold_collision_is_refused_before_any_write() {
+        let dir = boundary_scratch("case-fold");
+        let lower = dir.join("config.json");
+        std::fs::write(&lower, br#"{"a":1}"#).unwrap();
+        let upper = dir.join("Config.json");
+        let res = commit_file(
+            "case-collide",
+            &upper,
+            br#"{"a":2}"#,
+            DocumentKind::StrictJson,
+        );
+        assert!(
+            res.is_err(),
+            "a case-variant creation must be refused (it would land over the sibling on a \
+             case-insensitive filesystem)"
+        );
+        match res {
+            Err(ConfigError::Io { .. }) => {}
+            other => panic!("expected typed Io refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&lower).unwrap(),
+            br#"{"a":1}"#,
+            "the existing file is untouched"
+        );
+        // The exact-name overwrite keeps working through the same boundary.
+        commit_file(
+            "case-exact",
+            &lower,
+            br#"{"a":3}"#,
+            DocumentKind::StrictJson,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&lower).unwrap(), br#"{"a":3}"#);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn windows_reserved_device_names_are_refused_as_write_targets() {
+        // Pure helper table (host-independent, QAL-09).
+        for reserved in [
+            "CON", "con", "CON.json", "PRN.txt", "aux", "NUL.dat", "COM1", "com9.cfg", "LPT7",
+            "CONIN$", "CONOUT$",
+        ] {
+            assert!(
+                windows_reserved_device_name(&Path::new("/data").join(reserved)),
+                "{reserved} is a reserved device name"
+            );
+        }
+        for ordinary in [
+            "console.json",
+            "control",
+            "COM10.txt",
+            "COM0",
+            "context.rs",
+            "component",
+            "lpt-1.json",
+        ] {
+            assert!(
+                !windows_reserved_device_name(&Path::new("/data").join(ordinary)),
+                "{ordinary} is an ordinary file name"
+            );
+        }
+        // The boundary refuses them as write targets before any disk work.
+        let dir = boundary_scratch("reserved");
+        for reserved in ["CON", "con.json", "PRN.txt", "AUX", "NUL", "COM1", "LPT9"] {
+            let path = dir.join(reserved);
+            let res = commit_file(
+                "reserved-write",
+                &path,
+                br#"{"a":1}"#,
+                DocumentKind::StrictJson,
+            );
+            assert!(res.is_err(), "{reserved} must be refused as a write target");
+            let listing = std::fs::read_dir(&dir).unwrap().flatten().count();
+            assert_eq!(listing, 0, "the refusal must leave the directory empty");
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan-02 fold: structural source guarantees
+    // -----------------------------------------------------------------------
+
+    fn crate_src(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The raw atomic primitive must not be a public write entrypoint: the
+    /// boundary (`commit_file` / `Transaction`) is the only public way to
+    /// mutate a file through this crate.
+    #[test]
+    fn plan02_atomic_write_family_is_crate_internal() {
+        let src = crate_src("atomic.rs");
+        assert!(
+            !src.contains("pub fn atomic_write"),
+            "the atomic write family must not be a public write entrypoint (plan-02 fold)"
+        );
+        assert!(
+            src.contains("pub(crate) fn atomic_write"),
+            "atomic_write remains the crate-internal replace primitive"
+        );
+    }
+
+    /// Every codec store commits through the boundary; the raw editor
+    /// commits through the shared stage+commit core.
+    #[test]
+    fn plan02_codec_stores_share_the_boundary() {
+        for name in [
+            "json.rs",
+            "jsonc.rs",
+            "toml_file.rs",
+            "yaml.rs",
+            "env_file.rs",
+        ] {
+            let src = crate_src(name);
+            assert!(
+                !src.contains("atomic::atomic_write"),
+                "{name} must not call the raw atomic primitive"
+            );
+            assert!(
+                src.contains("transaction::commit_file"),
+                "{name} must commit through the boundary"
+            );
+        }
+        let editor = crate_src("raw_editor.rs");
+        assert!(
+            !editor.contains("atomic::atomic_write"),
+            "raw_editor must not call the raw atomic primitive"
+        );
+        assert!(
+            editor.contains("commit_staged_file"),
+            "raw_editor must commit through the shared transaction core"
+        );
+    }
+
+    /// No superai-core / superai-cli source bypasses the boundary with a
+    /// direct atomic write.
+    #[test]
+    fn plan02_core_and_cli_have_no_direct_atomic_writes() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&manifest.join("../superai-core/src"), &mut files);
+        collect_rs_files(&manifest.join("../superai-cli/src"), &mut files);
+        assert!(
+            files.len() > 40,
+            "expected to scan the superai-core/cli sources, found {}",
+            files.len()
+        );
+        for file in &files {
+            let src = std::fs::read_to_string(file).unwrap_or_default();
+            assert!(
+                !src.contains("atomic_write"),
+                "{} must write through superai_config::transaction (plan-02 fold)",
+                file.display()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan-13 / QAL-09 platform-adversarial cases (executed by the windows
+    // and macos CI runners; compiled out elsewhere)
+    // -----------------------------------------------------------------------
+
+    /// A target held open the way a running harness holds its config (reads
+    /// and writes shared, deletion/replacement NOT shared) must surface a
+    /// typed error from the commit path — never corruption, never a leaked
+    /// temp.
+    #[cfg(windows)]
+    #[test]
+    fn windows_locked_target_commit_is_typed_error_never_corrupting() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        let dir = boundary_scratch("win-locked");
+        let file = dir.join("locked.json");
+        std::fs::write(&file, br#"{"locked":true}"#).unwrap();
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&file)
+            .unwrap();
+        let res = commit_file(
+            "win-locked",
+            &file,
+            br#"{"locked":false}"#,
+            DocumentKind::StrictJson,
+        );
+        match res {
+            Err(ConfigError::Io { .. }) => {}
+            other => panic!("expected typed Io error from the locked target, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            br#"{"locked":true}"#,
+            "the locked target is never corrupted"
+        );
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".tmp."),
+                "locked commit leaked staged temp {name}"
+            );
+        }
+        drop(handle);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Windows reserved device names are refused as write targets on the
+    /// real platform (the pure helper table above runs on every host).
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_device_paths_rejected_live() {
+        let dir = boundary_scratch("win-reserved");
+        for reserved in ["CON", "PRN", "AUX", "NUL", "COM1", "LPT1"] {
+            let path = dir.join(format!("{reserved}.json"));
+            let res = commit_file(
+                "win-reserved",
+                &path,
+                br#"{"a":1}"#,
+                DocumentKind::StrictJson,
+            );
+            assert!(res.is_err(), "{reserved}.json must be refused on windows");
+            assert!(
+                !path.exists(),
+                "{reserved}.json must not materialize as a device-named file"
+            );
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A path deeper than `MAX_PATH` either commits with verified read-back
+    /// (long-path-aware system) or fails with a typed error — never a panic
+    /// or a partial file.
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_path_commit_is_verified_or_typed_never_partial() {
+        let dir = boundary_scratch("win-long");
+        let mut deep = dir.clone();
+        while deep.to_string_lossy().len() < 300 {
+            deep = deep.join("nested-level-dir");
+        }
+        let file = deep.join("settings.json");
+        match commit_file("win-long", &file, br#"{"a":1}"#, DocumentKind::StrictJson) {
+            Ok(report) => {
+                let _ = report;
+                assert_eq!(
+                    std::fs::read(&file).unwrap(),
+                    br#"{"a":1}"#,
+                    "a long-path commit must read back verified"
+                );
+            }
+            Err(ConfigError::Io { .. }) => {
+                assert!(
+                    !file.exists(),
+                    "a typed MAX_PATH refusal must not leave a partial file"
+                );
+            }
+            other => panic!("long path must verify or fail typed, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// QAL-09 real-platform case-insensitive collision: on the default
+    /// (case-insensitive) APFS volume, creating `Settings.json` next to an
+    /// existing `settings.json` would silently land over it — the boundary
+    /// refuses the case-variant and never corrupts the original.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_case_insensitive_collision_write_is_typed_never_corrupting() {
+        let dir = boundary_scratch("macos-case");
+        let lower = dir.join("settings.json");
+        std::fs::write(&lower, br#"{"a":1}"#).unwrap();
+        let upper = dir.join("Settings.json");
+        let res = commit_file(
+            "macos-case",
+            &upper,
+            br#"{"a":2}"#,
+            DocumentKind::StrictJson,
+        );
+        assert!(
+            res.is_err(),
+            "a case-variant creation must be refused on a case-insensitive volume"
+        );
+        assert_eq!(
+            std::fs::read(&lower).unwrap(),
+            br#"{"a":1}"#,
+            "the original is never corrupted"
+        );
+        commit_file(
+            "macos-case-exact",
+            &lower,
+            br#"{"a":3}"#,
+            DocumentKind::StrictJson,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&lower).unwrap(),
+            br#"{"a":3}"#,
+            "exact-name overwrites keep working through the boundary"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// QAL-09 macOS application paths: `~/Library/Application Support/...`
+    /// shaped config locations (capitals and the embedded space) commit
+    /// through the boundary with verified read-back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_application_support_paths_commit_through_the_boundary() {
+        let dir = boundary_scratch("macos-app");
+        let app = dir
+            .join("Library")
+            .join("Application Support")
+            .join("Claude");
+        let file = app.join("settings.json");
+        commit_file(
+            "macos-app-path",
+            &file,
+            br#"{"a":1}"#,
+            DocumentKind::StrictJson,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            br#"{"a":1}"#,
+            "the application-path write must read back verified"
+        );
+        let variant = app.join("SETTINGS.json");
+        assert!(
+            commit_file(
+                "macos-app-case",
+                &variant,
+                br#"{"a":2}"#,
+                DocumentKind::StrictJson
+            )
+            .is_err(),
+            "a case-variant of an existing application-path file is refused"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            br#"{"a":1}"#,
+            "the application-path original is untouched"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

@@ -203,12 +203,23 @@ Observable assertions:
 
 ## Exit gate
 
-- [ ] All supported writes go through one transaction boundary.
-      > open: codec store paths (json/toml/yaml/jsonc/env) remain public alongside the
-      > Transaction — the plan-02 integration fold (deprecating direct store paths so the
-      > boundary is type-enforced) was explicitly deferred by area 2. Behavior is safe at
-      > every store site (backup + atomic write internally); only the API-level fold is
-      > missing.
+- [x] All supported writes go through one transaction boundary.
+      > Closed (area 9b): `transaction::commit_file`/`commit_file_expecting` is the ONE
+      > single-file mutation boundary — a one-step Transaction whose prepare/commit core
+      > performs the full discipline (path validation → fresh snapshot → backup of
+      > existing contents → staged parse-validation → §4.2 conflict recheck → atomic
+      > replacement → read-back verify). Every codec store (json/jsonc/toml/yaml/env)
+      > and the raw-editor commit route through it or the shared
+      > `stage_temp_file`+`commit_staged_file` core; every superai-core production
+      > write (wrapper, receipts, profiles/active identity, provider env, daemon
+      > identity) was migrated off the raw primitive; the `atomic_write` family is
+      > `pub(crate)` (journal bookkeeping + backup restore only), and
+      > `atomic_write_{injected,with_expected_digest,with_snapshot}` were deleted.
+      > Machine-checked structurally by `plan02_atomic_write_family_is_crate_internal`,
+      > `plan02_codec_stores_share_the_boundary`, and
+      > `plan02_core_and_cli_have_no_direct_atomic_writes` (source-scan tests), plus
+      > behavior tests `commit_file_creates_missing_and_backs_up_existing` and
+      > `commit_file_expecting_aborts_on_foreign_edit_and_cleans_temp`.
 - [x] Backup-before-foreign-write is structurally unavoidable.
 - [x] Same-file conflicts abort.
 - [x] Single-file replacement is atomic per supported platform.

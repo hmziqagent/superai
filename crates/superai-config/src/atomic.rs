@@ -189,6 +189,13 @@ fn is_directory(path: &Path) -> bool {
 
 /// Atomically write `bytes` to `path` via a same-directory temporary file.
 ///
+/// Crate-internal since the plan-02 fold: this is the low-level replace
+/// primitive used by the crash journal (superai's own bookkeeping file) and
+/// this module's own tests — never a public write path. The ONE public
+/// mutation boundary is [`crate::transaction::commit_file`] (plus the
+/// multi-step [`crate::transaction::Transaction`]); everything else routes
+/// there.
+///
 /// Steps:
 /// 1. Create same-directory temp with exclusive name.
 /// 2. Hold the temp owner-only while it carries bytes.
@@ -202,41 +209,8 @@ fn is_directory(path: &Path) -> bool {
 ///
 /// Never truncates the original in place; the original is only replaced via
 /// atomic rename.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_expecting(path, bytes, WriteExpectation::Any, None, None)
-}
-
-/// Atomically write `bytes` to `path` through the REAL production path with a
-/// failure injector attached (QAL-06).
-///
-/// Every boundary of [`atomic_write`] — temp create, temp write, temp flush,
-/// conflict recheck, rename, parent sync, read-back verify — calls
-/// `injector.inject` first, so the failure matrix exercises this exact code.
-pub fn atomic_write_injected(path: &Path, bytes: &[u8], injector: &dyn Injector) -> Result<()> {
-    atomic_write_expecting(path, bytes, WriteExpectation::Any, None, Some(injector))
-}
-
-/// Atomically write `bytes` to `path`, failing if the current file digest
-/// does not match `expected_digest`.
-///
-/// `expected_digest` is `None` for a file that is expected not to exist.
-/// When `Some`, the current on-disk digest (or empty for missing) must match
-/// exactly or a `ConcurrentModification` error is returned. This implements
-/// MUT-01 conflict detection.
-///
-/// The function also rechecks for concurrent modification between temp
-/// creation and rename even when `expected_digest` is `None` (detecting any
-/// change during the preparation window).
-pub fn atomic_write_with_expected_digest(
-    path: &Path,
-    bytes: &[u8],
-    expected_digest: Option<&str>,
-) -> Result<()> {
-    let expectation = match expected_digest {
-        Some(digest) => WriteExpectation::Digest(digest),
-        None => WriteExpectation::Missing,
-    };
-    atomic_write_expecting(path, bytes, expectation, None, None)
 }
 
 /// How the current on-disk state of the target must relate to the write.
@@ -457,20 +431,6 @@ pub(crate) fn atomic_write_expecting(
     Ok(())
 }
 
-/// Convenience wrapper that takes an optional [`crate::snapshot::Snapshot`]
-/// as the expected token.
-///
-/// If `expected` is `Some`, its digest must match the current on-disk digest
-/// or the write is aborted with `ConcurrentModification`.
-pub fn atomic_write_with_snapshot(
-    path: &Path,
-    bytes: &[u8],
-    expected: Option<&crate::snapshot::Snapshot>,
-) -> Result<()> {
-    let expected_digest = expected.and_then(|s| s.digest.as_deref());
-    atomic_write_with_expected_digest(path, bytes, expected_digest)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -537,7 +497,13 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         let snap_digest = compute_digest(b"original");
         std::fs::write(&path, b"concurrent edit").unwrap();
-        let res = atomic_write_with_expected_digest(&path, b"new", Some(&snap_digest));
+        let res = atomic_write_expecting(
+            &path,
+            b"new",
+            WriteExpectation::Digest(&snap_digest),
+            None,
+            None,
+        );
         assert!(res.is_err(), "should detect concurrent modification");
         match res.unwrap_err() {
             ConfigError::ConcurrentModification { .. } => {}
@@ -552,7 +518,7 @@ mod tests {
     fn atomic_write_with_none_expected_succeeds_for_new_file() {
         let path = unique_scratch("atomic-new-none");
         drop(std::fs::remove_file(&path));
-        atomic_write_with_expected_digest(&path, b"fresh", None).unwrap();
+        atomic_write_expecting(&path, b"fresh", WriteExpectation::Missing, None, None).unwrap();
         let read = std::fs::read(&path).unwrap();
         assert_eq!(read, b"fresh");
         drop(std::fs::remove_file(&path));
@@ -563,7 +529,7 @@ mod tests {
         let path = unique_scratch("atomic-appeared");
         drop(std::fs::remove_file(&path));
         std::fs::write(&path, b"concurrent").unwrap();
-        let res = atomic_write_with_expected_digest(&path, b"new", None);
+        let res = atomic_write_expecting(&path, b"new", WriteExpectation::Missing, None, None);
         assert!(res.is_err());
         match res.unwrap_err() {
             ConfigError::ConcurrentModification { .. } => {}
@@ -587,7 +553,9 @@ mod tests {
         std::fs::write(&path, b"v1").unwrap();
         let snap = crate::snapshot::snapshot(&path);
         std::fs::write(&path, b"v2").unwrap();
-        let res = atomic_write_with_snapshot(&path, b"v3", Some(&snap));
+        let digest = snap.digest.unwrap_or_default();
+        let res =
+            atomic_write_expecting(&path, b"v3", WriteExpectation::Digest(&digest), None, None);
         assert!(res.is_err());
         let cur = std::fs::read(&path).unwrap();
         assert_eq!(cur, b"v2");

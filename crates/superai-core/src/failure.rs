@@ -2464,9 +2464,11 @@ mod tests {
     // ---- QAL-06: injector on the REAL production paths ----
 
     #[test]
-    fn single_file_matrix_hits_real_atomic_write_path() {
+    fn single_file_matrix_hits_real_transaction_commit_path() {
         // Every temp/rename boundary here is the production
-        // atomic_write_expecting body, not a parallel wrapper.
+        // stage_temp_file + commit_staged_file body — the shared transaction
+        // commit core every write in the workspace now routes through
+        // (plan-02 fold), not a parallel wrapper.
         let dir = test_dir("failure-real-atomic");
         let file = dir.join("settings.json");
         std::fs::write(&file, br#"{"a":1}"#).unwrap();
@@ -2482,7 +2484,27 @@ mod tests {
             let inj = TestInjector::new();
             inj.fail_at(point, 1);
             let adapter = ConfigInjector(&inj as &dyn FailureInjector);
-            let res = superai_config::atomic::atomic_write_injected(&file, br#"{"a":2}"#, &adapter);
+            // The §4.2 token mirrors the boundary's own discipline: a fresh
+            // snapshot taken before staging, so a target that changes inside
+            // the preparation window aborts at ConflictRecheck.
+            let token = superai_config::snapshot::snapshot(&file);
+            let res = superai_config::transaction::stage_temp_file(
+                &file,
+                br#"{"a":2}"#,
+                Some(&adapter as &dyn superai_config::injector::Injector),
+            )
+            .and_then(|staged| {
+                let commit = superai_config::transaction::commit_staged_file(
+                    &file,
+                    &staged,
+                    Some(&token),
+                    Some(&adapter as &dyn superai_config::injector::Injector),
+                );
+                if commit.is_err() {
+                    drop(std::fs::remove_file(&staged));
+                }
+                commit
+            });
             assert!(res.is_err(), "point {point} must fail the real write");
             match res.unwrap_err() {
                 superai_config::ConfigError::ConcurrentModification { .. }
@@ -2505,6 +2527,14 @@ mod tests {
                 std::fs::write(&file, br#"{"a":1}"#).unwrap();
             } else {
                 assert_eq!(cur, br#"{"a":1}"#, "point {point} corrupted the file");
+            }
+            // No staged temp survives any injected failure.
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                assert!(
+                    !name.starts_with(".tmp."),
+                    "point {point} leaked staged temp {name}"
+                );
             }
         }
         drop(std::fs::remove_dir_all(&dir));

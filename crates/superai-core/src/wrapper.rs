@@ -308,7 +308,18 @@ pub fn write_wrapper(path: &WrapperPath, content: &str) -> Result<String> {
     }
     // Digest is the value embedded in the marker (hash of content without digest placeholder)
     let digest = extract_digest(content).unwrap_or_else(|| compute_digest(content.as_bytes()));
-    superai_config::atomic::atomic_write(target, content.as_bytes()).map_err(CoreError::Config)?;
+    // Plan-02 fold: launcher writes go through the config crate's ONE
+    // mutation boundary — snapshot, backup-before-foreign-write, §4.2
+    // conflict recheck, atomic replace, read-back verify. The content is a
+    // generated launcher script, so its document kind is opaque (no parse
+    // validation) and the 0o755 marker below still lands after the commit.
+    superai_config::transaction::commit_file(
+        "wrapper-install",
+        target,
+        content.as_bytes(),
+        superai_config::document::DocumentKind::Opaque,
+    )
+    .map_err(CoreError::Config)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

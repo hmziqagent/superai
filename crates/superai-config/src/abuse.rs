@@ -54,7 +54,6 @@ pub fn assert_no_sentinel_in_debug<T: std::fmt::Debug>(value: &T, context: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atomic::atomic_write_with_snapshot;
     use crate::backup::{backup, list_backups};
     use crate::document::DocumentKind;
     use crate::quarantine::validate_quarantine_target;
@@ -180,7 +179,13 @@ mod tests {
             );
 
             // Attempt atomic write with original snapshot should abort
-            let res = atomic_write_with_snapshot(&link, br#"{"model":"new"}"#, Some(&snap));
+            let res = crate::transaction::commit_file_expecting(
+                "abuse-symlink-race",
+                &link,
+                br#"{"model":"new"}"#,
+                DocumentKind::StrictJson,
+                Some(&snap),
+            );
             assert!(
                 res.is_err(),
                 "symlink swap should cause ConcurrentModification"
@@ -202,7 +207,14 @@ mod tests {
             std::fs::write(&other_target, b"other").unwrap();
             std::fs::remove_file(&link2).unwrap();
             std::os::unix::fs::symlink(&other_target, &link2).unwrap();
-            let err = atomic_write_with_snapshot(&link2, b"new", Some(&snap2)).unwrap_err();
+            let err = crate::transaction::commit_file_expecting(
+                "abuse-symlink-sentinel",
+                &link2,
+                b"new",
+                DocumentKind::Opaque,
+                Some(&snap2),
+            )
+            .unwrap_err();
             let err_str = format!("{err:?}");
             assert!(
                 !err_str.contains(SENTINEL),
@@ -220,8 +232,14 @@ mod tests {
             std::fs::write(&path, b"v1").unwrap();
             let snap = snapshot(&path);
             std::fs::write(&path, b"v2").unwrap();
-            let res = atomic_write_with_snapshot(&path, b"v3", Some(&snap));
-            assert!(res.is_err());
+            let res = crate::transaction::commit_file_expecting(
+                "abuse-swap-nonunix",
+                &path,
+                b"v3",
+                DocumentKind::StrictJson,
+                Some(&snap),
+            );
+            drop(res.unwrap_err());
             drop(std::fs::remove_dir_all(&dir));
         }
     }
@@ -507,11 +525,19 @@ mod tests {
         std::fs::write(&path, &sentinel_content).unwrap();
         let snap = snapshot(&path);
 
-        // Try to commit malformed huge content
+        // Try to commit malformed huge content — through the boundary as an
+        // opaque payload (the write layer must carry arbitrary bytes safely;
+        // parse-validating kinds would fail-closed at staging instead).
         let bad_content = vec![b'{'; 2 * 1024 * 1024]; // 2MB of '{'
-        let res = atomic_write_with_snapshot(&path, &bad_content, Some(&snap));
-        // It may succeed writing invalid JSON? atomic_write doesn't validate JSON, but raw_editor would. atomic_write will write whatever bytes.
-        // However after write, file would contain bad content, but error handling should not leak sentinel
+        let res = crate::transaction::commit_file_expecting(
+            "abuse-huge",
+            &path,
+            &bad_content,
+            DocumentKind::Opaque,
+            Some(&snap),
+        );
+        // The boundary writes whatever opaque bytes it is given; errors (or
+        // the overwrite itself) must not leak the sentinel.
         if let Err(e) = res {
             let msg = format!("{e:?}");
             assert!(!msg.contains(SENTINEL));
@@ -563,8 +589,15 @@ mod tests {
             let path = dir.join(format!("{reserved}.json"));
             // Attempt to use as quarantine target – should be rejected or at least not treated as safe broad deletion
             // We test that atomic write with snapshot still works for regular reserved-looking file inside temp (allowed on unix) but does not leak sentinel
-            let res = atomic_write_with_snapshot(&path, br#"{"a":1}"#, None);
-            // On unix it's allowed; on windows it would be rejected – either way must not panic and error must not leak sentinel
+            let res = crate::transaction::commit_file(
+                "abuse-reserved-name",
+                &path,
+                br#"{"a":1}"#,
+                DocumentKind::StrictJson,
+            );
+            // Reserved device names are rejected at plan validation on every
+            // host (QAL-09 guard); must not panic and the error must not leak
+            // the sentinel.
             if let Err(e) = res {
                 let msg = format!("{e:?}");
                 assert!(!msg.contains(SENTINEL));
@@ -578,7 +611,12 @@ mod tests {
         let long_name = "a".repeat(300);
         let long_path = dir.join(format!("{long_name}.json"));
         let long_res = std::panic::catch_unwind(|| {
-            atomic_write_with_snapshot(&long_path, br#"{"a":1}"#, None)
+            crate::transaction::commit_file(
+                "abuse-long-path",
+                &long_path,
+                br#"{"a":1}"#,
+                DocumentKind::StrictJson,
+            )
         });
         assert!(long_res.is_ok(), "long path must not panic");
         if let Ok(Err(e)) = long_res {
@@ -659,10 +697,17 @@ mod tests {
         for seg in bad_segments {
             let path = dir.join(format!("{seg}.json"));
             // Path containing metachars is legal as file name on unix but transaction must handle without shell interpolation
-            let res =
-                std::panic::catch_unwind(|| atomic_write_with_snapshot(&path, br#"{"a":1}"#, None));
+            let res = std::panic::catch_unwind(|| {
+                crate::transaction::commit_file(
+                    "abuse-metachars",
+                    &path,
+                    br#"{"a":1}"#,
+                    DocumentKind::StrictJson,
+                )
+            });
             assert!(res.is_ok(), "metachars {seg:?} must not panic");
-            if let Ok(Ok(())) = res {
+            if let Ok(Ok(report)) = res {
+                let _ = report;
                 // If file was created, ensure its content is exactly what we wrote and error paths didn't leak sentinel
                 let bytes = std::fs::read(&path).unwrap();
                 assert_eq!(bytes, br#"{"a":1}"#);
@@ -681,7 +726,13 @@ mod tests {
             std::os::unix::fs::symlink(&outside_file, &link).unwrap();
             let snap = snapshot(&link);
             assert!(snap.is_symlink);
-            let res = atomic_write_with_snapshot(&link, br#"{"new":1}"#, Some(&snap));
+            let res = crate::transaction::commit_file_expecting(
+                "abuse-symlink-escape",
+                &link,
+                br#"{"new":1}"#,
+                DocumentKind::StrictJson,
+                Some(&snap),
+            );
             // Should succeed via symlink (followed) but is_modified must handle symlink target; at least must not panic and must not leak
             if let Err(e) = res {
                 let msg = format!("{e:?}");

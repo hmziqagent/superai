@@ -3,7 +3,6 @@ use std::path::Path;
 use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
-use crate::backup::backup;
 use crate::error::{ConfigError, Result};
 
 // ---------------------------------------------------------------------------
@@ -221,24 +220,27 @@ pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
 
 /// Back up, then write an arbitrary JSON `value` to `path`.
 ///
+/// Plan-02 fold: the write goes through the crate's one mutation boundary
+/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
+/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
+/// replacement, read-back verify — not around it.
+///
 /// See [`store`] for the lexical guarantee. This entry point preserves a
 /// non-object root (array, string, number, bool, null) for raw-editor use.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
-    backup(path)?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::io(parent, e))?;
-    }
-
     let mut text = serde_json::to_string_pretty(value).map_err(|source| ConfigError::Json {
         path: path.to_path_buf(),
         source,
     })?;
     text.push('\n');
 
-    crate::atomic::atomic_write(path, text.as_bytes())
+    crate::transaction::commit_file(
+        "json-store",
+        path,
+        text.as_bytes(),
+        crate::document::DocumentKind::StrictJson,
+    )?;
+    Ok(())
 }
 
 /// Read fresh, apply `edit`, write back only if the value changed.

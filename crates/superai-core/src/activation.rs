@@ -27,9 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use superai_config::atomic::atomic_write;
 use superai_config::document::DocumentKind;
-use superai_config::transaction::{FileAction, OperationId as TxOperationId, Transaction};
+use superai_config::transaction::{
+    FileAction, OperationId as TxOperationId, Transaction, commit_file,
+};
 
 use crate::daemon::pid_is_alive;
 use crate::error::{CoreError, Result};
@@ -520,12 +521,28 @@ impl FixedPathProfileStore {
             saved_at: now_iso8601(),
             fixed_path: fixed_path.display().to_string(),
         };
-        atomic_write(&self.content_path(name), content).map_err(CoreError::Config)?;
+        // Plan-02 fold: profile content (opaque — the captured harness
+        // fixed-path bytes, any format) and metadata (pretty JSON,
+        // parse-validated) both persist through the config crate's ONE
+        // mutation boundary.
+        commit_file(
+            "profile-content",
+            &self.content_path(name),
+            content,
+            DocumentKind::Opaque,
+        )
+        .map_err(CoreError::Config)?;
         let meta = serde_json::to_vec_pretty(&summary).map_err(|e| CoreError::Validation {
             field: "profile_metadata".to_owned(),
             reason: format!("cannot serialize profile metadata: {e}"),
         })?;
-        atomic_write(&self.meta_path(name), &meta).map_err(CoreError::Config)?;
+        commit_file(
+            "profile-metadata",
+            &self.meta_path(name),
+            &meta,
+            DocumentKind::StrictJson,
+        )
+        .map_err(CoreError::Config)?;
         Ok(summary)
     }
 
@@ -737,7 +754,15 @@ impl FixedPathProfileStore {
                 field: "active_identity".to_owned(),
                 reason: format!("cannot serialize active identity: {e}"),
             })?;
-        atomic_write(&self.active_path(), &active_bytes).map_err(CoreError::Config)?;
+        // Plan-02 fold: the active-identity record persists through the ONE
+        // mutation boundary (pretty JSON, staged parse-validation included).
+        commit_file(
+            "active-identity",
+            &self.active_path(),
+            &active_bytes,
+            DocumentKind::StrictJson,
+        )
+        .map_err(CoreError::Config)?;
 
         // WRP-06 "launch app if requested": launch only after the swap
         // verified and the identity (with the possibly-writing marker) is
@@ -779,7 +804,15 @@ impl FixedPathProfileStore {
             field: "active_identity".to_owned(),
             reason: format!("cannot serialize active identity: {e}"),
         })?;
-        atomic_write(&self.active_path(), &bytes).map_err(CoreError::Config)?;
+        // Plan-02 fold: the write-window mark persists through the ONE
+        // mutation boundary like every other fixed-path record.
+        commit_file(
+            "active-identity-mark",
+            &self.active_path(),
+            &bytes,
+            DocumentKind::StrictJson,
+        )
+        .map_err(CoreError::Config)?;
         Ok(identity)
     }
 

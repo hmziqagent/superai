@@ -22,7 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use superai_config::atomic::atomic_write;
+use superai_config::document::DocumentKind;
+use superai_config::transaction::commit_file;
 
 use crate::error::{CoreError, Result};
 use crate::process::{ExecuteOpts, run_command};
@@ -625,7 +626,15 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
         field: "daemon_identity".to_owned(),
         reason: format!("cannot serialize daemon identity: {e}"),
     })?;
-    atomic_write(&id_path, &id_bytes).map_err(CoreError::Config)?;
+    // Plan-02 fold: the identity record persists through the config crate's
+    // ONE mutation boundary (pretty JSON, staged parse-validation included).
+    commit_file(
+        "daemon-identity",
+        &id_path,
+        &id_bytes,
+        DocumentKind::StrictJson,
+    )
+    .map_err(CoreError::Config)?;
 
     if let Err(e) = wait_for_ready(config.harness.as_str(), &config.readiness, port) {
         // Our own child: kill by handle, never by pid; wait reaps it so the
