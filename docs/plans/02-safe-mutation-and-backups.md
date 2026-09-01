@@ -238,3 +238,22 @@ Observable assertions:
 > journal (`abandoned_journal_at_each_phase_recovers_via_production_journal`). MUT-01's
 > `schema_version` token field remains punted (no config-layer schema-version vocabulary;
 > area-2 disclosure).
+>
+> Final-gate-fix round: MUT-02's default link policy ("follow an existing symlink only
+> after resolving target within adapter-allowed roots; preserve link itself and mutate
+> target") landed at the mutation layer. A `Write` step whose target is currently a
+> symlink resolves within the transaction's declared follow roots
+> (`Transaction::with_symlink_follow_roots`, canonical comparison) or is refused with the
+> typed `ConfigError::SymlinkFollowRefused` — the link is never silently replaced by a
+> regular file. Allowed follows retarget staging, backup, §4.2 snapshot, commit, and
+> journal onto the referent (link preserved, referent mutated, foreign referent backed
+> up) and re-verify the link at commit (a retarget between prepare and commit aborts).
+> `Symlink` step targets are constrained to the declared root set whenever roots are
+> declared. The single-file boundary exposes the same policy
+> (`commit_file_expecting_with_roots`). Tests:
+> `write_onto_symlink_refused_outside_follow_roots`,
+> `write_follows_and_preserves_symlink_within_declared_roots`,
+> `followed_symlink_retarget_between_prepare_and_commit_aborts`,
+> `symlink_step_target_outside_declared_roots_is_refused`, and the abuse-suite
+> symlink-swap race now asserts both the follow-refused default and the swap-detected
+> ConcurrentModification under declared roots.

@@ -227,6 +227,10 @@ No global in-memory cached config.
 > (judge-verified rounds 1-2: exact 33+15 MCP partition and 7+41 plugin partition
 > test-enforced); EXT-10/11 (scope transfer with conflict preview, bulk cross-instance
 > ops with per-target Completed/RolledBack/Refused) closed by area 7. JSONC/YAML MCP
-> destinations are inspect-only with typed refusal (codec honesty); no adapter's corpus
-> documents a non-mutating MCP diagnostic command, so that EXT-10 sub-step is honestly
-> absent rather than invented.
+> destinations are inspect-only with typed refusal (codec honesty). The EXT-10
+> "validate via harness diagnostic command where non-mutating" sub-step is
+> UNIMPLEMENTED: inspect validates by reading the destination files, which is
+> sound but is not the documented diagnostic path, and the corpus DOES document
+> candidate non-mutating commands for it (amp `amp mcp doctor`, auggie
+> `auggie mcp list [--json]`, cursor `agent mcp list|list-tools`) — a future
+> implementation should drive validation through those adapters' commands.

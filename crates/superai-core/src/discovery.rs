@@ -595,12 +595,87 @@ fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 // foreign-manager detection
 // ---------------------------------------------------------------------------
 
+/// Orchestrator workspace markers (DRF-04) per
+/// docs/harness-configs/orchestrators.md: each GUI orchestrator keeps its
+/// managed workspaces under a well-known root. A candidate living under one
+/// of those roots is orchestrator-managed — superai never adopts or removes
+/// another manager's workspace.
+const ORCHESTRATOR_WORKSPACE_MARKERS: &[(&str, &str)] = &[
+    // Vibe Kanban: worktrees live under `.vibe-kanban-workspaces/`
+    // (configurable in Settings → General, but the default is the marker).
+    (".vibe-kanban-workspaces", "vibe-kanban"),
+    // Conductor: workspaces live under `~/conductor/workspaces/`
+    // (docs/concepts/workspaces-and-branches + troubleshooting).
+    ("conductor/workspaces", "conductor"),
+    // Sculptor: workspaces are git worktrees under
+    // `~/.sculptor/workspaces/<id>/code/`.
+    (".sculptor/workspaces", "sculptor"),
+];
+
+/// Detect whether `path` is a workspace managed by a known GUI orchestrator
+/// (DRF-04 "orchestrator-managed profiles where local evidence exists").
+///
+/// Evidence is structural and local only: a path component sequence matching
+/// a documented orchestrator workspace root (compared case-insensitively on
+/// the separator-normalized path, so Windows separators match too), or a
+/// home-level orchestrator settings file (`~/.conductor/settings.toml`,
+/// `~/.sculptor/.env`) that references the candidate (bounded read, the
+/// same discipline as the claude-multi config check). Nothing is executed.
+fn detect_orchestrator_manager(path: &Path, home: Option<&Path>) -> Option<(&'static str, String)> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let lowered = normalized.to_ascii_lowercase();
+    for (marker, owner) in ORCHESTRATOR_WORKSPACE_MARKERS {
+        if lowered.contains(marker) {
+            return Some((
+                owner,
+                format!(
+                    "candidate {} lies under the documented {owner} workspace root `{marker}`",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let home_path = home?;
+    // Conductor user settings referencing the candidate (bounded, no parse).
+    let conductor_settings = home_path.join(".conductor").join("settings.toml");
+    if conductor_settings.is_file()
+        && let Ok(text) = read_bounded(&conductor_settings, 256 * 1024)
+        && text.contains(path.to_string_lossy().as_ref())
+    {
+        return Some((
+            "conductor",
+            format!(
+                "candidate {} referenced in {}",
+                path.display(),
+                conductor_settings.display()
+            ),
+        ));
+    }
+    // Sculptor global env referencing the candidate (bounded, no parse).
+    let sculptor_env = home_path.join(".sculptor").join(".env");
+    if sculptor_env.is_file()
+        && let Ok(text) = read_bounded(&sculptor_env, 64 * 1024)
+        && text.contains(path.to_string_lossy().as_ref())
+    {
+        return Some((
+            "sculptor",
+            format!(
+                "candidate {} referenced in {}",
+                path.display(),
+                sculptor_env.display()
+            ),
+        ));
+    }
+    None
+}
+
 /// Detect whether `path` is owned by a foreign manager.
 ///
 /// Checks in order:
 /// - `.foreign-managed` marker inside the candidate
 /// - `.claude-multi` sibling marker
 /// - `$HOME/.claude-multi/config.json` referencing the candidate
+/// - orchestrator-managed workspace roots / settings (DRF-04)
 /// - generic `.superai-foreign` marker
 ///
 /// Never parses a known secret store; only bounded reads of small config files.
@@ -624,6 +699,19 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
                 ambiguous: false,
             };
         }
+    }
+
+    // Orchestrator-managed workspaces (DRF-04): structural evidence first so
+    // an orchestrator workspace is never adoptable, regardless of what other
+    // markers sit beside it.
+    if let Some((owner, reason)) = detect_orchestrator_manager(path, home) {
+        evidence.push(reason);
+        return ForeignCheck {
+            is_foreign: true,
+            owner: Some(owner.to_owned()),
+            evidence,
+            ambiguous: false,
+        };
     }
 
     // .claude-multi marker file inside candidate
@@ -1508,10 +1596,11 @@ fn classify_finding(
                         vec!["repair: regenerate the wrapper (INS-09)".to_owned()],
                     );
                 }
-                let content = std::fs::read_to_string(wpath).unwrap_or_default();
-                if !crate::wrapper::is_owned_wrapper(wpath, Some(&wrapper.content_digest))
-                    && !content.contains(&wrapper.content_digest)
-                {
+                // Strict ownership check (WRP-08 discipline, matching the
+                // repair path's full-content comparison): parseable marker +
+                // digest EQUALITY. A merely-edited wrapper that still happens
+                // to contain the digest string is drift, not health.
+                if !crate::wrapper::is_owned_wrapper(wpath, Some(&wrapper.content_digest)) {
                     return (
                         DriftCategory::WrapperChanged,
                         RiskLevel::Medium,
@@ -2202,6 +2291,82 @@ mod tests {
         }
         std::fs::remove_file(&cfg).unwrap_or(());
         std::fs::remove_dir_all(&multi_dir).unwrap_or(());
+    }
+
+    /// DRF-04: orchestrator-managed workspace roots (Vibe Kanban /
+    /// Conductor / Sculptor per docs/harness-configs/orchestrators.md) are
+    /// classified foreign-owned with the orchestrator named, and adoption is
+    /// refused — superai never takes over another manager's workspace.
+    #[test]
+    fn orchestrator_workspaces_are_foreign_managed_and_block_adoption() {
+        let home = tmp_home("orchestrator_foreign");
+
+        // Structural markers: the candidate lives under a documented
+        // orchestrator workspace root.
+        let cases = [
+            (
+                home.join("repo")
+                    .join(".vibe-kanban-workspaces")
+                    .join("vk-abc"),
+                "vibe-kanban",
+            ),
+            (
+                home.join("conductor").join("workspaces").join("task-1"),
+                "conductor",
+            ),
+            (
+                home.join(".sculptor")
+                    .join("workspaces")
+                    .join("w7")
+                    .join("code"),
+                "sculptor",
+            ),
+        ];
+        for (candidate, owner) in &cases {
+            std::fs::create_dir_all(candidate).unwrap();
+            // settings.json gives the adoption floor's Medium fingerprint so
+            // the foreign check is actually reached.
+            std::fs::write(candidate.join("settings.json"), "{}").unwrap();
+            let foreign = is_foreign_managed(candidate, Some(&home));
+            assert!(foreign.is_foreign, "{owner}: must be foreign: {foreign:?}");
+            assert_eq!(foreign.owner.as_deref(), Some(*owner), "{foreign:?}");
+            assert!(!foreign.ambiguous);
+            let err = can_adopt(candidate, Some(&home)).unwrap_err();
+            match err {
+                CoreError::ForeignOwnership {
+                    path, owner: named, ..
+                } => {
+                    assert_eq!(path, *candidate);
+                    assert_eq!(named, *owner);
+                }
+                other => panic!("{owner}: expected ForeignOwnership, got {other:?}"),
+            }
+        }
+
+        // Conductor user settings referencing the candidate: foreign even
+        // though the path itself carries no marker component.
+        let referenced = home.join(".claude-from-conductor");
+        std::fs::create_dir_all(&referenced).unwrap();
+        std::fs::write(referenced.join("settings.json"), "{}").unwrap();
+        let conductor_home = home.join(".conductor");
+        std::fs::create_dir_all(&conductor_home).unwrap();
+        let settings = conductor_home.join("settings.toml");
+        std::fs::write(
+            &settings,
+            format!("[[workspaces]]\npath = '{}'\n", referenced.display()),
+        )
+        .unwrap();
+        let foreign = is_foreign_managed(&referenced, Some(&home));
+        assert!(foreign.is_foreign, "{foreign:?}");
+        assert_eq!(foreign.owner.as_deref(), Some("conductor"));
+        std::fs::remove_file(&settings).unwrap_or(());
+
+        // Negative: an ordinary unmanaged root is neither foreign nor ambiguous.
+        let plain = home.join(".claude-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let clean = is_foreign_managed(&plain, Some(&home));
+        assert!(!clean.is_foreign, "{clean:?}");
+        assert!(!clean.ambiguous, "{clean:?}");
     }
 
     /// Platform: Linux/macOS — dedup by `(dev, ino)` via `MetadataExt` for symlinked roots; Windows — lexical dedup (no `MetadataExt`), hardlinks/junctions not resolved. Test asserts one entry on each via `#[cfg(unix)]`/`#[cfg(not(unix))]`.

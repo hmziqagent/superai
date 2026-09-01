@@ -216,6 +216,24 @@ pub enum ConfigError {
         /// Why the copy is unsupported.
         reason: String,
     },
+
+    /// A mutation target is (or resolves through) a symlink whose referent
+    /// lies OUTSIDE the adapter-allowed root set (MUT-02 default link
+    /// policy: follow an existing symlink only after resolving the target
+    /// within adapter-allowed roots). Nothing was mutated and the link
+    /// itself was never replaced — following it would silently mutate a
+    /// file the caller never declared authority over.
+    #[error(
+        "symlink follow refused at {path}: resolves to {resolved}, outside allowed roots {roots}"
+    )]
+    SymlinkFollowRefused {
+        /// Symlink path whose follow was refused.
+        path: PathBuf,
+        /// Where the link resolves (or why it could not be resolved).
+        resolved: String,
+        /// Rendering of the declared allowed roots.
+        roots: String,
+    },
 }
 
 impl ConfigError {
@@ -349,6 +367,18 @@ impl ConfigError {
         Self::UnsupportedCopy {
             path: path.into(),
             reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn symlink_follow_refused(
+        path: impl Into<PathBuf>,
+        resolved: impl Into<String>,
+        roots: impl Into<String>,
+    ) -> Self {
+        Self::SymlinkFollowRefused {
+            path: path.into(),
+            resolved: resolved.into(),
+            roots: roots.into(),
         }
     }
 }

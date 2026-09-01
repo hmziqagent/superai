@@ -452,9 +452,16 @@ pub fn extract_version(text: &str) -> Option<String> {
                     })
                     .to_owned();
                 if !cleaned.is_empty() {
-                    // Bound length to avoid pathological capture
+                    // Bound length to avoid pathological capture. The bound
+                    // is BYTES (a multi-byte token must not exceed it even
+                    // when it has fewer than 64 chars), truncated at a
+                    // UTF-8 char boundary.
                     let bounded = if cleaned.len() > 64 {
-                        cleaned.chars().take(64).collect::<String>()
+                        let mut end = 64;
+                        while end > 0 && !cleaned.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        cleaned.get(0..end).unwrap_or_default().to_owned()
                     } else {
                         cleaned
                     };
@@ -538,6 +545,22 @@ mod tests {
         let v2 = extract_version(&unicode).unwrap();
         assert!(v2.len() <= 64);
         assert!(v2.is_char_boundary(v2.len()));
+    }
+
+    #[test]
+    fn extract_version_semver_bound_is_bytes_not_chars() {
+        // A multi-byte semver-shaped token must be bounded to 64 BYTES, not
+        // 64 chars (found by the QAL-04 detection fuzz family).
+        let token = "1.2.3-β".repeat(30); // 6 bytes per rep, 180 bytes, 90 chars
+        let text = format!("tool {token}");
+        let v = extract_version(&text)
+            .unwrap_or_else(|| panic!("semver-shaped token must be extracted: {text:?}"));
+        assert!(
+            v.len() <= 64,
+            "extracted version must be byte-bounded, got {} bytes: {v:?}",
+            v.len()
+        );
+        assert!(v.is_char_boundary(v.len()));
     }
 
     #[test]

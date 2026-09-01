@@ -150,6 +150,36 @@ pub enum CreateSource {
     ConfigRoot(AbsolutePath),
 }
 
+/// Asset-inheritance choice for a create request (INS-02: "asset
+/// inheritance choices only where adapter permits exclusions").
+///
+/// Shared assets the adapter declares link-safe are inherited (linked) by
+/// default. The caller may opt named assets out of inheritance — every
+/// opted-out name must be an adapter-declared shared asset
+/// ([`Adapter::mirror_link_paths`]); preflight raises a blocking conflict
+/// for a name the adapter does not declare, because the adapter permits no
+/// such exclusion. Opted-out assets are COPIED so the new instance owns a
+/// private copy instead of sharing the source's.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AssetInheritance {
+    /// Link every adapter-declared shared asset (INS-04 step 4 default).
+    #[default]
+    InheritDeclared,
+    /// Copy the named adapter-declared shared assets instead of linking
+    /// them, so the new instance owns private copies.
+    ExcludeAssets(Vec<String>),
+}
+
+impl AssetInheritance {
+    /// Names opted out of inheritance (empty when the default is chosen).
+    pub fn excluded_names(&self) -> &[String] {
+        match self {
+            Self::InheritDeclared => &[],
+            Self::ExcludeAssets(names) => names,
+        }
+    }
+}
+
 /// Request to create a new isolated instance by mirroring a working source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateRequest {
@@ -178,6 +208,10 @@ pub struct CreateRequest {
     /// with a fresh conflict check, WRP-07); `Some(port)` is conflict-checked
     /// during preflight.
     pub daemon_port: Option<u16>,
+    /// Asset-inheritance choice (INS-02): which adapter-declared shared
+    /// assets to inherit (link) versus copy privately. See
+    /// [`AssetInheritance`].
+    pub asset_inheritance: AssetInheritance,
 }
 
 impl CreateRequest {
@@ -198,6 +232,7 @@ impl CreateRequest {
             wrapper: None,
             target_root: None,
             daemon_port: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         }
     }
 }
@@ -497,6 +532,10 @@ fn matches_declared_path(relative: &Path, declared: &[String]) -> bool {
     clippy::too_many_lines,
     reason = "mirror classification covers every INS-03 kind explicitly"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirror inputs are flat by design"
+)]
 fn build_mirror_plan(
     source_root: &Path,
     target_root: &Path,
@@ -505,6 +544,7 @@ fn build_mirror_plan(
     link_paths: &[String],
     rewrite_files: &[String],
     transform_targets: &[PathBuf],
+    asset_exclusions: &[String],
 ) -> Result<MirrorPlan> {
     let mut copied: Vec<MirrorEntry> = Vec::new();
     let mut linked: Vec<MirrorEntry> = Vec::new();
@@ -589,8 +629,15 @@ fn build_mirror_plan(
                 reason: "OAuth/keychain credentials stay external (default needs-auth)".to_owned(),
                 mode,
             });
-        } else if matches_declared_path(&relative, link_paths) {
-            // Adapter-declared shared asset (INS-03 Linked / INS-04 step 4).
+        } else if matches_declared_path(&relative, link_paths)
+            && !asset_exclusions
+                .iter()
+                .any(|name| matches_declared_path(&relative, std::slice::from_ref(name)))
+        {
+            // Adapter-declared shared asset (INS-03 Linked / INS-04 step 4),
+            // unless the request's asset-inheritance choice opted it out
+            // (INS-02) — an opted-out asset is copied below so the new
+            // instance owns a private copy.
             linked_roots.push(src.clone());
             linked.push(MirrorEntry {
                 source: src,
@@ -599,6 +646,29 @@ fn build_mirror_plan(
                 reason: "adapter-declared link-safe shared asset".to_owned(),
                 mode,
             });
+        } else if matches_declared_path(&relative, link_paths) {
+            // INS-02 asset-inheritance exclusion: copy the shared asset
+            // privately instead of linking it. Directory entries are
+            // recreated implicitly by their file copies (the staging layer
+            // creates parents), so they stay out of the byte-copy set.
+            if std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_dir()) {
+                skipped.push(MirrorEntry {
+                    source: src,
+                    target,
+                    kind: MirrorKind::Skipped,
+                    reason: "directory entry; recreated by its copied files".to_owned(),
+                    mode,
+                });
+            } else {
+                copied.push(MirrorEntry {
+                    source: src,
+                    target,
+                    kind: MirrorKind::Copied,
+                    reason: "asset-inheritance choice: private copy instead of shared link"
+                        .to_owned(),
+                    mode,
+                });
+            }
         } else if transform_targets.iter().any(|t| *t == target) {
             // The template mutation rewrites this file during copy.
             transformed.push(MirrorEntry {
@@ -634,6 +704,17 @@ fn build_mirror_plan(
                     mode,
                 });
             }
+        } else if std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_dir()) {
+            // Directory entries never enter the byte-copy set: their files
+            // are copied individually and the staging layer creates every
+            // parent, so the directory is recreated implicitly.
+            skipped.push(MirrorEntry {
+                source: src,
+                target,
+                kind: MirrorKind::Skipped,
+                reason: "directory entry; recreated by its copied files".to_owned(),
+                mode,
+            });
         } else {
             copied.push(MirrorEntry {
                 source: src,
@@ -1906,6 +1987,52 @@ fn preflight_create(
             path: None,
         });
     }
+
+    // Asset-inheritance choices (INS-02): only where the adapter permits
+    // exclusions — every opted-out asset must be an adapter-declared
+    // link-safe shared asset. An undeclared name is a blocking conflict, not
+    // a silent skip.
+    let declared_links = adapter.mirror_link_paths();
+    let adapter_exclusions = adapter.plan_mirror_exclusions();
+    if !request.asset_inheritance.excluded_names().is_empty() {
+        let all_declared = request
+            .asset_inheritance
+            .excluded_names()
+            .iter()
+            .all(|name| declared_links.iter().any(|declared| declared == name));
+        preconditions.push(Precondition {
+            kind: PreconditionKind::Exists,
+            description: format!(
+                "excluded assets must be declared shared assets of {} (declared: {:?})",
+                request.harness, declared_links
+            ),
+            path: None,
+            satisfied: all_declared,
+        });
+        for name in request.asset_inheritance.excluded_names() {
+            if !declared_links.iter().any(|declared| declared == name) {
+                conflicts.push(Conflict {
+                    code: "asset_exclusion_not_declared".to_owned(),
+                    message: format!(
+                        "asset `{name}` is not a declared shared asset of {}; the adapter \
+                         permits no such exclusion",
+                        request.harness
+                    ),
+                    paths: vec![],
+                });
+            } else if adapter_exclusions.iter().any(|excl| excl == name) {
+                conflicts.push(Conflict {
+                    code: "asset_exclusion_redundant".to_owned(),
+                    message: format!(
+                        "asset `{name}` is already excluded by the adapter's mirror policy; it \
+                         is never inherited"
+                    ),
+                    paths: vec![],
+                });
+            }
+        }
+    }
+
     // Adapter's supported operations maybe constrain? For now, check harness matches adapter id
     if adapter.id() != request.harness {
         // Generic adapter may not match; but if it's generic, allow?
@@ -2201,11 +2328,33 @@ pub fn plan_mirror_for_template(
     adapter: &dyn Adapter,
     template: Option<&TemplateRef>,
 ) -> Result<MirrorPlan> {
+    plan_mirror_with_asset_choice(
+        source_root,
+        target_root,
+        adapter,
+        template,
+        &AssetInheritance::InheritDeclared,
+    )
+}
+
+/// [`plan_mirror_for_template`] with an explicit asset-inheritance choice
+/// (INS-02): declared shared assets named in the choice are copied instead
+/// of linked. Exclusion names are validated against the adapter's declared
+/// link-safe assets; an undeclared name is a typed error, never a silent
+/// skip.
+pub fn plan_mirror_with_asset_choice(
+    source_root: &Path,
+    target_root: &Path,
+    adapter: &dyn Adapter,
+    template: Option<&TemplateRef>,
+    asset_inheritance: &AssetInheritance,
+) -> Result<MirrorPlan> {
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
     let link_paths = adapter.mirror_link_paths();
     let rewrite_files = adapter.mirror_content_rewrite_files();
     let transform_targets = template_transform_targets(target_root, template);
+    validate_asset_exclusions(asset_inheritance, &link_paths, &exclusions)?;
     build_mirror_plan(
         source_root,
         target_root,
@@ -2214,7 +2363,41 @@ pub fn plan_mirror_for_template(
         &link_paths,
         &rewrite_files,
         &transform_targets,
+        asset_inheritance.excluded_names(),
     )
+}
+
+/// INS-02: an asset-inheritance exclusion is only permitted where the
+/// adapter declares the asset — every opted-out name must be an
+/// adapter-declared link-safe shared asset (an adapter-declared mirror
+/// exclusion already covers the asset and needs no inheritance choice).
+fn validate_asset_exclusions(
+    asset_inheritance: &AssetInheritance,
+    link_paths: &[String],
+    adapter_exclusions: &[String],
+) -> Result<()> {
+    for name in asset_inheritance.excluded_names() {
+        if !link_paths.iter().any(|declared| declared == name) {
+            return Err(CoreError::Validation {
+                field: "asset_inheritance".to_owned(),
+                reason: format!(
+                    "asset `{name}` is not a declared shared asset of this harness (declared: \
+                     {:?}); the adapter permits no such exclusion",
+                    link_paths
+                ),
+            });
+        }
+        if adapter_exclusions.iter().any(|excl| excl == name) {
+            return Err(CoreError::Validation {
+                field: "asset_inheritance".to_owned(),
+                reason: format!(
+                    "asset `{name}` is already excluded by the adapter's mirror policy; it is \
+                     never inherited"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2231,17 +2414,33 @@ pub fn preview_create_mirrored(
 ) -> Result<OperationPreview> {
     let (source_root, target_root) = resolve_source_and_target(request, registry, adapter)?;
     // Build the mirror plan first so preflight can check disk space against
-    // the plan's real byte total (fresh stats at preflight time).
+    // the plan's real byte total (fresh stats at preflight time) and honor
+    // the request's asset-inheritance choice (INS-02). An exclusion the
+    // adapter does not declare is surfaced by preflight as a blocking
+    // conflict (visible in the preview) and planned as if unchosen; the
+    // commit path refuses the same request with the typed error.
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
+    let link_paths = adapter.mirror_link_paths();
+    let exclusions_declared = request
+        .asset_inheritance
+        .excluded_names()
+        .iter()
+        .all(|name| link_paths.iter().any(|declared| declared == name));
+    let planned_asset_exclusions: Vec<String> = if exclusions_declared {
+        request.asset_inheritance.excluded_names().to_vec()
+    } else {
+        Vec::new()
+    };
     let mirror_plan = build_mirror_plan(
         &source_root,
         &target_root,
         &exclusions,
         &credential_names,
-        &adapter.mirror_link_paths(),
+        &link_paths,
         &adapter.mirror_content_rewrite_files(),
         &template_transform_targets(&target_root, request.template.as_ref()),
+        &planned_asset_exclusions,
     )?;
     let planned_bytes = planned_copy_bytes(&mirror_plan);
     let (preconditions, conflicts, warnings) = preflight_create(
@@ -2535,14 +2734,17 @@ fn isolate_and_configure(
 ) -> Result<(Vec<FileAction>, WrapperPlan, MirrorPlan)> {
     let exclusions = adapter.plan_mirror_exclusions();
     let credential_names = adapter_credential_file_names(adapter);
+    let link_paths = adapter.mirror_link_paths();
+    validate_asset_exclusions(&request.asset_inheritance, &link_paths, &exclusions)?;
     let mirror_plan = build_mirror_plan(
         source_root,
         target_root,
         &exclusions,
         &credential_names,
-        &adapter.mirror_link_paths(),
+        &link_paths,
         &adapter.mirror_content_rewrite_files(),
         &template_transform_targets(target_root, request.template.as_ref()),
+        request.asset_inheritance.excluded_names(),
     )?;
 
     let mut steps: Vec<FileAction> = Vec::new();
@@ -3235,6 +3437,7 @@ pub fn rename_instance(
     registry_path: &Path,
     old_name: &str,
     new_name: InstanceName,
+    adapter: &dyn Adapter,
 ) -> Result<OperationResult> {
     let preview_id = new_operation_id()?;
     let mut registry = Registry::load(registry_path)?;
@@ -3284,49 +3487,20 @@ pub fn rename_instance(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            if old_file_name == old_name {
+            let moved = if old_file_name == old_name {
                 // Need to rename wrapper file to new name in same directory
                 if let Some(parent) = old_path.parent() {
                     let new_path = parent.join(new_name.as_str());
                     // Backup old wrapper before rename (INS-05: replacement is
                     // backed up; the rename itself is a single fs::rename).
-                    if old_path.exists() {
-                        drop(superai_config::backup::backup(&old_path));
-                    }
+                    drop(superai_config::backup::backup(&old_path));
                     // Atomic move via std::fs::rename
                     match std::fs::rename(&old_path, &new_path) {
                         Ok(()) => {
                             wrapper_renamed = true;
                             wrapper_old_path = Some(old_path.clone());
                             wrapper_new_path = Some(new_path.clone());
-                            // Reflect the new wrapper location (and freshly
-                            // computed digest + command name, which
-                            // Registry::rename already advanced) in the
-                            // record before it is stored.
-                            let mut removed =
-                                registry.remove(new_name.as_str()).ok_or_else(|| {
-                                    CoreError::Validation {
-                                        field: "name".to_owned(),
-                                        reason:
-                                            "failed to remove renamed instance for wrapper update"
-                                                .to_owned(),
-                                    }
-                                })?;
-                            let new_wrapper_path =
-                                WrapperPath::from_path(&new_path).map_err(|e| {
-                                    CoreError::Validation {
-                                        field: "wrapper.path".to_owned(),
-                                        reason: format!("new wrapper path invalid: {e}"),
-                                    }
-                                })?;
-                            if let Some(w) = &mut removed.wrapper {
-                                w.path = new_wrapper_path;
-                                w.command_name = new_name.clone();
-                                let content = std::fs::read(&new_path).unwrap_or_default();
-                                w.content_digest = compute_digest_bytes(&content);
-                                w.generator_version = wrapper_helper::GENERATOR_VERSION.to_owned();
-                            }
-                            registry.insert(removed)?;
+                            Some(new_path)
                         }
                         Err(e) => {
                             return Err(CoreError::Config(ConfigError::Io {
@@ -3335,8 +3509,54 @@ pub fn rename_instance(
                             }));
                         }
                     }
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            // Reflect the new wrapper location (and freshly computed digest + command name,
+            // which Registry::rename already advanced) in the record before it is stored.
+            let mut removed =
+                registry
+                    .remove(new_name.as_str())
+                    .ok_or_else(|| CoreError::Validation {
+                        field: "name".to_owned(),
+                        reason: "failed to remove renamed instance for wrapper update".to_owned(),
+                    })?;
+            let effective_path = moved.unwrap_or_else(|| old_path.clone());
+            let new_wrapper_path =
+                WrapperPath::from_path(&effective_path).map_err(|e| CoreError::Validation {
+                    field: "wrapper.path".to_owned(),
+                    reason: format!("new wrapper path invalid: {e}"),
+                })?;
+            if let Some(w) = &mut removed.wrapper {
+                w.path = new_wrapper_path;
+                w.command_name = new_name.clone();
             }
+            if removed.wrapper.is_some() {
+                // INS-05/INS-09 consistency: the wrapper is superai-owned and
+                // deterministic, and its marker embeds the INSTANCE NAME — a
+                // verbatim byte move would leave the old name on disk while
+                // detect_repairs regenerates with the new one, producing a
+                // spurious WrapperDrift finding after every rename. The
+                // honest fix is regeneration through the wrapper writer:
+                // marker + digest updated to the new name, atomically, with
+                // the moved bytes backed up first (write_wrapper's
+                // owned-replacement discipline).
+                let (content, _expected_digest, _plan) = expected_wrapper_for(&removed, adapter);
+                let Some(wrapper_ref) = removed.wrapper.as_mut() else {
+                    return Err(CoreError::Validation {
+                        field: "wrapper".to_owned(),
+                        reason: "wrapper record vanished during rename regeneration".to_owned(),
+                    });
+                };
+                let wrapper_path = wrapper_ref.path.clone();
+                let digest = wrapper_helper::write_wrapper(&wrapper_path, &content)?;
+                wrapper_ref.content_digest = digest;
+                wrapper_ref.generator_version = wrapper_helper::GENERATOR_VERSION.to_owned();
+            }
+            registry.insert(removed)?;
         }
     }
 
@@ -6095,6 +6315,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let registry = Registry::load(&tmp.join("registry.json")).unwrap();
         let preview = preview_create_mirrored(&request, &registry, &adapter).unwrap();
@@ -6145,6 +6366,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let registry = Registry::load(&tmp.join("registry.json")).unwrap();
 
@@ -6207,6 +6429,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
 
         // A real adapter with an api-key owned selector resolves a sink.
@@ -6280,6 +6503,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
 
         let registry = Registry::load(&registry_path).unwrap();
@@ -6386,6 +6610,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
 
         let result = create_mirrored(request, &registry_path, &adapter);
@@ -6433,7 +6658,8 @@ mod tests {
         let target_root = tmp.join("target");
 
         // Worst case: an adapter contributing zero exclusions of its own.
-        let plan = build_mirror_plan(&source_root, &target_root, &[], &[], &[], &[], &[]).unwrap();
+        let plan =
+            build_mirror_plan(&source_root, &target_root, &[], &[], &[], &[], &[], &[]).unwrap();
 
         let credential_sources = [
             source_root.join(".credentials.json"),
@@ -6555,6 +6781,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target_root).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let result = create_mirrored(request, &registry_path, &adapter).unwrap();
         assert!(
@@ -6606,7 +6833,8 @@ mod tests {
 
         // Worst case: no adapter exclusions and no adapter-declared names —
         // the static corpus list alone must gate every credential path.
-        let plan = build_mirror_plan(&source_root, &target_root, &[], &[], &[], &[], &[]).unwrap();
+        let plan =
+            build_mirror_plan(&source_root, &target_root, &[], &[], &[], &[], &[], &[]).unwrap();
 
         let credential_sources = [
             source_root.join("data/auth.json"),
@@ -6777,6 +7005,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -6825,6 +7054,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target_root1).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let r = create_mirrored(req1, &registry_path, &adapter).unwrap();
         assert!(r.success);
@@ -6842,6 +7072,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target_root2).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let registry = Registry::load(&registry_path).unwrap();
         let preview = preview_create_mirrored(&req2, &registry, &adapter).unwrap();
@@ -6904,8 +7135,13 @@ mod tests {
             preview_rename(&loaded, "work", &InstanceName::new("work2").unwrap()).unwrap();
         assert!(preview.conflicts.is_empty());
         // Commit rename
-        let result =
-            rename_instance(&registry_path, "work", InstanceName::new("work2").unwrap()).unwrap();
+        let result = rename_instance(
+            &registry_path,
+            "work",
+            InstanceName::new("work2").unwrap(),
+            &make_adapter("claude-code"),
+        )
+        .unwrap();
         assert!(result.success);
 
         let after = Registry::load(&registry_path).unwrap();
@@ -8295,6 +8531,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
 
         // A planned provider on a sink-less adapter is a BLOCKING conflict.
@@ -8448,6 +8685,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let registry_path = tmp.join("registry.json");
         let result = create_mirrored(request, &registry_path, &adapter).unwrap();
@@ -8491,6 +8729,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let registry_path = tmp.join("registry.json");
         let result = create_mirrored(request, &registry_path, &adapter).unwrap();
@@ -8504,6 +8743,117 @@ mod tests {
         assert_eq!(std::fs::read_link(&linked).unwrap(), source.join("skills"));
         // And it resolves to the shared content.
         assert!(linked.join("SKILL.md").exists());
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-02: the asset-inheritance request field — the caller can opt a
+    /// declared shared asset out of inheritance; the mirror then owns a
+    /// private COPY instead of a shared link.
+    #[test]
+    fn asset_inheritance_choice_copies_excluded_shared_asset() {
+        let tmp = unique_temp("asset_inheritance_copy");
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let source = tmp.join("source");
+        std::fs::create_dir_all(source.join("skills")).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        std::fs::write(source.join("skills").join("SKILL.md"), "# shared skill\n").unwrap();
+        let target = tmp.join("target");
+
+        let request = CreateRequest {
+            name: InstanceName::new("private").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&target).unwrap()),
+            daemon_port: None,
+            provider: None,
+            asset_inheritance: AssetInheritance::ExcludeAssets(vec!["skills".to_owned()]),
+        };
+        let registry_path = tmp.join("registry.json");
+        let result = create_mirrored(request, &registry_path, &adapter).unwrap();
+        assert!(result.success, "{:?}", result.diagnostics_redacted);
+
+        let skills = target.join("skills");
+        assert!(
+            skills.join("SKILL.md").exists(),
+            "the excluded asset's content must still land in the target"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&skills)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "an opted-out shared asset is a private copy, not a link"
+        );
+        // Private means private: editing the copy leaves the source alone.
+        std::fs::write(skills.join("SKILL.md"), "# private edit\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source.join("skills").join("SKILL.md")).unwrap(),
+            "# shared skill\n",
+            "the source asset must be untouched by edits to the private copy"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-02: exclusion is only permitted where the adapter declares the
+    /// asset — an unknown name is a blocking preflight conflict, and the
+    /// mirror refuses to build rather than silently skipping.
+    #[test]
+    fn asset_inheritance_undeclared_exclusion_is_a_preflight_conflict() {
+        let tmp = unique_temp("asset_inheritance_bad");
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let source = tmp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+
+        let request = CreateRequest {
+            name: InstanceName::new("badchoice").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            source: CreateSource::ConfigRoot(AbsolutePath::from_path(&source).unwrap()),
+            isolation: Isolation::RelocatedRoot,
+            template: None,
+            wrapper: None,
+            target_root: Some(AbsolutePath::from_path(&tmp.join("target")).unwrap()),
+            daemon_port: None,
+            provider: None,
+            asset_inheritance: AssetInheritance::ExcludeAssets(vec!["not-an-asset".to_owned()]),
+        };
+        let registry = Registry::load(&tmp.join("registry.json")).unwrap();
+
+        let preview = preview_create_mirrored(&request, &registry, &adapter).unwrap();
+        let conflict = preview
+            .conflicts
+            .iter()
+            .find(|c| c.code == "asset_exclusion_not_declared")
+            .expect("undeclared exclusion must surface as a conflict");
+        assert!(
+            conflict.message.contains("not-an-asset"),
+            "{}",
+            conflict.message
+        );
+        assert!(
+            preview
+                .preconditions
+                .iter()
+                .any(|p| p.description.contains("declared shared assets")),
+            "the precondition must name the declared set"
+        );
+
+        // The commit path refuses the same request (conflict gate; the
+        // mirror never builds).
+        let err = create_mirrored(request, &tmp.join("registry.json"), &adapter).unwrap_err();
+        match &err {
+            CoreError::Validation { field, reason } => {
+                assert_eq!(field, "preflight");
+                assert!(
+                    reason.contains("not-an-asset"),
+                    "refusal must name the undeclared asset: {reason}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
         drop(std::fs::remove_dir_all(&tmp));
     }
 
@@ -8556,6 +8906,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let result = create_mirrored(request, &registry_path, &adapter);
         assert!(result.is_err(), "adapter validation must refuse");
@@ -8598,6 +8949,7 @@ mod tests {
             target_root: Some(AbsolutePath::from_path(&target).unwrap()),
             daemon_port: None,
             provider: None,
+            asset_inheritance: AssetInheritance::InheritDeclared,
         };
         let result = create_mirrored(request, &registry_path, &adapter).unwrap();
         assert!(result.success);
@@ -8623,6 +8975,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let bin = tmp.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        let adapter = make_adapter("claude-code");
 
         // Generate + write the wrapper for instance "work" at bin/work.
         let harness = HarnessId::new("claude-code").unwrap();
@@ -8647,18 +9000,32 @@ mod tests {
         registry.insert(inst).unwrap();
         registry.store(&registry_path).unwrap();
 
-        let result =
-            rename_instance(&registry_path, "work", InstanceName::new("work2").unwrap()).unwrap();
+        let result = rename_instance(
+            &registry_path,
+            "work",
+            InstanceName::new("work2").unwrap(),
+            &adapter,
+        )
+        .unwrap();
         assert!(result.success);
 
         // The wrapper FILE moved on disk, atomically, with its backup kept.
         assert!(!bin.join("work").exists(), "old wrapper path is gone");
         let new_wrapper = bin.join("work2");
         assert!(new_wrapper.exists(), "wrapper moved to the new name");
-        assert_eq!(
+        // INS-05/INS-09: the wrapper is superai-owned and deterministic, so
+        // rename REGENERATES it for the new name (marker + digest) instead of
+        // moving stale bytes that would immediately read as drift.
+        assert_ne!(
             std::fs::read_to_string(&new_wrapper).unwrap(),
             content,
-            "rename moves bytes; it does not regenerate"
+            "the marker must carry the NEW instance name, not the moved old bytes"
+        );
+        assert!(
+            std::fs::read_to_string(&new_wrapper)
+                .unwrap()
+                .contains("instance=work2"),
+            "marker must name the renamed instance"
         );
 
         // The record's wrapper metadata followed: path, command name, digest.
@@ -8668,9 +9035,82 @@ mod tests {
         let wrapper = renamed.wrapper.as_ref().expect("wrapper preserved");
         assert_eq!(wrapper.path.as_path(), new_wrapper);
         assert_eq!(wrapper.command_name.as_str(), "work2");
+        // On-disk bytes equal the deterministic regeneration from the record
+        // (byte-for-byte what detect_repairs compares against), and the
+        // recorded digest is the marker digest is_owned_wrapper verifies.
+        let (expected_regen, regen_digest, _) = expected_wrapper_for(renamed, &adapter);
         assert_eq!(
-            wrapper.content_digest,
-            compute_digest_bytes(content.as_bytes())
+            std::fs::read_to_string(&new_wrapper).unwrap(),
+            expected_regen,
+            "on-disk bytes must equal the deterministic regeneration for work2"
+        );
+        assert_eq!(wrapper.content_digest, regen_digest);
+        assert!(crate::wrapper::is_owned_wrapper(
+            &new_wrapper,
+            Some(&wrapper.content_digest)
+        ));
+
+        // INS-09 regression (R1): a rename must NOT leave a spurious
+        // WrapperDrift repair finding behind.
+        let repairs = detect_repairs(&after, &adapter);
+        assert!(
+            repairs
+                .iter()
+                .all(|r| r.kind != RepairKind::WrapperDrift && r.kind != RepairKind::MissingWrapper),
+            "no wrapper drift may survive a rename: {repairs:?}"
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// INS-09/R1 regression: rename then detect_repairs finds NO wrapper
+    /// drift — rename regenerates the wrapper through the deterministic
+    /// generator instead of moving stale bytes with the old marker.
+    #[test]
+    fn rename_leaves_no_wrapper_drift_for_repair_detection() {
+        let tmp = unique_temp("rename_no_drift");
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let adapter = make_adapter("claude-code");
+
+        let harness = HarnessId::new("claude-code").unwrap();
+        let temp_inst = make_instance("work", &root, "claude-code");
+        let mut plan = WrapperPlan::new("test");
+        plan.env_vars.push((
+            crate::wrapper::env_var_for_harness(&harness),
+            root.display().to_string(),
+        ));
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+        std::fs::write(bin.join("work"), &content).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        let mut inst = make_instance("work", &root, "claude-code");
+        inst.wrapper = Some(WrapperRef {
+            path: WrapperPath::from_path(&bin.join("work")).unwrap(),
+            command_name: InstanceName::new("work").unwrap(),
+            generator_version: crate::wrapper::GENERATOR_VERSION.to_owned(),
+            content_digest: digest,
+        });
+        registry.insert(inst).unwrap();
+        registry.store(&registry_path).unwrap();
+
+        rename_instance(
+            &registry_path,
+            "work",
+            InstanceName::new("work2").unwrap(),
+            &adapter,
+        )
+        .unwrap();
+
+        let after = Registry::load(&registry_path).unwrap();
+        let repairs = detect_repairs(&after, &adapter);
+        assert!(
+            repairs
+                .iter()
+                .all(|r| r.kind != RepairKind::WrapperDrift && r.kind != RepairKind::MissingWrapper),
+            "rename must not manufacture drift findings: {repairs:?}"
         );
         drop(std::fs::remove_dir_all(&tmp));
     }

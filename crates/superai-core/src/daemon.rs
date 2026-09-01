@@ -457,6 +457,61 @@ pub struct DaemonStartConfig {
     pub readiness: ReadinessSpec,
     /// Superai-owned root for the identity file.
     pub identity_root: PathBuf,
+    /// WRP-07 foreground/background launch. Background (default) spawns the
+    /// daemon detached with nulled stdio and returns once ready; foreground
+    /// spawns it with INHERITED stdio and BLOCKS until it exits, cleaning the
+    /// identity afterwards — the caller's terminal fronts the daemon.
+    pub foreground: bool,
+    /// WRP-07 graceful shutdown command: when set, [`stop_daemon`] runs this
+    /// argv (a `{port}` placeholder receives the daemon's port) instead of
+    /// signaling the pid first; the TERM/KILL escalation remains the
+    /// fallback when the process does not exit. `None` = signal-only.
+    pub shutdown_command: Option<ShutdownCommand>,
+}
+
+/// WRP-07 graceful shutdown command spec: an argv (tokens, never a shell
+/// string) with optional env and a bounded timeout. `{port}` placeholders in
+/// `args` receive the daemon's resolved port at stop time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutdownCommand {
+    /// Shutdown executable (argv token, never a shell string).
+    pub executable: String,
+    /// Shutdown argv; `{port}` placeholders receive the daemon's port.
+    pub args: Vec<String>,
+    /// Extra environment for the shutdown command.
+    pub env: Vec<(String, String)>,
+    /// Total budget for the shutdown command itself.
+    pub timeout: Duration,
+}
+
+impl ShutdownCommand {
+    /// Materialize the argv against a resolved port (replaces `{port}`).
+    #[must_use]
+    fn for_port(&self, port: u16) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|arg| arg.replace("{port}", &port.to_string()))
+            .collect()
+    }
+}
+
+/// Outcome of [`start_daemon`] (WRP-07 foreground/background launch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonLaunch {
+    /// Background: daemon running detached; identity recorded; caller holds
+    /// a handle for stop.
+    Background(DaemonHandle),
+    /// Foreground: daemon ran attached with inherited stdio until it exited
+    /// (superai blocked in [`start_daemon`]); the identity was cleaned up
+    /// after exit. `success` is the process's exit status.
+    Foreground {
+        /// Pid the foreground daemon ran as.
+        pid: u32,
+        /// Port the foreground daemon used.
+        port: u16,
+        /// Whether the process exited 0.
+        success: bool,
+    },
 }
 
 /// Handle to a started, ready daemon.
@@ -471,12 +526,15 @@ pub struct DaemonHandle {
 }
 
 /// Stop tuning.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StopOptions {
     /// Grace period between terminate and escalate.
     pub grace: Duration,
     /// Poll interval while waiting for exit.
     pub poll_interval: Duration,
+    /// WRP-07 graceful shutdown command run BEFORE any signal; the
+    /// TERM/KILL escalation stays the fallback. `None` = signal-only.
+    pub shutdown: Option<ShutdownCommand>,
 }
 
 impl Default for StopOptions {
@@ -484,6 +542,7 @@ impl Default for StopOptions {
         Self {
             grace: Duration::from_secs(5),
             poll_interval: Duration::from_millis(50),
+            shutdown: None,
         }
     }
 }
@@ -554,18 +613,31 @@ fn identity_token(pid: u32) -> String {
     format!("dmt-{:016x}", hasher.finish())
 }
 
-/// Start a daemon: resolve the port (conflict-checked), spawn detached via
-/// duct with the port in env/args, record the superai-owned identity, and
-/// wait bounded for readiness.
+/// Start a daemon: resolve the port (conflict-checked), spawn via duct with
+/// the port in env/args, record the superai-owned identity, and wait bounded
+/// for readiness.
+///
+/// Background launch (the default) spawns detached with nulled stdio and
+/// returns a [`DaemonLaunch::Background`] handle once ready. Foreground
+/// launch (`config.foreground`, WRP-07) spawns with inherited stdio and
+/// BLOCKS until the daemon exits, cleaning the identity afterwards.
 ///
 /// On readiness timeout the just-spawned process is killed (it is our own
 /// child, killed by handle — never by pid), the identity file is removed, and
 /// the typed [`CoreError::DaemonNotReady`] is returned.
-pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Result<DaemonHandle> {
+pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Result<DaemonLaunch> {
     if config.executable.is_empty() || config.executable.contains('\0') {
         return Err(CoreError::Validation {
             field: "executable".to_owned(),
             reason: "daemon executable must be a non-empty argv token".to_owned(),
+        });
+    }
+    if let Some(shutdown) = &config.shutdown_command
+        && (shutdown.executable.is_empty() || shutdown.executable.contains('\0'))
+    {
+        return Err(CoreError::Validation {
+            field: "shutdown_command.executable".to_owned(),
+            reason: "shutdown executable must be a non-empty argv token".to_owned(),
         });
     }
     std::fs::create_dir_all(&config.identity_root).map_err(|e| CoreError::Validation {
@@ -645,16 +717,34 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
         return Err(e);
     }
 
-    Ok(DaemonHandle {
+    if config.foreground {
+        // WRP-07 foreground launch: block until the daemon exits (the
+        // caller's terminal fronts it), then clean the identity. The exit
+        // status reaches the caller; nothing is signaled by superai.
+        let status = handle.wait().map_err(|e| CoreError::BinaryDetection {
+            binary: config.executable.clone(),
+            reason: format!("cannot wait for foreground daemon: {e}"),
+        })?;
+        drop(std::fs::remove_file(&id_path));
+        return Ok(DaemonLaunch::Foreground {
+            pid,
+            port,
+            success: status.status.success(),
+        });
+    }
+
+    Ok(DaemonLaunch::Background(DaemonHandle {
         identity_path: id_path,
         pid,
         port,
-    })
+    }))
 }
 
-/// Spawn the daemon process detached (no capture, no shell), with the
-/// resolved port substituted into args/env per the plan. Returns the duct
-/// handle (for kill-by-handle on failure) and the pid.
+/// Spawn the daemon process (no capture, no shell), with the resolved port
+/// substituted into args/env per the plan. Foreground launches keep the
+/// daemon's stdio INHERITED (the terminal fronts it); background launches
+/// detach with nulled stdio. Returns the duct handle (for kill-by-handle /
+/// foreground wait) and the pid.
 fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::Handle, u32)> {
     let mut args: Vec<String> = config
         .args
@@ -669,10 +759,17 @@ fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::
         env.push((port_env.clone(), port.to_string()));
     }
 
-    let mut cmd = duct::cmd(&config.executable, &args)
-        .stdin_null()
-        .stdout_null()
-        .stderr_null();
+    let mut cmd = if config.foreground {
+        // WRP-07 foreground: inherited stdio so the daemon fronts the
+        // caller's terminal (stdin stays null — the daemon is not
+        // interactive through superai).
+        duct::cmd(&config.executable, &args).stdin_null()
+    } else {
+        duct::cmd(&config.executable, &args)
+            .stdin_null()
+            .stdout_null()
+            .stderr_null()
+    };
     if let Some(cwd) = &config.cwd {
         cmd = cmd.dir(cwd);
     }
@@ -776,9 +873,11 @@ pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) ->
 /// Stop a daemon recorded at `identity_path`.
 ///
 /// Fresh-reads the identity (disk is truth), refuses when the pid cannot be
-/// proven to still be the process superai started, signals TERM then (after
-/// the grace period) escalates to a hard kill, and removes the identity file
-/// only once the process is confirmed dead (or was already dead).
+/// proven to still be the process superai started, then — when a graceful
+/// [`ShutdownCommand`] is supplied (WRP-07) — runs that command INSTEAD of
+/// signaling first; the TERM-then-KILL escalation remains the fallback when
+/// the daemon does not exit. The identity file is removed only once the
+/// process is confirmed dead (or was already dead).
 pub fn stop_daemon(
     identity_path: &Path,
     probe: &dyn ProcessProbe,
@@ -793,6 +892,35 @@ pub fn stop_daemon(
         });
     }
     verify_process_identity(&id, probe)?;
+
+    // WRP-07 graceful shutdown command before any signal: the command runs
+    // bounded; a non-zero exit is not fatal (the exit poll below is the
+    // truth, same discipline as send_signal), and the signal escalation
+    // covers a daemon that ignores it.
+    if let Some(shutdown) = &opts.shutdown {
+        let args = shutdown.for_port(id.port);
+        let run_opts = ExecuteOpts {
+            timeout: Some(shutdown.timeout),
+            env: shutdown.env.clone(),
+            ..ExecuteOpts::default()
+        };
+        run_command(&shutdown.executable, &args, &run_opts).map_err(|e| {
+            CoreError::BinaryDetection {
+                binary: shutdown.executable.clone(),
+                reason: format!(
+                    "cannot run graceful shutdown command `{}`: {e}",
+                    shutdown.executable
+                ),
+            }
+        })?;
+        if wait_for_exit(id.pid, probe, opts.grace, opts.poll_interval) {
+            drop(std::fs::remove_file(identity_path));
+            return Ok(DaemonStopOutcome::Stopped {
+                pid: id.pid,
+                port: id.port,
+            });
+        }
+    }
 
     send_signal(id.pid, false)?;
     if wait_for_exit(id.pid, probe, opts.grace, opts.poll_interval) {
@@ -1215,6 +1343,8 @@ mod tests {
                 interval: Duration::from_millis(50),
             },
             identity_root: dir.join("daemons"),
+            foreground: false,
+            shutdown_command: None,
         }
     }
 
@@ -1230,7 +1360,12 @@ mod tests {
         let config = default_start_config(&dir, &ready_file, &pid_file);
         let probe = SystemProcessProbe;
 
-        let handle = start_daemon(&config, &probe).unwrap();
+        let handle = match start_daemon(&config, &probe).unwrap() {
+            DaemonLaunch::Background(handle) => handle,
+            other @ DaemonLaunch::Foreground { .. } => {
+                panic!("background launch must return a handle, got {other:?}")
+            }
+        };
         assert!(ready_file.exists(), "daemon must be ready");
         let identity = load_identity(&handle.identity_path).unwrap();
         assert_eq!(identity.pid, handle.pid);
@@ -1244,6 +1379,7 @@ mod tests {
             &StopOptions {
                 grace: Duration::from_secs(5),
                 poll_interval: Duration::from_millis(50),
+                shutdown: None,
             },
         )
         .unwrap();
@@ -1259,6 +1395,214 @@ mod tests {
         assert!(!handle.identity_path.exists(), "identity cleaned up");
         assert!(!probe.is_alive(handle.pid), "daemon is dead");
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// WRP-07 foreground launch: `start_daemon` blocks until the daemon exits,
+    /// reports the exit status, and cleans the identity afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreground_launch_runs_to_exit_and_cleans_identity() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-fg");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let mut config = default_start_config(&dir, &ready_file, &pid_file);
+        config.foreground = true;
+        // The foreground daemon exits by itself after touching the flag.
+        config.args = vec![
+            "-c".to_owned(),
+            format!(
+                "echo $$ > {} ; touch {} ; echo fg-ran >> {} ; exit 0",
+                pid_file.display(),
+                ready_file.display(),
+                dir.join("fg.log").display()
+            ),
+        ];
+        let probe = SystemProcessProbe;
+
+        let launch = start_daemon(&config, &probe).unwrap();
+        match launch {
+            DaemonLaunch::Foreground { pid, port, success } => {
+                assert!(success, "exit 0 must be reported as success");
+                assert!(pid > 0);
+                assert!((49160..=49180).contains(&port));
+            }
+            other @ DaemonLaunch::Background(_) => {
+                panic!("foreground launch must not return a background handle: {other:?}")
+            }
+        }
+        // The daemon genuinely ran and exited.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fg.log"))
+                .unwrap_or_default()
+                .trim(),
+            "fg-ran"
+        );
+        // Identity cleaned up after exit; the port is free again for the
+        // harness/instance pair.
+        let id_path = identity_path(
+            &config.identity_root,
+            config.harness.as_str(),
+            config.instance.as_str(),
+        );
+        assert!(!id_path.exists(), "foreground exit must clean the identity");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// WRP-07 graceful shutdown command: stop runs the declared command
+    /// INSTEAD of signaling — proven by a daemon that exits on the command's
+    /// own trigger and writes a graceful-exit marker before exiting 0 (a
+    /// TERM'd `sh` never writes it).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_uses_declared_shutdown_command_before_any_signal() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-graceful");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let stop_flag = dir.join("stop.flag");
+        let graceful_log = dir.join("graceful.log");
+        let mut config = default_start_config(&dir, &ready_file, &pid_file);
+        // Daemon: ready once started; exits GRACEFULLY (marker + exit 0)
+        // only when the stop flag appears.
+        config.args = vec![
+            "-c".to_owned(),
+            format!(
+                "echo $$ > {} ; touch {} ; while [ ! -e {} ]; do sleep 0.05; done; echo \
+                 graceful > {} ; exit 0",
+                pid_file.display(),
+                ready_file.display(),
+                stop_flag.display(),
+                graceful_log.display()
+            ),
+        ];
+        let probe = SystemProcessProbe;
+
+        let handle = match start_daemon(&config, &probe).unwrap() {
+            DaemonLaunch::Background(handle) => handle,
+            other @ DaemonLaunch::Foreground { .. } => {
+                panic!("expected background handle, got {other:?}")
+            }
+        };
+
+        let outcome = stop_daemon(
+            &handle.identity_path,
+            &probe,
+            &StopOptions {
+                grace: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(50),
+                shutdown: Some(ShutdownCommand {
+                    executable: "touch".to_owned(),
+                    args: vec![stop_flag.to_string_lossy().into_owned()],
+                    env: Vec::new(),
+                    timeout: Duration::from_secs(5),
+                }),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, DaemonStopOutcome::Stopped { pid, port } if pid == handle.pid && port == handle.port),
+            "graceful stop outcome: {outcome:?}"
+        );
+        // The graceful marker proves the daemon exited through the shutdown
+        // command's trigger, not through a signal (a TERM'd `sh` dies inside
+        // the loop and never writes the marker).
+        assert_eq!(
+            std::fs::read_to_string(&graceful_log)
+                .unwrap_or_default()
+                .trim(),
+            "graceful",
+            "the daemon must exit via the graceful shutdown command"
+        );
+        assert!(!probe.is_alive(handle.pid));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// WRP-07 fallback: a shutdown command that does NOT stop the daemon is
+    /// not fatal — the TERM/KILL escalation still stops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_command_that_does_not_stop_falls_back_to_signals() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-graceful-fallback");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let config = default_start_config(&dir, &ready_file, &pid_file);
+        let probe = SystemProcessProbe;
+
+        let handle = match start_daemon(&config, &probe).unwrap() {
+            DaemonLaunch::Background(handle) => handle,
+            other @ DaemonLaunch::Foreground { .. } => {
+                panic!("expected background handle, got {other:?}")
+            }
+        };
+        let outcome = stop_daemon(
+            &handle.identity_path,
+            &probe,
+            &StopOptions {
+                grace: Duration::from_millis(500),
+                poll_interval: Duration::from_millis(20),
+                shutdown: Some(ShutdownCommand {
+                    // `true` runs, exits 0, stops nothing.
+                    executable: "true".to_owned(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    timeout: Duration::from_secs(2),
+                }),
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, DaemonStopOutcome::Stopped { .. }));
+        assert!(!probe.is_alive(handle.pid), "escalation must stop it");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// WRP-07 spec validation: an empty shutdown executable is refused
+    /// before anything is spawned.
+    #[test]
+    fn empty_shutdown_executable_is_refused_up_front() {
+        let config = DaemonStartConfig {
+            harness: crate::ids::HarnessId::new("daemon-test").unwrap(),
+            instance: crate::ids::InstanceName::new("t1").unwrap(),
+            executable: "sh".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            bind_addr: DEFAULT_BIND_ADDR,
+            port: None,
+            port_range: 49160..=49180,
+            port_env: None,
+            port_arg: None,
+            readiness: ReadinessSpec::Command {
+                executable: "true".to_owned(),
+                args: Vec::new(),
+                env: Vec::new(),
+                timeout: Duration::from_secs(1),
+                interval: Duration::from_millis(10),
+            },
+            identity_root: std::env::temp_dir().join("superai-test-daemon-never"),
+            foreground: false,
+            shutdown_command: Some(ShutdownCommand {
+                executable: String::new(),
+                args: Vec::new(),
+                env: Vec::new(),
+                timeout: Duration::from_secs(1),
+            }),
+        };
+        let err = start_daemon(&config, &SystemProcessProbe).unwrap_err();
+        match err {
+            CoreError::Validation { field, reason } => {
+                assert_eq!(field, "shutdown_command.executable");
+                assert!(reason.contains("argv token"), "{reason}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]

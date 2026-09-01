@@ -178,13 +178,19 @@ mod tests {
                 "swap should be detected as modified"
             );
 
-            // Attempt atomic write with original snapshot should abort
-            let res = crate::transaction::commit_file_expecting(
+            // Attempt atomic write with original snapshot should abort. With
+            // the dir declared as a follow root the write would follow the
+            // link (MUT-02) and the caller's token detects the swap; with NO
+            // roots declared the boundary refuses to follow the symlink at
+            // all — both paths abort, neither overwrites through the swapped
+            // link.
+            let res = crate::transaction::commit_file_expecting_with_roots(
                 "abuse-symlink-race",
                 &link,
                 br#"{"model":"new"}"#,
                 DocumentKind::StrictJson,
                 Some(&snap),
+                std::slice::from_ref(&dir),
             );
             assert!(
                 res.is_err(),
@@ -193,6 +199,17 @@ mod tests {
             match res.unwrap_err() {
                 crate::error::ConfigError::ConcurrentModification { .. } => {}
                 other => panic!("expected ConcurrentModification, got {other:?}: after swap"),
+            }
+            let rootless = crate::transaction::commit_file_expecting(
+                "abuse-symlink-race-rootless",
+                &link,
+                br#"{"model":"new"}"#,
+                DocumentKind::StrictJson,
+                Some(&snap),
+            );
+            match rootless {
+                Err(crate::error::ConfigError::SymlinkFollowRefused { .. }) => {}
+                other => panic!("expected SymlinkFollowRefused, got {other:?}: rootless"),
             }
 
             // Verify no sentinel leak in error (if sentinel had been involved, it would not appear)

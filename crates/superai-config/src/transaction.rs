@@ -907,6 +907,25 @@ pub fn commit_file_expecting(
     kind: DocumentKind,
     expected: Option<&Snapshot>,
 ) -> Result<FileCommitReport> {
+    commit_file_expecting_with_roots(id, target, content, kind, expected, &[])
+}
+
+/// [`commit_file_expecting`] with the MUT-02 adapter-allowed follow roots
+/// (see [`Transaction::with_symlink_follow_roots`]).
+///
+/// When `target` is an allowed symlink the write follows-and-preserves the
+/// link (the referent is mutated). A caller-supplied `expected` token in
+/// that case guards the LINK the caller actually read: any retarget or byte
+/// change observed through it aborts with `ConcurrentModification` before
+/// the referent is touched.
+pub fn commit_file_expecting_with_roots(
+    id: &str,
+    target: &Path,
+    content: &[u8],
+    kind: DocumentKind,
+    expected: Option<&Snapshot>,
+    follow_roots: &[PathBuf],
+) -> Result<FileCommitReport> {
     // Keep the directory-target contract of the former atomic_write path: a
     // typed refusal before any staging work.
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
@@ -939,16 +958,42 @@ pub fn commit_file_expecting(
             content: content.to_vec(),
             kind,
         }],
-    );
+    )
+    .with_symlink_follow_roots(follow_roots.to_vec());
     // prepare: path safety, hard-link warning, backup-before-foreign-write,
-    // staged parse-validation, §4.2 token.
+    // staged parse-validation, §4.2 token, MUT-02 follow-and-preserve
+    // retargeting onto allowed symlink referents.
     if let Err(e) = transaction.prepare() {
         cleanup_staged_temps(&transaction.staged_temps);
         return Err(e);
     }
     // The caller's older token (when supplied) guards its full read→commit
     // window instead of just prepare→commit.
-    if let Some(expected) = expected {
+    let effective_target = transaction.steps.first().map_or_else(
+        || target.to_path_buf(),
+        |step| step.primary_path().to_path_buf(),
+    );
+    if effective_target != target {
+        // MUT-02 follow-and-preserve: the caller read through the LINK, so
+        // its token is checked against the link's current state — a retarget
+        // or content change since the read aborts before the referent is
+        // mutated.
+        if let Some(expected) = expected
+            && is_modified(expected, &snapshot(target))
+        {
+            cleanup_staged_temps(&transaction.staged_temps);
+            return Err(ConfigError::concurrent_modification(
+                target,
+                expected
+                    .symlink_target
+                    .as_ref()
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .or_else(|| expected.digest.clone())
+                    .unwrap_or_else(|| "<absent>".to_owned()),
+                "<changed since read>".to_owned(),
+            ));
+        }
+    } else if let Some(expected) = expected {
         transaction
             .expected_states
             .insert(target.to_path_buf(), expected.clone());
@@ -1619,6 +1664,19 @@ pub struct Transaction {
     /// Optional failure injector threaded through the REAL staging, rename,
     /// backup, and rollback boundaries (QAL-06). `None` in production runs.
     injector: Option<Arc<dyn Injector>>,
+    /// Adapter-allowed roots for the MUT-02 default link policy: a `Write`
+    /// step whose target is currently a symlink may FOLLOW the link (the
+    /// link itself is preserved and the referent is mutated) only when the
+    /// referent resolves inside this set. A symlinked write target resolving
+    /// outside it is refused with the typed
+    /// [`ConfigError::SymlinkFollowRefused`] before any mutation. When the
+    /// set is non-empty it additionally constrains `Symlink` step targets.
+    symlink_follow_roots: Vec<PathBuf>,
+    /// Follow-and-preserve retargeting bookkeeping (link, referent) recorded
+    /// during [`Transaction::prepare`] — the link must still point at the
+    /// referent at commit time or the step aborts (MUT-02 changed-target
+    /// detection).
+    symlink_followed: Vec<(PathBuf, PathBuf)>,
     /// Journal directory enabling production crash journaling (MUT-09).
     /// `None` disables journaling entirely.
     journal_root: Option<PathBuf>,
@@ -1642,6 +1700,8 @@ impl Transaction {
             partial_rollback: None,
             expected_states: HashMap::new(),
             injector: None,
+            symlink_follow_roots: Vec::new(),
+            symlink_followed: Vec::new(),
             journal_root: None,
             journal_state: None,
             journal_completed: Vec::new(),
@@ -1669,6 +1729,87 @@ impl Transaction {
     pub fn with_journal(mut self, journal_root: PathBuf) -> Self {
         self.journal_root = Some(journal_root);
         self
+    }
+
+    /// Builder: declare the adapter-allowed root set for the MUT-02 default
+    /// link policy (see [`Self::symlink_follow_roots`]).
+    ///
+    /// Roots are canonicalized when they exist so a linked root directory
+    /// (e.g. `/tmp` on macOS) compares equal to the canonical referent.
+    #[must_use = "the policy is only enabled on the returned transaction"]
+    pub fn with_symlink_follow_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.symlink_follow_roots = roots
+            .into_iter()
+            .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+            .collect();
+        self
+    }
+
+    /// Whether `resolved` lies inside one of the declared follow roots
+    /// (equality counts; canonical comparison on both sides).
+    fn resolves_within_follow_roots(&self, resolved: &Path) -> bool {
+        let canonical = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+        self.symlink_follow_roots.iter().any(|root| {
+            canonical.starts_with(root)
+                || std::fs::canonicalize(root)
+                    .is_ok_and(|canon_root| canonical.starts_with(&canon_root))
+        })
+    }
+
+    /// Resolve the follow-and-preserve target for a mutation path (MUT-02
+    /// default link policy).
+    ///
+    /// - Not a symlink → `Ok(None)` (nothing to follow).
+    /// - Symlink resolving inside the allowed roots → `Ok(Some(referent))`:
+    ///   the caller preserves the link and mutates the referent.
+    /// - Symlink resolving outside the roots, or unresolvable (broken
+    ///   link / loop) → typed [`ConfigError::SymlinkFollowRefused`].
+    fn symlink_follow_target(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return Ok(None);
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(None);
+        }
+        let roots = self
+            .symlink_follow_roots
+            .iter()
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let roots = if roots.is_empty() {
+            "<none declared>".to_owned()
+        } else {
+            roots
+        };
+        let resolved = std::fs::canonicalize(path).map_err(|e| {
+            ConfigError::symlink_follow_refused(path, format!("<unresolvable: {e}>"), roots.clone())
+        })?;
+        if self.resolves_within_follow_roots(&resolved) {
+            Ok(Some(resolved))
+        } else {
+            Err(ConfigError::symlink_follow_refused(
+                path,
+                resolved.display().to_string(),
+                roots,
+            ))
+        }
+    }
+
+    /// Absolute best-effort resolution of a `Symlink` step target for the
+    /// declared-root containment check: relative targets resolve against the
+    /// link's parent; the result is canonicalized when it exists so linked
+    /// roots compare equal.
+    fn resolve_symlink_step_target(link: &Path, target: &Path) -> PathBuf {
+        let absolute = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            link.parent()
+                .map(|parent| parent.join(target))
+                .filter(|joined| joined.is_absolute())
+                .unwrap_or_else(|| target.to_path_buf())
+        };
+        std::fs::canonicalize(&absolute).unwrap_or(absolute)
     }
 
     /// Invoke the attached injector, if any. Zero cost when `None`.
@@ -1748,11 +1889,15 @@ impl Transaction {
     /// Validate the plan without touching disk beyond fresh snapshots.
     ///
     /// Checks path safety, symlink loops, duplicate path/case-fold
-    /// collisions, traversal, and — MUT-02 — that no two planned paths
-    /// resolve to the same inode on one device (a hard-link alias).
-    /// Committing both aliases would mutate the same bytes twice and atomic
-    /// replacement of either breaks link sharing, so the plan is rejected
-    /// with a typed [`ConfigError::HardlinkConflict`].
+    /// collisions, traversal, — MUT-02 — that no two planned paths
+    /// resolve to the same inode on one device (a hard-link alias), and the
+    /// default link policy: a `Write` step onto an existing symlink must
+    /// resolve within the adapter-allowed follow roots (typed
+    /// [`ConfigError::SymlinkFollowRefused`] otherwise), and a `Symlink`
+    /// step target must resolve within the roots whenever roots are
+    /// declared. Committing both aliases would mutate the same bytes twice
+    /// and atomic replacement of either breaks link sharing, so the plan is
+    /// rejected with a typed [`ConfigError::HardlinkConflict`].
     pub fn validate_plan(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_folded: HashSet<String> = HashSet::new();
@@ -1765,6 +1910,33 @@ impl Transaction {
                     path,
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "symlink loop detected"),
                 ));
+            }
+            // MUT-02 default link policy for mutation targets: a Write onto an
+            // existing symlink follows it only within the declared roots.
+            if matches!(step, FileAction::Write { .. }) {
+                self.symlink_follow_target(path)?;
+            }
+            // MUT-02 policy for link creation: when the caller declared an
+            // allowed root set, a planned link may not point outside it.
+            if let FileAction::Symlink { link, target, .. } = step
+                && !self.symlink_follow_roots.is_empty()
+            {
+                let resolved = Self::resolve_symlink_step_target(link, target);
+                if !self.resolves_within_follow_roots(&resolved) {
+                    return Err(ConfigError::symlink_follow_refused(
+                        link,
+                        format!(
+                            "{} (planned target {})",
+                            resolved.display(),
+                            target.display()
+                        ),
+                        self.symlink_follow_roots
+                            .iter()
+                            .map(|r| r.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ));
+                }
             }
             let key = path.to_string_lossy().into_owned();
             if !seen.insert(key.clone()) {
@@ -1818,9 +1990,17 @@ impl Transaction {
     /// are validated via parsers before any commit. The prepare-time snapshot
     /// of every step path is recorded as the §4.2 conflict token each commit
     /// step rechecks immediately before its mutation.
+    ///
+    /// MUT-02 follow-and-preserve: after validation, every `Write` step whose
+    /// target is an allowed symlink (resolved within
+    /// [`Transaction::with_symlink_follow_roots`]) is RETARGETED to the
+    /// referent — staging, backup, snapshot, commit, and journal then operate
+    /// on the file actually mutated while the link itself is preserved. The
+    /// originating link is re-verified at commit time.
     pub fn prepare(&mut self) -> Result<()> {
         self.validate_plan()?;
         self.sort_steps();
+        self.apply_symlink_follow_retargeting()?;
         self.write_journal(JournalPhase::Plan)?;
 
         let snapshots = self.snapshot_targets();
@@ -1992,6 +2172,56 @@ impl Transaction {
         stage_temp_file(target, content, self.injector.as_deref())
     }
 
+    /// Retarget `Write` steps sitting on allowed symlinks to their referents
+    /// (MUT-02 follow-and-preserve) and record the (link, referent) pairs the
+    /// commit phase re-verifies. Runs after [`Self::validate_plan`]; the
+    /// policy decision is re-derived here with errors propagated, never
+    /// swallowed.
+    fn apply_symlink_follow_retargeting(&mut self) -> Result<()> {
+        let mut retargets: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+        for (idx, step) in self.steps.iter().enumerate() {
+            let FileAction::Write { path, .. } = step else {
+                continue;
+            };
+            if let Some(referent) = self.symlink_follow_target(path)?
+                && referent.as_path() != path.as_path()
+            {
+                retargets.push((idx, path.clone(), referent));
+            }
+        }
+        for (idx, link, referent) in retargets {
+            if let Some(FileAction::Write { path, .. }) = self.steps.get_mut(idx) {
+                path.clone_from(&referent);
+                self.symlink_followed.push((link, referent));
+            }
+        }
+        Ok(())
+    }
+
+    /// MUT-02 changed-target detection: every link followed during prepare
+    /// must still point at the referent the plan mutated. A retarget between
+    /// prepare and commit is a concurrent modification — abort before the
+    /// rename lands on a file the caller no longer reaches through that link.
+    fn recheck_followed_symlinks(&self) -> Result<()> {
+        for (link, referent) in &self.symlink_followed {
+            let current = std::fs::canonicalize(link).map_err(|e| {
+                ConfigError::concurrent_modification(
+                    link,
+                    referent.display().to_string(),
+                    format!("<unresolvable: {e}>"),
+                )
+            })?;
+            if &current != referent {
+                return Err(ConfigError::concurrent_modification(
+                    link,
+                    referent.display().to_string(),
+                    current.display().to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Commit in dependency order.
     ///
     /// Assumes [`Self::prepare`] has been called. Every step rechecks the
@@ -2127,6 +2357,9 @@ impl Transaction {
     }
 
     fn commit_write(&self, target: &Path, staged: &Path) -> Result<()> {
+        // MUT-02: the followed links must still resolve to the referents the
+        // plan retargeted onto, immediately before any rename lands.
+        self.recheck_followed_symlinks()?;
         commit_staged_file(
             target,
             staged,
@@ -3495,6 +3728,197 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         let err = txn.commit().unwrap_err();
         assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    // ------------------------------------------------------------------
+    // MUT-02 default link policy: follow-and-preserve within roots
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_onto_symlink_refused_outside_follow_roots() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("allowed")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let referent = root.join("elsewhere").join("real.json");
+        std::fs::write(&referent, br#"{"foreign":true}"#).unwrap();
+        let link = root.join("allowed").join("cfg.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        // No roots declared: the default policy refuses to follow at all.
+        // `execute` records the prepare failure as an unsuccessful outcome
+        // (no commit was ever attempted).
+        let id = OperationId::new("op-follow-none").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: link.clone(),
+                content: br#"{"owned":true}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        );
+        let outcome = txn.execute().unwrap();
+        assert!(!outcome.success, "refused plan must not report success");
+        assert!(outcome.commit.is_none(), "commit must never be attempted");
+        assert!(
+            outcome
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("symlink follow refused")),
+            "diagnostics must name the refusal: {:?}",
+            outcome.diagnostics_redacted
+        );
+        // Nothing was mutated and the link structure survived.
+        assert_eq!(std::fs::read_link(&link).unwrap(), referent);
+        assert_eq!(std::fs::read(&referent).unwrap(), br#"{"foreign":true}"#);
+
+        // Roots declared but excluding the referent: still refused.
+        let id2 = OperationId::new("op-follow-outside").unwrap();
+        let mut txn2 = Transaction::new(
+            id2,
+            vec![FileAction::Write {
+                path: link.clone(),
+                content: br#"{"owned":true}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        )
+        .with_symlink_follow_roots(vec![root.join("allowed")]);
+        let outcome2 = txn2.execute().unwrap();
+        assert!(!outcome2.success);
+        assert!(outcome2.commit.is_none());
+        assert!(
+            outcome2
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("symlink follow refused")),
+            "diagnostics must name the refusal: {:?}",
+            outcome2.diagnostics_redacted
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), referent);
+        assert_eq!(std::fs::read(&referent).unwrap(), br#"{"foreign":true}"#);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_follows_and_preserves_symlink_within_declared_roots() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("allowed")).unwrap();
+        let referent = root.join("allowed").join("real.json");
+        std::fs::write(&referent, br#"{"foreign":true}"#).unwrap();
+        let link = root.join("cfg.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        let id = OperationId::new("op-follow-ok").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: link.clone(),
+                content: br#"{"owned":true}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        )
+        .with_symlink_follow_roots(vec![root.join("allowed")]);
+        let outcome = txn.execute().unwrap();
+        // The link itself is PRESERVED (follow, never replace).
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+            "the link must survive the mutation"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), referent);
+        // The REFERENT carries the new bytes.
+        assert_eq!(std::fs::read(&referent).unwrap(), br#"{"owned":true}"#);
+        // The foreign referent was backed up before the follow landed.
+        let backups = outcome
+            .commit
+            .map(|commit| commit.backups)
+            .unwrap_or_default();
+        assert!(
+            !backups.is_empty(),
+            "following a foreign referent must back it up first"
+        );
+        assert!(
+            backups
+                .iter()
+                .any(|b| b.original_path == referent.canonicalize().unwrap()),
+            "backup must be taken of the mutated referent"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn followed_symlink_retarget_between_prepare_and_commit_aborts() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("allowed")).unwrap();
+        let referent = root.join("allowed").join("real.json");
+        let other = root.join("allowed").join("other.json");
+        std::fs::write(&referent, br#"{"a":1}"#).unwrap();
+        std::fs::write(&other, br#"{"b":2}"#).unwrap();
+        let link = root.join("cfg.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        let id = OperationId::new("op-follow-retarget").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: link.clone(),
+                content: br#"{"owned":true}"#.to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        )
+        .with_symlink_follow_roots(vec![root.join("allowed")]);
+        txn.prepare().unwrap();
+        // The link is repointed between prepare and commit: the plan would now
+        // mutate a file the caller no longer reaches through that link.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        let err = txn.commit().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ConcurrentModification { .. }),
+            "expected ConcurrentModification, got {err:?}"
+        );
+        assert_eq!(std::fs::read(&referent).unwrap(), br#"{"a":1}"#);
+        assert_eq!(std::fs::read(&other).unwrap(), br#"{"b":2}"#);
+        assert_eq!(std::fs::read_link(&link).unwrap(), other);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_step_target_outside_declared_roots_is_refused() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("inside")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let id = OperationId::new("op-link-outside").unwrap();
+        let txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: root.join("inside").join("asset"),
+                target: root.join("outside").join("asset"),
+                expected_current: None,
+            }],
+        )
+        .with_symlink_follow_roots(vec![root.join("inside")]);
+        let err = txn.validate_plan().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SymlinkFollowRefused { .. }),
+            "expected SymlinkFollowRefused, got {err:?}"
+        );
+
+        // The same step inside the declared roots validates.
+        let id2 = OperationId::new("op-link-inside").unwrap();
+        let txn2 = Transaction::new(
+            id2,
+            vec![FileAction::Symlink {
+                link: root.join("inside").join("asset"),
+                target: root.join("inside").join("asset-src"),
+                expected_current: None,
+            }],
+        )
+        .with_symlink_follow_roots(vec![root.join("inside")]);
+        assert!(txn2.validate_plan().is_ok());
         drop(std::fs::remove_dir_all(&root));
     }
 

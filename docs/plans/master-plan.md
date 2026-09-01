@@ -1,6 +1,6 @@
 # superai non-UI master implementation plan
 
-Status: implementation complete — completion run 3 (areas 1–9) through commit ee22afa; 81/83 subplan exit-gate items closed with 2 documented open items (plans 02, 13), §10 DoD 16/16 evidenced by the tested coverage ledger (crates/superai-core/src/coverage_ledger.rs); final full-corpus re-verification pending  
+Status: implementation complete — completion run 3 (areas 1–9) through commit c164204, then the final-gate-fix round closing the five verifier-flagged narrow gaps (MUT-02 symlink follow-and-preserve policy, QAL-04 adapter-detection fuzz family, INS-02 asset-inheritance request field, DRF-04 orchestrator detector, WRP-07 foreground/shutdown-command spec) plus the rename/drift consistency bug; 83/83 subplan exit-gate items closed with residuals disclosed in each plan's completion record, §10 DoD 16/16 evidenced by the tested coverage ledger (crates/superai-core/src/coverage_ledger.rs); the six-group final re-verification is the remaining release gate  
 Source baseline: repository at 2026-08-26  
 Scope authority: [goal.md](../goal.md), [harness configuration index](../harness-configs/README.md), [AGENTS.MD](../../AGENTS.MD)
 
@@ -141,10 +141,12 @@ Estimate uses reviewable change sets, not calendar promises.
 | 12 | [Raw editor backend](12-raw-editor-backend.md) | Read/validate/diff/commit API for future editors | 01–03 | 4–6 | 6/6 |
 | 13 | [Verification and release](13-verification-and-release.md) | Fixtures, fault tests, platform gates, non-UI release criteria | all | 10–16 | 6/7 |
 
-Exit-gate column = subplan exit-gate checkboxes closed as of run 3 (commit ee22afa); each
-plan's Exit gate section carries the evidence citations and the open-item notes (open:
-plan 02 single-transaction-boundary fold; plan 13 macOS/Windows-adversarial platform
-cases). Subplan task boxes are completion records per §12.
+Exit-gate column = subplan exit-gate checkboxes closed as of run 3 (commit c164204) plus the
+final-gate-fix round; each plan's Exit gate section carries the evidence citations and the
+residual notes (plan 02's single-transaction-boundary fold and plan 13's macOS/Windows
+adversarial platform cases were closed by c164204; remaining residuals are disclosed inline
+per plan, e.g. plan 10's unimplemented EXT-10 diagnostic-validation sub-step). Subplan task
+boxes are completion records per §12.
 
 Expected total: roughly 144–208 reviewable change sets, dominated by one adapter/fixture set per
 documented harness surface. Parallel work becomes safe only after subplans 00–03 freeze contracts.
@@ -298,11 +300,12 @@ Exit:
 - Non-UI definition of done in section 10 passes.
 - Remaining limitations are adapter support states with evidence, not hidden TODOs.
 
-> Run-3 status: ACHIEVED with one open item — §10 DoD 16/16 evidenced by the tested
+> Run-3 status: ACHIEVED — §10 DoD 16/16 evidenced by the tested
 > coverage ledger; ledgers/freshness machine-verified, mutation baseline recorded (610
 > mutants, 50.2% caught, CI job continue-on-error), windows CI backlog closed, user docs
-> completed (area 8). Open: macOS application-path and Windows adversarial long-path/
-> locked-file platform cases (plan 13 note); mutation-score uplift and coverage-guided
+> completed (area 8). The formerly open macOS application-path and Windows adversarial
+> long-path/locked-file platform cases were closed by area 9b (cfg-gated tests executed by
+> the platform CI runners); mutation-score uplift and coverage-guided
 > fuzz budget are recorded follow-ups.
 
 ## 7. Dependency flow
@@ -414,10 +417,10 @@ All items must be true:
 
 > Run-3 completion record: all 16 items are machine-verified by the §9/§10 coverage ledger
 > (crates/superai-core/src/coverage_ledger.rs — every checkbox maps to named passing tests
-> or committed artifacts; `cargo test -p superai-core coverage_ledger` green at ee22afa).
+> or committed artifacts; `cargo test -p superai-core coverage_ledger` green at c164204).
 > Item 16's platform slice: linux/macos/windows/supply-chain CI jobs carry the matrix; the
-> windows job is the execution-of-record for cfg(windows) semantics (see plan 13's open
-> item for the two uncovered platform-state families).
+> windows job is the execution-of-record for cfg(windows) semantics; the macOS/Windows
+> adversarial platform-state families were closed by area 9b (commit c164204).
 
 ## 11. Planning decisions that require evidence during implementation
 

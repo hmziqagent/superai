@@ -24,8 +24,8 @@ single-instance instead.
 
 superai never edits a harness config in place. Every write goes through:
 fresh read → backup → atomic replace → read-back verify. If anything goes
-wrong mid-operation, the transaction layer rolls back and the crash journal
-makes the next startup offer recovery.
+wrong mid-operation, the transaction layer rolls back, and for the journaled
+multi-file arms the crash journal makes the next startup offer recovery.
 
 Data locations (all under your home directory, nothing in the cloud):
 
@@ -33,7 +33,7 @@ Data locations (all under your home directory, nothing in the cloud):
 |---|---|
 | `~/.superai/instances.json` | superai's own instance records — which instances exist, where their config dirs are, which template each came from |
 | `~/.superai/quarantine/` | recoverable deletions: removed instance roots are moved here (digest-verified) before any final delete, and can be restored |
-| `~/.superai/journal/` | per-operation crash journal, written before each multi-file mutation and removed after verified success; leftover journals are detected at startup and recovered from |
+| `~/.superai/journal/` | per-operation crash journal for the journaled multi-file arms (fixed-path profile activation, instance reconfigure, provider changes); written before the mutation and removed after verified success; skills/MCP/plugin/template-update transactions commit through the same atomic write boundary with side-by-side backups but are not journal-recovered yet. Leftover journals are detected at startup and recovered from |
 | `~/.superai/install_receipts/` | receipts for harness binaries superai installed |
 | `~/.superai/templates/`, `~/.superai/assets/`, `~/.superai/backups/` | fetched template files, shared assets, and superai-managed backup artifacts; uninstall never touches these without explicit intent |
 | `<config>.bak.<millis>.<rand>` | side-by-side backups of every foreign config file before each write; listing and verified restore work from them |

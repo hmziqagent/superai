@@ -314,17 +314,25 @@ Fuzz/mutation commands use pinned documented tool versions in CI once added.
 - [x] Non-UI release claims match observable behavior.
 
 > Completion record (run 3): QAL-03/07/08/10/11/12 verified at baseline; QAL-01
-> (SUPERAI_TEST_KEEP retain-on-failure), QAL-02 (48/48 fixture corpora + layout.default/
-> isolated fixture kind), QAL-04 (executor + span-codec fuzz targets over the new engine
-> surfaces; coverage-guided cargo-fuzz stays a documented local recipe per the pinned
-> stable-toolchain/dependency rules in fuzz.rs), QAL-05 (cargo-mutants 27.1.0 installed
-> and run: 610-mutant scoped baseline at 50.2% caught, .cargo/mutants.toml + CI
-> continue-on-error job with artifact; diff-scoped/sharded runs are recorded follow-up),
-> QAL-06 (real-path fault injection — area 2), QAL-13/14 (coverage_ledger.rs: §9/§10
-> machine-verified ledgers + research-file coverage + freshness window), QAL-15 (README
-> backup/recovery, data locations, security posture, template-repo sections) closed by
-> area 8, judge-verified round 2. docs/dependency-review.md carries the per-crate
-> dependency evidence (QAL-12). QAL-09's platform-state families (macOS
-> application paths, macOS case-insensitive collisions, Windows locked-file,
-> reserved-device-name, and long-path adversarial cases) were closed by area 9b
-> with cfg-gated tests executed by the platform CI runners.
+> (SUPERAI_TEST_KEEP retain-on-failure), QAL-02 (48/48 fixture corpora; the
+> layout.default/isolated fixture kind covers the 3 flagship relocated-root
+> surfaces — claude_code, codex_cli, gemini_cli — machine-checked against the
+> adapters' own constants; 16 RelocatedRoot surfaces exist in the catalog, the
+> other 13 carry the standard minimal/populated/foreign/malformed kinds),
+> QAL-04 (executor + span-codec fuzz targets over the new engine surfaces plus
+> the adapter version/schema detection family — version-output fixtures,
+> PATH-shaped strings, and catalog entries driven through the real detect path
+> with injected PATH/home, which found and fixed a byte-vs-char bound bug in
+> version extraction; coverage-guided cargo-fuzz stays a documented local
+> recipe per the pinned stable-toolchain/dependency rules in fuzz.rs), QAL-05
+> (cargo-mutants 27.1.0 installed and run: 610-mutant scoped baseline at 50.2%
+> caught, .cargo/mutants.toml + CI continue-on-error job with artifact;
+> diff-scoped/sharded runs are recorded follow-up), QAL-06 (real-path fault
+> injection — area 2), QAL-13/14 (coverage_ledger.rs: §9/§10 machine-verified
+> ledgers + research-file coverage + freshness window), QAL-15 (README
+> backup/recovery, data locations, security posture, template-repo sections)
+> closed by area 8, judge-verified round 2. docs/dependency-review.md carries
+> the per-crate dependency evidence (QAL-12). QAL-09's platform-state families
+> (macOS application paths, macOS case-insensitive collisions, Windows
+> locked-file, reserved-device-name, and long-path adversarial cases) were
+> closed by area 9b with cfg-gated tests executed by the platform CI runners.

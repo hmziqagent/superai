@@ -169,4 +169,16 @@ No UI formatting. Stable data supports future GPUI/TUI/CLI.
 > OrphanWrapperChoice + quarantine_unmanaged_root; 15-category drift report with risk and
 > next-operations — `drift_report_groups_by_harness_with_risk_and_next_ops`). DRF-06 adoption
 > was already implemented at baseline (12 tests).
+>
+> Final-gate-fix round: DRF-04's orchestrator-managed detector landed
+> (`detect_orchestrator_manager`: the documented Vibe Kanban
+> `.vibe-kanban-workspaces/`, Conductor `~/conductor/workspaces/` (+ a bounded
+> `~/.conductor/settings.toml` reference check), and Sculptor
+> `~/.sculptor/workspaces/` markers classify the candidate ForeignManaged with the
+> orchestrator named and block adoption — test
+> `orchestrator_workspaces_are_foreign_managed_and_block_adoption`), and the drift
+> classifier's lenient digest-substring fallback was removed: wrapper health now requires
+> parseable-marker + digest equality (`is_owned_wrapper`), the same strict standard the
+> repair path compares against, so an edited wrapper that merely still contains the digest
+> string reports WrapperChanged instead of healthy.
 

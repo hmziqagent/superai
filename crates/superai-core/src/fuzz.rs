@@ -776,4 +776,241 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
+
+    // ------------------------------------------------------------------
+    // QAL-04: adapter version/schema detection fuzz family — detect.rs
+    // inputs (version-output fixtures, PATH-shaped strings, catalog
+    // entries) driven through the real detection path with injected
+    // PATH/home (no ambient environment, no live package-manager probes).
+    // ------------------------------------------------------------------
+
+    const DETECT_SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+    /// Heredoc delimiter for fake `--version` executables; never appears in
+    /// generated fixtures (occurrences are stripped).
+    const HEREDOC_EOF: &str = "SUPERAI_FUZZ_EOF_7f3a";
+
+    fn gen_version_output(prng: &mut Prng, iter: u64) -> String {
+        let base = match iter % 8 {
+            0 => format!(
+                "claude-code {}.{}.{} (build abc{})",
+                iter % 9,
+                iter,
+                iter % 7,
+                iter
+            ),
+            1 => format!("\x1b[1mclaude\x1b[0m {}.{}.{}", iter % 5, iter % 3, iter),
+            2 => format!("v{}.{}.{}", iter % 11, iter % 4, iter % 13),
+            3 => format!(
+                "aider {}\nchat transcripts: ~/.aider\npython: 3.{}",
+                iter,
+                iter % 12
+            ),
+            4 => String::new(),
+            5 => "   \t\n  ".to_owned(),
+            6 => {
+                // Huge output: many tokens then a semver at the end.
+                let mut s = String::new();
+                for i in 0..2000 {
+                    s.push_str(&format!("token{i} "));
+                }
+                s.push_str(&format!("{}.9.9\n", iter % 6));
+                s
+            }
+            _ => format!(
+                "版本 {}.{}-βeta (build {})",
+                iter % 3,
+                iter,
+                DETECT_SENTINEL
+            ),
+        };
+        let mut variants: Vec<String> = vec![base.clone()];
+        let truncated = gen_truncated(prng, base.as_bytes());
+        variants.push(String::from_utf8_lossy(&truncated).into_owned());
+        let with_sentinel = format!("{base} {DETECT_SENTINEL}");
+        variants.push(with_sentinel);
+        let malformed = gen_random_malformed(prng, 512);
+        variants.push(String::from_utf8_lossy(&malformed).into_owned());
+        variants
+            .get(prng.gen_range(0, variants.len()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn write_fake_version_exe(dir: &Path, name: &str, fixture: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let safe_fixture = fixture.replace(HEREDOC_EOF, "");
+        let script = format!("#!/bin/sh\ncat <<'{HEREDOC_EOF}'\n{safe_fixture}\n{HEREDOC_EOF}\n");
+        std::fs::write(&path, script).expect("write fake exe");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat fake exe")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake exe");
+    }
+
+    /// Build a PATH-shaped string over the given directories plus junk
+    /// segments (empty, dot, nonexistent), then split it the same way the
+    /// production ambient splitter does.
+    #[cfg(unix)]
+    fn gen_path_shaped(prng: &mut Prng, dirs: &[PathBuf]) -> Vec<PathBuf> {
+        let mut parts: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            parts.push(dir.clone());
+            if prng.gen_range(0, 3) == 0 {
+                parts.push(PathBuf::from("")); // empty PATH segment
+            }
+            if prng.gen_range(0, 4) == 0 {
+                parts.push(PathBuf::from("."));
+            }
+            if prng.gen_range(0, 4) == 0 {
+                parts.push(PathBuf::from(format!(
+                    "/nonexistent-fuzz-{}",
+                    prng.next_u64() % 1000
+                )));
+            }
+        }
+        let joined = std::env::join_paths(parts).expect("join path parts");
+        std::env::split_paths(&joined)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn fuzz_adapter_detection_version_outputs_no_panic_bounded_100() {
+        for iter in 0u64..100u64 {
+            let mut prng = Prng::new(iter + 0x7777);
+            let fixture = gen_version_output(&mut prng, iter);
+            assert!(fixture.len() <= MAX_INPUT_BYTES);
+
+            let parsed = std::panic::catch_unwind(|| crate::process::extract_version(&fixture));
+            assert!(parsed.is_ok(), "extract_version panicked at {iter}");
+            if let Some(version) = parsed.expect("catch ok") {
+                assert!(
+                    version.len() <= 64,
+                    "extracted version unbounded at {iter}: len {} fixture {:?}",
+                    version.len(),
+                    fixture
+                );
+                // Deterministic: re-parse yields the same token.
+                assert_eq!(
+                    crate::process::extract_version(&fixture),
+                    Some(version.clone()),
+                    "extract_version not deterministic at {iter}"
+                );
+                // No-leak: a sentinel the input never carried is never
+                // invented by the parser.
+                if !fixture.contains(DETECT_SENTINEL) {
+                    assert!(
+                        !version.contains(DETECT_SENTINEL),
+                        "version leaked sentinel at {iter}: {version}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fuzz_adapter_detection_catalog_entries_no_panic_no_leak_100() {
+        use crate::detect::{DetectOptions, detect_all_for_entry};
+        use crate::install_catalog::InstallCatalog;
+
+        let catalog = InstallCatalog::embedded().expect("embedded catalog");
+        let entries = catalog.entries;
+        assert!(!entries.is_empty(), "embedded catalog must be populated");
+
+        for iter in 0u64..100u64 {
+            let mut prng = Prng::new(iter + 0x8888);
+            let fixture = gen_version_output(&mut prng, iter);
+            let Some(entry) = entries
+                .get(prng.gen_range(0, entries.len()))
+                .or_else(|| entries.first())
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(exe_name) = entry.executables.first().cloned() else {
+                continue;
+            };
+
+            let dir = temp_dir_unique("fuzz-detect");
+            let bin = dir.join("bin");
+            let home = dir.join("home");
+            std::fs::create_dir_all(&bin).expect("mkdir bin");
+            std::fs::create_dir_all(&home).expect("mkdir home");
+            write_fake_version_exe(&bin, &exe_name, &fixture);
+            // Sometimes a mise-shaped shim under the injected home: a
+            // non-executable text file (the broken-shim arm).
+            if iter % 3 == 0 {
+                let shims = home.join(".local/share/mise/shims");
+                std::fs::create_dir_all(&shims).expect("mkdir shims");
+                std::fs::write(shims.join(&exe_name), format!("mise x -- {exe_name}\n"))
+                    .expect("write shim");
+            }
+            let before = snapshot_dir(&dir);
+
+            let path_dirs = gen_path_shaped(&mut prng, &[bin.clone()]);
+            // Hermetic: only injected PATH/home are consulted; every
+            // live package-manager probe is disabled (the group-F
+            // no-live-network discipline).
+            let opts = DetectOptions {
+                path_dirs: Some(path_dirs.clone()),
+                home_dir: Some(home.clone()),
+                configured_binary: None,
+                probe_mise: true,
+                probe_brew: false,
+                probe_npm: false,
+                probe_cargo: false,
+                probe_pipx: false,
+                probe_uv: false,
+                probe_system: false,
+                probe_apps: false,
+                probe_timeout: std::time::Duration::from_secs(2),
+            };
+
+            let result = std::panic::catch_unwind(|| detect_all_for_entry(&entry, &opts));
+            assert!(result.is_ok(), "detect_all_for_entry panicked at {iter}");
+            let detections = result.expect("catch ok");
+            // Bounded hit count: at most one per PATH dir per executable,
+            // plus the configured/mise arms.
+            let bound = path_dirs.len().saturating_mul(entry.executables.len()) + 2;
+            assert!(
+                detections.len() <= bound,
+                "detection count unbounded at {iter}: {} > {bound}",
+                detections.len()
+            );
+            let clean_input = !fixture.contains(DETECT_SENTINEL);
+            for detection in &detections {
+                if let Some(version) = &detection.version {
+                    assert!(
+                        version.len() <= 64,
+                        "detected version unbounded at {iter}: {version}"
+                    );
+                    if clean_input {
+                        assert!(
+                            !version.contains(DETECT_SENTINEL),
+                            "detection leaked sentinel at {iter}: {version}"
+                        );
+                    }
+                }
+                let repr = format!("{detection:?}");
+                assert!(
+                    repr.len() <= MAX_OUTPUT_BYTES,
+                    "detection debug repr unbounded at {iter}"
+                );
+                if clean_input {
+                    assert!(
+                        !repr.contains(DETECT_SENTINEL),
+                        "detection repr leaked sentinel at {iter}"
+                    );
+                }
+            }
+            // Detection is read-only: the temp tree is byte-identical.
+            let after = snapshot_dir(&dir);
+            assert_dir_unchanged(&before, &after, &format!("fuzz-detect {iter}"));
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
 }

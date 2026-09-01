@@ -168,3 +168,14 @@ Remove:
 > discipline as capability declarations. Windows graceful-stop stage punted to area 8's
 > taskkill /F both-stages decision; non-Linux stop verification conservatively refuses
 > without platform evidence (plan-mandated).
+>
+> Final-gate-fix round: WRP-07's remaining spec elements landed —
+> `DaemonStartConfig.foreground` (foreground launch: inherited stdio, start blocks until
+> the daemon exits and cleans the identity; `DaemonLaunch::Foreground` carries the exit
+> status — `foreground_launch_runs_to_exit_and_cleans_identity`) and
+> `ShutdownCommand`/`StopOptions.shutdown` (graceful shutdown command run INSTEAD of
+> signaling first, with the TERM/KILL escalation kept as fallback and an empty executable
+> refused up front — `stop_uses_declared_shutdown_command_before_any_signal` proves the
+> daemon exits through the command's own trigger via a graceful-exit marker a signal
+> could never produce, `shutdown_command_that_does_not_stop_falls_back_to_signals`,
+> `empty_shutdown_executable_is_refused_up_front`).
