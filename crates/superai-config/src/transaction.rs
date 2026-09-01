@@ -214,6 +214,16 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
             ),
         ));
     }
+    reject_broad_or_home_roots(path, s)?;
+    reject_kind_specific_target(path, kind, s)?;
+    Ok(())
+}
+
+/// Reject broad roots and the home directory for any removal target:
+/// unix broad roots, Windows-shaped broad roots (drive roots, UNC roots,
+/// first-level system directories — case-insensitive, both separators), and
+/// the home directory compared with platform-correct case rules.
+fn reject_broad_or_home_roots(path: &Path, s: &str) -> Result<()> {
     if s == "/" || s == "/home" || s == "/tmp" || s == "/usr" || s == "/etc" {
         return Err(ConfigError::io(
             path,
@@ -223,8 +233,17 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
             ),
         ));
     }
+    if windows_shaped_broad_root(path) {
+        return Err(ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to remove broad windows root",
+            ),
+        ));
+    }
     if let Some(home) = home_dir()
-        && path == home
+        && paths_equal_platform_folded(path, &home)
     {
         return Err(ConfigError::io(
             path,
@@ -234,28 +253,30 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
             ),
         ));
     }
-    #[expect(
-        clippy::match_same_arms,
-        reason = "different kinds have different future handling"
-    )]
-    match kind {
-        RemoveKind::RegistryOnly => {
-            // No filesystem path should be removed; target is informational.
-            // Allow any absolute path but do not require quarantine.
+    Ok(())
+}
+
+/// Per-[`RemoveKind`] additional refusals.
+fn reject_kind_specific_target(path: &Path, kind: RemoveKind, s: &str) -> Result<()> {
+    if matches!(kind, RemoveKind::Binary) {
+        // Binary removal must not target a directory that looks like a config root.
+        // Windows-shaped paths honor both separators and case-folding
+        // (`C:\Users\me\.CLAUDE`); unix paths keep exact matching.
+        let ends_config_root = if looks_windows_shaped(s) {
+            let folded = normalize_windows_style(s);
+            folded.ends_with("/.claude") || folded.ends_with("/.superai")
+        } else {
+            s.ends_with("/.claude") || s.ends_with("/.superai")
+        };
+        if ends_config_root {
+            return Err(ConfigError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "binary removal must not target config root",
+                ),
+            ));
         }
-        RemoveKind::Binary => {
-            // Binary removal must not target a directory that looks like a config root.
-            if s.ends_with("/.claude") || s.ends_with("/.superai") {
-                return Err(ConfigError::io(
-                    path,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "binary removal must not target config root",
-                    ),
-                ));
-            }
-        }
-        RemoveKind::InstanceRoot | RemoveKind::WrapperFile | RemoveKind::ConfigEntry => {}
     }
     Ok(())
 }
@@ -274,6 +295,94 @@ fn home_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether `s` is shaped like a Windows path (drive-letter prefix or UNC
+/// `\\server` root), independent of the host platform.
+fn looks_windows_shaped(s: &str) -> bool {
+    s.starts_with("\\\\")
+        || s.starts_with("//")
+        || (s.chars().nth(1) == Some(':')
+            && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+}
+
+/// Normalize a path string for Windows-style comparison: backslashes to
+/// forward slashes and ASCII lowercasing (Windows matches paths
+/// case-insensitively).
+fn normalize_windows_style(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Whether `path` is a Windows-shaped broad root that must never be removed
+/// or quarantined: drive roots (`C:\`), UNC roots (`\\server`, `\\server\share`),
+/// and the first-level system directories (`C:\Windows`, `C:\Program Files`,
+/// `C:\Program Files (x86)`, `C:\ProgramData`, `C:\Users`,
+/// `C:\Documents and Settings`).
+///
+/// Matching is anchored, ASCII-case-folded, and treats `/` and `\` as
+/// equivalent — Windows path semantics. Unix-shaped paths never match, so
+/// the helper is inert on unix regardless of the literal path text.
+pub(crate) fn windows_shaped_broad_root(path: &Path) -> bool {
+    let normalized = normalize_windows_style(&path.to_string_lossy());
+    let trimmed = normalized.trim_end_matches('/');
+
+    let has_drive_prefix = trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && trimmed.chars().nth(1) == Some(':');
+    if has_drive_prefix {
+        // Drive-shaped path. Anything after the prefix must not exist
+        // (drive root) or be exactly one first-level system directory.
+        let Some(rest) = trimmed.get(2..) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return true; // `c:` / `c:/`
+        }
+        let first_level = rest.trim_start_matches('/');
+        let mut parts = first_level.split('/');
+        let Some(head) = parts.next() else {
+            return true; // `c://`
+        };
+        if parts.next().is_some() {
+            return false; // deeper than first level: a specific target
+        }
+        return matches!(
+            head,
+            "windows"
+                | "program files"
+                | "program files (x86)"
+                | "programdata"
+                | "users"
+                | "documents and settings"
+        );
+    }
+
+    // UNC root: `\\server` or `\\server\share` — the share itself is broad
+    // (2 or 3 separators after normalization); anything deeper is a specific
+    // target. Only windows-shaped text matches: a verbatim `\\` prefix on
+    // any host, or `//` on Windows (where it is also a UNC root). A unix
+    // `//`-prefixed path is NOT treated as UNC — unix behavior is unchanged.
+    let raw = path.to_string_lossy();
+    let unc_shaped = raw.starts_with("\\\\") || (cfg!(windows) && raw.starts_with("//"));
+    unc_shaped && trimmed.matches('/').count() <= 3
+}
+
+/// Path equality with platform-correct case rules: byte equality first;
+/// when either side is windows-shaped, compare normalized and
+/// ASCII-case-folded (Windows filesystems match case-insensitively).
+pub(crate) fn paths_equal_platform_folded(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_s = a.to_string_lossy();
+    let b_s = b.to_string_lossy();
+    if looks_windows_shaped(&a_s) || looks_windows_shaped(&b_s) {
+        normalize_windows_style(&a_s) == normalize_windows_style(&b_s)
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,8 +581,15 @@ fn sync_parent(path: &Path) -> Result<()> {
         Ok(f) => match f.sync_all() {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+            // Windows FlushFileBuffers on a directory handle is denied on
+            // several filesystems; the committed file was already synced.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
             Err(e) => Err(ConfigError::io(parent, e)),
         },
+        // Windows cannot open a directory handle without backup semantics
+        // (winerror 5). Parent sync is best-effort durability, not a
+        // correctness requirement — the rename already landed.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(parent, e)),
     }
@@ -2365,6 +2481,84 @@ mod tests {
 
         let ok2 = RemovePlan::new(RemoveKind::InstanceRoot, Path::new("/tmp/instance-root"));
         assert!(ok2.unwrap().requires_quarantine);
+    }
+
+    /// QAL-09/11 platform case: windows-shaped broad roots are recognized on
+    /// every host (pure string semantics — drive roots, UNC roots, first-level
+    /// system directories, case-folded, both separators).
+    #[test]
+    fn windows_shaped_broad_roots_are_detected_cross_platform() {
+        let broad = [
+            "C:\\",
+            "C:/",
+            "c:",
+            "C:\\Windows",
+            "c:\\windows",
+            "C:/Program Files",
+            "C:\\Program Files (x86)",
+            "c:\\programdata\\",
+            "C:\\Users",
+            "C:\\Documents and Settings",
+            "\\\\fileserver",
+            "\\\\fileserver\\share",
+        ];
+        for p in broad {
+            assert!(
+                windows_shaped_broad_root(Path::new(p)),
+                "windows-shaped broad root must be detected: {p}"
+            );
+        }
+        // Forward-slash UNC text is only a UNC root on Windows itself; on
+        // unix `//x` is an ordinary (if unusual) absolute path and must not
+        // be flagged — unix removal/quarantine semantics are unchanged.
+        if cfg!(windows) {
+            assert!(windows_shaped_broad_root(Path::new("//server/share/")));
+        } else {
+            assert!(!windows_shaped_broad_root(Path::new("//server/share/")));
+        }
+        let specific = [
+            "C:\\Users\\me\\.claude",
+            "C:\\Windows\\Temp\\target.json",
+            "C:/Program Files/Tool/config.toml",
+            "\\\\server\\share\\dir\\file.json",
+            "/tmp",
+            "/home",
+            "/",
+            "relative/path",
+            // A drive prefix needs BOTH an alphabetic first char and ':' as
+            // the second: `1:` is not windows-shaped (kills the `&&`->`||`
+            // mutant in the drive-prefix check, which would flag it broad).
+            "1:",
+        ];
+        for p in specific {
+            assert!(
+                !windows_shaped_broad_root(Path::new(p)),
+                "specific (or unix) target must not be flagged broad: {p}"
+            );
+        }
+    }
+
+    /// Windows case-folding in path identity: home and quarantine comparisons
+    /// must match case-insensitively for windows-shaped paths.
+    #[test]
+    fn paths_equal_platform_folded_matches_windows_case() {
+        assert!(paths_equal_platform_folded(
+            Path::new("C:\\Users\\Me"),
+            Path::new("c:/users/me")
+        ));
+        assert!(paths_equal_platform_folded(
+            Path::new("/tmp/a"),
+            Path::new("/tmp/a")
+        ));
+        // Unix paths stay case-sensitive: differing case is NOT equal.
+        assert!(!paths_equal_platform_folded(
+            Path::new("/tmp/A"),
+            Path::new("/tmp/a")
+        ));
+        assert!(!paths_equal_platform_folded(
+            Path::new("C:\\Windows"),
+            Path::new("C:\\Windows\\Temp")
+        ));
     }
 
     #[test]

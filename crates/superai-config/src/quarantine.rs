@@ -44,6 +44,10 @@ fn is_broad_root(path: &Path) -> bool {
     matches!(raw, "/" | "/home" | "/tmp" | "/usr" | "/etc" | "/var")
         || raw == "/home/"
         || raw == "/tmp/"
+        // Windows-shaped broad roots (drive roots, UNC roots, first-level
+        // system directories), case-folded with both separators — inert on
+        // unix, where no absolute path is windows-shaped.
+        || crate::transaction::windows_shaped_broad_root(path)
 }
 
 /// Check for unresolved variable patterns.
@@ -213,7 +217,7 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
         ));
     }
     if let Some(home) = home_dir() {
-        if path == home {
+        if crate::transaction::paths_equal_platform_folded(path, &home) {
             return Err(ConfigError::io(
                 path,
                 std::io::Error::new(
@@ -224,7 +228,7 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
         }
         // Also reject the quarantine base itself or its parent.
         let base = home.join(".superai").join("quarantine");
-        if path == base {
+        if crate::transaction::paths_equal_platform_folded(path, &base) {
             return Err(ConfigError::io(
                 path,
                 std::io::Error::new(

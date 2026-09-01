@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,7 +45,7 @@ fn get_owner_ids(_meta: &std::fs::Metadata) -> Option<(u32, u32)> {
 fn get_ctime(meta: &std::fs::Metadata) -> Option<SystemTime> {
     use std::os::unix::fs::MetadataExt;
     let secs = u64::try_from(meta.ctime().max(0)).unwrap_or(0);
-    Some(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
 }
 
 #[cfg(not(unix))]
@@ -299,7 +299,7 @@ mod tests {
 
     fn unique_scratch(prefix: &str) -> PathBuf {
         let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         scratch(&format!("{prefix}-{now}-{}", std::process::id()))
     }

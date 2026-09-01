@@ -40,6 +40,10 @@ fn set_permissions_u32(path: &Path, mode: u32) -> Result<()> {
     std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
 }
 
+/// Windows: mode bits carry no meaning beyond the readonly attribute, which
+/// `fs::copy` already propagates from the source onto the backup. Recording a
+/// POSIX-shaped mode here would be dishonest, so backups record `None` off
+/// unix and the readonly truth lives on the file itself.
 #[cfg(not(unix))]
 #[expect(
     clippy::unnecessary_wraps,
@@ -47,6 +51,54 @@ fn set_permissions_u32(path: &Path, mode: u32) -> Result<()> {
 )]
 fn set_permissions_u32(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+/// Flush + sync the freshly copied backup file (MUT-03 durability step).
+///
+/// Platform truth: on Windows `sync_all` is `FlushFileBuffers`, which
+/// requires write access on the handle — a read-only open fails with winerror
+/// 5 for EVERY backup. A backup of a readonly source additionally carries the
+/// readonly attribute (propagated by `fs::copy`), so the attribute is cleared
+/// for the sync and reinstated afterwards. On unix, a read-only mode backup
+/// cannot be opened for write at all, but `fsync` works through a read-only
+/// descriptor, so that fallback is used.
+fn flush_backup_file(target: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let was_readonly = std::fs::metadata(target).is_ok_and(|m| m.permissions().readonly());
+        if was_readonly {
+            crate::atomic::windows_clear_readonly(target);
+        }
+        let sync_result = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target)
+            .and_then(|f| f.sync_all());
+        let outcome = sync_result.map_err(|e| ConfigError::io(target, e));
+        if was_readonly && let Ok(meta) = std::fs::metadata(target) {
+            let mut perm = meta.permissions();
+            perm.set_readonly(true);
+            drop(std::fs::set_permissions(target, perm));
+        }
+        outcome
+    }
+    #[cfg(not(windows))]
+    {
+        let write_sync = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target)
+            .and_then(|f| f.sync_all());
+        if write_sync.is_ok() {
+            return Ok(());
+        }
+        // Read-only mode backup: open read-only and fsync through it.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(target)
+            .map_err(|e| ConfigError::io(target, e))?;
+        f.sync_all().map_err(|e| ConfigError::io(target, e))
+    }
 }
 
 fn timestamp_millis_now() -> u128 {
@@ -271,11 +323,7 @@ fn backup_inner(
 
     {
         inject(injector, Point::BackupFlush)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&target)
-            .map_err(|e| ConfigError::io(&target, e))?;
-        file.sync_all().map_err(|e| ConfigError::io(&target, e))?;
+        flush_backup_file(&target)?;
     }
 
     inject(injector, Point::BackupVerify)?;
@@ -951,6 +999,51 @@ mod tests {
             assert_eq!(backup_perms, entry.permissions);
         }
 
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// Windows platform truth for backup permission inheritance: mode bits
+    /// do not exist, so the catalog records `None`, and the only permision
+    /// that exists — the readonly attribute — is inherited by the copy and
+    /// survives the flush (which needs it cleared momentarily for
+    /// `FlushFileBuffers`).
+    #[test]
+    #[cfg(windows)]
+    fn backup_of_readonly_source_keeps_readonly_attribute_and_flushes() {
+        let path = unique_scratch("perms-ro-win");
+        std::fs::write(&path, b"readonly source").unwrap();
+        let mut src_perm = std::fs::metadata(&path).unwrap().permissions();
+        src_perm.set_readonly(true);
+        std::fs::set_permissions(&path, src_perm).unwrap();
+
+        let entry = backup(&path)
+            .unwrap()
+            .expect("backup of a readonly source must succeed (flush clears readonly momentarily)");
+        assert!(
+            entry.permissions.is_none(),
+            "windows records no POSIX mode for backups"
+        );
+        let readonly = std::fs::metadata(&entry.backup_path)
+            .unwrap()
+            .permissions()
+            .readonly();
+        assert!(readonly, "fs::copy propagates the readonly attribute");
+        // And restore over the readonly target works (rename clears the
+        // destination attribute first).
+        restore(&entry.backup_path, &path).unwrap();
+        let restored = std::fs::read(&path).unwrap();
+        assert_eq!(restored, b"readonly source");
+
+        let mut clear = std::fs::metadata(&path).unwrap().permissions();
+        // Windows-only test cleanup of the attribute; cannot affect unix modes.
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "windows-only test cleanup of the readonly attribute"
+        )]
+        clear.set_readonly(false);
+        std::fs::set_permissions(&path, clear).unwrap();
+        crate::atomic::windows_clear_readonly(&entry.backup_path);
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&entry.backup_path));
     }

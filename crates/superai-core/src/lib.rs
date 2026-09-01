@@ -11,6 +11,8 @@ pub mod adapters;
 mod capability;
 /// Capability resolver — harness/provider matrix.
 pub mod capability_resolver;
+/// Goal-sentence and DoD coverage ledgers as tested artifacts (QAL-13/14).
+pub mod coverage_ledger;
 /// Discovery, adoption, and drift reporting.
 pub mod discovery;
 mod error;

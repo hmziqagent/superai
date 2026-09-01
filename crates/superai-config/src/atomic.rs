@@ -90,14 +90,57 @@ fn apply_mode(path: &Path, mode: u32) -> Result<()> {
     std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
 }
 
-#[cfg(not(unix))]
+/// Windows permission semantics: POSIX mode bits do not exist beyond the
+/// readonly attribute, and the only stable std API is
+/// `Permissions::set_readonly`. The platform-correct projection of `0o600`
+/// hardening is therefore: files we create or replace always carry the
+/// owner-write bit (`0o200`) in the requested mode, which maps to "not
+/// readonly" — the attribute that would block a later rename-over or delete
+/// of the same file is never set by us.
+#[cfg(windows)]
+fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+    let masked = mode & 0o777;
+    let safe_mode = if masked == 0 { 0o600 } else { masked };
+    let mut perm = std::fs::metadata(path)
+        .map(|m| m.permissions())
+        .map_err(|e| ConfigError::io(path, e))?;
+    // Only the owner-write bit has a Windows equivalent: without it the file
+    // is readonly; with it the file is writable.
+    perm.set_readonly(safe_mode & 0o200 == 0);
+    std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
+}
+
+#[cfg(not(any(unix, windows)))]
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
+    reason = "no POSIX chmod and no windows readonly bit; keeps call sites uniform"
 )]
 fn apply_mode(path: &Path, _mode: u32) -> Result<()> {
     let _ = path;
     Ok(())
+}
+
+/// Clear the Windows readonly attribute from `path` if set.
+///
+/// Used only where we are about to replace or delete the file ourselves
+/// (rename-over in an atomic write, cleanup of our own temp/backup files):
+/// a readonly destination makes `MoveFileEx`/delete fail with winerror 5,
+/// so the attribute is cleared right before the replacement lands.
+#[cfg(windows)]
+pub(crate) fn windows_clear_readonly(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().readonly()
+    {
+        let mut perm = meta.permissions();
+        // Windows-only code path: the readonly attribute is the only bit that
+        // exists there, so clearing it cannot make a unix file world-writable.
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "windows-only path; the readonly attribute is the only permission bit"
+        )]
+        perm.set_readonly(false);
+        drop(std::fs::set_permissions(path, perm));
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -109,8 +152,17 @@ fn sync_parent(path: &Path) -> Result<()> {
         Ok(f) => match f.sync_all() {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+            // Windows FlushFileBuffers on a directory handle is denied on
+            // several filesystems; the data file itself is already synced,
+            // so the parent sync is best-effort there.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
             Err(e) => Err(ConfigError::io(parent, e)),
         },
+        // Windows cannot open a directory handle without backup semantics,
+        // so `File::open(parent)` fails with winerror 5 there. The parent
+        // sync is a durability nicety, not a correctness requirement — the
+        // replacement file was flushed and synced before the rename.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(ConfigError::io(parent, e)),
     }
@@ -352,11 +404,22 @@ pub(crate) fn atomic_write_expecting(
     }
 
     inject(injector, Point::AtomicReplace)?;
+    // Windows: a readonly destination makes MoveFileEx-with-replace fail with
+    // winerror 5. We are replacing the target right now, so clear the
+    // attribute first; the replacement itself carries the final mode. Only
+    // the destination is touched — never a file we merely read.
+    #[cfg(windows)]
+    windows_clear_readonly(path);
     let mut rename_attempts: u64 = 0;
     loop {
         match std::fs::rename(&temp_path, path) {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && rename_attempts < 3 => {
+                // Windows: antivirus/indexer can hold a fresh file briefly;
+                // retry. Clearing readonly again covers the attribute having
+                // been re-applied by another writer mid-window.
+                #[cfg(windows)]
+                windows_clear_readonly(path);
                 rename_attempts += 1;
                 std::thread::sleep(std::time::Duration::from_millis(10 * rename_attempts));
             }
@@ -539,6 +602,90 @@ mod tests {
         let digest = compute_digest(data);
         let read = std::fs::read(&path).unwrap();
         assert_eq!(compute_digest(&read), digest);
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// Mark `path` readonly the platform-native way (unix mode bits, the
+    /// Windows readonly attribute) for the write-over-readonly test.
+    fn mark_readonly(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o444);
+            std::fs::set_permissions(path, perm).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut perm = std::fs::metadata(path).unwrap().permissions();
+            perm.set_readonly(true);
+            std::fs::set_permissions(path, perm).unwrap();
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+        }
+    }
+
+    /// QAL-09 platform case: an atomic write must be able to replace a file
+    /// that currently carries the readonly state. The final state asserts the
+    /// platform truth: unix derives the replacement mode from the existing
+    /// target (0o444 stays 0o444 — the recorded mode is honored); Windows has
+    /// no POSIX bits, the readonly attribute is cleared for the replacement
+    /// and the replacement itself is never readonly.
+    #[test]
+    fn atomic_write_replaces_readonly_target_with_platform_correct_mode() {
+        let path = unique_scratch("atomic-ro");
+        std::fs::write(&path, b"old").unwrap();
+        mark_readonly(&path);
+        atomic_write(&path, b"new").unwrap();
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(read, b"new");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o444,
+                "unix derives the replacement mode from the target"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let readonly = std::fs::metadata(&path).unwrap().permissions().readonly();
+            assert!(
+                !readonly,
+                "windows replacement never carries the readonly attribute"
+            );
+        }
+        // Restore writability so cleanup can delete the file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&path, perm).unwrap();
+        }
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// Files this crate creates are always owner-writable: unix lands
+    /// owner-only `0o600`, Windows never sets the readonly attribute. This is
+    /// the invariant that keeps every later rename-over/delete working.
+    #[test]
+    fn atomic_write_new_file_is_never_readonly() {
+        let path = unique_scratch("atomic-fresh-mode");
+        atomic_write(&path, b"fresh").unwrap();
+        let perm = std::fs::metadata(&path).unwrap().permissions();
+        assert!(
+            !perm.readonly(),
+            "a fresh atomic file must not be readonly on any platform"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = perm.mode() & 0o777;
+            assert_eq!(mode, 0o600, "unix fresh files are owner-only 0o600");
+        }
         drop(std::fs::remove_file(&path));
     }
 }

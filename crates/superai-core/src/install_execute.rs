@@ -1306,6 +1306,35 @@ fn detection_source_to_method(source: &DetectionSource) -> Option<InstallMethodK
     }
 }
 
+/// Injection seam for update-plan command execution, mirroring the area-7
+/// `VersionProbe` seam in `install_plan.rs`: production runs the real package
+/// manager command via [`run_command`]; tests inject a fake so the suite
+/// never shells out to a real `npm`/`brew`/`cargo`.
+pub trait UpdateCommandRunner {
+    /// Run the update command. `executable`/`args` mirror the plan's
+    /// `command_preview`; `redact` selects redacted output handling.
+    fn run(
+        &self,
+        executable: &str,
+        args: &[String],
+        redact: bool,
+    ) -> Result<ProcessOutput, CoreError>;
+}
+
+/// Production runner: the real bounded subprocess via [`run_command`].
+struct SystemUpdateRunner;
+
+impl UpdateCommandRunner for SystemUpdateRunner {
+    fn run(
+        &self,
+        executable: &str,
+        args: &[String],
+        redact: bool,
+    ) -> Result<ProcessOutput, CoreError> {
+        run_command(executable, args, &structured_opts(redact))
+    }
+}
+
 /// Execute an update plan with native method (PKG-07).
 ///
 /// Checks `blocked` unless `explicit_accept` is true, refuses external/direct
@@ -1317,6 +1346,24 @@ pub fn execute_update(
     detect_opts: &DetectOptions,
     explicit_accept: bool,
     redact: bool,
+) -> Result<ProcessOutput, CoreError> {
+    execute_update_with_runner(
+        plan,
+        detect_opts,
+        explicit_accept,
+        redact,
+        &SystemUpdateRunner,
+    )
+}
+
+/// [`execute_update`] with an injected [`UpdateCommandRunner`] — the
+/// hermetic entry tests use so no real package manager executes.
+pub fn execute_update_with_runner(
+    plan: &UpdatePlan,
+    detect_opts: &DetectOptions,
+    explicit_accept: bool,
+    redact: bool,
+    runner: &dyn UpdateCommandRunner,
 ) -> Result<ProcessOutput, CoreError> {
     if plan.blocked && !explicit_accept {
         return Err(CoreError::Validation {
@@ -1341,10 +1388,10 @@ pub fn execute_update(
         });
     }
     plan.command_preview.validate()?;
-    let out = run_command(
+    let out = runner.run(
         &plan.command_preview.executable,
         &plan.command_preview.args,
-        &structured_opts(redact),
+        redact,
     )?;
     if !out.success {
         let display = display_command(
@@ -2457,10 +2504,11 @@ mod tests {
     fn update_execute_respects_block() {
         let tmp = make_temp_dir("update-exec");
         let home = make_temp_dir("home-update-exec");
-        fs::write(tmp.join("codex"), "#!/bin/sh\necho \"1.2.3\"\n").unwrap();
-        let mut perms = fs::metadata(tmp.join("codex")).unwrap().permissions();
+        let codex_path = tmp.join("codex");
+        fs::write(&codex_path, "#!/bin/sh\necho \"1.2.3\"\n").unwrap();
+        let mut perms = fs::metadata(&codex_path).unwrap().permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(tmp.join("codex"), perms).unwrap();
+        fs::set_permissions(&codex_path, perms).unwrap();
 
         let opts = DetectOptions {
             path_dirs: Some(vec![tmp.clone()]),
@@ -2475,22 +2523,91 @@ mod tests {
         let harness = HarnessId::new("codex-cli").unwrap();
         let plan = plan_update(&harness, &opts, None, false, Some("2.0.0")).unwrap();
         assert!(plan.blocked);
-        let err = execute_update(&plan, &opts, false, false).unwrap_err();
+        let err =
+            execute_update_with_runner(&plan, &opts, false, false, &PanickingRunner).unwrap_err();
         assert!(
             format!("{err}").contains("blocked") || format!("{err}").contains("explicit accept")
         );
-        // With explicit accept, execution proceeds to run the native update command.
-        // For codex-cli the native update is `npm update -g @openai/codex`, which may not be
-        // present in this sandbox. We test that explicit_accept bypasses the block check,
-        // not that npm succeeds. So we catch either success or npm-not-found error,
-        // but not the blocked error.
-        let result = execute_update(&plan, &opts, true, false);
-        // result may be Err due to missing npm, but it must not be the blocked error
-        if let Err(e) = result {
-            assert!(!format!("{e}").contains("blocked"));
-        }
+
+        // With explicit accept, execution proceeds to the update command.
+        // Hermetic: the injected runner simulates the package manager by
+        // rewriting the fake codex binary to the expected new version, so no
+        // real npm/brew/cargo ever executes and the PKG-07 strict
+        // post-update validation sees exactly the expected 2.0.0.
+        let runner = SimulatedNpmUpdate {
+            binary: codex_path.clone(),
+        };
+        let result = execute_update_with_runner(&plan, &opts, true, false, &runner);
+        let out = result.expect("simulated update with matching post-version must succeed");
+        assert!(out.success);
+        let after = fs::read_to_string(&codex_path).unwrap();
+        assert!(after.contains("2.0.0"), "runner must land the new version");
         drop(fs::remove_dir_all(tmp));
         drop(fs::remove_dir_all(home));
+    }
+
+    /// Runner that must never be reached in the blocked arm.
+    #[cfg(unix)]
+    struct PanickingRunner;
+
+    #[cfg(unix)]
+    impl UpdateCommandRunner for PanickingRunner {
+        fn run(
+            &self,
+            _executable: &str,
+            _args: &[String],
+            _redact: bool,
+        ) -> Result<ProcessOutput, CoreError> {
+            Err(CoreError::Validation {
+                field: "runner".to_owned(),
+                reason: "command must not execute while blocked".to_owned(),
+            })
+        }
+    }
+
+    /// Hermetic stand-in for `npm update -g @openai/codex`: rewrites the
+    /// fake binary so it reports the new version.
+    #[cfg(unix)]
+    struct SimulatedNpmUpdate {
+        binary: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl UpdateCommandRunner for SimulatedNpmUpdate {
+        fn run(
+            &self,
+            executable: &str,
+            args: &[String],
+            _redact: bool,
+        ) -> Result<ProcessOutput, CoreError> {
+            if executable != "npm" {
+                return Err(CoreError::Verification {
+                    path: self.binary.clone(),
+                    kind: "simulated_update".to_owned(),
+                    reason: format!("codex-cli native update uses npm, got `{executable}`"),
+                });
+            }
+            if !args.iter().any(|a| a.contains("@openai/codex")) {
+                return Err(CoreError::Verification {
+                    path: self.binary.clone(),
+                    kind: "simulated_update".to_owned(),
+                    reason: format!("update must target the package, got {args:?}"),
+                });
+            }
+            fs::write(&self.binary, "#!/bin/sh\necho \"2.0.0\"\n").map_err(|e| {
+                CoreError::Verification {
+                    path: self.binary.clone(),
+                    kind: "simulated_update".to_owned(),
+                    reason: format!("fake runner could not land new version: {e}"),
+                }
+            })?;
+            Ok(ProcessOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                success: true,
+            })
+        }
     }
 
     // ---- PKG-08 ----

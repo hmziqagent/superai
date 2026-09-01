@@ -888,6 +888,74 @@ mod tests {
         );
     }
 
+    // ---- QAL-02: default-vs-isolated path-layout fixture kind ----
+
+    /// Read a `key=value` line from a layout fixture file.
+    fn layout_value(dir: &Path, file: &str, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(dir.join(file)).ok()?;
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .map(ToOwned::to_owned)
+    }
+
+    /// The default-vs-isolated layout dimension of the fixture corpus: the
+    /// three flagship relocated-root adapters carry BOTH layout variants, and
+    /// each variant is machine-checked against the adapter's own code — the
+    /// default layout root must equal `DEFAULT_CONFIG_ROOT_FALLBACK` and the
+    /// isolated layout env must equal `CONFIG_ENV_VAR`. A drift in either
+    /// direction (adapter code or fixture) fails here.
+    #[test]
+    fn fixture_layout_variants_match_adapter_constants() {
+        let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "claude_code",
+                crate::adapters::claude_code::DEFAULT_CONFIG_ROOT_FALLBACK,
+                crate::adapters::claude_code::CONFIG_ENV_VAR,
+            ),
+            (
+                "codex_cli",
+                crate::adapters::codex_cli::DEFAULT_CONFIG_ROOT_FALLBACK,
+                crate::adapters::codex_cli::CONFIG_ENV_VAR,
+            ),
+            (
+                "gemini_cli",
+                crate::adapters::gemini_cli::DEFAULT_CONFIG_ROOT_FALLBACK,
+                crate::adapters::gemini_cli::CONFIG_ENV_VAR,
+            ),
+        ];
+        assert!(
+            cases.len() >= 3,
+            "layout fixtures must cover at least three adapters"
+        );
+        for (dir_name, default_root, env_var) in cases {
+            let dir = fixtures_root.join(dir_name);
+            let default = layout_value(&dir, "layout.default", "root");
+            let isolated_env = layout_value(&dir, "layout.isolated", "env");
+            let isolated_root = layout_value(&dir, "layout.isolated", "root");
+            let example = layout_value(&dir, "layout.isolated", "example");
+            assert_eq!(
+                default.as_deref(),
+                Some(default_root),
+                "{dir_name}: layout.default root must match DEFAULT_CONFIG_ROOT_FALLBACK"
+            );
+            assert_eq!(
+                isolated_env.as_deref(),
+                Some(env_var),
+                "{dir_name}: layout.isolated env must match CONFIG_ENV_VAR"
+            );
+            assert_eq!(
+                isolated_root.as_deref(),
+                Some(format!("${env_var}").as_str()),
+                "{dir_name}: layout.isolated root must relocate through the env var"
+            );
+            assert!(
+                example.is_some_and(|e| e.contains("<instance>")),
+                "{dir_name}: layout.isolated example must show a per-instance path"
+            );
+        }
+    }
+
     // ---- corpus-less surface corpora (HAD-06 / QAL-02) ----
 
     /// Whether any file in `dir` carries the `.<variant>.` name segment.

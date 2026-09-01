@@ -251,11 +251,31 @@ mod tests {
                 home.display()
             );
         }
-        // Windows style
+        // Windows style: `C:\Windows` is a broad windows root on every host —
+        // on Windows via the drive-root/system-dir rule, on unix via the
+        // absolute-path requirement (it parses as relative there).
+        for win_root in [
+            "C:\\Windows",
+            "c:\\program files",
+            "C:\\",
+            "C:/",
+            "\\\\server\\share",
+        ] {
+            let err = validate_quarantine_target(Path::new(win_root));
+            assert!(
+                err.is_err(),
+                "windows broad root {win_root} should be rejected"
+            );
+        }
         let win = Path::new("C:\\Windows");
         let err = validate_quarantine_target(win);
-        // On unix, this is relative (no leading /), so should be rejected as relative
         assert!(err.is_err(), "C:\\Windows should be rejected");
+        // The removal gate recognizes windows-shaped broad roots directly.
+        let err = crate::transaction::validate_remove_target(
+            win,
+            crate::transaction::RemoveKind::InstanceRoot,
+        );
+        assert!(err.is_err(), "C:\\Windows should be rejected for removal");
 
         // Globs
         for p in ["/tmp/*.json", "/var/*.log", "/home/user/[abc]"] {
@@ -594,7 +614,10 @@ mod tests {
             );
         }
         assert!(!format!("{snap_lower:?}").contains(SENTINEL));
-        // CRLF handling: env/json with CRLF must not panic and must round-trip
+        // CRLF handling: env/json with CRLF must not panic and must round-trip.
+        // FS truth: CRLF is ordinary whitespace for JSON — load and edit both
+        // succeed on every platform, and the edit lands the new key while the
+        // on-disk file stays parseable.
         let crlf_path = dir.join("crlf.json");
         let crlf_content = b"{\r\n  \"a\": 1,\r\n  \"b\": \"val\"\r\n}";
         std::fs::write(&crlf_path, crlf_content).unwrap();
@@ -606,9 +629,22 @@ mod tests {
         let edit_res = crate::json::edit(&crlf_path, |m| {
             m.insert("c".to_owned(), serde_json::Value::String("new".to_owned()));
         });
-        assert!(edit_res.is_ok(), "CRLF edit must not panic");
+        assert!(
+            edit_res.is_ok(),
+            "CRLF edit must succeed on every platform: {edit_res:?}"
+        );
         let after = std::fs::read(&crlf_path).unwrap();
         assert!(!contains_sentinel(&after));
+        let reparsed = crate::json::load_value(&crlf_path);
+        assert!(
+            reparsed.is_ok(),
+            "edited CRLF file must re-parse: {reparsed:?}"
+        );
+        assert_eq!(
+            reparsed.unwrap().get("c").and_then(|v| v.as_str()),
+            Some("new"),
+            "the edit must land the new key"
+        );
         drop(std::fs::remove_dir_all(&dir));
     }
 

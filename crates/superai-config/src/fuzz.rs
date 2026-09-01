@@ -1753,4 +1753,244 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // QAL-04: NEW engine surface — executor operations (DOC-02) fuzz
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_executor_operations_no_panic_and_no_mutation_on_reject_100() {
+        let corpus = seed_corpus();
+        use crate::document::{
+            DuplicateHandling, EditOperation, Operation, RedactionPolicy, Selector,
+        };
+        use serde_json::Value;
+        for iter in 0..100 {
+            let mut prng = Prng::new(iter as u64 + 0x5eed_1234);
+            let base = corpus
+                .get(prng.gen_range(0, corpus.len()))
+                .cloned()
+                .unwrap_or_else(|| br#"{"a":1}"#.to_vec());
+            let (ext, kind) = match iter % 5 {
+                0 => (".json", DocumentKind::StrictJson),
+                1 => (".toml", DocumentKind::Toml),
+                2 => (".yaml", DocumentKind::Yaml),
+                3 => (".env", DocumentKind::Env),
+                _ => (".jsonc", DocumentKind::JsonC),
+            };
+            let dir = temp_dir_unique("fuzz-executor");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let path = dir.join(format!("exec-{iter}{ext}"));
+            std::fs::write(&path, &base).expect("write initial");
+            let before = snapshot_dir(&dir);
+
+            let key = format!("k{iter}");
+            let selector = match prng.gen_range(0, 4) {
+                0 => Selector::Key(key.clone()),
+                1 => Selector::Key(format!("outer.{}", key)),
+                2 => Selector::Index(prng.gen_range(0, 4)),
+                _ => Selector::ManagedSpan(format!("span{iter}")),
+            };
+            let edit = match prng.gen_range(0, 7) {
+                0 => EditOperation::Set {
+                    selector: selector.clone(),
+                    value: Value::String("v".to_owned()),
+                },
+                1 => EditOperation::Remove {
+                    selector: selector.clone(),
+                },
+                2 => EditOperation::InsertEntry {
+                    selector: selector.clone(),
+                    key: key.clone(),
+                    value: Value::Bool(prng.gen_bool()),
+                },
+                3 => EditOperation::Merge {
+                    selector: selector.clone(),
+                    value: serde_json::json!({ key.clone(): 7 }),
+                },
+                4 => EditOperation::EnableDisable {
+                    selector: selector.clone(),
+                    enabled: prng.gen_bool(),
+                },
+                5 => EditOperation::AppendIdentityItem {
+                    selector: selector.clone(),
+                    value: serde_json::json!({"name": key.clone()}),
+                    identity_key: "name".to_owned(),
+                },
+                _ => EditOperation::EnsureDirEntry {
+                    selector: selector.clone(),
+                    path: format!("skills/{key}"),
+                },
+            };
+            let duplicate_handling = match prng.gen_range(0, 4) {
+                0 => DuplicateHandling::Overwrite,
+                1 => DuplicateHandling::KeepFirst,
+                2 => DuplicateHandling::Error,
+                _ => DuplicateHandling::Append,
+            };
+            let redaction_policy = match prng.gen_range(0, 4) {
+                0 => RedactionPolicy::None,
+                1 => RedactionPolicy::RedactValue,
+                2 => RedactionPolicy::RedactKey,
+                _ => RedactionPolicy::Full,
+            };
+            let owned: Vec<String> = if prng.gen_bool() {
+                vec![key.clone(), format!("outer.{key}"), format!("skills/{key}")]
+            } else {
+                Vec::new()
+            };
+            let expected_old = match prng.gen_range(0, 3) {
+                0 => None,
+                1 => Some(None),
+                _ => Some(Some(Value::String("absent".to_owned()))),
+            };
+            let mut op = Operation::new(edit)
+                .with_owned_keys(owned)
+                .with_duplicate_handling(duplicate_handling)
+                .with_redaction_policy(redaction_policy)
+                .with_create_parent(prng.gen_bool());
+            if let Some(exp) = expected_old {
+                op = op.with_expected_old(exp);
+            }
+
+            let outcome = std::panic::catch_unwind(|| crate::executor::apply(&path, kind, &op));
+            assert!(
+                outcome.is_ok(),
+                "executor panicked at iter {iter} ext={ext}"
+            );
+            let applied = outcome.expect("catch ok");
+            match applied {
+                Ok(result) => {
+                    // Accepted (or a no-op): the file must re-parse or be absent,
+                    // and the output must stay bounded.
+                    let after = std::fs::read(&path).unwrap_or_default();
+                    assert!(
+                        after.len() <= MAX_OUTPUT_BYTES,
+                        "executor-ok {ext} {iter}: output {} exceeds bound",
+                        after.len()
+                    );
+                    if result.changed {
+                        let reparse = crate::raw_editor::validate(&after, kind);
+                        let fatal = reparse
+                            .iter()
+                            .filter(|d| {
+                                matches!(d.severity, crate::document::DiagnosticSeverity::Error)
+                            })
+                            .count();
+                        assert_eq!(
+                            fatal, 0,
+                            "executor-ok {ext} {iter}: output must re-parse cleanly"
+                        );
+                    }
+                    let summary = format!("{result:?}");
+                    assert!(
+                        !summary.contains("sk-superai-test-sentinel-12345-fake"),
+                        "executor summary leaked a sentinel at {iter}"
+                    );
+                    for p in snapshot_dir(&dir) {
+                        assert_no_path_escape(&dir, &p.0, "fuzz-executor");
+                    }
+                }
+                Err(err) => {
+                    // Rejected: no filesystem mutation of any kind — the DOC-02
+                    // policies are enforced before any write.
+                    let after = snapshot_dir(&dir);
+                    assert_dir_unchanged(&before, &after, &format!("executor-rejected {iter}"));
+                    let msg = format!("{err:?}");
+                    assert!(
+                        !msg.contains("sk-superai-test-sentinel-12345-fake"),
+                        "executor error leaked a sentinel at {iter}"
+                    );
+                }
+            }
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // QAL-04: NEW engine surface — managed span codec (DOC-08) fuzz
+    // -----------------------------------------------------------------------
+
+    /// Generate a random text with a mix of plain lines, sentinel-ish lines,
+    /// CRLF line endings, and smuggled sentinels.
+    fn gen_span_text(prng: &mut Prng, iter: usize) -> String {
+        let codec = crate::span_codec::SpanCodec::default();
+        let mut text = String::new();
+        let lines = prng.gen_range(0, 12);
+        for line_i in 0..lines {
+            match prng.gen_range(0, 6) {
+                0 => text.push_str("plain content\n"),
+                1 => text.push_str("  indented # superai:begin:not-a-sentinel\n"),
+                2 => text.push_str(&format!("note {}\r\n", line_i)),
+                3 => text.push_str(&codec.begin_sentinel(&format!("smuggled{line_i}"))),
+                4 => text.push_str(&codec.end_sentinel("dangling")),
+                _ => text.push_str("# comment\r\n"),
+            }
+        }
+        if iter % 7 == 0 {
+            text.push_str("# superai:begin:good\nbody\n# superai:end:good\n");
+        }
+        text
+    }
+
+    #[test]
+    fn fuzz_span_codec_no_panic_and_invariants_hold_100() {
+        use crate::span_codec::SpanCodec;
+        for iter in 0..100 {
+            let mut prng = Prng::new(iter as u64 + 0x5eecd0de);
+            let codec = SpanCodec::default();
+            let text = gen_span_text(&mut prng, iter);
+            let name = format!("span{iter}");
+            let body = if prng.gen_bool() {
+                prng.gen_ascii_string(0, 64)
+            } else {
+                format!(
+                    "body with\nnewlines and # markers {}",
+                    prng.gen_range(0, 99)
+                )
+            };
+
+            // Insert must never panic; success implies the result validates.
+            let inserted = std::panic::catch_unwind(|| codec.insert_span(&text, &name, &body));
+            assert!(inserted.is_ok(), "insert_span panicked at {iter}");
+            let ins = inserted.expect("catch ok");
+            if let Ok(out) = &ins {
+                assert!(
+                    codec.validate(out).is_ok(),
+                    "insert output must validate at {iter}"
+                );
+                // DOC-08 invariant: the original text is a byte prefix.
+                assert!(
+                    out.starts_with(&text) || out.starts_with(text.trim_end_matches('\n')),
+                    "insert preserves the original bytes as a prefix at {iter}"
+                );
+                // Replace then remove must keep every byte outside the span
+                // identical, and removing the inserted span restores the
+                // pre-insert text (canonical newline caveat aside).
+                if let Ok(replaced) = codec.replace_span(out, &name, "replaced body") {
+                    assert!(
+                        codec.outside_span_bytes(&replaced) == codec.outside_span_bytes(out),
+                        "replace preserves outside-span bytes at {iter}"
+                    );
+                }
+                if let Ok(removed) = codec.remove_span(out, &name) {
+                    assert!(
+                        codec.outside_span_bytes(&removed) == codec.outside_span_bytes(out),
+                        "remove preserves outside-span bytes at {iter}"
+                    );
+                }
+            }
+            // Invalid bases (smuggled/dangling sentinels) must fail closed
+            // rather than corrupt: remove on a name that does not exist is a
+            // typed error, never a panic.
+            let removed = std::panic::catch_unwind(|| codec.remove_span(&text, &name));
+            assert!(removed.is_ok(), "remove_span panicked at {iter}");
+            drop(removed.expect("catch ok"));
+
+            // validate itself never panics and is bounded.
+            let validated = std::panic::catch_unwind(|| codec.validate(&text));
+            assert!(validated.is_ok(), "validate panicked at {iter}");
+            drop(validated.expect("catch ok"));
+        }
+    }
 }

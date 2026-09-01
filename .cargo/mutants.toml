@@ -1,0 +1,21 @@
+# QAL-05: mutation-testing configuration (docs/plans/13-verification-and-release.md).
+#
+# Scope: the safety-critical mutation family in superai-config — the modules
+# whose behavior is the product's safety story (atomic single-file commit,
+# backup catalog/restore, multi-file transaction with conflict rechecks,
+# quarantine, production crash journal, snapshot conflict tokens). CI runs
+# this scoped set with a mutants-count baseline and is allowed to fail while
+# scores are being driven up; expand the globs per-module as the score
+# improves (never shrink the set to make the number look better).
+examine_globs = [
+    "crates/superai-config/src/atomic.rs",
+    "crates/superai-config/src/backup.rs",
+    "crates/superai-config/src/transaction.rs",
+    "crates/superai-config/src/quarantine.rs",
+    "crates/superai-config/src/journal.rs",
+    "crates/superai-config/src/snapshot.rs",
+]
+
+# Tests are quick (~2s for superai-config); mutants that hang indicate a
+# killed-by-timeout case worth knowing about, so keep the timeout tight.
+minimum_test_timeout = 30
