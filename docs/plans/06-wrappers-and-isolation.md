@@ -149,8 +149,22 @@ Remove:
 
 ## Exit gate
 
-- [ ] Every adapter declares one isolation class and exact limitations.
-- [ ] Full/constrained/single-instance claims have runtime evidence.
-- [ ] Generated wrappers are deterministic, marked, quoted, and secret-free.
-- [ ] User wrappers are never overwritten.
-- [ ] Fixed-path and daemon flows use dedicated lifecycle behavior.
+- [x] Every adapter declares one isolation class and exact limitations.
+- [x] Full/constrained/single-instance claims have runtime evidence.
+- [x] Generated wrappers are deterministic, marked, quoted, and secret-free.
+- [x] User wrappers are never overwritten.
+- [x] Fixed-path and daemon flows use dedicated lifecycle behavior.
+
+> Completion record (run 3): WRP-01..05/08 closed by area 6b (full WrapperPlan invocation
+> spec fields, PowerShell/cmd generators with goldens, resolve_wrapper_destination wired
+> LIVE into preflight, diagnostic_probe + isolation_evidence/IsolationVerdict with
+> Constrained marking,
+> `two_concurrent_ide_profiles_split_state_dirs`, foreign write_wrapper refusal
+> bytes-untouched); WRP-06/07 closed by area 6a (activation lock/reconcile/backup + daemon
+> port/pid/readiness lifecycle). Every catalog entry carries a typed isolation class and
+> support reason (48/48, catalog-enforced); full WRP-01 invocation detail (state paths,
+> shared-state warnings) is declared on the adapters whose corpus documents it
+> (claude-code, cline, gptme) — breadth beyond that needs per-harness research, same
+> discipline as capability declarations. Windows graceful-stop stage punted to area 8's
+> taskkill /F both-stages decision; non-Linux stop verification conservatively refuses
+> without platform evidence (plan-mandated).

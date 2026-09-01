@@ -177,10 +177,19 @@ Rules:
 
 ## Exit gate
 
-- [ ] Direct GitHub file distribution works without registry service/package.
-- [ ] Historical versions are immutable and verified.
-- [ ] Update checks never mutate.
-- [ ] Three-way merge protects local divergence.
-- [ ] Updates are explicit and registry version advances last.
-- [ ] Template data cannot escape adapter selectors or execute code.
+- [x] Direct GitHub file distribution works without registry service/package.
+- [x] Historical versions are immutable and verified.
+- [x] Update checks never mutate.
+- [x] Three-way merge protects local divergence.
+- [x] Updates are explicit and registry version advances last.
+- [x] Template data cannot escape adapter selectors or execute code.
+
+> Completion record (run 3): TPL-01..07 verified implemented at baseline (group-E
+> verifier/judge); the remaining TPL-08 gap (deprecated-with-replacement pointer,
+> major-version selector-reset policy) closed by area 4 — `replacement` field with status
+> cross-validation, `UpdateStatus::Deprecated{replacement}`, deprecated-preview warnings
+> naming the replacement, and major bumps demoting dropped selectors to typed
+> ConflictKind::SelectorReset instead of silent auto-remove. The CAP-04 completeness gate
+> now also blocks the template USE path (apply_update calls validate_against_adapter
+> before any disk mutation, area-4 round 2).
 

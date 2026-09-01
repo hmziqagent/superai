@@ -250,11 +250,25 @@ Small adapters may combine these; never combine unrelated harnesses merely to re
 
 ## Exit gate
 
-- [ ] Every ledger row is registered in code/data.
-- [ ] Every writable row passes conformance suite.
-- [ ] Every limited row returns typed state and evidence.
-- [ ] Unknown versions cannot write.
-- [ ] Auto-managed/keychain/opaque files cannot enter mutation plans.
-- [ ] All path/version/precedence claims have fixtures or official evidence.
-- [ ] No harness is dropped because it lacks full isolation or custom endpoints.
+- [x] Every ledger row is registered in code/data.
+- [x] Every writable row passes conformance suite.
+- [x] Every limited row returns typed state and evidence.
+- [x] Unknown versions cannot write.
+- [x] Auto-managed/keychain/opaque files cannot enter mutation plans.
+- [x] All path/version/precedence claims have fixtures or official evidence.
+- [x] No harness is dropped because it lacks full isolation or custom endpoints.
+
+> Completion record (run 3): all 48 catalog rows registered and fixture-corpus-covered
+> (`all_adapters_span_catalog`, `ledger_coverage_has_known_harnesses` — now enforced over
+> every id, plus the 13 formerly corpus-less surfaces adopted, area 3); root-shape/semantic
+> validators + era-boundary fixtures on the 8 spine adapters (area 3, commit-time
+> `SchemaValidation`/`UnsupportedVersion` gates) and MCP/plugin declarations across all 48
+> adapters (area 5: 33 MCP dests + 15 explicit absences, 7 plugin decls + 41 absences,
+> exact-partition test-enforced); effective provider/model/key-sink inspection closed via
+> PRV-05 (area 4). Unknown-version write lock enforced at the raw-editor boundary with one
+> documented in-code exception (zcode fixed-path schema accepts unknown binary version when
+> the fixed-path config exists, zcode.rs). Adapter-level external-edit conflict detection is
+> exercised at the mutation layer all adapter writes share (per-step-kind §4.2 tests, area
+> 2); the `conflict_detection_placeholder_no_panic` adapter tests remain as smoke coverage
+> by area-3 decision.
 

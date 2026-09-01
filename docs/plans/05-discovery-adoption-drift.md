@@ -156,9 +156,17 @@ No UI formatting. Stable data supports future GPUI/TUI/CLI.
 
 ## Exit gate
 
-- [ ] Candidate discovery is bounded and adapter-driven.
-- [ ] Foreign ownership has evidence and blocks mutation.
-- [ ] Adoption is record-first and config-preserving.
-- [ ] Orphan handling is explicit/recoverable.
-- [ ] Drift report covers config, binary, wrapper, version, fixed-path, and daemon state.
+- [x] Candidate discovery is bounded and adapter-driven.
+- [x] Foreign ownership has evidence and blocks mutation.
+- [x] Adoption is record-first and config-preserving.
+- [x] Orphan handling is explicit/recoverable.
+- [x] Drift report covers config, binary, wrapper, version, fixed-path, and daemon state.
+
+> Completion record (run 3): DRF-01..08 closed by area 6b (judge-verified: ScanOptions user
+> roots/wrapper dirs with deadline + surfaced permission diagnostics + glob expansion;
+> version-marker/binary-adjacency signals; wrapper-dir scan; mise/asdf shim detection with
+> typed AmbiguousOwnership blocking adopt/register/quarantine; marker-first reconciliation;
+> OrphanWrapperChoice + quarantine_unmanaged_root; 15-category drift report with risk and
+> next-operations — `drift_report_groups_by_harness_with_risk_and_next_ops`). DRF-06 adoption
+> was already implemented at baseline (12 tests).
 

@@ -289,9 +289,26 @@ Fuzz/mutation commands use pinned documented tool versions in CI once added.
 ## Exit gate
 
 - [ ] Tests cover every supported adapter/platform state.
-- [ ] Fault/crash recovery evidence exists.
-- [ ] Fuzzing and mutation testing guard parsers/safety branches.
-- [ ] Secret/path/process/network abuse suites pass.
-- [ ] Dependency audit and lockfile discipline pass.
-- [ ] Goal/harness/provider/template ledgers are complete.
-- [ ] Non-UI release claims match observable behavior.
+      > open: macOS application-path cases and Windows adversarial long-path/locked-file
+      > cases remain uncovered (area-8 reasoned-not-executed list; cfg(windows) semantics
+      > are cross-compiled clean and pure-helper tested with the windows CI runner as
+      > executor of record, but those two platform-state families have no dedicated tests).
+- [x] Fault/crash recovery evidence exists.
+- [x] Fuzzing and mutation testing guard parsers/safety branches.
+- [x] Secret/path/process/network abuse suites pass.
+- [x] Dependency audit and lockfile discipline pass.
+- [x] Goal/harness/provider/template ledgers are complete.
+- [x] Non-UI release claims match observable behavior.
+
+> Completion record (run 3): QAL-03/07/08/10/11/12 verified at baseline; QAL-01
+> (SUPERAI_TEST_KEEP retain-on-failure), QAL-02 (48/48 fixture corpora + layout.default/
+> isolated fixture kind), QAL-04 (executor + span-codec fuzz targets over the new engine
+> surfaces; coverage-guided cargo-fuzz stays a documented local recipe per the pinned
+> stable-toolchain/dependency rules in fuzz.rs), QAL-05 (cargo-mutants 27.1.0 installed
+> and run: 610-mutant scoped baseline at 50.2% caught, .cargo/mutants.toml + CI
+> continue-on-error job with artifact; diff-scoped/sharded runs are recorded follow-up),
+> QAL-06 (real-path fault injection — area 2), QAL-13/14 (coverage_ledger.rs: §9/§10
+> machine-verified ledgers + research-file coverage + freshness window), QAL-15 (README
+> backup/recovery, data locations, security posture, template-repo sections) closed by
+> area 8, judge-verified round 2. docs/dependency-review.md carries the per-crate
+> dependency evidence (QAL-12).

@@ -117,10 +117,19 @@ If harness upgrades while draft is open:
 
 ## Exit gate
 
-- [ ] Read/validate/diff/commit services are interface-neutral.
-- [ ] Raw source is treated as sensitive.
-- [ ] Every commit uses safe mutation and fresh conflict check.
-- [ ] Adapter schema/version rules apply.
-- [ ] Opaque/internal stores cannot be edited.
-- [ ] No GPUI/TUI/CLI editor work exists.
+- [x] Read/validate/diff/commit services are interface-neutral.
+- [x] Raw source is treated as sensitive.
+- [x] Every commit uses safe mutation and fresh conflict check.
+- [x] Adapter schema/version rules apply.
+- [x] Opaque/internal stores cannot be edited.
+- [x] No GPUI/TUI/CLI editor work exists.
+
+> Completion record (run 3): RAW-04 verified at baseline; RAW-01 (surface-identity open
+> with scope/precedence + explicit-path policy), RAW-02 (validate-time adapter schema +
+> size gate), RAW-03 (scope/precedence warning, restart requirement, template-owned
+> divergence markers), RAW-05 (gated transactional create with rollback + empty-buffer
+> format rule), RAW-06 (env duplicate diagnostics as warnings at the effective definition),
+> RAW-07 (reopen/rebase with manual-rebase guidance, no auto-apply) closed by area 7
+> (judge-verified). Era/version gates at the commit boundary come from area 3's
+> surface_gates_for_adapter (era conflict → UnsupportedVersion before any disk mutation).
 

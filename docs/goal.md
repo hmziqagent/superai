@@ -65,7 +65,7 @@ The wrapper's name is mine to choose. `claude-glm` is one convention, not the ru
 
 **Manages skills.** One registry, and how a skill reaches an instance is my choice per instance: symlink the whole registry directory, symlink specific skills, or copy specific skills. Enable and disable per harness and per instance.
 
-**Installs and uninstalls harnesses,** with detection for what's already there. [toride](https://github.com/freeoxide/toride) is a TUI app, but underneath it is modular crates over `duct` for running CLIs and `mise` for installing them. superai depends on those crates, not on toride itself.
+**Installs and uninstalls harnesses,** with detection for what's already there. [toride](https://github.com/freeoxide/toride) is a TUI app, but underneath it is modular crates over `duct` for running CLIs and `mise` for installing them. superai uses the same building block directly — `duct`, verified on crates.io — not toride itself, whose crates turned out not to be published (the subplan 11 dependency spike records this).
 
 **Raw editors.** A real TOML editor and JSON editor with validation, on the same files the tools read.
 

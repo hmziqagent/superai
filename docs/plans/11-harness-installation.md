@@ -186,10 +186,21 @@ workflow state, not an excuse to download unknown binaries.
 
 ## Exit gate
 
-- [ ] toride/mise/duct dependencies and package identifiers verified before use.
-- [ ] Detection covers pre-existing and multiple installs.
-- [ ] Install/update/uninstall are structured, previewed, and verified.
-- [ ] Binary lifecycle never implies config/data deletion.
-- [ ] Adapter compatibility is checked around updates.
-- [ ] External/manual installation is represented honestly.
+- [x] toride/mise/duct dependencies and package identifiers verified before use.
+- [x] Detection covers pre-existing and multiple installs.
+- [x] Install/update/uninstall are structured, previewed, and verified.
+- [x] Binary lifecycle never implies config/data deletion.
+- [x] Adapter compatibility is checked around updates.
+- [x] External/manual installation is represented honestly.
+
+> Completion record (run 3): PKG-01/02/05 verified at baseline (toride verified NOT on
+> crates.io — duct 1.1.1 is the single direct dependency, spike recorded in process.rs);
+> PKG-03 (pipx/uv/dpkg probes, hermetic), PKG-04 (real registry availability probes with
+> typed Unavailable-with-reason; Direct/External misattribution fixed to docs-URL preview
+> + execute refusal), PKG-06 (persisted receipts, verified-new-only), PKG-07 (skip-on-
+> matching, strict post-update validation, read-only instance revalidation, hermetic
+> update runner seam), PKG-08 (receipt-owned preflight + real binary-missing registry
+> marking), PKG-09 (pin-exact-binary + wrapper pin + ambiguity report), PKG-10 (typed
+> CoreError::ExternalInstallRequired) closed by area 7, judge-verified incl. the
+> offline-probe fix round. No live package manager executes in the default suite.
 

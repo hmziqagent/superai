@@ -201,9 +201,16 @@ resolution remain ordinary functions and data types.
 
 ## Exit gate
 
-- [ ] Registry schema v1 documented with golden fixtures.
-- [ ] Current records migrate losslessly for all facts they contain.
-- [ ] All identifiers, names, paths, states, previews, results, and errors are validated.
-- [ ] No interface or harness-config value appears in instance records.
-- [ ] Public types have one canonical path.
+- [x] Registry schema v1 documented with golden fixtures.
+- [x] Current records migrate losslessly for all facts they contain.
+- [x] All identifiers, names, paths, states, previews, results, and errors are validated.
+- [x] No interface or harness-config value appears in instance records.
+- [x] Public types have one canonical path.
+
+> Completion record (run 3): all five closed at the verification-run baseline — FND-01..07
+> verified IMPLEMENTED by the group-A verifier/judge (registry.rs `golden_fixtures_old_and_new_
+> are_valid`, `serialization_never_emits_forbidden_fields`, `unknown_enum_and_schema_failure_
+> are_actionable`, `round_trips_through_disk_keeping_foreign_keys`; ids/paths/state/operation/
+> error test suites). FND-03's optional migration-preview API remains a documented minor gap;
+> migration itself is lossless and golden-fixture tested.
 

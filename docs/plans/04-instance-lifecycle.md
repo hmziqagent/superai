@@ -184,10 +184,22 @@ Daemon:
 
 ## Exit gate
 
-- [ ] Default, created, mirrored, adopted, fixed-path, and daemon flows exist.
-- [ ] Record is committed only after target verification.
-- [ ] Source instance cannot change during mirror/create.
-- [ ] Remove choices are distinct and recoverable.
-- [ ] Repair is ownership-aware.
-- [ ] Instance records remain free of harness-owned values/secrets.
+- [x] Default, created, mirrored, adopted, fixed-path, and daemon flows exist.
+- [x] Record is committed only after target verification.
+- [x] Source instance cannot change during mirror/create.
+- [x] Remove choices are distinct and recoverable.
+- [x] Repair is ownership-aware.
+- [x] Instance records remain free of harness-owned values/secrets.
+
+> Completion record (run 3): INS-01..09 closed by areas 6a/6b (judge-verified rounds 1-2:
+> real foreign-managed determination, blocking provider/sink preflight, Linked/Transformed
+> mirror kinds with mode preservation, real before/after source-digest proof, wrapper-file
+> rename on disk, demo-marker-free reconfigure over provider/template/skill/plugin/MCP
+> mutations, FixedPathEntries removal, TemplateVersionDrift + journal repairs); INS-10
+> fixed-path activation + WRP-07 daemon lifecycle delivered in 6a (activation.rs/daemon.rs,
+> `activation_swaps_content_with_backup_and_restores_prior_profile`,
+> `daemon_start_ready_stop_round_trip`). Records secret/foreign-value-free pinned by
+> `property_registry_no_forbidden_fields`. Daemon lifecycle for openclaw itself stays
+> honestly ResearchBlocked (documented DaemonConstraints); the generic machinery is real
+> and tested.
 

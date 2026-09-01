@@ -216,9 +216,17 @@ Semantic diff remains stable across whitespace. Lexical diff proves preservation
 
 ## Exit gate
 
-- [ ] All six required format classes have explicit read/write/read-only support decisions.
-- [ ] No-op byte identity passes.
-- [ ] Unknown data and supported lexical material survive edits.
-- [ ] Unsupported ambiguous constructs fail before mutation planning.
-- [ ] Adapters can express every owned edit without format-specific logic in core workflows.
+- [x] All six required format classes have explicit read/write/read-only support decisions.
+- [x] No-op byte identity passes.
+- [x] Unknown data and supported lexical material survive edits.
+- [x] Unsupported ambiguous constructs fail before mutation planning.
+- [x] Adapters can express every owned edit without format-specific logic in core workflows.
+
+> Completion record (run 3): DOC-01/03..07 verified at baseline (group-A verifier/judge);
+> DOC-02 executor, DOC-08 managed spans, DOC-09 schema/deprecation hooks, and DOC-10
+> formatting-change warnings closed by area 1 (judge-verified: executor policy enforcement,
+> span fail-closed codec, validate_with_schema, DiffResult.formatting_warnings). JSONC/YAML
+> refuse changing writes with typed LossyWrite — the codecs' explicit read-only decision per
+> the DOC-05/06 preservation-policy fallback, not a gap. TOML executor refuses array-of-tables
+> identity edits with a typed UnsupportedOperation (no production caller needs them).
 

@@ -204,9 +204,26 @@ Observable assertions:
 ## Exit gate
 
 - [ ] All supported writes go through one transaction boundary.
-- [ ] Backup-before-foreign-write is structurally unavoidable.
-- [ ] Same-file conflicts abort.
-- [ ] Single-file replacement is atomic per supported platform.
-- [ ] Multi-file failure rolls back or reports verified residuals.
-- [ ] Backup listing and restore work by stable IDs.
-- [ ] Crash recovery tests pass.
+      > open: codec store paths (json/toml/yaml/jsonc/env) remain public alongside the
+      > Transaction — the plan-02 integration fold (deprecating direct store paths so the
+      > boundary is type-enforced) was explicitly deferred by area 2. Behavior is safe at
+      > every store site (backup + atomic write internally); only the API-level fold is
+      > missing.
+- [x] Backup-before-foreign-write is structurally unavoidable.
+- [x] Same-file conflicts abort.
+- [x] Single-file replacement is atomic per supported platform.
+- [x] Multi-file failure rolls back or reports verified residuals.
+- [x] Backup listing and restore work by stable IDs.
+- [x] Crash recovery tests pass.
+
+> Completion record (run 3): every store site performs the backup internally and the guard
+> is mutation-tested (`mutant_backup_before_write_is_not_skippable`, superai-config
+> property_tests); §4.2 conflict window closed by area 2 (fresh recheck before every
+> transaction step, judge-verified — no overwrite path for externally-changed files);
+> Windows replacement semantics (readonly-attribute projection, clear-before-rename,
+> flush discipline) landed in area 8 with the windows CI runner as executor of record;
+> rollback/residuals pinned by `commit_failure_surfaces_intermediate_rollback_in_outcome`;
+> restore-by-BackupId verified at baseline; crash recovery runs against the production
+> journal (`abandoned_journal_at_each_phase_recovers_via_production_journal`). MUT-01's
+> `schema_version` token field remains punted (no config-layer schema-version vocabulary;
+> area-2 disclosure).
