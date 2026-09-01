@@ -4,7 +4,7 @@
 //! harness version and surface ownership policies before delegating to the
 //! config-layer backend. No interface types are introduced.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use superai_config::document::DocumentKind as ConfigKind;
 use superai_config::raw_editor::{CommitReport, DiffResult, RawDocument};
@@ -355,10 +355,549 @@ fn surface_gates_for_adapter(
     }
 }
 
+// ---------------------------------------------------------------------------
+// RAW-01 — open with surface identity and path policy
+// ---------------------------------------------------------------------------
+
+/// Response of an adapter-aware open (RAW-01).
+#[derive(Debug, Clone)]
+pub struct RawOpenReport {
+    /// Surface identity the path resolved to, if any.
+    pub surface_id: Option<String>,
+    /// Declared scope of that surface.
+    pub scope: Option<crate::adapter::ConfigScope>,
+    /// Declared precedence of that surface (higher wins).
+    pub precedence: Option<u8>,
+    /// The sensitive document, read fresh. `None` when the surface is a
+    /// store that must not be opened for editing (read-only reason set).
+    pub document: Option<RawDocument>,
+    /// Why the surface cannot be edited, where applicable.
+    pub read_only_reason: Option<String>,
+    /// Resolved harness version summary (`compatible`, detected, schema).
+    pub version_compatible: bool,
+    /// Detected harness version, if any.
+    pub detected_version: Option<String>,
+    /// Mismatch between the caller's expected harness version and the
+    /// adapter's resolution, surfaced as a diagnostic.
+    pub expected_version_mismatch: Option<String>,
+    /// Which path policy admitted the request.
+    pub path_policy: &'static str,
+}
+
+impl RawEditor {
+    /// Open `path` through the adapter's surface identity and policy
+    /// (RAW-01).
+    ///
+    /// - The path must resolve to one of the adapter's declared surfaces;
+    ///   arbitrary paths outside the harness's surfaces are refused.
+    /// - Internal stores (SQLite/keychain/executable/opaque, external secret
+    ///   stores, harness-managed files) open with a read-only reason and NO
+    ///   content.
+    /// - The caller's `expected_version` input is compared against the
+    ///   adapter's resolution and surfaced as a mismatch diagnostic (it does
+    ///   not block the read).
+    pub fn open_for_adapter(
+        &self,
+        adapter: &dyn Adapter,
+        path: &Path,
+        expected_version: Option<&str>,
+    ) -> Result<RawOpenReport> {
+        open_for_adapter(adapter, path, expected_version)
+    }
+
+    /// Open an explicit path for advanced local editing after path-policy
+    /// validation (RAW-01): absolute, normalized, and not an internal
+    /// db/keychain/opaque store. No adapter surface is required.
+    pub fn open_explicit(&self, path: &Path) -> Result<RawDocument> {
+        open_explicit(path)
+    }
+}
+
+/// Surface kind/ownership read-only reason for RAW-01 opens.
+fn surface_read_only_reason(surface: &crate::adapter::ConfigSurface) -> Option<String> {
+    let kind_reason = match surface.kind {
+        AdapterKind::Executable => {
+            Some("executable config is read-only via the raw editor".to_owned())
+        }
+        AdapterKind::Sqlite | AdapterKind::Keychain | AdapterKind::Opaque => Some(format!(
+            "surface `{}` is an internal store ({}) and never opens for editing",
+            surface.id, surface.kind
+        )),
+        _ => None,
+    };
+    kind_reason.or_else(|| {
+        if surface.ownership == SurfaceOwnership::ExternalSecretStore {
+            Some(format!(
+                "surface `{}` is an external secret store; read-only",
+                surface.id
+            ))
+        } else if surface.ownership == SurfaceOwnership::HarnessManaged {
+            Some(format!(
+                "surface `{}` is harness-managed; read-only",
+                surface.id
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// Adapter-aware open (RAW-01). See [`RawEditor::open_for_adapter`].
+pub fn open_for_adapter(
+    adapter: &dyn Adapter,
+    path: &Path,
+    expected_version: Option<&str>,
+) -> Result<RawOpenReport> {
+    let Some(surface) = surface_for_path(adapter, path) else {
+        return Err(CoreError::UnsupportedSurface {
+            harness: adapter.id().to_string(),
+            surface: path.display().to_string(),
+            reason: "path resolves to no declared surface for this harness; use \
+                     open_explicit for advanced local editing after path-policy validation"
+                .to_owned(),
+        });
+    };
+    let read_only_reason = surface_read_only_reason(&surface);
+    let document = if read_only_reason.is_none() {
+        Some(read(path)?)
+    } else {
+        None
+    };
+    let version = adapter.version_resolution();
+    let expected_version_mismatch = match expected_version {
+        Some(expected) => match version.detected_version.as_deref() {
+            Some(detected) if detected != expected => Some(format!(
+                "caller expected harness version `{expected}`, adapter resolved `{detected}` \
+                 (compatible: {})",
+                version.compatible
+            )),
+            _ => None,
+        },
+        None => None,
+    };
+    Ok(RawOpenReport {
+        surface_id: Some(surface.id),
+        scope: Some(surface.scope),
+        precedence: Some(surface.precedence),
+        document,
+        read_only_reason,
+        version_compatible: version.compatible,
+        detected_version: version.detected_version,
+        expected_version_mismatch,
+        path_policy: "adapter-surface",
+    })
+}
+
+/// Path-policy-validated explicit open (RAW-01).
+pub fn open_explicit(path: &Path) -> Result<RawDocument> {
+    let normalized =
+        crate::paths::AbsolutePath::from_path(path).map_err(|e| CoreError::InvalidPath {
+            kind: "raw_explicit_open".to_owned(),
+            value: path.display().to_string(),
+            reason: format!(
+                "explicit paths must be absolute, normalized, and free of traversal: {e}"
+            ),
+        })?;
+    let lower = normalized.as_path().to_string_lossy().to_ascii_lowercase();
+    if lower.contains(".db")
+        || lower.contains(".sqlite")
+        || lower.ends_with(".keychain")
+        || lower.contains("keychain")
+    {
+        return Err(CoreError::UnsupportedOperation {
+            harness: "raw-editor".to_owned(),
+            operation: "open_explicit".to_owned(),
+            reason: "internal SQLite/keychain/auth stores never open for editing (RAW-06)"
+                .to_owned(),
+        });
+    }
+    read(normalized.as_path())
+}
+
+// ---------------------------------------------------------------------------
+// RAW-02 — validate a draft (schema at validate time)
+// ---------------------------------------------------------------------------
+
+/// Result of draft validation (RAW-02): syntax + size + adapter schema
+/// diagnostics and the version gate, without touching disk.
+#[derive(Debug, Clone)]
+pub struct DraftValidation {
+    /// All diagnostics (syntax, size, semantic schema, deprecations),
+    /// adapter-attributed where a surface matched.
+    pub diagnostics: Vec<superai_config::document::Diagnostic>,
+    /// Blocking (Error-severity) diagnostics only.
+    pub blocking: Vec<superai_config::document::Diagnostic>,
+    /// Version-gate refusal text when the adapter's resolution blocks writes.
+    pub version_gate: Option<String>,
+    /// The surface the path resolved to, if any.
+    pub surface_id: Option<String>,
+}
+
+impl RawEditor {
+    /// Validate a draft against the adapter's surface schema and version
+    /// gate (RAW-02): size + encoding + syntax + adapter semantic schema +
+    /// deprecated/owned-key identification + root/type constraints, plus the
+    /// harness version gate — all at VALIDATE time, never touching disk.
+    pub fn validate_draft(
+        &self,
+        adapter: &dyn Adapter,
+        path: &Path,
+        draft: &[u8],
+    ) -> DraftValidation {
+        validate_draft(adapter, path, draft)
+    }
+}
+
+/// Adapter-aware draft validation (RAW-02). See [`RawEditor::validate_draft`].
+pub fn validate_draft(adapter: &dyn Adapter, path: &Path, draft: &[u8]) -> DraftValidation {
+    let kind = ConfigKind::from_path(path);
+    let surface = surface_for_path(adapter, path);
+    let diagnostics = match &surface {
+        Some(surface) => {
+            crate::adapter::validate_surface_content(adapter, &surface.id, draft, kind)
+        }
+        None => validate(draft, kind),
+    };
+    let version = adapter.version_resolution();
+    let version_gate = (!version.compatible).then(|| {
+        format!(
+            "harness version {} not compatible for writes",
+            version.detected_version.as_deref().unwrap_or("unknown")
+        )
+    });
+    let blocking = diagnostics
+        .iter()
+        .filter(|d| d.severity == superai_config::document::DiagnosticSeverity::Error)
+        .cloned()
+        .collect();
+    DraftValidation {
+        diagnostics,
+        blocking,
+        version_gate,
+        surface_id: surface.map(|s| s.id),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAW-03 — diff with scope/precedence, restart, and template ownership
+// ---------------------------------------------------------------------------
+
+/// Adapter-aware diff (RAW-03): the base diff plus scope/precedence warning,
+/// restart/reload requirement, and template-owned divergence markers.
+#[derive(Debug, Clone)]
+pub struct AdapterDiffResult {
+    /// Base lexical/semantic/redaction diff.
+    pub base: DiffResult,
+    /// Declared scope of the surface.
+    pub scope: Option<crate::adapter::ConfigScope>,
+    /// Declared precedence of the surface.
+    pub precedence: Option<u8>,
+    /// Restart/reload requirement after committing this change.
+    pub restart_requirement: Option<String>,
+    /// Scope/precedence warning: other surfaces may override this file.
+    pub scope_warning: Option<String>,
+    /// Template-owned fields the draft diverges on (reported, never
+    /// forbidden — disk is authoritative and users may intentionally
+    /// diverge).
+    pub template_owned_changes: Vec<superai_config::raw_editor::SemanticOp>,
+}
+
+impl RawEditor {
+    /// Diff `old` vs `new` with the adapter's surface context (RAW-03).
+    ///
+    /// `template_owned` lists the selector prefixes a template wrote (from
+    /// the instance's template patches); changed selectors inside them are
+    /// marked as template-owned divergence. `None` marks no template
+    /// ownership knowledge.
+    pub fn diff_for_adapter(
+        &self,
+        adapter: &dyn Adapter,
+        path: &Path,
+        old: &[u8],
+        new: &[u8],
+        template_owned: Option<&[String]>,
+    ) -> AdapterDiffResult {
+        diff_for_adapter(adapter, path, old, new, template_owned)
+    }
+}
+
+/// Adapter-aware diff (RAW-03). See [`RawEditor::diff_for_adapter`].
+pub fn diff_for_adapter(
+    adapter: &dyn Adapter,
+    path: &Path,
+    old: &[u8],
+    new: &[u8],
+    template_owned: Option<&[String]>,
+) -> AdapterDiffResult {
+    let kind = ConfigKind::from_path(path);
+    let base = superai_config::raw_editor::diff(old, new, kind);
+    let Some(surface) = surface_for_path(adapter, path) else {
+        return AdapterDiffResult {
+            base,
+            scope: None,
+            precedence: None,
+            restart_requirement: None,
+            scope_warning: None,
+            template_owned_changes: Vec::new(),
+        };
+    };
+    let restart_requirement = match surface.restart_behavior {
+        crate::adapter::RestartBehavior::None => None,
+        other => Some(format!("{other} required after committing this change")),
+    };
+    // Scope/precedence warning: any other declared surface of the same
+    // harness with HIGHER precedence can override this file's keys.
+    let higher = adapter
+        .config_surfaces()
+        .iter()
+        .any(|s| s.precedence > surface.precedence);
+    let scope_warning = higher.then(|| {
+        format!(
+            "surface `{}` has precedence {}; surfaces with higher precedence exist for `{}` and \
+             may override these keys",
+            surface.id,
+            surface.precedence,
+            adapter.id()
+        )
+    });
+    // Template-owned divergence: semantic ops touching selectors the
+    // template owns (or, without template knowledge, the adapter's owned
+    // selectors as the managed-field proxy).
+    let template_owned_changes: Vec<_> = base
+        .semantic_ops
+        .iter()
+        .filter(|op| {
+            let selector = op
+                .selector
+                .trim_start_matches("key:")
+                .trim_start_matches("table:");
+            let owned: Vec<String> =
+                template_owned.map_or_else(|| surface.owned_selectors.clone(), <[String]>::to_vec);
+            owned
+                .iter()
+                .any(|prefix| selector == prefix || selector.starts_with(&format!("{prefix}.")))
+        })
+        .cloned()
+        .collect();
+    AdapterDiffResult {
+        base,
+        scope: Some(surface.scope),
+        precedence: Some(surface.precedence),
+        restart_requirement,
+        scope_warning,
+        template_owned_changes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAW-05 — adapter-permission-gated creation with rollback
+// ---------------------------------------------------------------------------
+
+/// Preview of creating a missing config file (RAW-05).
+#[derive(Debug, Clone)]
+pub struct CreatePreview {
+    /// Target path.
+    pub path: PathBuf,
+    /// Parent directories the creation would own (missing ones).
+    pub owned_parents: Vec<PathBuf>,
+    /// Note on file permissions the creation applies.
+    pub permissions_note: String,
+    /// Scope/precedence effect of the new file.
+    pub precedence_note: Option<String>,
+    /// First-run risk note.
+    pub first_run_risk: String,
+    /// Whether the adapter permits creating this surface at all.
+    pub permitted: bool,
+    /// Why creation is refused, when not permitted.
+    pub refusal_reason: Option<String>,
+}
+
+impl RawEditor {
+    /// Preview creating `path` under the adapter's rules (RAW-05).
+    pub fn preview_create_for_adapter(
+        &self,
+        adapter: &dyn Adapter,
+        path: &Path,
+        initial: &[u8],
+    ) -> CreatePreview {
+        preview_create_for_adapter(adapter, path, initial)
+    }
+
+    /// Create a missing config file with rollback (RAW-05): validates the
+    /// initial document (including the format's empty-document rule),
+    /// refuses when the adapter does not permit creating the surface, and
+    /// stages the creation through the compensated transaction so a failure
+    /// removes only the created file and empty owned parents.
+    pub fn create_file_for_adapter(
+        &self,
+        adapter: &dyn Adapter,
+        path: &Path,
+        initial: &[u8],
+    ) -> Result<CommitReport> {
+        create_file_for_adapter(adapter, path, initial)
+    }
+}
+
+/// Adapter permission gate + preview for creation (RAW-05).
+pub fn preview_create_for_adapter(
+    adapter: &dyn Adapter,
+    path: &Path,
+    initial: &[u8],
+) -> CreatePreview {
+    let mut owned_parents = Vec::new();
+    let mut probe = path.parent();
+    while let Some(dir) = probe
+        && !dir.as_os_str().is_empty()
+    {
+        if dir.exists() {
+            break;
+        }
+        owned_parents.push(dir.to_path_buf());
+        probe = dir.parent();
+    }
+    owned_parents.reverse();
+    let kind = ConfigKind::from_path(path);
+    let (permitted, refusal_reason, precedence_note) = match surface_for_path(adapter, path) {
+        Some(surface) => match surface_read_only_reason(&surface) {
+            Some(reason) => (false, Some(reason), None),
+            None => (
+                true,
+                None,
+                Some(format!(
+                    "new file acts as `{}` surface at precedence {} (scope {:?})",
+                    surface.id, surface.precedence, surface.scope
+                )),
+            ),
+        },
+        None => (
+            false,
+            Some(format!(
+                "path resolves to no declared surface of `{}`; the adapter does not define an \
+                 initial document shape here",
+                adapter.id()
+            )),
+            None,
+        ),
+    };
+    let empty_note = std::str::from_utf8(initial).is_ok_and(|t| t.trim().is_empty())
+        && matches!(kind, ConfigKind::StrictJson | ConfigKind::JsonC);
+    CreatePreview {
+        path: path.to_path_buf(),
+        owned_parents,
+        permissions_note: "created with default user permissions; existing files are never \
+                           replaced"
+            .to_owned(),
+        precedence_note,
+        first_run_risk: if empty_note {
+            "empty buffer is not the format's empty document; the initial draft must be a valid \
+             document (e.g. `{}` for JSON)"
+                .to_owned()
+        } else {
+            "a newly created surface takes effect on the harness's next start/reload".to_owned()
+        },
+        permitted,
+        refusal_reason,
+    }
+}
+
+/// Adapter-permission-gated creation (RAW-05).
+pub fn create_file_for_adapter(
+    adapter: &dyn Adapter,
+    path: &Path,
+    initial: &[u8],
+) -> Result<CommitReport> {
+    let preview = preview_create_for_adapter(adapter, path, initial);
+    if !preview.permitted {
+        return Err(CoreError::UnsupportedOperation {
+            harness: adapter.id().to_string(),
+            operation: "raw_create".to_owned(),
+            reason: preview
+                .refusal_reason
+                .unwrap_or_else(|| "adapter does not permit creating this surface".to_owned()),
+        });
+    }
+    superai_config::raw_editor::create_file(path, initial).map_err(CoreError::Config)
+}
+
+// ---------------------------------------------------------------------------
+// RAW-07 — reopen with a new schema (manual rebase)
+// ---------------------------------------------------------------------------
+
+/// Rebase report after a schema-version change invalidated a draft (RAW-07).
+#[derive(Debug, Clone)]
+pub struct RebaseReport {
+    /// The reopened document, read fresh from disk under the new resolution.
+    pub reopened: RawDocument,
+    /// Harness version the draft was authored against (caller's record).
+    pub draft_version: String,
+    /// Harness version the adapter resolves NOW.
+    pub new_version: Option<String>,
+    /// Whether the current resolution is write-compatible at all.
+    pub new_version_compatible: bool,
+    /// Keys/spans affected between the draft and the current on-disk
+    /// document — the manual rebase work list. Nothing is auto-applied.
+    pub affected: Vec<superai_config::raw_editor::SemanticOp>,
+    /// Lexical unified diff (draft -> current disk) for the human rebase.
+    pub lexical: String,
+    /// Guidance for the manual rebase.
+    pub guidance: String,
+}
+
+impl RawEditor {
+    /// Reopen `path` under the adapter's CURRENT schema resolution and mark
+    /// the draft's affected keys/spans for MANUAL rebase (RAW-07).
+    ///
+    /// The draft text is never auto-applied under the new schema: the report
+    /// carries the semantic deltas between the draft and the fresh on-disk
+    /// document, plus a lexical diff, and the caller decides the merge.
+    pub fn reopen_rebase(
+        &self,
+        adapter: &dyn Adapter,
+        path: &Path,
+        draft: &[u8],
+        draft_version: &str,
+    ) -> Result<RebaseReport> {
+        reopen_rebase(adapter, path, draft, draft_version)
+    }
+}
+
+/// Reopen-with-new-schema flow (RAW-07). See [`RawEditor::reopen_rebase`].
+pub fn reopen_rebase(
+    adapter: &dyn Adapter,
+    path: &Path,
+    draft: &[u8],
+    draft_version: &str,
+) -> Result<RebaseReport> {
+    let reopened_doc = read(path)?;
+    let kind = ConfigKind::from_path(path);
+    let diff = superai_config::raw_editor::diff(draft, reopened_doc.content.expose(), kind);
+    let version = adapter.version_resolution();
+    let affected = diff.semantic_ops.clone();
+    let guidance = if affected.is_empty() {
+        "draft is semantically identical to the reopened document; rebase is a no-op".to_owned()
+    } else {
+        format!(
+            "harness changed {} -> {} while the draft was open; {} affected key(s)/span(s) \
+             listed for MANUAL rebase — superai never auto-applies a draft under a new schema",
+            draft_version,
+            version.detected_version.as_deref().unwrap_or("unknown"),
+            affected.len()
+        )
+    };
+    Ok(RebaseReport {
+        reopened: reopened_doc,
+        draft_version: draft_version.to_owned(),
+        new_version: version.detected_version.clone(),
+        new_version_compatible: version.compatible,
+        affected,
+        lexical: diff.lexical_unified_diff,
+        guidance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::adapter::{
@@ -805,5 +1344,350 @@ mod tests {
         let surface = surface_for_path(&adapter, Path::new("/tmp/root/config.toml")).unwrap();
         assert_eq!(surface.id, "config.toml");
         assert!(surface_for_path(&adapter, Path::new("/tmp/root/other.txt")).is_none());
+    }
+    // -------------------------------------------------------------------
+    // RAW-01/02/03/05/07 — adapter-aware open/validate/diff/create/reopen
+    // -------------------------------------------------------------------
+
+    /// Writable adapter with two scoped surfaces (project .mcp.json at lower
+    /// precedence requiring reload; user settings.json at higher precedence).
+    #[derive(Debug)]
+    struct ScopedAdapter;
+
+    impl ScopedAdapter {
+        fn surfaces() -> Vec<crate::adapter::ConfigSurface> {
+            let mut project = crate::adapter::ConfigSurface::new(
+                ".mcp.json",
+                PathResolver::fallback_only(".mcp.json"),
+                DocumentKind::Json,
+                crate::adapter::ConfigScope::ProjectWorkspace,
+                SurfaceOwnership::UserEditable,
+            );
+            project.precedence = 0;
+            project.restart_behavior = crate::adapter::RestartBehavior::Reload;
+            project.owned_selectors = vec!["mcpServers".to_owned()];
+            let mut user = crate::adapter::ConfigSurface::new(
+                "settings.json",
+                PathResolver::fallback_only("settings.json"),
+                DocumentKind::Json,
+                crate::adapter::ConfigScope::User,
+                SurfaceOwnership::UserEditable,
+            );
+            user.precedence = 5;
+            vec![project, user]
+        }
+    }
+
+    impl Adapter for ScopedAdapter {
+        fn id(&self) -> HarnessId {
+            HarnessId::new("claude-code").unwrap()
+        }
+        fn display_name(&self) -> &'static str {
+            "Claude Code"
+        }
+        fn product_status(&self) -> ProductStatus {
+            ProductStatus::Active
+        }
+        fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+            Vec::new()
+        }
+        fn adapter_revision(&self) -> &'static str {
+            "0.1.0"
+        }
+        fn research_doc_link(&self) -> &'static str {
+            "docs/harness-configs/claude-code.md"
+        }
+        fn last_verified_date(&self) -> &'static str {
+            "2026-08-25"
+        }
+        fn detection(&self) -> DetectionResult {
+            DetectionResult::absent(vec!["test".to_owned()])
+        }
+        fn version_resolution(&self) -> VersionResolution {
+            VersionResolution::new(Some("2.1.0".to_owned()), Some("2".to_owned()), true)
+        }
+        fn config_surfaces(&self) -> Vec<crate::adapter::ConfigSurface> {
+            Self::surfaces()
+        }
+        fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
+            Vec::new()
+        }
+        fn plan_mirror_exclusions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_wrapper(
+            &self,
+            _instance: &crate::instance::Instance,
+        ) -> std::result::Result<crate::adapter::WrapperPlan, CoreError> {
+            Ok(crate::adapter::WrapperPlan::new("test"))
+        }
+        fn scan_candidates(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn validate_instance(&self, _instance: &crate::instance::Instance) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn open_for_adapter_surfaces_identity_scope_and_read_only_reasons() {
+        let editor = RawEditor::new();
+        // Writable surface: document + scope/precedence + version.
+        let root = surface_scratch("raw01-open", "");
+        let mcp_path = root.join(".mcp.json");
+        std::fs::write(&mcp_path, br#"{"mcpServers":{"a":{"command":"x"}}}"#).unwrap();
+        let report = editor
+            .open_for_adapter(&ScopedAdapter, &mcp_path, Some("2.0.0"))
+            .unwrap();
+        assert_eq!(report.surface_id.as_deref(), Some(".mcp.json"));
+        assert_eq!(
+            report.scope,
+            Some(crate::adapter::ConfigScope::ProjectWorkspace)
+        );
+        assert_eq!(report.precedence, Some(0));
+        assert!(report.document.is_some());
+        assert!(report.read_only_reason.is_none());
+        assert!(report.version_compatible);
+        // Expected-version mismatch is surfaced, not fatal.
+        let mismatch = report.expected_version_mismatch.as_deref().unwrap();
+        assert!(
+            mismatch.contains("2.0.0") && mismatch.contains("2.1.0"),
+            "{mismatch}"
+        );
+
+        // Internal store: read-only reason, NO content.
+        let keychain_path = unique_scratch("raw01-keychain", ".keychain");
+        std::fs::write(&keychain_path, b"secret-bytes").unwrap();
+        let ro_report = editor
+            .open_for_adapter(&ReadOnlyAdapter, &keychain_path, None)
+            .unwrap();
+        assert!(
+            ro_report.document.is_none(),
+            "stores never open for editing"
+        );
+        let reason = ro_report.read_only_reason.as_deref().unwrap();
+        assert!(
+            reason.contains("internal store") || reason.contains("external secret"),
+            "{reason}"
+        );
+
+        // Arbitrary undeclared path: refused outright.
+        let err = editor
+            .open_for_adapter(&ScopedAdapter, Path::new("/etc/passwd"), None)
+            .unwrap_err();
+        match err {
+            CoreError::UnsupportedSurface { .. } => {}
+            other => panic!("expected UnsupportedSurface, got {other:?}"),
+        }
+
+        // Explicit open passes policy for a normal file, refuses stores.
+        let explicit = editor.open_explicit(&mcp_path).unwrap();
+        assert!(!explicit.diagnostics.is_empty() || explicit.diagnostics.is_empty());
+        let db_path = unique_scratch("raw01-db", ".db");
+        std::fs::write(&db_path, b"sqlite").unwrap();
+        let db_err = editor.open_explicit(&db_path).unwrap_err();
+        assert!(format!("{db_err}").contains("never open for editing"));
+        let rel_err = editor
+            .open_explicit(Path::new("relative.json"))
+            .unwrap_err();
+        assert!(format!("{rel_err}").contains("absolute"));
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_file(&keychain_path));
+        drop(std::fs::remove_file(&db_path));
+    }
+
+    #[test]
+    fn validate_draft_runs_schema_and_version_gate_without_disk() {
+        let editor = RawEditor::new();
+        let path = surface_scratch("raw02", "config.toml");
+        // Schema-invalid draft (model must be a string) has blocking
+        // diagnostics attributed to the surface.
+        let validation = editor.validate_draft(&SchemaEraAdapter, &path, b"model = 5\n");
+        assert_eq!(validation.surface_id.as_deref(), Some("config.toml"));
+        assert!(
+            validation.blocking.iter().any(|d| d
+                .message
+                .contains("`model` must hold a value of type string")),
+            "{:?}",
+            validation.diagnostics
+        );
+        // Version gate: an incompatible adapter surfaces the refusal text.
+        let gated = editor.validate_draft(&IncompatibleAdapter, &path, b"model = \"gpt-5\"\n");
+        assert!(
+            gated
+                .version_gate
+                .as_deref()
+                .is_some_and(|g| g.contains("not compatible"))
+        );
+        // Oversize drafts are a size diagnostic before parsing (RAW-02).
+        let huge = vec![b'a'; superai_config::raw_editor::MAX_VALIDATION_BYTES + 1];
+        let sized = editor.validate_draft(&SchemaEraAdapter, &path, &huge);
+        assert!(
+            sized
+                .blocking
+                .iter()
+                .any(|d| d.message.contains("size limit")),
+            "{:?}",
+            sized.diagnostics
+        );
+    }
+
+    #[test]
+    fn diff_for_adapter_carries_scope_restart_and_template_markers() {
+        let editor = RawEditor::new();
+        let path = surface_scratch("raw03", ".mcp.json");
+        let old = br#"{"mcpServers":{"a":{"command":"x"},"template-key":{"command":"t"}}}"#;
+        let new = br#"{"mcpServers":{"a":{"command":"y"},"template-key":{"command":"changed"}}}"#;
+        // Template owns the `mcpServers.template-key` selector.
+        let template_owned = vec!["mcpServers.template-key".to_owned()];
+        let result =
+            editor.diff_for_adapter(&ScopedAdapter, &path, old, new, Some(&template_owned));
+        assert_eq!(
+            result.scope,
+            Some(crate::adapter::ConfigScope::ProjectWorkspace)
+        );
+        assert_eq!(result.precedence, Some(0));
+        // Higher-precedence surface exists -> scope warning.
+        let warning = result.scope_warning.as_deref().unwrap();
+        assert!(
+            warning.contains("precedence 0") && warning.contains("may override"),
+            "{warning}"
+        );
+        // Restart requirement surfaced.
+        assert!(
+            result
+                .restart_requirement
+                .as_deref()
+                .is_some_and(|r| r.contains("reload")),
+            "{:?}",
+            result.restart_requirement
+        );
+        // Template-owned divergence reported, not forbidden.
+        assert!(
+            result
+                .template_owned_changes
+                .iter()
+                .any(|op| op.selector.contains("template-key")),
+            "{:?}",
+            result.template_owned_changes
+        );
+        // Without template knowledge, the adapter's owned selectors act as
+        // the managed-field proxy.
+        let proxy = editor.diff_for_adapter(&ScopedAdapter, &path, old, new, None);
+        assert!(
+            proxy
+                .template_owned_changes
+                .iter()
+                .any(|op| op.selector.contains("mcpServers")),
+            "{:?}",
+            proxy.template_owned_changes
+        );
+    }
+
+    #[test]
+    fn create_is_permission_gated_and_rolls_back_on_refusal() {
+        let editor = RawEditor::new();
+        // Declared surface: preview + create succeed.
+        let root = surface_scratch("raw05", "");
+        let target = root.join("deep/owned/.mcp.json");
+        let preview =
+            editor.preview_create_for_adapter(&ScopedAdapter, &target, br#"{"mcpServers":{}}"#);
+        assert!(preview.permitted, "{:?}", preview.refusal_reason);
+        assert_eq!(
+            preview.owned_parents,
+            vec![root.join("deep"), root.join("deep/owned")]
+        );
+        assert!(
+            preview
+                .precedence_note
+                .as_deref()
+                .is_some_and(|n| n.contains("precedence 0"))
+        );
+        let report = editor
+            .create_file_for_adapter(&ScopedAdapter, &target, br#"{"mcpServers":{}}"#)
+            .unwrap();
+        assert!(!report.is_noop);
+        assert!(target.exists());
+
+        // Undeclared surface: refused before touching disk.
+        let stray = root.join("undeclared.json");
+        let err = editor
+            .create_file_for_adapter(&ScopedAdapter, &stray, br#"{"a":1}"#)
+            .unwrap_err();
+        match err {
+            CoreError::UnsupportedOperation { operation, .. } => {
+                assert_eq!(operation, "raw_create");
+            }
+            other => panic!("expected UnsupportedOperation, got {other:?}"),
+        }
+        assert!(!stray.exists());
+
+        // Read-only surface: refused with the store reason.
+        let keychain_target = root.join("keychain-store.keychain");
+        let err2 = editor
+            .create_file_for_adapter(&ReadOnlyAdapter, &keychain_target, b"x")
+            .unwrap_err();
+        assert!(format!("{err2}").contains("read-only") || format!("{err2}").contains("never"));
+        assert!(!keychain_target.exists());
+
+        // Empty buffer is not the format's empty document (declared
+        // settings.json surface, JSON kind).
+        let empty_target = root.join("settings.json");
+        let err3 = editor
+            .create_file_for_adapter(&ScopedAdapter, &empty_target, b"  ")
+            .unwrap_err();
+        assert!(
+            format!("{err3}").contains("empty buffer") || format!("{err3}").contains("invalid"),
+            "{err3}"
+        );
+        assert!(!empty_target.exists());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn reopen_rebase_marks_affected_keys_for_manual_rebase() {
+        let editor = RawEditor::new();
+        let root = surface_scratch("raw07", "");
+        let path = root.join(".mcp.json");
+        // Draft authored under 2.0.0; the harness meanwhile wrote a new file.
+        let draft = br#"{"mcpServers":{"a":{"command":"draft"}}}"#;
+        std::fs::write(
+            &path,
+            br#"{"mcpServers":{"a":{"command":"current"},"b":{"command":"new"}}}"#,
+        )
+        .unwrap();
+        let report = editor
+            .reopen_rebase(&ScopedAdapter, &path, draft, "2.0.0")
+            .unwrap();
+        assert_eq!(report.draft_version, "2.0.0");
+        assert_eq!(report.new_version.as_deref(), Some("2.1.0"));
+        assert!(report.new_version_compatible);
+        // Affected keys include the changed server and the added one.
+        assert!(
+            report.affected.iter().any(|op| op.selector.contains('a')),
+            "{:?}",
+            report.affected
+        );
+        assert!(
+            report.affected.iter().any(|op| op.selector.contains('b')),
+            "{:?}",
+            report.affected
+        );
+        // Guidance demands manual rebase; nothing was auto-applied.
+        assert!(
+            report.guidance.contains("MANUAL rebase"),
+            "{}",
+            report.guidance
+        );
+        assert!(
+            !report.lexical.is_empty(),
+            "lexical draft->disk diff must be present"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            br#"{"mcpServers":{"a":{"command":"current"},"b":{"command":"new"}}}"#.to_vec(),
+            "reopen must not write anything"
+        );
+        drop(std::fs::remove_dir_all(&root));
     }
 }

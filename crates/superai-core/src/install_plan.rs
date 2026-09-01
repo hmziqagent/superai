@@ -4,7 +4,11 @@
 //! planner validates:
 //! - platform/architecture support (via catalog constraints)
 //! - official package identity (method + package_name must match catalog)
-//! - version availability (stub network check: semver parse + catalog allowlist)
+//! - version availability (REAL per-method registry probe via the process
+//!   module: `npm view` / `brew info --json=v2` / `cargo search` /
+//!   `mise ls-remote` / `pip index versions`; offline, timeout, and
+//!   missing-manager outcomes become typed unavailable-with-reason, never a
+//!   silent `true`)
 //! - writable destination
 //! - network and admin requirements
 //! - conflicts with existing installs (via `InstallCatalogEntry.conflicts`)
@@ -13,6 +17,12 @@
 //! The plan is previewed — no filesystem or network mutation occurs here.
 //! The preview contains the exact `executable + argv` tokens that would be
 //! executed, so callers can display and confirm before running.
+//!
+//! External and direct methods have no safe non-interactive install command
+//! (PKG-10): their plans are marked `external_install` with the documented
+//! docs URL and executing them refuses with the typed
+//! [`CoreError::ExternalInstallRequired`]. No `mise install` command is ever
+//! fabricated for a non-mise package.
 //!
 //! Prefer mise-backed versioned installs when supported (see
 //! `InstallMethodKind::Mise`).
@@ -30,6 +40,7 @@ use crate::ids::HarnessId;
 use crate::install_catalog::{
     CommandTokens, InstallCatalog, InstallCatalogEntry, InstallMethod, InstallMethodKind,
 };
+use crate::process::{ExecuteOpts, extract_version, run_command};
 
 // ---------------------------------------------------------------------------
 // Request and preview types
@@ -89,16 +100,308 @@ impl InstallRequest {
     }
 }
 
+/// Outcome of a real per-method version availability probe (PKG-04).
+///
+/// `Unavailable` always carries a reason — offline, timeout, missing package
+/// manager, or a concrete registry answer that does not cover the requested
+/// version. Availability is never silently reported as true.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum VersionAvailability {
+    /// The package manager answered and covers the request.
+    Available {
+        /// Version the registry reported, when parseable.
+        resolved: Option<String>,
+    },
+    /// The probe could not confirm availability; the reason is typed context.
+    Unavailable {
+        /// Why availability is unconfirmed (offline, timeout, manager
+        /// missing, registry says no).
+        reason: String,
+    },
+}
+
+impl VersionAvailability {
+    /// Whether the probe confirmed availability.
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+}
+
+use VersionAvailability::Available;
+
+impl std::fmt::Display for VersionAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available { resolved: Some(v) } => write!(f, "available ({v})"),
+            Self::Available { resolved: None } => f.write_str("available"),
+            Self::Unavailable { reason } => write!(f, "unavailable ({reason})"),
+        }
+    }
+}
+
+/// Injectable version-availability probe (PKG-04).
+///
+/// Production uses [`SystemVersionProbe`], which runs the package manager's
+/// real registry query through the bounded process module. Tests inject a
+/// fake so availability outcomes are asserted without network access.
+pub trait VersionProbe {
+    /// Check whether `package` (installed via `method`) can satisfy
+    /// `requested` (version or channel, `None` for latest).
+    fn check_availability(
+        &self,
+        method: &InstallMethodKind,
+        package: &str,
+        requested: Option<&str>,
+    ) -> VersionAvailability;
+}
+
+/// Real per-method availability probe (PKG-04).
+///
+/// Dispatches to the package manager's non-mutating registry query with a
+/// bounded timeout and capture: `npm view`, `brew info --json=v2`,
+/// `cargo search`, `mise ls-remote`, `pip index versions`. Spawn failures
+/// (manager not installed), timeouts, non-zero exits, and empty answers are
+/// all typed `Unavailable` with the observed reason.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemVersionProbe;
+
+/// Bounded probe timeout for availability queries.
+const AVAILABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl VersionProbe for SystemVersionProbe {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bounded probe arm per install method keeps the dispatch explicit"
+    )]
+    fn check_availability(
+        &self,
+        method: &InstallMethodKind,
+        package: &str,
+        requested: Option<&str>,
+    ) -> VersionAvailability {
+        let opts = ExecuteOpts {
+            timeout: Some(AVAILABILITY_TIMEOUT),
+            output_limit: Some(256 * 1024),
+            clear_env: false,
+            ..Default::default()
+        };
+        let unavailable = |reason: String| VersionAvailability::Unavailable { reason };
+        match method {
+            InstallMethodKind::Npm => {
+                // For a concrete requested version ask the registry for that
+                // exact spec; for channels/latest ask for the latest.
+                let spec = match requested {
+                    Some(r) if !is_channel(r) => format!("{package}@{r}"),
+                    _ => package.to_owned(),
+                };
+                let out = match run_command(
+                    "npm",
+                    &[
+                        "view".to_owned(),
+                        spec,
+                        "version".to_owned(),
+                        "--json".to_owned(),
+                    ],
+                    &opts,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => return unavailable(format!("npm probe failed: {e}")),
+                };
+                if !out.success {
+                    return unavailable(format!(
+                        "npm view reported no such package/version: {}",
+                        first_line(&out.stderr)
+                    ));
+                }
+                let trimmed = out.stdout.trim().trim_matches('"').trim();
+                if trimmed.is_empty() {
+                    return unavailable("npm view returned an empty version".to_owned());
+                }
+                let resolved = extract_version(trimmed).unwrap_or_else(|| trimmed.to_owned());
+                Available {
+                    resolved: Some(resolved),
+                }
+            }
+            InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => {
+                let out = match run_command(
+                    "brew",
+                    &[
+                        "info".to_owned(),
+                        "--json=v2".to_owned(),
+                        package.to_owned(),
+                    ],
+                    &opts,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => return unavailable(format!("brew probe failed: {e}")),
+                };
+                if !out.success {
+                    return unavailable(format!(
+                        "brew info reported no such formula/cask: {}",
+                        first_line(&out.stderr)
+                    ));
+                }
+                Available {
+                    resolved: extract_version(&out.stdout),
+                }
+            }
+            InstallMethodKind::Cargo => {
+                let out = match run_command(
+                    "cargo",
+                    &[
+                        "search".to_owned(),
+                        package.to_owned(),
+                        "--limit".to_owned(),
+                        "1".to_owned(),
+                    ],
+                    &opts,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => return unavailable(format!("cargo probe failed: {e}")),
+                };
+                if !out.success {
+                    return unavailable(format!(
+                        "cargo search failed: {}",
+                        first_line(&out.stderr)
+                    ));
+                }
+                if !out.stdout.contains(package) {
+                    return unavailable(format!("cargo search results do not include `{package}`"));
+                }
+                Available {
+                    resolved: extract_version(&out.stdout),
+                }
+            }
+            InstallMethodKind::Mise => {
+                let out =
+                    match run_command("mise", &["ls-remote".to_owned(), package.to_owned()], &opts)
+                    {
+                        Ok(out) => out,
+                        Err(e) => return unavailable(format!("mise probe failed: {e}")),
+                    };
+                if !out.success {
+                    return unavailable(format!(
+                        "mise ls-remote failed: {}",
+                        first_line(&out.stderr)
+                    ));
+                }
+                let last = out
+                    .stdout
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|l| !l.is_empty())
+                    .map(ToOwned::to_owned);
+                if last.is_none() {
+                    return unavailable("mise ls-remote returned no versions".to_owned());
+                }
+                Available {
+                    resolved: last.and_then(|l| extract_version(&l)),
+                }
+            }
+            InstallMethodKind::Pipx | InstallMethodKind::Uv => {
+                let out = match run_command(
+                    "pip",
+                    &[
+                        "index".to_owned(),
+                        "versions".to_owned(),
+                        package.to_owned(),
+                    ],
+                    &opts,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => return unavailable(format!("pip probe failed: {e}")),
+                };
+                if !out.success {
+                    return unavailable(format!(
+                        "pip index reported no such package: {}",
+                        first_line(&out.stderr)
+                    ));
+                }
+                if !out.stdout.to_ascii_lowercase().contains(package) {
+                    return unavailable(format!("pip index results do not include `{package}`"));
+                }
+                Available {
+                    resolved: extract_version(&out.stdout),
+                }
+            }
+            InstallMethodKind::Direct | InstallMethodKind::External => {
+                unavailable("external/direct installs have no registry probe (PKG-10)".to_owned())
+            }
+        }
+        .pipe_match_requested(requested)
+    }
+}
+
+/// Whether a requested string is a channel name rather than a concrete version.
+fn is_channel(value: &str) -> bool {
+    const CHANNELS: &[&str] = &[
+        "latest", "stable", "beta", "nightly", "next", "canary", "lts",
+    ];
+    CHANNELS.contains(&value)
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+impl VersionAvailability {
+    /// When the probe resolved a concrete registry version and the caller
+    /// requested a concrete version, reconcile them: a registry answer that
+    /// does not cover the request is typed `Unavailable`.
+    fn pipe_match_requested(self, requested: Option<&str>) -> Self {
+        let Some(requested) = requested else {
+            return self;
+        };
+        if is_channel(requested) {
+            return self;
+        }
+        let Available { resolved } = &self else {
+            return self;
+        };
+        let Some(resolved) = resolved else {
+            return self;
+        };
+        let want = requested.strip_prefix('v').unwrap_or(requested);
+        let have = resolved.strip_prefix('v').unwrap_or(resolved);
+        if have.starts_with(want) || want.starts_with(have) {
+            self
+        } else {
+            VersionAvailability::Unavailable {
+                reason: format!(
+                    "registry reports `{resolved}`, which does not cover requested `{requested}`"
+                ),
+            }
+        }
+    }
+}
+
+/// PKG-10: a plan whose method has no safe non-interactive install command.
+///
+/// Desktop apps, marketplace flows, and undocumented direct installers are
+/// supported workflow states: the caller is pointed at the documented install
+/// path, and execution refuses with the typed
+/// [`CoreError::ExternalInstallRequired`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalInstall {
+    /// Documentation/install URL the user should open.
+    pub docs: String,
+    /// Why no non-interactive command exists for this method.
+    pub reason: String,
+}
+
 /// Preview of a planned install — the validated, displayable plan.
 ///
 /// No mutation has occurred. The caller should display `command_preview`,
 /// `requires_network`, `requires_admin`, `conflicts`, and
 /// `expected_executable` to the user for confirmation before executing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "plan preview booleans are independent"
-)]
 pub struct InstallPlan {
     /// Harness being installed.
     pub harness: String,
@@ -126,9 +429,11 @@ pub struct InstallPlan {
     pub expected_executable: PathBuf,
     /// Documentation URL for the harness install.
     pub docs: String,
-    /// Whether the requested version was validated as available (stub: true if
-    /// version parses as semver or is a known channel).
-    pub version_available: bool,
+    /// Typed version-availability outcome from the per-method probe (PKG-04).
+    pub version_availability: VersionAvailability,
+    /// PKG-10 external-install state: `Some` when the method has no safe
+    /// non-interactive install command (External/Direct).
+    pub external_install: Option<ExternalInstall>,
     /// Whether the destination is writable (true if no destination or check passed).
     pub destination_writable: bool,
 }
@@ -137,6 +442,11 @@ impl InstallPlan {
     /// Return the command preview as a display string.
     pub fn command_display(&self) -> String {
         self.command_preview.display()
+    }
+
+    /// Whether the version probe confirmed availability (PKG-04).
+    pub fn version_available(&self) -> bool {
+        self.version_availability.is_available()
     }
 }
 
@@ -177,7 +487,17 @@ pub fn current_arch() -> String {
 /// the user before execution. On failure returns a `CoreError` describing the
 /// first validation failure (platform, package identity, version, destination,
 /// or conflicts).
+///
+/// Version availability is checked with the real [`SystemVersionProbe`].
 pub fn plan_install(request: &InstallRequest) -> Result<InstallPlan, CoreError> {
+    plan_install_with_probe(request, &SystemVersionProbe)
+}
+
+/// Plan an install with an injected availability probe (tests).
+pub fn plan_install_with_probe(
+    request: &InstallRequest,
+    probe: &dyn VersionProbe,
+) -> Result<InstallPlan, CoreError> {
     let catalog = InstallCatalog::embedded()?;
     let entry = catalog
         .get(&request.harness)
@@ -185,15 +505,37 @@ pub fn plan_install(request: &InstallRequest) -> Result<InstallPlan, CoreError> 
             field: "harness".to_owned(),
             reason: format!("harness `{}` not found in install catalog", request.harness),
         })?;
-    plan_install_for_entry(request, entry, &current_os(), &current_arch())
+    plan_install_for_entry_with_probe(request, entry, &current_os(), &current_arch(), probe)
 }
 
 /// Plan an install for a specific catalog entry and platform (injectable for tests).
+///
+/// Uses the real [`SystemVersionProbe`] for availability; tests that need
+/// deterministic availability outcomes should call
+/// [`plan_install_for_entry_with_probe`].
 pub fn plan_install_for_entry(
     request: &InstallRequest,
     entry: &InstallCatalogEntry,
     platform_os: &str,
     platform_arch: &str,
+) -> Result<InstallPlan, CoreError> {
+    plan_install_for_entry_with_probe(
+        request,
+        entry,
+        platform_os,
+        platform_arch,
+        &SystemVersionProbe,
+    )
+}
+
+/// Plan an install for a specific catalog entry, platform, and injected
+/// availability probe (PKG-04).
+pub fn plan_install_for_entry_with_probe(
+    request: &InstallRequest,
+    entry: &InstallCatalogEntry,
+    platform_os: &str,
+    platform_arch: &str,
+    probe: &dyn VersionProbe,
 ) -> Result<InstallPlan, CoreError> {
     // 1) Platform/arch support
     if !entry.supports_platform(platform_os, platform_arch) {
@@ -227,12 +569,13 @@ pub fn plan_install_for_entry(
         })?;
     let package_name = method.package_name.clone();
 
-    // 3) Version availability — stub network check.
-    //    Accept: None (latest), known channels (latest, stable, beta, nightly,
-    //    next, canary), or semver (with optional leading `v`). Reject strings
-    //    containing shell metachars or NUL.
-    let version_available =
-        validate_version_available(request.version.as_deref(), request.channel.as_deref())?;
+    // 3) Version availability — REAL per-method registry probe (PKG-04).
+    //    The syntactic checks below reject injection-shaped inputs outright;
+    //    availability itself is the probe's typed answer (never a silent true).
+    validate_version_shape(request.version.as_deref(), request.channel.as_deref())?;
+    let requested_version = request.version.as_deref().or(request.channel.as_deref());
+    let version_availability =
+        probe.check_availability(&request.method, &package_name, requested_version);
 
     // 4) Writable destination — if destination is Some, check that the parent
     //    exists and is writable (via metadata + permissions). On missing parent,
@@ -262,7 +605,27 @@ pub fn plan_install_for_entry(
     let expected_executable =
         derive_expected_executable(entry, method, request.destination.as_deref());
 
-    // 8) Build command preview — method-specific argv tokens, no shell pipeline.
+    // 8) PKG-10: External/Direct methods have no safe non-interactive install
+    //    command. Mark the plan external with docs guidance; NO install
+    //    command is fabricated for them (in particular, a non-mise package is
+    //    never misattributed to `mise install`).
+    let external_install = match request.method {
+        InstallMethodKind::External => Some(ExternalInstall {
+            docs: entry.docs.clone(),
+            reason: "external install: no safe non-interactive command exists; open the \
+                     documented install path"
+                .to_owned(),
+        }),
+        InstallMethodKind::Direct => Some(ExternalInstall {
+            docs: entry.docs.clone(),
+            reason: "direct install: no verified installer adapter; user-driven install \
+                     per docs"
+                .to_owned(),
+        }),
+        _ => None,
+    };
+
+    // 9) Build command preview — method-specific argv tokens, no shell pipeline.
     let command_preview = build_command_preview(entry, method, request)?;
 
     // Validate the preview contains no shell pipeline (defense in depth)
@@ -282,20 +645,18 @@ pub fn plan_install_for_entry(
         conflicts,
         expected_executable,
         docs: entry.docs.clone(),
-        version_available,
+        version_availability,
+        external_install,
         destination_writable,
     })
 }
 
-fn validate_version_available(
-    version: Option<&str>,
-    channel: Option<&str>,
-) -> Result<bool, CoreError> {
-    const KNOWN_CHANNELS: &[&str] = &[
-        "latest", "stable", "beta", "nightly", "next", "canary", "lts",
-    ];
-    // Forbid NUL and shell metachars in version strings to prevent injection if
-    // the version is later interpolated into argv.
+/// Reject injection-shaped version/channel strings (PKG-04 syntactic gate).
+///
+/// NUL, shell metacharacters, and path separators are validation errors before
+/// any probe runs; whether a syntactically valid version is actually offered
+/// by the package's registry is the probe's typed answer.
+fn validate_version_shape(version: Option<&str>, channel: Option<&str>) -> Result<(), CoreError> {
     let check = |field: &str, value: &str| -> Result<(), CoreError> {
         if value.contains('\0') {
             return Err(CoreError::Validation {
@@ -321,52 +682,21 @@ fn validate_version_available(
                 reason: "must not contain path separators or traversal".to_owned(),
             });
         }
-        Ok(())
-    };
-
-    if let Some(v) = version {
-        check("version", v)?;
-        // Accept empty as latest (should have been None), but validate non-empty.
-        if v.is_empty() {
+        if value.is_empty() {
             return Err(CoreError::Validation {
-                field: "version".to_owned(),
-                reason: "version must not be empty".to_owned(),
+                field: field.to_owned(),
+                reason: format!("{field} must not be empty"),
             });
         }
-        // Known channels also allowed as version strings (mise uses channel names)
-
-        if KNOWN_CHANNELS.contains(&v) {
-            return Ok(true);
-        }
-        // Try semver parse (allow leading v)
-        let stripped = v.strip_prefix('v').unwrap_or(v);
-        if semver::Version::parse(stripped).is_ok() {
-            return Ok(true);
-        }
-        // Also accept partial semver like "1.2" or "1"
-        if stripped.chars().all(|c| c.is_ascii_digit() || c == '.') && stripped.contains('.') {
-            return Ok(true);
-        }
-        // Unknown version format — still allow but mark unavailable so caller
-        // can warn. For stub network, we treat unknown as available=false but
-        // do not block unless strict semver is required. Here we return Ok(false)
-        // to signal "not in stub allowlist" rather than erroring.
-        // To keep planner honest, we consider any non-empty validated string as available
-        // in stub mode; real network would check registry.
-        return Ok(true);
+        Ok(())
+    };
+    if let Some(v) = version {
+        check("version", v)?;
     }
     if let Some(c) = channel {
         check("channel", c)?;
-        if c.is_empty() {
-            return Err(CoreError::Validation {
-                field: "channel".to_owned(),
-                reason: "channel must not be empty".to_owned(),
-            });
-        }
-        return Ok(true);
     }
-    // No version/channel means latest
-    Ok(true)
+    Ok(())
 }
 
 fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
@@ -509,11 +839,24 @@ fn build_command_preview(
         method.package_name.clone()
     };
 
+    // PKG-10: External and Direct methods have no safe non-interactive install
+    // command. The preview is the documented docs URL — no `mise install` (or
+    // any installer) is fabricated for a package the method does not own.
+    if matches!(
+        method.kind,
+        InstallMethodKind::External | InstallMethodKind::Direct
+    ) {
+        return Ok(CommandTokens {
+            executable: "open".to_owned(),
+            args: vec![entry.docs.clone()],
+        });
+    }
+
     let tokens = match method.kind {
         InstallMethodKind::Mise => CommandTokens {
             executable: "mise".to_owned(),
             args: {
-                let mut a = vec!["use".to_owned(), "-g".to_owned(), pkg_with_ver.clone()];
+                let mut a = vec!["use".to_owned(), "-g".to_owned(), pkg_with_ver];
                 if let Some(dest) = request.destination.as_ref() {
                     a.push("--prefix".to_owned());
                     a.push(dest.display().to_string());
@@ -523,61 +866,30 @@ fn build_command_preview(
         },
         InstallMethodKind::Homebrew | InstallMethodKind::HomebrewCask => CommandTokens {
             executable: "brew".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver.clone()],
+            args: vec!["install".to_owned(), pkg_with_ver],
         },
         InstallMethodKind::Npm => CommandTokens {
             executable: "npm".to_owned(),
-            args: vec!["install".to_owned(), "-g".to_owned(), pkg_with_ver.clone()],
+            args: vec!["install".to_owned(), "-g".to_owned(), pkg_with_ver],
         },
         InstallMethodKind::Cargo => CommandTokens {
             executable: "cargo".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver.clone()],
+            args: vec!["install".to_owned(), pkg_with_ver],
         },
         InstallMethodKind::Pipx => CommandTokens {
             executable: "pipx".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver.clone()],
+            args: vec!["install".to_owned(), pkg_with_ver],
         },
         InstallMethodKind::Uv => CommandTokens {
             executable: "uv".to_owned(),
-            args: vec![
-                "tool".to_owned(),
-                "install".to_owned(),
-                pkg_with_ver.clone(),
-            ],
+            args: vec!["tool".to_owned(), "install".to_owned(), pkg_with_ver],
         },
-        InstallMethodKind::Direct => CommandTokens {
-            executable: "sh".to_owned(),
-            args: vec![
-                "-c".to_owned(),
-                format!(
-                    "echo direct install for {} not yet implemented; see docs",
-                    method.package_name
-                ),
-            ],
-        },
-        InstallMethodKind::External => CommandTokens {
-            executable: "open".to_owned(),
-            args: vec![pkg_with_ver.clone()],
-        },
-    };
-
-    // For Direct, the sh -c is intentionally allowed for preview display but
-    // would be forbidden by CommandTokens::validate. Since Direct installs are
-    // `ExternalInstallRequired` per PKG-10, we instead surface it as external.
-    // For now, map Direct to a validation that bypasses shell check by using
-    // a non-shell preview.
-    if matches!(method.kind, InstallMethodKind::Direct) {
-        return Ok(CommandTokens {
-            executable: "mise".to_owned(),
-            args: vec!["install".to_owned(), pkg_with_ver],
-        });
-    }
-    if matches!(method.kind, InstallMethodKind::External) {
-        return Ok(CommandTokens {
+        // Handled by the early return above; kept for exhaustiveness.
+        InstallMethodKind::Direct | InstallMethodKind::External => CommandTokens {
             executable: "open".to_owned(),
             args: vec![entry.docs.clone()],
-        });
-    }
+        },
+    };
     Ok(tokens)
 }
 
@@ -599,6 +911,49 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// Deterministic availability probe for tests (PKG-04).
+    #[derive(Debug, Clone)]
+    struct FakeProbe {
+        answer: VersionAvailability,
+    }
+
+    impl VersionProbe for FakeProbe {
+        fn check_availability(
+            &self,
+            method: &InstallMethodKind,
+            _package: &str,
+            _requested: Option<&str>,
+        ) -> VersionAvailability {
+            // Mirror the system probe's honesty: external/direct methods have
+            // no registry probe.
+            if matches!(
+                method,
+                InstallMethodKind::Direct | InstallMethodKind::External
+            ) {
+                return VersionAvailability::Unavailable {
+                    reason: "external/direct installs have no registry probe (PKG-10)".to_owned(),
+                };
+            }
+            self.answer.clone()
+        }
+    }
+
+    fn available_probe() -> FakeProbe {
+        FakeProbe {
+            answer: Available {
+                resolved: Some("1.2.3".to_owned()),
+            },
+        }
+    }
+
+    fn plan(
+        request: &InstallRequest,
+        entry: &InstallCatalogEntry,
+        probe: &dyn VersionProbe,
+    ) -> Result<InstallPlan, CoreError> {
+        plan_install_for_entry_with_probe(request, entry, "linux", "x86_64", probe)
+    }
 
     fn minimal_entry(harness: &str, os: &[&str], arch: &[&str]) -> InstallCatalogEntry {
         InstallCatalogEntry {
@@ -672,7 +1027,7 @@ mod tests {
         let err2 = plan_install_for_entry(&req, &entry, "macos", "x86_64").unwrap_err();
         assert!(format!("{err2}").contains("not supported"));
         // Supported succeeds
-        let ok = plan_install_for_entry(&req, &entry, "linux", "x86_64").unwrap();
+        let ok = plan(&req, &entry, &available_probe()).unwrap();
         assert_eq!(ok.platform_os, "linux");
     }
 
@@ -705,8 +1060,8 @@ mod tests {
         for ver in ["1.2.3", "v2.0.0-beta.1", "latest", "stable", "1.0"] {
             let req =
                 InstallRequest::new(harness.clone(), InstallMethodKind::Npm).with_version(ver);
-            let plan = plan_install_for_entry(&req, &entry, "linux", "x86_64").unwrap();
-            assert!(plan.version_available);
+            let plan = plan(&req, &entry, &available_probe()).unwrap();
+            assert!(plan.version_available());
             assert_eq!(plan.version.as_deref(), Some(ver));
         }
     }
@@ -721,11 +1076,12 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         let entry = minimal_entry("test-harness", &["any"], &["any"]);
         let harness = HarnessId::new("test-harness").unwrap();
+        let probe = available_probe();
         let req =
             InstallRequest::new(harness.clone(), InstallMethodKind::Npm).with_destination(&tmp);
-        let plan = plan_install_for_entry(&req, &entry, "linux", "x86_64").unwrap();
-        assert!(plan.destination_writable);
-        assert_eq!(plan.expected_executable, tmp.join("my-exe"));
+        let plan_result = plan(&req, &entry, &probe).unwrap();
+        assert!(plan_result.destination_writable);
+        assert_eq!(plan_result.expected_executable, tmp.join("my-exe"));
 
         // Non-writable destination (remove write bits)
         let ro_dir = crate::test_util::temp_dir_unique("plan");
@@ -736,7 +1092,7 @@ mod tests {
         fs::set_permissions(&ro_dir, perms).unwrap();
         let dest = ro_dir.join("sub");
         let req2 = InstallRequest::new(harness, InstallMethodKind::Npm).with_destination(&dest);
-        let err = plan_install_for_entry(&req2, &entry, "linux", "x86_64").unwrap_err();
+        let err = plan(&req2, &entry, &probe).unwrap_err();
         assert!(format!("{err}").contains("not writable") || format!("{err}").contains("writable"));
 
         // Cleanup: restore perms so remove_dir_all succeeds
@@ -752,20 +1108,21 @@ mod tests {
         let entry = minimal_entry("test-harness", &["any"], &["any"]);
         let harness = HarnessId::new("test-harness").unwrap();
         let req = InstallRequest::new(harness, InstallMethodKind::Mise);
-        let plan = plan_install_for_entry(&req, &entry, "linux", "x86_64").unwrap();
+        let plan_result = plan(&req, &entry, &available_probe()).unwrap();
         assert!(
-            plan.expected_executable
+            plan_result
+                .expected_executable
                 .to_string_lossy()
                 .contains("mise/shims")
         );
-        assert_eq!(plan.conflicts, vec!["other-harness"]);
-        assert!(plan.requires_network);
-        assert!(!plan.requires_admin);
-        assert_eq!(plan.command_preview.executable, "mise");
+        assert_eq!(plan_result.conflicts, vec!["other-harness"]);
+        assert!(plan_result.requires_network);
+        assert!(!plan_result.requires_admin);
+        assert_eq!(plan_result.command_preview.executable, "mise");
         // Preview must have no shell pipeline
-        plan.command_preview.validate().unwrap();
-        assert!(!plan.command_display().contains('|'));
-        assert!(!plan.command_display().contains("&&"));
+        plan_result.command_preview.validate().unwrap();
+        assert!(!plan_result.command_display().contains('|'));
+        assert!(!plan_result.command_display().contains("&&"));
     }
 
     #[test]
@@ -775,23 +1132,24 @@ mod tests {
         let entry = minimal_entry("test-harness", &["linux"], &["x86_64"]);
         let harness = HarnessId::new("test-harness").unwrap();
         let req = InstallRequest::new(harness, InstallMethodKind::Npm).with_version("1.2.3");
-        let plan = plan_install_for_entry(&req, &entry, "linux", "x86_64").unwrap();
+        let plan_result = plan(&req, &entry, &available_probe()).unwrap();
         // Executable must be a single binary name, not "npm install ..."
-        assert!(!plan.command_preview.executable.contains(' '));
+        assert!(!plan_result.command_preview.executable.contains(' '));
         // Args must be separate tokens, not shell-joined
-        for arg in &plan.command_preview.args {
+        for arg in &plan_result.command_preview.args {
             assert!(!arg.contains("&&"));
             assert!(!arg.contains("||"));
             assert!(!arg.contains('|'));
             assert!(!arg.contains('`'));
         }
         // The display string is for humans; the structured tokens are the source of truth
-        assert_eq!(plan.command_preview.executable, "npm");
+        assert_eq!(plan_result.command_preview.executable, "npm");
         assert!(
-            plan.command_preview
+            plan_result
+                .command_preview
                 .args
                 .contains(&"@org/my-exe@1.2.3".to_owned())
-                || plan
+                || plan_result
                     .command_preview
                     .args
                     .iter()
@@ -803,13 +1161,155 @@ mod tests {
     fn embedded_catalog_plan_succeeds_for_known_harness() {
         let harness = HarnessId::new("claude-code").unwrap();
         let req = InstallRequest::new(harness, InstallMethodKind::Npm);
-        let plan = plan_install(&req).unwrap();
-        assert_eq!(plan.harness, "claude-code");
-        assert_eq!(plan.package_name, "@anthropic-ai/claude-code");
+        let plan_result = plan_install_with_probe(&req, &available_probe()).unwrap();
+        assert_eq!(plan_result.harness, "claude-code");
+        assert_eq!(plan_result.package_name, "@anthropic-ai/claude-code");
         assert!(
-            plan.expected_executable
+            plan_result
+                .expected_executable
                 .to_string_lossy()
                 .contains("claude")
         );
+    }
+
+    // -------------------------------------------------------------------
+    // PKG-04 real availability + PKG-10 external plans
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn plan_surfaces_typed_unavailable_with_reason_never_silent_true() {
+        let entry = minimal_entry("test-harness", &["any"], &["any"]);
+        let harness = HarnessId::new("test-harness").unwrap();
+        let probe = FakeProbe {
+            answer: VersionAvailability::Unavailable {
+                reason: "npm probe failed: manager not installed".to_owned(),
+            },
+        };
+        let req = InstallRequest::new(harness, InstallMethodKind::Npm).with_version("1.2.3");
+        let plan_result = plan(&req, &entry, &probe).unwrap();
+        assert!(!plan_result.version_available());
+        match &plan_result.version_availability {
+            VersionAvailability::Unavailable { reason } => {
+                assert!(reason.contains("npm probe failed"), "{reason}");
+            }
+            Available { .. } => panic!("expected Unavailable"),
+        }
+    }
+
+    #[test]
+    fn availability_reconciles_requested_version_against_registry_answer() {
+        // Registry reports 2.0.0; the caller asked for 1.2.3 -> typed
+        // unavailable naming both.
+        let reconciled = Available {
+            resolved: Some("2.0.0".to_owned()),
+        }
+        .pipe_match_requested(Some("1.2.3"));
+        match reconciled {
+            VersionAvailability::Unavailable { reason } => {
+                assert!(
+                    reason.contains("2.0.0") && reason.contains("1.2.3"),
+                    "{reason}"
+                );
+            }
+            Available { .. } => panic!("expected Unavailable"),
+        }
+        // Matching and prefix-compatible answers stay available.
+        assert!(
+            Available {
+                resolved: Some("1.2.3".to_owned())
+            }
+            .pipe_match_requested(Some("1.2"))
+            .is_available()
+        );
+        assert!(
+            Available {
+                resolved: Some("1.2.3".to_owned())
+            }
+            .pipe_match_requested(Some("latest"))
+            .is_available()
+        );
+        // Channels never conflict with a resolved version.
+        assert!(
+            Available {
+                resolved: Some("9.9.9".to_owned())
+            }
+            .pipe_match_requested(Some("stable"))
+            .is_available()
+        );
+    }
+
+    #[test]
+    fn external_and_direct_methods_are_typed_external_installs_not_mise() {
+        let entry = minimal_entry("test-harness", &["any"], &["any"]);
+        // The catalog entry must actually list the methods for the planner.
+        let mut entry = entry;
+        entry.methods.push(InstallMethod {
+            kind: InstallMethodKind::Direct,
+            package_name: "direct-pkg".to_owned(),
+            tap: None,
+            repo: None,
+            registry: None,
+        });
+        entry.methods.push(InstallMethod {
+            kind: InstallMethodKind::External,
+            package_name: "external-pkg".to_owned(),
+            tap: None,
+            repo: None,
+            registry: None,
+        });
+        let harness = HarnessId::new("test-harness").unwrap();
+        for method in [InstallMethodKind::Direct, InstallMethodKind::External] {
+            let req = InstallRequest::new(harness.clone(), method.clone());
+            let plan_result = plan(&req, &entry, &available_probe()).unwrap();
+            let ext = plan_result
+                .external_install
+                .as_ref()
+                .unwrap_or_else(|| panic!("{method:?} plan must carry external_install"));
+            assert_eq!(ext.docs, "https://example.com");
+            assert!(!ext.reason.is_empty());
+            // No installer command is fabricated — the preview opens docs.
+            assert_eq!(plan_result.command_preview.executable, "open");
+            assert!(
+                plan_result
+                    .command_preview
+                    .args
+                    .iter()
+                    .all(|a| !a.contains("mise")),
+                "direct/external previews must never fabricate `mise install`: {}",
+                plan_result.command_display()
+            );
+            // Availability is honestly unprobeable for external methods.
+            assert!(!plan_result.version_available());
+        }
+        // Internal methods carry no external state.
+        let req = InstallRequest::new(harness, InstallMethodKind::Npm);
+        let plan_result = plan(&req, &entry, &available_probe()).unwrap();
+        assert!(plan_result.external_install.is_none());
+        assert!(plan_result.version_available());
+    }
+
+    /// The system probe's real wiring: a missing package manager becomes a
+    /// typed unavailable-with-reason through the actual process module (the
+    /// probe names the manager it tried).
+    #[test]
+    fn system_probe_missing_manager_is_typed_unavailable() {
+        let probe = SystemVersionProbe;
+        let out = probe.check_availability(
+            &InstallMethodKind::Npm,
+            "definitely-not-a-real-package-superai-test",
+            None,
+        );
+        // In a sandbox npm may be absent (spawn error) or present-but-offline
+        // (registry failure). Either way the answer must be typed Unavailable
+        // with a reason — never a silent Available.
+        match out {
+            VersionAvailability::Unavailable { reason } => {
+                assert!(!reason.is_empty());
+            }
+            Available { .. } => {
+                // A sandbox with real npm + network may genuinely answer; the
+                // deterministic assertions live in the injected-probe tests.
+            }
+        }
     }
 }

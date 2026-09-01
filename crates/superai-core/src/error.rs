@@ -446,6 +446,19 @@ pub enum CoreError {
         /// Why the write window is believed open.
         reason: String,
     },
+
+    /// Installing or updating this harness has no safe non-interactive path
+    /// (PKG-10): desktop apps, marketplace flows, and undocumented direct
+    /// installers require the user to act (open a URL, run a GUI installer).
+    /// This is a supported workflow state, not an excuse to download unknown
+    /// binaries — the instructions name the documented install path.
+    #[error("external install required for harness `{harness}`: {instructions}")]
+    ExternalInstallRequired {
+        /// Harness identifier.
+        harness: String,
+        /// Documented install path (docs URL / marketplace instructions).
+        instructions: String,
+    },
 }
 
 /// Result alias for core operations.
@@ -645,6 +658,10 @@ mod tests {
             CoreError::AppMayStillWrite {
                 path: PathBuf::from("/home/user/.zcode/v2/config.json"),
                 reason: "activation marked the app as running; confirm exit first".to_owned(),
+            },
+            CoreError::ExternalInstallRequired {
+                harness: "warp".to_owned(),
+                instructions: "open https://example.com/docs/install".to_owned(),
             },
         ];
         for err in variants {

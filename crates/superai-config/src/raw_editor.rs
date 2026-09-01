@@ -272,14 +272,35 @@ impl RawEditor {
 // Validation
 // ---------------------------------------------------------------------------
 
+/// Maximum document size accepted by validation (RAW-02 size check).
+///
+/// Mirrors the process-layer capture bound: drafts larger than this are a
+/// diagnostic before any parse is attempted, so pathological inputs cannot
+/// drive unbounded parser work.
+pub const MAX_VALIDATION_BYTES: usize = 1_048_576;
+
 /// Validate `content` for `kind` without touching disk.
 ///
 /// Returns syntax diagnostics only; adapter schema is optional and not
 /// applied here. Empty diagnostics means the content is syntactically valid.
-/// For `StrictJson`, empty/whitespace-only is considered valid (empty object
-/// compatibility); for other kinds, empty is valid where the codec allows it.
+/// An empty buffer is NOT automatically an empty document (RAW-05): the
+/// format decides — TOML/YAML/env accept an empty document, while JSON kinds
+/// require the explicit empty object `{}`.
 pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+
+    // RAW-02 size validation: bound the work before any parse.
+    if content.len() > MAX_VALIDATION_BYTES {
+        diagnostics.push(Diagnostic::new(
+            1,
+            1,
+            format!(
+                "document exceeds validation size limit: {} bytes (limit {MAX_VALIDATION_BYTES})",
+                content.len()
+            ),
+        ));
+        return diagnostics;
+    }
 
     // Encoding check: invalid UTF-8 is always a diagnostic.
     // Opaque and TextFragment still require valid UTF-8 for display; binary
@@ -299,9 +320,17 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     }
 
     let text = std::str::from_utf8(without_bom).unwrap_or_default();
-    // Empty/whitespace-only is valid for JSON (empty object), TOML/YAML (empty doc), env (empty map).
-    // For strictness, we still let parsers decide; empty is treated as valid.
     if text.trim().is_empty() {
+        // RAW-05: the format decides whether an empty buffer is a valid
+        // document. TOML/YAML/env have empty documents; JSON kinds do not —
+        // their empty document is the explicit `{}` object.
+        if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
+            diagnostics.push(Diagnostic::new(
+                1,
+                1,
+                "empty buffer is not a valid json document; the format-decided empty document is `{}`",
+            ));
+        }
         return diagnostics;
     }
 
@@ -439,7 +468,13 @@ fn validate_yaml(text: &str) -> Vec<Diagnostic> {
 fn validate_env(text: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     // Reuse env parsing logic: split lines, check syntax for entries.
+    // RAW-06: duplicate keys are tracked so effective-definition (last-wins)
+    // diagnostics can be surfaced. Duplicates stay non-blocking — env edits
+    // preserve them on disk by design.
     let lines: Vec<&str> = text.lines().collect();
+    // (key, first line) in first-seen order; later lines recorded for the
+    // effective-definition message.
+    let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -482,6 +517,31 @@ fn validate_env(text: &str) -> Vec<Diagnostic> {
                 idx.saturating_add(1),
                 1,
                 format!("invalid env key `{key}`"),
+            ));
+        } else {
+            seen.entry(key.to_owned())
+                .or_default()
+                .push(idx.saturating_add(1));
+        }
+    }
+    // RAW-06 duplicate diagnostics: one per duplicated key, placed at the
+    // effective (last) definition, naming every earlier definition. These are
+    // Warning severity so commits keep preserving duplicates on disk.
+    for (key, line_nums) in &seen {
+        if line_nums.len() > 1 {
+            let effective = line_nums.last().copied().unwrap_or(1);
+            let earlier: Vec<String> = line_nums
+                .iter()
+                .take(line_nums.len().saturating_sub(1))
+                .map(ToString::to_string)
+                .collect();
+            diags.push(Diagnostic::warning(
+                effective,
+                1,
+                format!(
+                    "duplicate env key `{key}` defined on lines {}; this last definition on line {effective} is the effective one (last wins)",
+                    earlier.join(", ")
+                ),
             ));
         }
     }
@@ -1589,6 +1649,140 @@ pub fn read(path: &Path) -> Result<RawDocument> {
 // Commit
 // ---------------------------------------------------------------------------
 
+/// Create a missing config file transactionally (RAW-05).
+///
+/// Creation is refused when the target already exists (the caller's
+/// expectation is "missing"), and staged through the compensated
+/// [`Transaction`](crate::transaction::Transaction): parents that do not
+/// exist are created as owned steps, the file is written atomically with
+/// read-back verification, and a failure rolls back EXACTLY the created file
+/// plus the now-empty owned parents — nothing foreign is touched. The
+/// format's empty-document rule applies (an empty buffer is not an empty
+/// JSON object).
+pub fn create_file(path: &Path, new_content: &[u8]) -> Result<CommitReport> {
+    create_file_with_injector(path, new_content, None)
+}
+
+/// [`create_file`] with an optional fault injector (RAW-05 rollback tests
+/// drive REAL creation-path failures through it).
+pub fn create_file_with_injector(
+    path: &Path,
+    new_content: &[u8],
+    injector: Option<std::sync::Arc<dyn crate::injector::Injector>>,
+) -> Result<CommitReport> {
+    let kind = DocumentKind::from_path(path);
+    if kind == DocumentKind::Opaque {
+        return Err(ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "opaque/internal store is read-only",
+            ),
+        ));
+    }
+    // Validate the exact draft bytes before any disk mutation (includes the
+    // RAW-05 empty-buffer rule and, for fragments, the span-only gate).
+    validate_for_commit(path, new_content, kind)?;
+    if kind == DocumentKind::TextFragment {
+        enforce_span_only_change(path, new_content)?;
+    }
+    // The caller expects a missing target; an existing file is a conflict.
+    if path.exists() {
+        let digest = compute_digest(&std::fs::read(path).map_err(|e| ConfigError::io(path, e))?);
+        return Err(ConfigError::concurrent_modification(
+            path,
+            String::new(),
+            digest,
+        ));
+    }
+    // EVERY missing ancestor becomes its own owned CreateDir step (ordered
+    // parents-first): rollback walks them in reverse — deepest first — so a
+    // failed create removes exactly the created file plus the now-empty
+    // owned parents, never anything foreign.
+    let mut steps: Vec<crate::transaction::FileAction> = Vec::new();
+    let mut missing_ancestors: Vec<PathBuf> = Vec::new();
+    let mut probe = path.parent();
+    while let Some(dir) = probe
+        && !dir.as_os_str().is_empty()
+    {
+        if dir.exists() {
+            break;
+        }
+        missing_ancestors.push(dir.to_path_buf());
+        probe = dir.parent();
+    }
+    missing_ancestors.reverse();
+    let owned_ancestors = missing_ancestors.clone();
+    for dir in missing_ancestors {
+        steps.push(crate::transaction::FileAction::CreateDir { path: dir });
+    }
+    steps.push(crate::transaction::FileAction::Write {
+        path: path.to_path_buf(),
+        content: new_content.to_vec(),
+        kind,
+    });
+    let op_id_str = format!(
+        "raw-create-{}-{}",
+        path.file_name()
+            .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned()),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    );
+    let op_id = crate::transaction::OperationId::new(&op_id_str).map_err(|e| {
+        ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid operation id: {e}"),
+            ),
+        )
+    })?;
+    let mut tx = crate::transaction::Transaction::new(op_id, steps);
+    if let Some(inj) = injector {
+        tx = tx.with_injector(inj);
+    }
+    let outcome = tx.execute()?;
+    if !outcome.success {
+        // The transaction compensated the steps it could. Staged temps are
+        // cleaned after its dir-removal pass, so empty owned parents can be
+        // left behind as rollback residuals; finish the job here — only the
+        // paths THIS operation created, only while empty, deepest first, and
+        // never anything foreign. The target itself did not exist at entry,
+        // so anything at `path` now is ours and is removed.
+        if path.exists() {
+            drop(std::fs::remove_file(path));
+        }
+        for dir in owned_ancestors.iter().rev() {
+            let empty = std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
+            if empty {
+                drop(std::fs::remove_dir(dir));
+            }
+        }
+        return Err(ConfigError::io(
+            path,
+            std::io::Error::other(format!(
+                "creation rolled back: {}",
+                outcome.diagnostics_redacted.join("; ")
+            )),
+        ));
+    }
+    let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
+    let new_digest = compute_digest(&read_back);
+    if new_digest != compute_digest(new_content) {
+        return Err(ConfigError::verification(
+            path,
+            "created file bytes do not match the draft".to_owned(),
+        ));
+    }
+    Ok(CommitReport {
+        backup: None,
+        new_digest,
+        new_snapshot: snapshot(path),
+        is_noop: false,
+    })
+}
+
 /// Report after a successful commit.
 #[derive(Debug, Clone)]
 pub struct CommitReport {
@@ -1677,11 +1871,19 @@ fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
 
 fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Result<()> {
     let diagnostics = validate(content, kind);
-    if diagnostics.is_empty() {
+    // Only Error-severity diagnostics block a commit. Warning/Hint/Deprecation
+    // diagnostics (RAW-06 env duplicates, deprecation notes) are surfaced to
+    // callers but must not change on-disk behavior: env commits keep
+    // preserving duplicate definitions exactly as they are.
+    let blocking: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|d| d.severity == crate::document::DiagnosticSeverity::Error)
+        .collect();
+    if blocking.is_empty() {
         return Ok(());
     }
-    // Map first diagnostic to a ConfigError variant per kind.
-    let Some(first) = diagnostics.first() else {
+    // Map first blocking diagnostic to a ConfigError variant per kind.
+    let Some(first) = blocking.first().copied() else {
         return Err(ConfigError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid syntax"),
@@ -2805,5 +3007,247 @@ mod tests {
             let spans_j = find_redaction_spans(json_content.as_bytes(), DocumentKind::StrictJson);
             assert!(!spans_j.is_empty(), "json key {key} should be redacted");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // RAW-06 env duplicate diagnostics
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_env_reports_duplicate_keys_with_effective_definition() {
+        let content = "API_KEY=first\nMODEL=opus\nAPI_KEY=second\nexport API_KEY=third\n";
+        let diags = validate(content.as_bytes(), DocumentKind::Env);
+        let dup: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("duplicate env key `API_KEY`"))
+            .collect();
+        assert_eq!(dup.len(), 1, "one diagnostic per duplicated key: {diags:?}");
+        let d = dup.first().copied().unwrap();
+        // Placed at the effective (last) definition with earlier lines named.
+        assert_eq!(d.line, 4);
+        assert!(d.message.contains("lines 1, 3"), "{}", d.message);
+        assert!(
+            d.message.contains("line 4 is the effective"),
+            "{}",
+            d.message
+        );
+        assert!(d.message.contains("last wins"), "{}", d.message);
+        // Non-duplicated keys produce no diagnostics.
+        assert!(!diags.iter().any(|d| d.message.contains("`MODEL`")));
+    }
+
+    #[test]
+    fn env_duplicate_diagnostics_are_non_blocking_warnings() {
+        let content = "API_KEY=first\nAPI_KEY=second\n";
+        let diags = validate(content.as_bytes(), DocumentKind::Env);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity == crate::document::DiagnosticSeverity::Warning),
+            "duplicates must be warnings, not errors: {diags:?}"
+        );
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.severity == crate::document::DiagnosticSeverity::Error)
+                .count(),
+            0
+        );
+        // Real syntax problems stay blocking errors.
+        let bad = "API_KEY\n";
+        let bad_diags = validate(bad.as_bytes(), DocumentKind::Env);
+        assert!(
+            bad_diags
+                .iter()
+                .any(|d| d.severity == crate::document::DiagnosticSeverity::Error)
+        );
+    }
+
+    #[test]
+    fn env_commit_preserves_duplicates_on_disk_despite_diagnostics() {
+        // `echo`-equivalent scratch path via a unique temp file.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "superai-raw-env-dup-{}-{}",
+            now,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        let original: &[u8] = b"API_KEY=first\nAPI_KEY=second\n";
+        let report = commit(&path, original, None).unwrap();
+        assert!(!report.is_noop);
+        // Duplicates preserved byte-for-byte on disk (existing behavior).
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        if let Some(b) = report.backup {
+            drop(std::fs::remove_file(b.backup_path));
+        }
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -------------------------------------------------------------------
+    // RAW-02 size validation + RAW-05 empty-buffer rule
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_reports_oversize_documents_before_parsing() {
+        let huge = vec![b'a'; MAX_VALIDATION_BYTES + 1];
+        let diags = validate(&huge, DocumentKind::StrictJson);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("exceeds validation size limit")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn empty_buffer_is_not_automatically_an_empty_json_object() {
+        // JSON kinds: the format decides — an empty buffer is NOT `{}`.
+        for kind in [DocumentKind::StrictJson, DocumentKind::JsonC] {
+            let diags = validate(b"   \n", kind);
+            assert!(
+                diags.iter().any(|d| d.message.contains("empty buffer")),
+                "{kind:?}: {diags:?}"
+            );
+        }
+        // TOML/YAML/env: an empty document IS the format's empty document.
+        for kind in [
+            DocumentKind::Toml,
+            DocumentKind::Yaml,
+            DocumentKind::Env,
+            DocumentKind::TextFragment,
+        ] {
+            assert!(
+                validate(b"", kind).is_empty(),
+                "{kind:?} empty document must stay valid"
+            );
+        }
+        // The explicit empty object remains valid.
+        assert!(validate(b"{}", DocumentKind::StrictJson).is_empty());
+    }
+    // -------------------------------------------------------------------
+    // RAW-05 create-file rollback
+    // -------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct FailAtPoint(crate::injector::Point);
+
+    impl crate::injector::Injector for FailAtPoint {
+        fn inject(&self, point: crate::injector::Point) -> Result<()> {
+            if point == self.0 {
+                Err(ConfigError::Verification {
+                    path: PathBuf::from("/injected"),
+                    reason: format!("injected failure at {point:?}"),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn raw_scratch(prefix: &str, name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "superai-raw-create-{}-{}-{now}",
+            prefix,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn create_file_creates_missing_with_owned_parents() {
+        let base = raw_scratch("ok", "");
+        let target = base.join("nested/owned/settings.json");
+        let report = create_file(&target, br#"{"model":"opus"}"#).unwrap();
+        assert!(!report.is_noop);
+        assert!(
+            report.backup.is_none(),
+            "nothing foreign existed to back up"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            br#"{"model":"opus"}"#.to_vec()
+        );
+        drop(std::fs::remove_dir_all(&base));
+    }
+
+    #[test]
+    fn create_file_refuses_existing_target_as_conflict() {
+        let base = raw_scratch("exists", "settings.json");
+        std::fs::write(&base, br#"{"a":1}"#).unwrap();
+        let err = create_file(&base, br#"{"a":2}"#).unwrap_err();
+        assert!(
+            format!("{err}").contains("concurrent modification"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&base).unwrap(), br#"{"a":1}"#.to_vec());
+        drop(std::fs::remove_file(&base));
+    }
+
+    #[test]
+    fn create_file_empty_buffer_is_not_an_empty_json_object() {
+        let base = raw_scratch("empty", "settings.json");
+        let err = create_file(&base, b"   ").unwrap_err();
+        assert!(
+            format!("{err}").contains("empty buffer") || format!("{err}").contains("invalid json"),
+            "{err}"
+        );
+        assert!(!base.exists(), "nothing created for an invalid draft");
+        drop(std::fs::remove_dir_all(base.parent().unwrap()));
+    }
+
+    #[test]
+    fn failed_create_rolls_back_owned_empty_parents_and_leaves_no_file() {
+        let base = raw_scratch("rollback", "");
+        // Foreign sibling content that must survive the rollback.
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::write(base.join("nested/foreign.txt"), b"keep me").unwrap();
+        let target = base.join("nested/owned/deep/settings.json");
+        // Fail the creation transaction at the real atomic-replace boundary
+        // (QAL-06 discipline): the owned parents had already been created,
+        // and the compensated transaction removes exactly them — no file
+        // lands, foreign content keeps its directories.
+        let err = create_file_with_injector(
+            &target,
+            br#"{"model":"opus"}"#,
+            Some(std::sync::Arc::new(FailAtPoint(
+                crate::injector::Point::AtomicReplace,
+            ))),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("rolled back"), "{err}");
+        assert!(!target.exists(), "no file may land after a failed create");
+        assert!(
+            !base.join("nested/owned").exists(),
+            "owned empty parents must be rolled back"
+        );
+        assert!(
+            base.join("nested/foreign.txt").exists(),
+            "foreign content keeps its directories"
+        );
+
+        // A failure even earlier (staged-content parse) never touches disk.
+        let target2 = base.join("nested/owned2/settings.json");
+        let err2 = create_file_with_injector(
+            &target2,
+            br#"{"model":"opus"}"#,
+            Some(std::sync::Arc::new(FailAtPoint(
+                crate::injector::Point::ParseStaged,
+            ))),
+        )
+        .unwrap_err();
+        assert!(!target2.exists(), "{err2}");
+        assert!(!base.join("nested/owned2").exists());
+        drop(std::fs::remove_dir_all(&base));
     }
 }

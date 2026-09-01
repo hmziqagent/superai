@@ -1109,6 +1109,86 @@ pub struct PluginAdapterDecl {
     pub restart: RestartBehavior,
 }
 
+/// How a harness's config disables skills (EXT-04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SkillDisableMechanism {
+    /// Dotted selector of a LIST of disabled skill names: disable adds the
+    /// name, enable removes it.
+    DenyList {
+        /// Dotted selector of the list, e.g. `skills.disabled`.
+        selector: String,
+    },
+    /// Dotted selector of a BOOLEAN switch that disables the documented
+    /// skill source (all-or-nothing, e.g. amp's
+    /// `amp.skills.disableClaudeCodeSkills`).
+    Switch {
+        /// Dotted selector of the boolean.
+        selector: String,
+    },
+}
+
+/// Harness-config skill enable/disable mechanism declaration (EXT-04).
+///
+/// Declared by adapters whose corpus documents config keys controlling skill
+/// loading. `set_skill_enabled_via_config` writes these keys through the
+/// engine executor with ownership + expected-old conflict detection; where
+/// nothing is declared the operation refuses honestly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillConfigDecl {
+    /// Config surface holding the mechanism keys (resolved inside the
+    /// instance config root), e.g. `settings.json`.
+    pub surface_id: String,
+    /// Documented disable mechanism, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable: Option<SkillDisableMechanism>,
+    /// Dotted selector of the skill search path (string or array): enable
+    /// adds the registry root to it, disable removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_path: Option<String>,
+}
+
+impl SkillConfigDecl {
+    /// Create a declaration with both mechanisms.
+    pub fn new(surface_id: &str) -> Self {
+        Self {
+            surface_id: surface_id.to_owned(),
+            disable: None,
+            search_path: None,
+        }
+    }
+
+    /// Set the disable mechanism.
+    #[must_use]
+    pub fn with_disable(mut self, mechanism: SkillDisableMechanism) -> Self {
+        self.disable = Some(mechanism);
+        self
+    }
+
+    /// Set the search-path selector.
+    #[must_use]
+    pub fn with_search_path(mut self, selector: &str) -> Self {
+        self.search_path = Some(selector.to_owned());
+        self
+    }
+
+    /// Every dotted selector this declaration owns (executor `owned_keys`).
+    pub fn owned_selectors(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match &self.disable {
+            Some(
+                SkillDisableMechanism::DenyList { selector }
+                | SkillDisableMechanism::Switch { selector },
+            ) => out.push(selector.clone()),
+            None => {}
+        }
+        if let Some(sp) = &self.search_path {
+            out.push(sp.clone());
+        }
+        out
+    }
+}
+
 impl PluginAdapterDecl {
     /// Create a file/config safe plugin declaration (no execution).
     pub fn file_config(
@@ -1380,6 +1460,17 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// is unverified). `Some(reason)` distinguishes verified-absent from
     /// not-yet-modeled and takes precedence over [`Adapter::plugin_decl`].
     fn plugin_absence_reason(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Harness-config skill enable/disable mechanism declaration (EXT-04).
+    ///
+    /// Adapters whose corpus documents config keys that enable/disable
+    /// skills (allow/deny lists, disable switches, skill search paths)
+    /// declare them here; `set_skill_enabled_via_config` writes them through
+    /// the engine executor. `None` (the default) is an honest refusal: the
+    /// harness documents no such mechanism and superai must not invent one.
+    fn skill_config_decl(&self) -> Option<SkillConfigDecl> {
         None
     }
 }

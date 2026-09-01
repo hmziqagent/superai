@@ -63,7 +63,9 @@ pub enum DetectionSource {
     Cargo,
     /// Found via desktop app bundle at a filesystem path.
     AppBundle,
-    /// Found via system package metadata (future: pipx/uv/apt).
+    /// Found via system/Python package metadata: `pipx list --json`,
+    /// `uv tool list`, or `dpkg -s <package>` (PKG-03). The evidence lines
+    /// name which manager answered.
     SystemPackage,
 }
 
@@ -194,6 +196,13 @@ pub struct DetectOptions {
     pub probe_npm: bool,
     /// Whether to probe cargo.
     pub probe_cargo: bool,
+    /// Whether to probe pipx (`pipx list --json`, PKG-03).
+    pub probe_pipx: bool,
+    /// Whether to probe uv (`uv tool list`, PKG-03).
+    pub probe_uv: bool,
+    /// Whether to probe system packages (`dpkg -s <package>` on Debian
+    /// families, PKG-03).
+    pub probe_system: bool,
     /// Whether to probe app bundles.
     pub probe_apps: bool,
     /// Timeout for each probe subprocess.
@@ -210,6 +219,9 @@ impl Default for DetectOptions {
             probe_brew: true,
             probe_npm: true,
             probe_cargo: true,
+            probe_pipx: true,
+            probe_uv: true,
+            probe_system: true,
             probe_apps: true,
             probe_timeout: Duration::from_secs(5),
         }
@@ -485,6 +497,62 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
                         seen_paths.insert(canon);
                         detections.push(d);
                     }
+                }
+            }
+        }
+    }
+
+    // 6b) pipx metadata: `pipx list --json` (PKG-03)
+    if opts.probe_pipx {
+        for method in entry
+            .methods
+            .iter()
+            .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Pipx))
+        {
+            if let Some(ds) = probe_pipx(&method.package_name, entry, opts) {
+                for d in ds {
+                    let canon = canonical_or_clone(&d.path);
+                    if !seen_paths.contains(&canon) {
+                        seen_paths.insert(canon);
+                        detections.push(d);
+                    }
+                }
+            }
+        }
+    }
+
+    // 6c) uv tool metadata: `uv tool list` (PKG-03)
+    if opts.probe_uv {
+        for method in entry
+            .methods
+            .iter()
+            .filter(|m| matches!(m.kind, crate::install_catalog::InstallMethodKind::Uv))
+        {
+            if let Some(ds) = probe_uv(&method.package_name, entry, opts) {
+                for d in ds {
+                    let canon = canonical_or_clone(&d.path);
+                    if !seen_paths.contains(&canon) {
+                        seen_paths.insert(canon);
+                        detections.push(d);
+                    }
+                }
+            }
+        }
+    }
+
+    // 6d) system package metadata: `dpkg -s <package>` on Debian families
+    // (PKG-03). Absent `dpkg` probes nothing — never a fabricated hit.
+    if opts.probe_system {
+        for method in entry
+            .methods
+            .iter()
+            .filter(|m| m.kind == crate::install_catalog::InstallMethodKind::Direct)
+        {
+            if let Some(d) = probe_system_package(&method.package_name, entry, opts) {
+                let canon = canonical_or_clone(&d.path);
+                if !seen_paths.contains(&canon) {
+                    seen_paths.insert(canon);
+                    detections.push(d);
                 }
             }
         }
@@ -1043,6 +1111,207 @@ fn probe_cargo(
     }
 }
 
+// ---------------------------------------------------------------------------
+// PKG-03 — pipx / uv / system-package probes
+// ---------------------------------------------------------------------------
+
+/// Exec opts for package-manager probes, scoped to the injected environment.
+fn package_probe_opts(opts: &DetectOptions) -> ExecuteOpts {
+    let mut env = Vec::new();
+    if let Some(home) = opts.resolve_home() {
+        env.push(("HOME".to_owned(), home.to_string_lossy().into_owned()));
+    }
+    ExecuteOpts {
+        timeout: Some(opts.probe_timeout),
+        cwd: None,
+        env,
+        env_remove: Vec::new(),
+        clear_env: true,
+        output_limit: Some(256 * 1024),
+        redact: false,
+    }
+}
+
+/// Resolve a package-manager binary to an absolute path from the injected
+/// PATH dirs when possible (tests place fake `pipx`/`uv`/`dpkg` there), else
+/// the bare name for ambient resolution. Absolute invocation removes any
+/// ambiguity about which PATH the child searches.
+fn resolve_manager(path_dirs: &[PathBuf], name: &str) -> String {
+    for dir in path_dirs {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    name.to_owned()
+}
+
+/// Extract the version for `package` from `pipx list --json` output.
+fn extract_pipx_version(json_text: &str, package: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json_text).ok()?;
+    let venvs = value.get("venvs").and_then(|v| v.as_object())?;
+    for (key, venv) in venvs {
+        // pipx keys venvs by package name; matching by key or the embedded
+        // package->version map covers both layouts.
+        if key == package
+            || venv
+                .get("package")
+                .and_then(|p| p.get("package_name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|n| n == package)
+        {
+            let version = venv
+                .get("package")
+                .and_then(|p| p.get("package_version"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    venv.get("main_package")
+                        .and_then(|p| p.get("package_version"))
+                        .and_then(serde_json::Value::as_str)
+                });
+            return version.map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+/// pipx metadata probe: `pipx list --json` (PKG-03).
+///
+/// The binary lives under pipx's venv bin dir; the reported path is derived
+/// from HOME (`~/.local/pipx/venvs/<pkg>/bin/<exe>`) and the detection
+/// carries `pipx list` evidence. Absent `pipx` or a missing entry probes
+/// nothing.
+fn probe_pipx(
+    package: &str,
+    entry: &InstallCatalogEntry,
+    opts: &DetectOptions,
+) -> Option<Vec<Detection>> {
+    let exec_opts = package_probe_opts(opts);
+    let pipx = resolve_manager(&opts.resolve_path_dirs(), "pipx");
+    let out = run_command(&pipx, &["list".to_owned(), "--json".to_owned()], &exec_opts).ok()?;
+    if !out.success {
+        return None;
+    }
+    let version = extract_pipx_version(&out.stdout, package)?;
+    let home = opts.resolve_home()?;
+    let exe = entry.executables.first().map_or(package, String::as_str);
+    let bin_path = home
+        .join(".local/pipx/venvs")
+        .join(package)
+        .join("bin")
+        .join(exe);
+    let mut d = Detection::new(
+        &entry.harness,
+        exe,
+        bin_path,
+        DetectionSource::SystemPackage,
+        DetectionConfidence::Medium,
+    );
+    d.version = Some(version.clone());
+    d.evidence.push(format!(
+        "pipx list --json: `{package}` {version} -> {}",
+        d.path.display()
+    ));
+    Some(vec![d])
+}
+
+/// Extract the version for `package` from `uv tool list` output lines shaped
+/// `package vX.Y.Z` (or `- package vX.Y.Z`).
+fn extract_uv_version(text: &str, package: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start_matches("- ").trim();
+        if let Some(rest) = trimmed.strip_prefix(package)
+            && rest.starts_with(' ')
+        {
+            let token = rest.split_whitespace().next();
+            if let Some(tok) = token {
+                return extract_version(tok).or(Some(tok.to_owned()));
+            }
+        }
+    }
+    None
+}
+
+/// uv tool metadata probe: `uv tool list` (PKG-03).
+///
+/// uv installs tools under `~/.local/share/uv/tools/<pkg>/`; the executable
+/// lands in `~/.local/bin/<exe>` (uv's bin dir on PATH).
+fn probe_uv(
+    package: &str,
+    entry: &InstallCatalogEntry,
+    opts: &DetectOptions,
+) -> Option<Vec<Detection>> {
+    let exec_opts = package_probe_opts(opts);
+    let uv = resolve_manager(&opts.resolve_path_dirs(), "uv");
+    let out = run_command(&uv, &["tool".to_owned(), "list".to_owned()], &exec_opts).ok()?;
+    if !out.success {
+        return None;
+    }
+    let version = extract_uv_version(&out.stdout, package)?;
+    let home = opts.resolve_home()?;
+    let exe = entry.executables.first().map_or(package, String::as_str);
+    let bin_path = home.join(".local/bin").join(exe);
+    let mut d = Detection::new(
+        &entry.harness,
+        exe,
+        bin_path,
+        DetectionSource::SystemPackage,
+        DetectionConfidence::Medium,
+    );
+    d.version = Some(version.clone());
+    d.evidence.push(format!(
+        "uv tool list: `{package}` {version} -> {}",
+        d.path.display()
+    ));
+    Some(vec![d])
+}
+
+/// System package probe: `dpkg -s <package>` on Debian families (PKG-03).
+///
+/// Only answers when `dpkg` exists AND reports the package installed; the
+/// executable path is the system location `/usr/bin/<exe>`. Absent `dpkg`
+/// (macOS/Windows/non-Debian) is not an error — there is simply no evidence.
+fn probe_system_package(
+    package: &str,
+    entry: &InstallCatalogEntry,
+    opts: &DetectOptions,
+) -> Option<Detection> {
+    let exec_opts = package_probe_opts(opts);
+    let dpkg = resolve_manager(&opts.resolve_path_dirs(), "dpkg");
+    let out = run_command(&dpkg, &["-s".to_owned(), package.to_owned()], &exec_opts).ok()?;
+    if !out.success {
+        return None;
+    }
+    let installed = out.stdout.lines().any(|l| {
+        l.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("status: install ok installed")
+    });
+    if !installed {
+        return None;
+    }
+    let version = out
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Version:"))
+        .map(|v| v.trim().to_owned());
+    let exe = entry.executables.first().map_or(package, String::as_str);
+    let mut d = Detection::new(
+        &entry.harness,
+        exe,
+        PathBuf::from("/usr/bin").join(exe),
+        DetectionSource::SystemPackage,
+        DetectionConfidence::Medium,
+    );
+    d.version = version;
+    d.evidence.push(format!(
+        "dpkg -s {package}: installed ({}) -> {}",
+        d.version.as_deref().unwrap_or("version unknown"),
+        d.path.display()
+    ));
+    Some(d)
+}
+
 fn probe_app_bundle_version(bundle_path: &Path) -> Option<String> {
     // Try reading Info.plist's CFBundleShortVersionString. Prefer `plutil` or
     // direct file read. Fallback to `defaults read` is avoided to keep no-shell
@@ -1305,5 +1574,180 @@ mod tests {
         let token = "$(echo pwned)".to_owned();
         let out = run_command("echo", std::slice::from_ref(&token), &opts).unwrap();
         assert_eq!(out.stdout_trimmed(), token);
+    }
+
+    // -------------------------------------------------------------------
+    // PKG-03 — pipx / uv / system-package probes
+    // -------------------------------------------------------------------
+
+    /// Entry exercising the pipx/uv/direct (system) methods.
+    fn pythonish_entry() -> InstallCatalogEntry {
+        use crate::install_catalog::{DetectHints, InstallMethod, PlatformConstraints};
+        InstallCatalogEntry {
+            harness: "test-py-harness".to_owned(),
+            executables: vec!["my-exe".to_owned()],
+            bundle_ids: Vec::new(),
+            apps: Vec::new(),
+            methods: vec![
+                InstallMethod {
+                    kind: crate::install_catalog::InstallMethodKind::Pipx,
+                    package_name: "my-pkg".to_owned(),
+                    tap: None,
+                    repo: None,
+                    registry: None,
+                },
+                InstallMethod {
+                    kind: crate::install_catalog::InstallMethodKind::Uv,
+                    package_name: "my-pkg".to_owned(),
+                    tap: None,
+                    repo: None,
+                    registry: None,
+                },
+                InstallMethod {
+                    kind: crate::install_catalog::InstallMethodKind::Direct,
+                    package_name: "my-pkg".to_owned(),
+                    tap: None,
+                    repo: None,
+                    registry: None,
+                },
+            ],
+            version_source: "my-exe --version".to_owned(),
+            constraints: PlatformConstraints {
+                os: vec!["any".to_owned()],
+                arch: vec!["any".to_owned()],
+            },
+            detect: DetectHints {
+                commands: vec![],
+                paths: vec![],
+            },
+            update: None,
+            uninstall: None,
+            requires_admin: false,
+            checksum: None,
+            conflicts: Vec::new(),
+            docs: "https://example.com".to_owned(),
+            last_verified: "2026-08-26".to_owned(),
+        }
+    }
+
+    /// Fake manager binary answering with fixed output (unix shell script).
+    #[cfg(unix)]
+    fn write_fake_manager(dir: &Path, name: &str, script_body: &str) {
+        let path = dir.join(name);
+        fs::write(&path, script_body).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_reports_pipx_uv_and_system_package_sources() {
+        let bin_dir = make_temp_dir("pkg03-bins");
+        let home = make_temp_dir("pkg03-home");
+        // pipx answers JSON for my-pkg.
+        write_fake_manager(
+            &bin_dir,
+            "pipx",
+            "#!/bin/sh\necho '{\"venvs\":{\"my-pkg\":{\"package\":{\"package_name\":\"my-pkg\",\"package_version\":\"1.4.2\"}}}}'\n",
+        );
+        // uv answers `my-pkg v1.4.2`.
+        write_fake_manager(&bin_dir, "uv", "#!/bin/sh\necho 'my-pkg v1.4.2'\n");
+        // dpkg reports my-pkg installed.
+        write_fake_manager(
+            &bin_dir,
+            "dpkg",
+            "#!/bin/sh\nprintf 'Package: my-pkg\\nStatus: install ok installed\\nVersion: 1.4.2\\n'\n",
+        );
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![bin_dir.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: true,
+            probe_uv: true,
+            probe_system: true,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        let pipx_hit = hits
+            .iter()
+            .find(|d| {
+                d.source == DetectionSource::SystemPackage
+                    && d.evidence.iter().any(|e| e.starts_with("pipx list"))
+            })
+            .unwrap_or_else(|| panic!("pipx detection missing: {hits:?}"));
+        assert_eq!(pipx_hit.version.as_deref(), Some("1.4.2"));
+        assert_eq!(
+            pipx_hit.path,
+            home.join(".local/pipx/venvs/my-pkg/bin/my-exe")
+        );
+        let uv_hit = hits
+            .iter()
+            .find(|d| d.evidence.iter().any(|e| e.starts_with("uv tool list")))
+            .unwrap_or_else(|| panic!("uv detection missing: {hits:?}"));
+        assert_eq!(uv_hit.version.as_deref(), Some("1.4.2"));
+        assert_eq!(uv_hit.path, home.join(".local/bin/my-exe"));
+        let dpkg_hit = hits
+            .iter()
+            .find(|d| d.evidence.iter().any(|e| e.starts_with("dpkg -s")))
+            .unwrap_or_else(|| panic!("dpkg detection missing: {hits:?}"));
+        assert_eq!(dpkg_hit.path, PathBuf::from("/usr/bin/my-exe"));
+        assert_eq!(dpkg_hit.version.as_deref(), Some("1.4.2"));
+
+        drop(fs::remove_dir_all(&bin_dir));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_managers_produce_no_system_package_hits() {
+        // No pipx/uv/dpkg in the injected PATH: no SystemPackage detections,
+        // no fabricated hits (PKG-03 honesty).
+        let bin_dir = make_temp_dir("pkg03-empty");
+        let home = make_temp_dir("pkg03-home-empty");
+        let entry = pythonish_entry();
+        let opts = DetectOptions {
+            path_dirs: Some(vec![bin_dir.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_pipx: true,
+            probe_uv: true,
+            probe_system: true,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let hits = detect_all_for_entry(&entry, &opts);
+        assert!(
+            hits.iter()
+                .all(|d| d.source != DetectionSource::SystemPackage),
+            "no manager present must yield no system-package hits: {hits:?}"
+        );
+        drop(fs::remove_dir_all(&bin_dir));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn pipx_version_extraction_covers_both_layouts() {
+        let venvs_named = r#"{"venvs":{"my-pkg":{"package":{"package_name":"my-pkg","package_version":"0.9.1"}}}}"#;
+        assert_eq!(
+            extract_pipx_version(venvs_named, "my-pkg").as_deref(),
+            Some("0.9.1")
+        );
+        let empty = "{}";
+        assert!(extract_pipx_version(empty, "my-pkg").is_none());
+        let uv_list = "other-tool v2.0.0\nmy-pkg v1.5.0\n";
+        assert_eq!(
+            extract_uv_version(uv_list, "my-pkg").as_deref(),
+            Some("1.5.0")
+        );
+        assert!(extract_uv_version(uv_list, "absent").is_none());
     }
 }

@@ -299,6 +299,162 @@ impl InstallReceipt {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PKG-06 — persisted install receipts
+// ---------------------------------------------------------------------------
+
+/// Superai-owned install-receipt directory for `home`:
+/// `<home>/.superai/install_receipts`.
+pub fn receipts_root(home: &Path) -> PathBuf {
+    home.join(".superai").join("install_receipts")
+}
+
+/// Receipt file for a `(harness, method)` pair.
+fn receipt_path(home: &Path, harness: &str, method: &InstallMethodKind) -> PathBuf {
+    let method_id = match method {
+        InstallMethodKind::Npm => "npm",
+        InstallMethodKind::Homebrew => "homebrew",
+        InstallMethodKind::HomebrewCask => "homebrew_cask",
+        InstallMethodKind::Cargo => "cargo",
+        InstallMethodKind::Mise => "mise",
+        InstallMethodKind::Pipx => "pipx",
+        InstallMethodKind::Uv => "uv",
+        InstallMethodKind::Direct => "direct",
+        InstallMethodKind::External => "external",
+    };
+    receipts_root(home).join(format!("{harness}-{method_id}.json"))
+}
+
+/// Persist a verified receipt for an explicit `(harness, method)` key
+/// (PKG-06).
+///
+/// Called only after `verify_install` produced a receipt for a NEW install;
+/// pre-existing installs (receipt `None`) never write a file, and failed
+/// installs error before this point. The receipt is written atomically under
+/// superai's own receipts directory, one file per `(harness, method)`.
+pub fn persist_receipt(
+    home: &Path,
+    harness: &HarnessId,
+    receipt: &InstallReceipt,
+) -> Result<PathBuf, CoreError> {
+    receipt.validate()?;
+    let path = receipt_path(home, harness.as_str(), &receipt.method);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::InvalidPath {
+            kind: "install_receipts".to_owned(),
+            value: parent.display().to_string(),
+            reason: format!("cannot create receipts dir: {e}"),
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(|e| CoreError::Validation {
+        field: "receipt".to_owned(),
+        reason: format!("serialize receipt failed: {e}"),
+    })?;
+    superai_config::atomic::atomic_write(&path, &bytes).map_err(CoreError::Config)?;
+    Ok(path)
+}
+
+/// Load every persisted receipt under `home` (PKG-06).
+///
+/// Invalid/unparseable receipt files are surfaced as errors (fail closed)
+/// rather than silently skipped.
+pub fn load_receipts(home: &Path) -> Result<Vec<InstallReceipt>, CoreError> {
+    let root = receipts_root(home);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(CoreError::InvalidPath {
+                kind: "install_receipts".to_owned(),
+                value: root.display().to_string(),
+                reason: format!("cannot read receipts dir: {e}"),
+            });
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| CoreError::InvalidPath {
+            kind: "install_receipt".to_owned(),
+            value: path.display().to_string(),
+            reason: format!("cannot read receipt: {e}"),
+        })?;
+        let receipt: InstallReceipt =
+            serde_json::from_slice(&bytes).map_err(|e| CoreError::Validation {
+                field: "install_receipt".to_owned(),
+                reason: format!("invalid receipt at {}: {e}", path.display()),
+            })?;
+        receipt.validate()?;
+        out.push(receipt);
+    }
+    out.sort_by(|a, b| a.package_id.cmp(&b.package_id));
+    Ok(out)
+}
+
+/// Find the persisted receipt for `(harness, method)` (PKG-08 ownership
+/// preflight). `method: None` matches any method's receipt for the harness.
+pub fn find_receipt(
+    home: &Path,
+    harness: &HarnessId,
+    method: Option<&InstallMethodKind>,
+) -> Result<Option<InstallReceipt>, CoreError> {
+    let root = receipts_root(home);
+    let prefix = format!("{}-", harness.as_str());
+    let method_id = method.map(|m| match m {
+        InstallMethodKind::Npm => "npm",
+        InstallMethodKind::Homebrew => "homebrew",
+        InstallMethodKind::HomebrewCask => "homebrew_cask",
+        InstallMethodKind::Cargo => "cargo",
+        InstallMethodKind::Mise => "mise",
+        InstallMethodKind::Pipx => "pipx",
+        InstallMethodKind::Uv => "uv",
+        InstallMethodKind::Direct => "direct",
+        InstallMethodKind::External => "external",
+    });
+    let wanted = method_id.map(|m| format!("{prefix}{m}.json"));
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(CoreError::InvalidPath {
+                kind: "install_receipts".to_owned(),
+                value: root.display().to_string(),
+                reason: format!("cannot read receipts dir: {e}"),
+            });
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        if !name.starts_with(&prefix) || !name.to_ascii_lowercase().ends_with(".json") {
+            continue;
+        }
+        if let Some(w) = &wanted
+            && name != *w
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| CoreError::InvalidPath {
+            kind: "install_receipt".to_owned(),
+            value: path.display().to_string(),
+            reason: format!("cannot read receipt: {e}"),
+        })?;
+        let receipt: InstallReceipt =
+            serde_json::from_slice(&bytes).map_err(|e| CoreError::Validation {
+                field: "install_receipt".to_owned(),
+                reason: format!("invalid receipt at {}: {e}", path.display()),
+            })?;
+        receipt.validate()?;
+        return Ok(Some(receipt));
+    }
+    Ok(None)
+}
+
 /// Whether a version satisfies a requested range/channel.
 ///
 /// Channels (`latest`, `stable`, `beta`, `nightly`, `next`, `canary`, `lts`)
@@ -629,18 +785,34 @@ pub fn verify_install(
 
 /// Execute an install plan and verify it, returning a receipt on success.
 ///
-/// This is the combined PKG-05 (execute) + PKG-06 (verify) flow. It captures
-/// pre-detections, runs the preview command with structured opts, then
-/// verifies and returns the receipt. Pre-existing installs return `Ok(None)`.
+/// This is the combined PKG-05 (execute) + PKG-06 (verify + persist) flow:
+///
+/// - PKG-10: plans whose method is External/Direct (`plan.external_install`)
+///   refuse with the typed [`CoreError::ExternalInstallRequired`] — no
+///   command is executed for them.
+/// - PKG-07: when the binary already on disk satisfies the request, the
+///   install command is NOT re-run — the plan declines with `Ok(None)` (no
+///   receipt, no execution).
+/// - PKG-06: a verified NEW install persists its receipt under
+///   `<home>/.superai/install_receipts`; failed installs error before any
+///   receipt is written.
 pub fn execute_and_verify(
     plan: &InstallPlan,
     detect_opts: &DetectOptions,
     redact: bool,
+    home: &Path,
 ) -> Result<Option<InstallReceipt>, CoreError> {
     let harness = HarnessId::new(&plan.harness).map_err(|e| CoreError::Validation {
         field: "harness".to_owned(),
         reason: format!("invalid harness in plan: {e}"),
     })?;
+    // PKG-10: no safe non-interactive command exists for this method.
+    if let Some(external) = &plan.external_install {
+        return Err(CoreError::ExternalInstallRequired {
+            harness: plan.harness.clone(),
+            instructions: format!("{} ({})", external.docs, external.reason),
+        });
+    }
     // Capture pre-detections before execution
     let catalog = InstallCatalog::embedded()?;
     let entry = catalog.get(&harness).ok_or_else(|| CoreError::Validation {
@@ -648,6 +820,24 @@ pub fn execute_and_verify(
         reason: format!("harness `{harness}` not in catalog"),
     })?;
     let pre = detect_all_for_entry(entry, detect_opts);
+
+    // PKG-07 existing-install skip: a non-broken pre-install detection whose
+    // version satisfies the request means the binary already matches — decline
+    // to re-run the install command (and write no receipt).
+    let requested = plan.version.as_deref().or(plan.channel.as_deref());
+    if let Some(best_pre) = select_best_detection(&pre) {
+        let already_satisfies = match (requested, best_pre.version.as_deref()) {
+            (Some(req), Some(detected)) => {
+                let clean = extract_version(detected).unwrap_or_else(|| detected.to_owned());
+                version_satisfies(req, &clean)
+            }
+            // No request: any present non-broken install is "already there".
+            (None, _) | (Some(_), None) => true,
+        };
+        if already_satisfies {
+            return Ok(None);
+        }
+    }
 
     // Execute with structured command
     plan.command_preview.validate()?;
@@ -677,9 +867,12 @@ pub fn execute_and_verify(
         });
     }
 
-    // Verify and build receipt
-    let requested = plan.version.as_deref().or(plan.channel.as_deref());
-    verify_install(&harness, requested, &plan.method, &pre, detect_opts)
+    // Verify and build receipt; persist it when the install is new (PKG-06).
+    let receipt = verify_install(&harness, requested, &plan.method, &pre, detect_opts)?;
+    if let Some(receipt) = &receipt {
+        persist_receipt(home, &harness, receipt)?;
+    }
+    Ok(receipt)
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,8 +1308,10 @@ fn detection_source_to_method(source: &DetectionSource) -> Option<InstallMethodK
 
 /// Execute an update plan with native method (PKG-07).
 ///
-/// Checks `blocked` unless `explicit_accept` is true, runs the update command
-/// with structured opts, then re-detects and validates the new version.
+/// Checks `blocked` unless `explicit_accept` is true, refuses external/direct
+/// methods with the typed [`CoreError::ExternalInstallRequired`] (PKG-10),
+/// runs the update command with structured opts, then re-detects and strictly
+/// validates the new version against the expected available version.
 pub fn execute_update(
     plan: &UpdatePlan,
     detect_opts: &DetectOptions,
@@ -1131,16 +1326,18 @@ pub fn execute_update(
             }),
         });
     }
-    // Dry-run for external methods: return ExternalInstallRequired-like error
+    // PKG-10: external/manual methods are a typed state, not a fake `echo`
+    // command the executor could trip over.
     if matches!(
         plan.method,
         InstallMethodKind::External | InstallMethodKind::Direct
-    ) && plan.command_preview.executable == "echo"
-    {
-        return Err(CoreError::UnsupportedOperation {
+    ) {
+        return Err(CoreError::ExternalInstallRequired {
             harness: plan.harness.clone(),
-            operation: "update".to_owned(),
-            reason: "external/manual update required; see docs".to_owned(),
+            instructions: format!(
+                "manual update required for method `{}`; see {}",
+                plan.method, plan.docs
+            ),
         });
     }
     plan.command_preview.validate()?;
@@ -1181,26 +1378,89 @@ pub fn execute_update(
     if let Some(entry) = catalog.get(&harness_id) {
         let post = detect_all_for_entry(entry, detect_opts);
         if let Some(best) = select_best_detection(&post) {
-            // If available_version was known, verify post version matches or advances
-            if let Some(expected) = plan.available_version.as_deref()
-                && let Some(detected) = best.version.as_deref()
-            {
-                let det_clean = extract_version(detected).unwrap_or_else(|| detected.to_owned());
-                let exp_clean = extract_version(expected).unwrap_or_else(|| expected.to_owned());
-                // Allow any detected version that is not empty when the update succeeded
-                // at the process level; strict equality would be too brittle for
-                // managers that report slightly different strings.
-                if det_clean.is_empty() {
-                    return Err(CoreError::Verification {
-                        path: best.path.clone(),
-                        kind: "version".to_owned(),
-                        reason: format!("post-update version empty (expected {exp_clean})"),
-                    });
+            // PKG-07 strict post-update validation: when the available version
+            // was resolved, the detected version must satisfy it — "any
+            // non-empty string" is not verification.
+            if let Some(expected) = plan.available_version.as_deref() {
+                match best.version.as_deref() {
+                    Some(detected) => {
+                        let det_clean =
+                            extract_version(detected).unwrap_or_else(|| detected.to_owned());
+                        if det_clean.is_empty() {
+                            return Err(CoreError::Verification {
+                                path: best.path.clone(),
+                                kind: "version".to_owned(),
+                                reason: format!("post-update version empty (expected {expected})"),
+                            });
+                        }
+                        if !version_satisfies(expected, &det_clean) {
+                            return Err(CoreError::Verification {
+                                path: best.path.clone(),
+                                kind: "version".to_owned(),
+                                reason: format!(
+                                    "post-update version `{det_clean}` does not satisfy \
+                                     expected available `{expected}`"
+                                ),
+                            });
+                        }
+                    }
+                    None => {
+                        return Err(CoreError::Verification {
+                            path: best.path.clone(),
+                            kind: "version".to_owned(),
+                            reason: format!(
+                                "post-update version probe failed (expected {expected})"
+                            ),
+                        });
+                    }
                 }
             }
         }
     }
     Ok(out)
+}
+
+/// Read-only instance revalidation after a binary update (PKG-07).
+///
+/// Re-detects the harness binary fresh and reports, per recorded instance of
+/// the harness, whether the new version keeps it compatible — read-only, no
+/// registry mutation, no config writes.
+pub fn revalidate_instances_after_update(
+    harness: &HarnessId,
+    registry: Option<&Registry>,
+    detect_opts: &DetectOptions,
+) -> Vec<CompatImpact> {
+    let Ok(catalog) = InstallCatalog::embedded() else {
+        return Vec::new();
+    };
+    let Some(entry) = catalog.get(harness) else {
+        return Vec::new();
+    };
+    let post = detect_all_for_entry(entry, detect_opts);
+    let current_version = select_best_detection(&post).and_then(|d| d.version.clone());
+    let support_note = harness_catalog::find_by_id(harness.as_str()).map_or_else(
+        || "unknown harness".to_owned(),
+        |e| format!("{} support: {}", e.display_name, e.support),
+    );
+    let mut impacts = Vec::new();
+    if let Some(reg) = registry {
+        for inst in reg.instances() {
+            if inst.harness.as_str() != harness.as_str() {
+                continue;
+            }
+            let avail = current_version.as_deref().unwrap_or("unknown");
+            let (cur_compat, new_compat, reason) =
+                update_compat_for_versions(current_version.as_deref(), avail);
+            impacts.push(CompatImpact {
+                instance: inst.name.as_str().to_owned(),
+                harness: harness.as_str().to_owned(),
+                current_compatible: cur_compat,
+                new_compatible: new_compat,
+                reason: format!("{support_note}; {reason}"),
+            });
+        }
+    }
+    impacts
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,6 +1469,10 @@ pub fn execute_update(
 
 /// Preflight for uninstall (PKG-08).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "preflight flags are independent ownership/safety booleans"
+)]
 pub struct UninstallPreflight {
     /// Harness to uninstall.
     pub harness: String,
@@ -1228,6 +1492,11 @@ pub struct UninstallPreflight {
     pub shared: bool,
     /// Whether the binary is foreign (not proven superai-owned).
     pub foreign: bool,
+    /// PKG-08 package receipt ownership: a persisted install receipt proves
+    /// superai performed this install.
+    pub receipt_owned: bool,
+    /// The persisted receipt, when one exists.
+    pub receipt: Option<InstallReceipt>,
     /// Whether auto-delete via native method is allowed.
     pub can_auto_delete: bool,
     /// Paths that will be preserved (config/instances/wrappers/backups/templates/assets).
@@ -1292,16 +1561,21 @@ fn preserved_paths_for(registry: Option<&Registry>, harness: &HarnessId) -> Vec<
 /// - Exact installed package/method/path via detection
 /// - Lists every instance/wrapper referencing the binary
 /// - Checks shared/foreign (multiple PATH hits, foreign ownership)
+/// - PKG-08 package-receipt ownership: a persisted receipt proving superai
+///   installed this `(harness, method)` clears the foreign flag
 /// - Default uninstall is binary-only via native method; config preservation
 ///   is enforced
 /// - Manual files not proven owned never auto-delete (`can_auto_delete`)
 ///
 /// When `explicit_allow_foreign` is true, foreign/shared blocks are ignored.
+///
+/// `home` scopes the receipts directory (`<home>/.superai/install_receipts`).
 pub fn plan_uninstall(
     harness: &HarnessId,
     detect_opts: &DetectOptions,
     registry: Option<&Registry>,
     explicit_allow_foreign: bool,
+    home: &Path,
 ) -> Result<UninstallPlan, CoreError> {
     let catalog = InstallCatalog::embedded()?;
     let entry = catalog.get(harness).ok_or_else(|| CoreError::Validation {
@@ -1346,9 +1620,13 @@ pub fn plan_uninstall(
     // Shared: multiple detections or multiple instances
     let shared = detections.len() > 1 || referencing_instances.len() > 1;
 
-    // Foreign: detection is not package-managed (Path without mise) or no receipt
-    // Here we approximate: if best source is Path/ConfiguredBinary/SystemPackage
-    // and not under mise/homebrew/npm/cargo managed locations, treat as foreign.
+    // PKG-08 package receipt ownership: a persisted receipt for this
+    // (harness, method) proves superai performed the install.
+    let receipt = find_receipt(home, harness, Some(&method))?;
+    let receipt_owned = receipt.is_some();
+
+    // Foreign: detection is not package-managed (Path without mise) and no
+    // receipt proves ownership.
     let managed_sources = [
         DetectionSource::MiseShim,
         DetectionSource::MiseManaged,
@@ -1358,14 +1636,16 @@ pub fn plan_uninstall(
         DetectionSource::AppBundle,
     ];
     let is_managed_source = managed_sources.contains(&best.source);
-    let foreign = !is_managed_source
+    let foreign = (!is_managed_source
         || (best.source == DetectionSource::Path
             && !best.path.to_string_lossy().contains(".local/share/mise")
             && !best.path.to_string_lossy().contains(".cargo/bin")
-            && !best.path.to_string_lossy().contains("/.local/bin"));
+            && !best.path.to_string_lossy().contains("/.local/bin")))
+        && !receipt_owned;
 
-    // can_auto_delete only when proven owned via package manager and not foreign manual file
-    let can_auto_delete = is_managed_source && !foreign;
+    // can_auto_delete only when proven owned (package manager or receipt) and
+    // not a foreign manual file.
+    let can_auto_delete = (is_managed_source || receipt_owned) && !foreign;
 
     let preserved = preserved_paths_for(registry, harness);
 
@@ -1433,6 +1713,8 @@ pub fn plan_uninstall(
         referencing_wrappers,
         shared,
         foreign,
+        receipt_owned,
+        receipt,
         can_auto_delete,
         preserved,
     };
@@ -1533,6 +1815,157 @@ pub fn execute_uninstall(
     Ok(out)
 }
 
+/// PKG-08: mark every affected instance binary-missing in the registry.
+///
+/// A successful uninstall removes the binary instances depend on. For each
+/// recorded instance of `harness` whose absolute binary pin now dangles, the
+/// stale pin is cleared through the registry's own update path — the same
+/// vocabulary INS-09's repair uses ("binary-missing is marked honestly,
+/// never left pointing at a dead path"). The registry is persisted; the
+/// return lists the instance names that were marked. PATH-named binaries
+/// carry no pin to clear — their absence is detected at repair time.
+pub fn mark_instances_binary_missing(
+    registry: &mut Registry,
+    registry_path: &Path,
+    harness: &HarnessId,
+) -> Result<Vec<String>, CoreError> {
+    let affected: Vec<String> = registry
+        .instances()
+        .iter()
+        .filter(|inst| inst.harness.as_str() == harness.as_str())
+        .filter_map(|inst| match &inst.binary {
+            Some(crate::paths::ExecutableRef::Absolute(abs)) => {
+                (!abs.as_path().exists()).then(|| inst.name.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    for name in &affected {
+        let Some(mut updated) = registry.remove(name) else {
+            continue;
+        };
+        updated.binary = None;
+        registry.insert(updated)?;
+    }
+    if affected.is_empty() {
+        return Ok(affected);
+    }
+    registry.store(registry_path)?;
+    Ok(affected)
+}
+
+/// Execute an uninstall plan and mark affected instances binary-missing
+/// (PKG-08 combined flow).
+///
+/// Runs the native uninstall, then updates the registry so referencing
+/// instances stop pointing at the removed binary. Returns the process output
+/// plus the names of the instances that were marked binary-missing.
+pub fn execute_uninstall_and_mark(
+    plan: &UninstallPlan,
+    explicit_allow_foreign: bool,
+    redact: bool,
+    registry: Option<(&mut Registry, &Path)>,
+) -> Result<(ProcessOutput, Vec<String>), CoreError> {
+    let out = execute_uninstall(plan, explicit_allow_foreign, redact)?;
+    let harness = HarnessId::new(&plan.preflight.harness).map_err(|e| CoreError::Validation {
+        field: "harness".to_owned(),
+        reason: format!("invalid harness in preflight: {e}"),
+    })?;
+    let mut marked = Vec::new();
+    if let Some((registry, registry_path)) = registry {
+        marked = mark_instances_binary_missing(registry, registry_path, &harness)?;
+    }
+    Ok((out, marked))
+}
+
+// ---------------------------------------------------------------------------
+// PKG-09 — pin-exact-binary selection
+// ---------------------------------------------------------------------------
+
+/// A user-selected exact binary pin (PKG-09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinaryPin {
+    /// The selected absolute executable path.
+    pub path: PathBuf,
+    /// Version detected for the selected binary, if probed.
+    pub version: Option<String>,
+    /// Other detections the selection shadows (ambiguity reporting).
+    pub shadowed_alternatives: Vec<PathBuf>,
+}
+
+/// Select and pin one exact binary from `detections` (PKG-09).
+///
+/// The selection must be one of the detected paths — an unseen path is a
+/// typed refusal, never an invented pin. Returns the pin plus the
+/// alternatives it shadows so callers can surface the ambiguity that
+/// motivated the explicit selection.
+pub fn pin_exact_binary(detections: &[Detection], selected: &Path) -> Result<BinaryPin, CoreError> {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let selected_canon = canonical(selected);
+    let chosen = detections
+        .iter()
+        .find(|d| d.path == selected || canonical(&d.path) == selected_canon)
+        .ok_or_else(|| CoreError::InvalidPath {
+            kind: "binary_pin".to_owned(),
+            value: selected.display().to_string(),
+            reason: format!(
+                "selected binary is not among the detected installations: {}",
+                detections
+                    .iter()
+                    .map(|d| d.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })?;
+    let shadowed_alternatives = detections
+        .iter()
+        .filter(|d| canonical(&d.path) != canonical(&chosen.path))
+        .map(|d| d.path.clone())
+        .collect();
+    Ok(BinaryPin {
+        path: chosen.path.clone(),
+        version: chosen.version.clone(),
+        shadowed_alternatives,
+    })
+}
+
+/// Report PATH ambiguity when no explicit selection was made (PKG-09).
+///
+/// `Some(message)` when multiple distinct-version detections exist and the
+/// caller has not pinned one — a PATH-based wrapper would be ambiguous.
+pub fn report_path_ambiguity(detections: &[Detection]) -> Option<String> {
+    let distinct_versions: std::collections::BTreeSet<&str> = detections
+        .iter()
+        .filter(|d| !d.broken_shim)
+        .filter_map(|d| d.version.as_deref())
+        .collect();
+    if distinct_versions.len() > 1 {
+        Some(format!(
+            "multiple harness versions detected ({}); PATH-based wrapper choice is ambiguous — \
+             pin an exact binary to proceed deterministically",
+            distinct_versions
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    } else {
+        None
+    }
+}
+
+/// The wrapper-executable reference for a pinned binary (PKG-09): wrapper
+/// generation pins the exact absolute path the user selected.
+pub fn pin_wrapper_executable(pin: &BinaryPin) -> Result<crate::paths::ExecutableRef, CoreError> {
+    let abs =
+        crate::paths::AbsolutePath::from_path(&pin.path).map_err(|e| CoreError::InvalidPath {
+            kind: "binary_pin".to_owned(),
+            value: pin.path.display().to_string(),
+            reason: format!("pinned binary is not a valid absolute path: {e}"),
+        })?;
+    Ok(crate::paths::ExecutableRef::Absolute(abs))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers: semver truncation, path display
 // ---------------------------------------------------------------------------
@@ -1546,6 +1979,7 @@ pub fn execute_uninstall(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::Adapter as _;
     use crate::install_catalog::{
         DetectHints, InstallCatalogEntry, InstallMethod, PlatformConstraints,
     };
@@ -2098,6 +2532,7 @@ mod tests {
         }]);
         fs::write(&reg_path, serde_json::to_string(&instance_json).unwrap()).unwrap();
         let registry = Registry::load(&reg_path).unwrap();
+        let receipts_home = make_temp_dir("home-uninstall-receipts");
 
         let opts = DetectOptions {
             path_dirs: Some(vec![tmp.clone()]),
@@ -2109,7 +2544,7 @@ mod tests {
             probe_apps: false,
             ..Default::default()
         };
-        let plan = plan_uninstall(&harness, &opts, Some(&registry), true).unwrap();
+        let plan = plan_uninstall(&harness, &opts, Some(&registry), true, &receipts_home).unwrap();
         assert!(
             plan.preflight
                 .referencing_instances
@@ -2186,7 +2621,7 @@ mod tests {
             probe_apps: false,
             ..Default::default()
         };
-        let plan = plan_uninstall(&harness, &opts, None, false).unwrap();
+        let plan = plan_uninstall(&harness, &opts, None, false, &home).unwrap();
         assert!(
             plan.preflight.foreign,
             "manual Path detection should be considered foreign"
@@ -2250,10 +2685,497 @@ mod tests {
             conflicts: Vec::new(),
             expected_executable: PathBuf::from("/usr/local/bin/claude"),
             docs: "https://example.com".to_owned(),
-            version_available: true,
+            version_availability: crate::install_plan::VersionAvailability::Available {
+                resolved: None,
+            },
+            external_install: None,
             destination_writable: true,
         };
         // Validation should fail on sh -c
         assert!(plan.command_preview.validate().is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // PKG-06 persisted receipts / PKG-07 skip / PKG-10 typed external
+    // -------------------------------------------------------------------
+
+    /// Build an executable plan whose install command runs `marker_prog`
+    /// (writing a marker file when it runs, so tests can prove the command
+    /// was or was not executed).
+    #[cfg(unix)]
+    fn marker_plan(tmp: &Path, marker: &Path) -> InstallPlan {
+        InstallPlan {
+            harness: "claude-code".to_owned(),
+            method: InstallMethodKind::Npm,
+            package_name: "@anthropic-ai/claude-code".to_owned(),
+            version: Some("1.2.3".to_owned()),
+            channel: None,
+            platform_os: "linux".to_owned(),
+            platform_arch: "x86_64".to_owned(),
+            command_preview: CommandTokens {
+                executable: marker.display().to_string(),
+                args: vec![
+                    tmp.join("ran-marker").display().to_string(),
+                    tmp.display().to_string(),
+                ],
+            },
+            requires_network: false,
+            requires_admin: false,
+            conflicts: Vec::new(),
+            expected_executable: tmp.join("claude"),
+            docs: "https://example.com".to_owned(),
+            version_availability: crate::install_plan::VersionAvailability::Available {
+                resolved: Some("1.2.3".to_owned()),
+            },
+            external_install: None,
+            destination_writable: true,
+        }
+    }
+
+    /// `#!/bin/sh` script that touches a marker file AND installs a fake
+    /// `claude` binary (help + 1.2.3 version) into the target dir — proves
+    /// whether the install command executed and gives post-detection
+    /// something real to find. Unix only.
+    #[cfg(unix)]
+    fn write_marker_prog(dir: &Path) -> PathBuf {
+        let path = dir.join("install-cmd");
+        // $1 = marker file, $2 = install dir. Installs a fake `claude` binary
+        // that answers --help and prints 1.2.3, so post-install detection and
+        // verification have something real to find.
+        let script = concat!(
+            "#!/bin/sh\n",
+            "printf x >> \"$1\"\n",
+            "{\n",
+            "  printf '%s\\n' '#!/bin/sh' > \"$2/claude\"\n",
+            "  printf '%s\\n' 'if [ \"$1\" = \"--help\" ]; then echo \"Usage: claude --help\"; exit 0; fi' >> \"$2/claude\"\n",
+            "  printf '%s\\n' 'if [ \"$1\" = \"--version\" ]; then echo \"1.2.3\"; exit 0; fi' >> \"$2/claude\"\n",
+            "  printf '%s\\n' 'echo \"1.2.3\"' >> \"$2/claude\"\n",
+            "  chmod +x \"$2/claude\"\n",
+            "}\n",
+            "exit 0\n",
+        );
+        fs::write(&path, script).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_new_install_persists_receipt_and_preexisting_writes_none() {
+        let tmp = make_temp_dir("receipt-new");
+        let home = make_temp_dir("home-receipt-new");
+        let marker = tmp.join("ran-marker");
+        let prog = write_marker_prog(&tmp);
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        // No pre-existing binary: the install command runs, verify claims a
+        // fresh receipt, and the receipt is persisted under
+        // <home>/.superai/install_receipts.
+        let plan = marker_plan(&tmp, &prog);
+        let receipt = execute_and_verify(&plan, &opts, false, &home).unwrap();
+        assert!(receipt.is_some(), "fresh install must be claimed");
+        assert!(marker.exists(), "install command must have run");
+        assert!(
+            tmp.join("claude").exists(),
+            "fake claude binary must be installed for post-detection"
+        );
+        let harness = HarnessId::new("claude-code").unwrap();
+        let loaded = load_receipts(&home).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].version, "1.2.3");
+        let found = find_receipt(&home, &harness, Some(&InstallMethodKind::Npm)).unwrap();
+        assert!(found.is_some());
+        assert_eq!(
+            found.unwrap().path,
+            receipt.unwrap().path,
+            "persisted receipt must match the verified one"
+        );
+
+        // Second execution: the binary now already satisfies 1.2.3 -> the
+        // command is NOT re-run (PKG-07) and no second receipt appears.
+        let marker2 = tmp.join("ran-marker-2");
+        fs::rename(&marker, &marker2).unwrap();
+        let plan2 = marker_plan(&tmp, &prog);
+        let again = execute_and_verify(&plan2, &opts, false, &home).unwrap();
+        assert!(again.is_none(), "pre-existing install must not be claimed");
+        assert!(!marker.exists(), "install command must NOT run again");
+        assert_eq!(load_receipts(&home).unwrap().len(), 1);
+
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_install_creates_no_receipt() {
+        let tmp = make_temp_dir("receipt-fail");
+        let home = make_temp_dir("home-receipt-fail");
+        let failing = tmp.join("install-cmd");
+        fs::write(&failing, "#!/bin/sh\nexit 3\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&failing).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&failing, perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![make_temp_dir("receipt-fail-path")]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let mut plan = marker_plan(&tmp, &failing);
+        plan.command_preview.args = vec![tmp.display().to_string()];
+        let err = execute_and_verify(&plan, &opts, false, &home).unwrap_err();
+        assert!(format!("{err}").contains("failed with"));
+        // No receipt was persisted for the failed install.
+        assert!(load_receipts(&home).unwrap().is_empty());
+        drop(fs::remove_file(&failing));
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn external_plan_refuses_execution_typed() {
+        // PKG-10: executing an external/direct plan is a typed state, not a
+        // fabricated command run.
+        let tmp = PathBuf::from("/tmp/superai-external-plan-test");
+        let mut plan = marker_plan(&tmp, Path::new("/bin/true"));
+        plan.external_install = Some(crate::install_plan::ExternalInstall {
+            docs: "https://example.com/install".to_owned(),
+            reason: "external install".to_owned(),
+        });
+        let home = PathBuf::from("/tmp/superai-external-home-test");
+        let opts = DetectOptions {
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let err = execute_and_verify(&plan, &opts, false, &home).unwrap_err();
+        match err {
+            CoreError::ExternalInstallRequired {
+                harness,
+                instructions,
+            } => {
+                assert_eq!(harness, "claude-code");
+                assert!(instructions.contains("https://example.com/install"));
+            }
+            other => panic!("expected ExternalInstallRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_execute_refuses_external_methods_typed() {
+        let plan = UpdatePlan {
+            harness: "claude-code".to_owned(),
+            method: InstallMethodKind::Direct,
+            package_name: "claude".to_owned(),
+            current_version: None,
+            current_path: None,
+            available_version: None,
+            command_preview: CommandTokens {
+                executable: "open".to_owned(),
+                args: vec!["https://example.com".to_owned()],
+            },
+            requires_network: false,
+            requires_admin: false,
+            compat_impacts: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            docs: "https://example.com".to_owned(),
+        };
+        let opts = DetectOptions {
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let err = execute_update(&plan, &opts, true, false).unwrap_err();
+        match err {
+            CoreError::ExternalInstallRequired { instructions, .. } => {
+                assert!(instructions.contains("manual update required"));
+            }
+            other => panic!("expected ExternalInstallRequired, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // PKG-08 receipt ownership + binary-missing marking
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_ownership_clears_foreign_in_uninstall_preflight() {
+        let tmp = make_temp_dir("receipt-owned");
+        let home = make_temp_dir("home-receipt-owned");
+        let manual_dir = tmp.join("manual_bin");
+        fs::create_dir_all(&manual_dir).unwrap();
+        fs::write(manual_dir.join("codex"), "#!/bin/sh\necho \"1.0.0\"\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(manual_dir.join("codex"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(manual_dir.join("codex"), perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![manual_dir.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let harness = HarnessId::new("codex-cli").unwrap();
+        // Without a receipt: manual Path detection is foreign.
+        let plan = plan_uninstall(&harness, &opts, None, false, &home).unwrap();
+        assert!(plan.preflight.foreign);
+        assert!(!plan.preflight.receipt_owned);
+        // Persist a receipt proving superai installed it: foreign clears.
+        let receipt = InstallReceipt {
+            method: InstallMethodKind::Npm,
+            package_id: "@openai/codex".to_owned(),
+            executable: "codex".to_owned(),
+            version: "1.0.0".to_owned(),
+            timestamp: "2026-08-26T00:00:00Z".to_owned(),
+            path: manual_dir.join("codex"),
+        };
+        persist_receipt(&home, &harness, &receipt).unwrap();
+        let plan2 = plan_uninstall(&harness, &opts, None, false, &home).unwrap();
+        assert!(plan2.preflight.receipt_owned, "{:?}", plan2.preflight);
+        assert!(!plan2.preflight.foreign);
+        assert!(plan2.preflight.can_auto_delete);
+
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_marks_instances_binary_missing_in_registry() {
+        let tmp = make_temp_dir("uninstall-mark");
+        let home = make_temp_dir("home-uninstall-mark");
+        let harness = HarnessId::new("codex-cli").unwrap();
+        let bin_dir = tmp.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let binary = bin_dir.join("codex");
+        fs::write(&binary, "#!/bin/sh\necho \"1.0.0\"\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&binary).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&binary, perms).unwrap();
+        }
+        // Registry with an instance pinning the binary absolutely.
+        let reg_path = tmp.join("registry.json");
+        let instance_json = serde_json::json!({
+            "schema_version": 1,
+            "instances": [{
+                "id": "mark-id-1",
+                "name": "work",
+                "harness": "codex-cli",
+                "config_root": tmp.join("config-root").to_string_lossy(),
+                "isolation": "relocated_root",
+                "origin": "created",
+                "ownership": "superai_created",
+                "created_at": "2026-08-26T00:00:00Z",
+                "adapter_revision": "0.1.0",
+                "binary": binary.to_string_lossy(),
+            }]
+        });
+        fs::write(&reg_path, serde_json::to_string(&instance_json).unwrap()).unwrap();
+        let mut registry = Registry::load(&reg_path).unwrap();
+
+        // Simulate the uninstall: binary removed from disk.
+        drop(fs::remove_file(&binary));
+        let marked = mark_instances_binary_missing(&mut registry, &reg_path, &harness).unwrap();
+        assert_eq!(marked, vec!["work".to_owned()]);
+        // Record update: the stale absolute pin is cleared on disk.
+        let reloaded = Registry::load(&reg_path).unwrap();
+        let inst = reloaded.get("work").unwrap();
+        assert!(
+            inst.binary.is_none(),
+            "stale pin must be cleared, got {:?}",
+            inst.binary
+        );
+
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
+    }
+
+    // -------------------------------------------------------------------
+    // PKG-09 pin-exact-binary selection
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_exact_binary_selection_and_wrapper_integration() {
+        let tmp1 = make_temp_dir("pin1");
+        let tmp2 = make_temp_dir("pin2");
+        write_help_exe(&tmp1, "codex");
+        fs::write(
+            tmp1.join("codex"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp2.join("codex"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"0.2.0\"\n",
+        )
+        .unwrap();
+        for dir in [&tmp1, &tmp2] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(dir.join("codex")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(dir.join("codex"), perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp1.clone(), tmp2.clone()]),
+            home_dir: Some(make_temp_dir("pin-home")),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let catalog = InstallCatalog::embedded().unwrap();
+        let entry = catalog.get_str("codex-cli").unwrap().clone();
+        let detections = detect_all_for_entry(&entry, &opts);
+        assert!(report_path_ambiguity(&detections).is_some());
+
+        // Pin the shadowed 0.2.0 binary exactly.
+        let selected = tmp2.join("codex");
+        let pin = pin_exact_binary(&detections, &selected).unwrap();
+        assert_eq!(pin.path, selected);
+        assert_eq!(pin.version.as_deref(), Some("0.2.0"));
+        assert_eq!(
+            pin.shadowed_alternatives,
+            vec![tmp1.join("codex")],
+            "the 0.1.0 detection is the shadowed alternative"
+        );
+        // Wrapper generation pins the exact absolute path the user selected.
+        let exec_ref = pin_wrapper_executable(&pin).unwrap();
+        let mut instance = registry_instance_for("pin-test", &tmp2);
+        instance.binary = Some(exec_ref);
+        let adapter = crate::adapter::GenericAdapter::new(
+            HarnessId::new("codex-cli").unwrap(),
+            "Codex CLI",
+            crate::adapter::ProductStatus::Active,
+            "docs/harness-configs/codex-cli.md",
+            "2026-08-25",
+            crate::state::AdapterSupport::Full,
+            "test full support",
+            "docs/harness-configs/codex-cli.md",
+        );
+        let wrapper_plan = adapter.plan_wrapper(&instance).unwrap();
+        let (content, _) = crate::wrapper::generate_shell_wrapper(&instance, &wrapper_plan);
+        assert!(
+            content.contains(selected.to_str().unwrap_or("")),
+            "wrapper must embed the pinned absolute path: {content}"
+        );
+
+        // An unseen path is refused, never invented.
+        let err = pin_exact_binary(&detections, &tmp2.join("nope")).unwrap_err();
+        assert!(format!("{err}").contains("not among the detected"));
+
+        drop(fs::remove_dir_all(&tmp1));
+        drop(fs::remove_dir_all(&tmp2));
+    }
+
+    /// Minimal instance helper for wrapper integration tests.
+    fn registry_instance_for(name: &str, root: &Path) -> crate::instance::Instance {
+        crate::instance::Instance {
+            id: crate::ids::InstanceId::new(format!("{name}-id").as_str()).unwrap(),
+            name: crate::ids::InstanceName::new(name).unwrap(),
+            harness: HarnessId::new("codex-cli").unwrap(),
+            config_root: crate::paths::AbsolutePath::from_path(&root.join("cfg")).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: crate::state::Isolation::RelocatedRoot,
+            origin: crate::state::InstanceOrigin::Created,
+            ownership: crate::state::Ownership::SuperaiCreated,
+            template: None,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            adapter_revision: "0.1.0".to_owned(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_update_strict_version_validation_rejects_wrong_version() {
+        // After a "successful" update command, a detected version that does
+        // not satisfy the expected available version is a typed failure.
+        let tmp = make_temp_dir("update-strict");
+        let home = make_temp_dir("home-update-strict");
+        // Post-update detection will see 1.2.3, but the plan expected 2.0.0.
+        fs::write(
+            tmp.join("codex"),
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"1.2.3\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(tmp.join("codex")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.join("codex"), perms).unwrap();
+        }
+        let opts = DetectOptions {
+            path_dirs: Some(vec![tmp.clone()]),
+            home_dir: Some(home.clone()),
+            probe_mise: false,
+            probe_brew: false,
+            probe_npm: false,
+            probe_cargo: false,
+            probe_apps: false,
+            ..Default::default()
+        };
+        let plan = UpdatePlan {
+            harness: "codex-cli".to_owned(),
+            method: InstallMethodKind::Npm,
+            package_name: "@openai/codex".to_owned(),
+            current_version: Some("1.2.3".to_owned()),
+            current_path: Some(tmp.join("codex")),
+            available_version: Some("2.0.0".to_owned()),
+            command_preview: CommandTokens {
+                executable: "echo".to_owned(),
+                args: vec!["updated".to_owned()],
+            },
+            requires_network: false,
+            requires_admin: false,
+            compat_impacts: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            docs: "https://example.com".to_owned(),
+        };
+        let err = execute_update(&plan, &opts, true, false).unwrap_err();
+        assert!(
+            format!("{err}").contains("does not satisfy"),
+            "wrong post-update version must fail: {err}"
+        );
+        drop(fs::remove_dir_all(&tmp));
+        drop(fs::remove_dir_all(&home));
     }
 }

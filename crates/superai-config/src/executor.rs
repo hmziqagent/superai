@@ -937,7 +937,7 @@ fn apply_json_family(path: &Path, op: &Operation, family: JsonFamily) -> Result<
 
 /// Convert a `toml_edit` document to its semantic JSON value (used for
 /// policy checks and semantic validation).
-pub(crate) fn toml_document_to_value(doc: &DocumentMut) -> Value {
+pub fn toml_document_to_value(doc: &DocumentMut) -> Value {
     table_to_value(doc.as_table())
 }
 

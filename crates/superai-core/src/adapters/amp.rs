@@ -606,6 +606,22 @@ impl Adapter for AmpAdapter {
             RestartBehavior::Reload,
         ))
     }
+
+    /// EXT-04: harness-config skill mechanism (amp.md core settings:
+    /// `amp.skills.disableClaudeCodeSkills` boolean switch and the
+    /// `amp.skills.path` skill search path, both inside the JSONC settings
+    /// file). Writes through the engine executor honor the JSONC
+    /// lossy-write gate (comment-free files write; comment-carrying files
+    /// refuse typed `LossyWrite`).
+    fn skill_config_decl(&self) -> Option<crate::adapter::SkillConfigDecl> {
+        Some(
+            crate::adapter::SkillConfigDecl::new("settings.json")
+                .with_disable(crate::adapter::SkillDisableMechanism::Switch {
+                    selector: "amp.skills.disableClaudeCodeSkills".to_owned(),
+                })
+                .with_search_path("amp.skills.path"),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -1248,66 +1248,9 @@ impl SkillRegistry {
         })?;
 
         let stage_result: Result<SkillMetadata> = (|| {
-            match source.kind {
-                SkillSourceKind::LocalDir => {
-                    let src = Path::new(&source.locator);
-                    copy_dir_recursive(src, &staging_skill_dir)?;
-                }
-                SkillSourceKind::GitHub | SkillSourceKind::Marketplace => {
-                    // For GitHub/Marketplace, fetch to staging.
-                    // Support file:// for tests and https:// via ureq.
-                    // If locator is file://, copy from that file path's directory.
-                    // Otherwise the https fetch must succeed: a failure returns
-                    // CoreError::SourceFetch, nothing is staged, and the
-                    // registry/disk are left unchanged.
-                    if source.locator.starts_with("file://") {
-                        let path_str = source.locator.trim_start_matches("file://");
-                        let src = Path::new(path_str);
-                        // If src is a directory, copy it; if it's a single SKILL.md file, copy its parent?
-                        let fm =
-                            std::fs::symlink_metadata(src).map_err(|e| CoreError::InvalidPath {
-                                kind: "skill_source".to_owned(),
-                                value: src.display().to_string(),
-                                reason: format!("metadata failed for file url: {e}"),
-                            })?;
-                        if fm.is_dir() {
-                            copy_dir_recursive(src, &staging_skill_dir)?;
-                        } else if fm.is_file() {
-                            // Assume src is SKILL.md itself; copy file into staging dir
-                            let bytes = std::fs::read(src).map_err(|e| CoreError::InvalidPath {
-                                kind: "skill_source".to_owned(),
-                                value: src.display().to_string(),
-                                reason: format!("cannot read file url: {e}"),
-                            })?;
-                            if bytes.len() > MAX_SINGLE_FILE_BYTES as usize {
-                                return Err(CoreError::Validation {
-                                    field: "skill_fetch".to_owned(),
-                                    reason: format!("file url exceeds size limit: {}", bytes.len()),
-                                });
-                            }
-                            std::fs::write(staging_skill_dir.join(SKILL_MD_NAME), &bytes).map_err(
-                                |e| CoreError::InvalidPath {
-                                    kind: "staging".to_owned(),
-                                    value: staging_skill_dir.display().to_string(),
-                                    reason: format!("write staging SKILL.md failed: {e}"),
-                                },
-                            )?;
-                        } else {
-                            return Err(CoreError::Validation {
-                                field: "skill_source".to_owned(),
-                                reason: format!(
-                                    "file url source `{}` is not a file or directory",
-                                    src.display()
-                                ),
-                            });
-                        }
-                    } else {
-                        // HTTPS: fetch via ureq. A failed fetch is a hard error —
-                        // content is never invented in place of a download.
-                        fetch_https_to_staging(&source.locator, &staging_skill_dir)?;
-                    }
-                }
-            }
+            // EXT-02: staged acquisition (local copy, pinned git checkout, or
+            // the documented non-executing download path).
+            stage_skill_source(source, &staging_skill_dir)?;
             // Validate tree if requested (always validate unless caller explicitly opts out?)
             // Spec says install_skill(source, validate) — validate bool controls frontmatter etc.
             let metadata = if validate {
@@ -1642,49 +1585,8 @@ impl SkillRegistry {
             value: staging_dir.display().to_string(),
             reason: format!("cannot create staging skill dir: {e}"),
         })?;
-        // Copy/fetch logic similar to install
-        let stage_res: Result<()> = (|| {
-            match source.kind {
-                SkillSourceKind::LocalDir => {
-                    let src = Path::new(&source.locator);
-                    copy_dir_recursive(src, &staging_dir)?;
-                }
-                SkillSourceKind::GitHub | SkillSourceKind::Marketplace => {
-                    if source.locator.starts_with("file://") {
-                        let path_str = source.locator.trim_start_matches("file://");
-                        let src = Path::new(path_str);
-                        let fm =
-                            std::fs::symlink_metadata(src).map_err(|e| CoreError::InvalidPath {
-                                kind: "skill_source".to_owned(),
-                                value: src.display().to_string(),
-                                reason: format!("metadata failed: {e}"),
-                            })?;
-                        if fm.is_dir() {
-                            copy_dir_recursive(src, &staging_dir)?;
-                        } else {
-                            let bytes = std::fs::read(src).map_err(|e| CoreError::InvalidPath {
-                                kind: "skill_source".to_owned(),
-                                value: src.display().to_string(),
-                                reason: format!("cannot read: {e}"),
-                            })?;
-                            std::fs::write(staging_dir.join(SKILL_MD_NAME), &bytes).map_err(
-                                |e| CoreError::InvalidPath {
-                                    kind: "staging".to_owned(),
-                                    value: staging_dir.display().to_string(),
-                                    reason: format!("write failed: {e}"),
-                                },
-                            )?;
-                        }
-                    } else {
-                        // HTTPS: fetch via ureq. A failed fetch is a hard error —
-                        // content is never invented in place of a download.
-                        fetch_https_to_staging(&source.locator, &staging_dir)?;
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(e) = stage_res {
+        // EXT-02: staged acquisition through the shared staging path.
+        if let Err(e) = stage_skill_source(&source, &staging_dir) {
             drop(std::fs::remove_dir_all(&staging_root));
             return Err(e);
         }
@@ -1876,48 +1778,8 @@ impl SkillRegistry {
             value: staging_dir.display().to_string(),
             reason: format!("cannot create staging skill dir: {e}"),
         })?;
-        let stage_res: Result<()> = (|| {
-            match source.kind {
-                SkillSourceKind::LocalDir => {
-                    let src = Path::new(&source.locator);
-                    copy_dir_recursive(src, &staging_dir)?;
-                }
-                SkillSourceKind::GitHub | SkillSourceKind::Marketplace => {
-                    if source.locator.starts_with("file://") {
-                        let path_str = source.locator.trim_start_matches("file://");
-                        let src = Path::new(path_str);
-                        let fm =
-                            std::fs::symlink_metadata(src).map_err(|e| CoreError::InvalidPath {
-                                kind: "skill_source".to_owned(),
-                                value: src.display().to_string(),
-                                reason: format!("metadata failed: {e}"),
-                            })?;
-                        if fm.is_dir() {
-                            copy_dir_recursive(src, &staging_dir)?;
-                        } else {
-                            let bytes = std::fs::read(src).map_err(|e| CoreError::InvalidPath {
-                                kind: "skill_source".to_owned(),
-                                value: src.display().to_string(),
-                                reason: format!("cannot read: {e}"),
-                            })?;
-                            std::fs::write(staging_dir.join(SKILL_MD_NAME), &bytes).map_err(
-                                |e| CoreError::InvalidPath {
-                                    kind: "staging".to_owned(),
-                                    value: staging_dir.display().to_string(),
-                                    reason: format!("write failed: {e}"),
-                                },
-                            )?;
-                        }
-                    } else {
-                        // HTTPS: fetch via ureq. A failed fetch is a hard error —
-                        // content is never invented in place of a download.
-                        fetch_https_to_staging(&source.locator, &staging_dir)?;
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(e) = stage_res {
+        // EXT-02: staged acquisition through the shared staging path.
+        if let Err(e) = stage_skill_source(&source, &staging_dir) {
             drop(std::fs::remove_dir_all(&staging_root));
             return Err(e);
         }
@@ -1990,11 +1852,11 @@ impl SkillRegistry {
                 }
             }
         }
-        // Ensure skill dir exists
-        steps.push(superai_config::transaction::FileAction::CreateDir {
-            path: final_skill_dir.clone(),
-        });
-        // Add writes for new files and ensure parent dirs exist
+        // Ensure skill dir + parent dirs exist. Dirs are collected into a
+        // set first: the plan must not carry duplicate CreateDir paths
+        // (validate_plan rejects duplicates since MUT-02).
+        let mut dirs_to_create: BTreeSet<PathBuf> = BTreeSet::new();
+        dirs_to_create.insert(final_skill_dir.clone());
         for staged_path in &staged_all {
             let meta =
                 std::fs::symlink_metadata(staged_path).map_err(|e| CoreError::InvalidPath {
@@ -2003,12 +1865,10 @@ impl SkillRegistry {
                     reason: format!("metadata failed: {e}"),
                 })?;
             if meta.is_dir() {
-                if let Ok(rel) = staged_path.strip_prefix(&staging_dir) {
-                    if !rel.as_os_str().is_empty() {
-                        steps.push(superai_config::transaction::FileAction::CreateDir {
-                            path: final_skill_dir.join(rel),
-                        });
-                    }
+                if let Ok(rel) = staged_path.strip_prefix(&staging_dir)
+                    && !rel.as_os_str().is_empty()
+                {
+                    dirs_to_create.insert(final_skill_dir.join(rel));
                 }
             } else {
                 let rel =
@@ -2020,10 +1880,30 @@ impl SkillRegistry {
                         })?;
                 let target = final_skill_dir.join(rel);
                 if let Some(parent) = target.parent() {
-                    steps.push(superai_config::transaction::FileAction::CreateDir {
-                        path: parent.to_path_buf(),
-                    });
+                    dirs_to_create.insert(parent.to_path_buf());
                 }
+            }
+        }
+        for dir in dirs_to_create {
+            steps.push(superai_config::transaction::FileAction::CreateDir { path: dir });
+        }
+        // Writes for the staged files.
+        for staged_path in &staged_all {
+            let meta =
+                std::fs::symlink_metadata(staged_path).map_err(|e| CoreError::InvalidPath {
+                    kind: "skill_tree".to_owned(),
+                    value: staged_path.display().to_string(),
+                    reason: format!("metadata failed: {e}"),
+                })?;
+            if meta.is_file() || meta.file_type().is_symlink() {
+                let rel =
+                    staged_path
+                        .strip_prefix(&staging_dir)
+                        .map_err(|_| CoreError::Validation {
+                            field: "skill_tree".to_owned(),
+                            reason: format!("cannot make relative for `{}`", staged_path.display()),
+                        })?;
+                let target = final_skill_dir.join(rel);
                 let bytes = std::fs::read(staged_path).map_err(|e| CoreError::InvalidPath {
                     kind: "skill_tree".to_owned(),
                     value: staged_path.display().to_string(),
@@ -2588,6 +2468,24 @@ pub fn apply_skill_mode(
                             ),
                         });
                     }
+                    // EXT-05 drift-checked re-copy: when provenance is
+                    // recorded for this destination, a locally-modified copy
+                    // is a previewable CONFLICT — refuse to overwrite instead
+                    // of silently clobbering the user's edits. Clean copies
+                    // replace; a missing destination falls through to the
+                    // normal copy (reinstall).
+                    if let Some(provenance) =
+                        load_provenance(&registry.root, skill_id, instance_skills_dir)
+                        && meta.is_dir()
+                        && check_drift(&provenance, registry, &dest_dir)?
+                            == DriftStatus::LocallyModified
+                    {
+                        return Err(CoreError::ConcurrentModification {
+                            path: dest_dir.clone(),
+                            expected: provenance.dest_digest_at_copy.clone(),
+                            actual: compute_skill_digest(&dest_dir)?,
+                        });
+                    }
                     // If dest is dir, we will overwrite via transaction (remove old files not in new, write new)
                     // Collect existing dest files to diff
                     // For simplicity, we will remove the whole dest dir via quarantine and recreate
@@ -2905,6 +2803,261 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// EXT-02 — staged source acquisition (shared by install/preview/commit)
+// ---------------------------------------------------------------------------
+
+/// Stage `source` into `staging_dir` (EXT-02).
+///
+/// - `LocalDir` copies the directory.
+/// - `GitHub`/`Marketplace` with a pinned revision uses the REAL git binary
+///   through the process module: `git clone --depth 1 --branch <rev>` into
+///   staging (argv tokens, no shell); a full commit sha falls back to
+///   `git fetch --depth 1 origin <sha>` + `checkout FETCH_HEAD`. The resolved
+///   HEAD is verified against the pin and `.git` is removed so the staged
+///   tree is plain skill content.
+/// - `GitHub`/`Marketplace` without a pin uses the documented non-executing
+///   download path (HTTPS GET of the artifact; nothing is ever executed).
+fn stage_skill_source(source: &SkillSource, staging_dir: &Path) -> Result<()> {
+    match source.kind {
+        SkillSourceKind::LocalDir => {
+            let src = Path::new(&source.locator);
+            copy_dir_recursive(src, staging_dir)?;
+        }
+        SkillSourceKind::GitHub => {
+            if let Some(rev) = source.pinned_revision.as_deref() {
+                stage_git_revision(&source.locator, rev, staging_dir)?;
+            } else if source.locator.starts_with("file://") {
+                stage_file_url(&source.locator, staging_dir)?;
+            } else {
+                fetch_https_to_staging(&source.locator, staging_dir)?;
+            }
+        }
+        SkillSourceKind::Marketplace => {
+            // Marketplace sources use the documented non-executing download
+            // path only (HTTPS fetch of metadata + artifact); no script is
+            // ever executed (EXT-02).
+            if source.locator.starts_with("file://") {
+                stage_file_url(&source.locator, staging_dir)?;
+            } else {
+                fetch_https_to_staging(&source.locator, staging_dir)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stage a `file://` locator (test path for the documented download route).
+fn stage_file_url(locator: &str, staging_dir: &Path) -> Result<()> {
+    let path_str = locator.trim_start_matches("file://");
+    let src = Path::new(path_str);
+    let fm = std::fs::symlink_metadata(src).map_err(|e| CoreError::InvalidPath {
+        kind: "skill_source".to_owned(),
+        value: src.display().to_string(),
+        reason: format!("metadata failed for file url: {e}"),
+    })?;
+    if fm.is_dir() {
+        copy_dir_recursive(src, staging_dir)?;
+    } else if fm.is_file() {
+        let bytes = std::fs::read(src).map_err(|e| CoreError::InvalidPath {
+            kind: "skill_source".to_owned(),
+            value: src.display().to_string(),
+            reason: format!("cannot read file url: {e}"),
+        })?;
+        if bytes.len() > MAX_SINGLE_FILE_BYTES as usize {
+            return Err(CoreError::Validation {
+                field: "skill_fetch".to_owned(),
+                reason: format!("file url exceeds size limit: {}", bytes.len()),
+            });
+        }
+        std::fs::write(staging_dir.join(SKILL_MD_NAME), &bytes).map_err(|e| {
+            CoreError::InvalidPath {
+                kind: "staging".to_owned(),
+                value: staging_dir.display().to_string(),
+                reason: format!("write staging SKILL.md failed: {e}"),
+            }
+        })?;
+    } else {
+        return Err(CoreError::Validation {
+            field: "skill_source".to_owned(),
+            reason: format!(
+                "file url source `{}` is not a file or directory",
+                src.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Bounded timeout for each git command during staged checkout.
+const GIT_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn git_stage_opts(cwd: Option<&Path>) -> crate::process::ExecuteOpts {
+    crate::process::ExecuteOpts {
+        timeout: Some(GIT_STAGE_TIMEOUT),
+        cwd: cwd.map(Path::to_path_buf),
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        clear_env: true,
+        output_limit: Some(64 * 1024),
+        redact: false,
+    }
+}
+
+fn is_full_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Stage a git source at a pinned revision via the `git` binary (EXT-02).
+///
+/// All invocation is argv tokens through the process module — no shell. A
+/// branch/tag pins use a depth-1 clone; a full commit sha uses
+/// `git fetch --depth 1 origin <sha>` (servers may refuse shallow fetch of
+/// arbitrary shas; that refusal is a typed error, never a fallback to HEAD).
+/// The resolved HEAD is verified against the pin when the pin is a full sha,
+/// and `.git` is removed from staging afterward.
+fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
+    validate_fetch_url(url)?;
+    if rev.contains('\0') || rev.chars().any(char::is_control) || contains_shell_metachars(rev) {
+        return Err(CoreError::Validation {
+            field: "pinned_revision".to_owned(),
+            reason: format!("invalid pinned revision `{rev}`"),
+        });
+    }
+    let url_display = url.to_owned();
+    let src_err = |reason: String| CoreError::SourceFetch {
+        kind: "skill_source".to_owned(),
+        locator: url_display.clone(),
+        reason,
+    };
+    let staging_str = staging_dir.to_string_lossy().into_owned();
+    let opts = git_stage_opts(None);
+
+    if is_full_sha(rev) {
+        // Shallow-fetch a specific commit: init + remote + fetch + checkout.
+        let init = crate::process::run_command(
+            "git",
+            &["init".to_owned(), "--quiet".to_owned(), staging_str.clone()],
+            &opts,
+        )
+        .map_err(|e| src_err(format!("git init failed: {e}")))?;
+        if !init.success {
+            return Err(src_err(format!("git init exited {:?}", init.exit_code)));
+        }
+        let remote = crate::process::run_command(
+            "git",
+            &[
+                "-C".to_owned(),
+                staging_str.clone(),
+                "remote".to_owned(),
+                "add".to_owned(),
+                "origin".to_owned(),
+                url.to_owned(),
+            ],
+            &git_stage_opts(Some(staging_dir)),
+        )
+        .map_err(|e| src_err(format!("git remote add origin failed: {e}")))?;
+        if !remote.success {
+            return Err(src_err(format!(
+                "git remote add origin exited {:?}",
+                remote.exit_code
+            )));
+        }
+        let fetch = crate::process::run_command(
+            "git",
+            &[
+                "-C".to_owned(),
+                staging_str.clone(),
+                "fetch".to_owned(),
+                "--depth".to_owned(),
+                "1".to_owned(),
+                "origin".to_owned(),
+                rev.to_owned(),
+            ],
+            &git_stage_opts(Some(staging_dir)),
+        )
+        .map_err(|e| src_err(format!("git fetch {rev} failed: {e}")))?;
+        if !fetch.success {
+            return Err(src_err(format!(
+                "git fetch origin {rev} exited {:?}: {} (server may not allow shallow fetch of arbitrary shas)",
+                fetch.exit_code,
+                fetch.stderr.trim()
+            )));
+        }
+        let checkout = crate::process::run_command(
+            "git",
+            &[
+                "-C".to_owned(),
+                staging_str.clone(),
+                "checkout".to_owned(),
+                "--quiet".to_owned(),
+                "FETCH_HEAD".to_owned(),
+            ],
+            &git_stage_opts(Some(staging_dir)),
+        )
+        .map_err(|e| src_err(format!("git checkout FETCH_HEAD failed: {e}")))?;
+        if !checkout.success {
+            return Err(src_err(format!(
+                "git checkout FETCH_HEAD exited {:?}",
+                checkout.exit_code
+            )));
+        }
+    } else {
+        // Branch or tag pin: depth-1 clone of that ref.
+        let clone = crate::process::run_command(
+            "git",
+            &[
+                "clone".to_owned(),
+                "--quiet".to_owned(),
+                "--depth".to_owned(),
+                "1".to_owned(),
+                "--branch".to_owned(),
+                rev.to_owned(),
+                url.to_owned(),
+                staging_str.clone(),
+            ],
+            &opts,
+        )
+        .map_err(|e| src_err(format!("git clone --branch {rev} failed: {e}")))?;
+        if !clone.success {
+            return Err(src_err(format!(
+                "git clone --branch {rev} exited {:?}: {}",
+                clone.exit_code,
+                clone.stderr.trim()
+            )));
+        }
+    }
+    // Verify the staged tree is actually at the pinned revision.
+    let resolved = crate::process::run_command(
+        "git",
+        &[
+            "-C".to_owned(),
+            staging_str.clone(),
+            "rev-parse".to_owned(),
+            "HEAD".to_owned(),
+        ],
+        &git_stage_opts(Some(staging_dir)),
+    )
+    .map_err(|e| src_err(format!("git rev-parse HEAD failed: {e}")))?;
+    if !resolved.success {
+        return Err(src_err(format!(
+            "git rev-parse HEAD exited {:?}",
+            resolved.exit_code
+        )));
+    }
+    let head = resolved.stdout_trimmed().to_owned();
+    if is_full_sha(rev) && !head.eq_ignore_ascii_case(rev) {
+        return Err(CoreError::SourceFetch {
+            kind: "skill_source".to_owned(),
+            locator: url.to_owned(),
+            reason: format!("staged tree resolved to {head}, not pinned {rev}"),
+        });
+    }
+    // Plain skill content in staging: drop the repository metadata.
+    drop(std::fs::remove_dir_all(staging_dir.join(".git")));
+    Ok(())
+}
+
 fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(10)))
@@ -3103,6 +3256,279 @@ pub fn disable_skill(
     })
 }
 
+// ---------------------------------------------------------------------------
+// EXT-04 — harness-config allow/deny enable/disable mechanism
+// ---------------------------------------------------------------------------
+
+/// Outcome of a config-driven skill enable/disable (EXT-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillConfigOutcome {
+    /// Surface file that was (or would be) edited.
+    pub surface_path: PathBuf,
+    /// Human-readable summaries of each applied change.
+    pub changes: Vec<String>,
+    /// Non-blocking notes (e.g. all-or-nothing switch semantics).
+    pub notes: Vec<String>,
+}
+
+/// Enable or disable a skill through the adapter-declared harness-config
+/// mechanism (EXT-04).
+///
+/// Writes the adapter-declared allow/deny/search-path keys through the
+/// engine executor with ownership and expected-old conflict detection:
+/// - a deny-LIST key gains/loses the skill name;
+/// - a disable SWITCH flips to true/false (noted as all-or-nothing);
+/// - the search-path key gains/loses the registry root (enable adds the
+///   path so the harness discovers registry skills; disable removes it).
+///
+/// Refuses honestly (typed `UnsupportedOperation`) when the adapter declares
+/// no mechanism, and surfaces the executor's typed errors (ownership,
+/// conflict, LossyWrite for comment-carrying JSONC) unchanged.
+pub fn set_skill_enabled_via_config(
+    config_root: &Path,
+    registry: &SkillRegistry,
+    skill_id: &SkillId,
+    adapter: &dyn Adapter,
+    enabled: bool,
+) -> Result<SkillConfigOutcome> {
+    use crate::adapter::SkillDisableMechanism;
+    let decl = adapter.skill_config_decl().ok_or_else(|| {
+        CoreError::UnsupportedOperation {
+            harness: adapter.id().to_string(),
+            operation: "set_skill_enabled_via_config".to_owned(),
+            reason: "harness declares no config allow/deny skill mechanism;                      only link/copy destination modes apply"
+                .to_owned(),
+        }
+    })?;
+    if registry.get_by_id(skill_id).is_none() {
+        return Err(CoreError::Validation {
+            field: "skill_id".to_owned(),
+            reason: format!("skill `{skill_id}` not found in registry"),
+        });
+    }
+    let surface_path = config_root.join(&decl.surface_id);
+    // The adapter's declared surface kind wins over extension inference
+    // (e.g. amp's `settings.json` is a JSONC document).
+    let kind = crate::raw_editor::surface_for_path(adapter, &surface_path)
+        .map(|surface| match surface.kind {
+            crate::adapter::DocumentKind::Json => {
+                superai_config::document::DocumentKind::StrictJson
+            }
+            crate::adapter::DocumentKind::Jsonc => superai_config::document::DocumentKind::JsonC,
+            crate::adapter::DocumentKind::Toml => superai_config::document::DocumentKind::Toml,
+            crate::adapter::DocumentKind::Yaml => superai_config::document::DocumentKind::Yaml,
+            crate::adapter::DocumentKind::Env => superai_config::document::DocumentKind::Env,
+            crate::adapter::DocumentKind::TextFragment => {
+                superai_config::document::DocumentKind::TextFragment
+            }
+            other => {
+                let _ = other;
+                superai_config::document::DocumentKind::from_path(&surface_path)
+            }
+        })
+        .unwrap_or_else(|| superai_config::document::DocumentKind::from_path(&surface_path));
+    // Fresh semantic read of the surface (disk is truth).
+    let current = load_surface_value_for_config(&surface_path, kind)?;
+    let mut changes = Vec::new();
+    let mut notes = Vec::new();
+
+    let lookup = |value: &Value, selector: &str| -> Option<Value> {
+        let mut node = value;
+        for segment in selector.split('.') {
+            node = node.get(segment)?;
+        }
+        Some(node.clone())
+    };
+
+    // 1) Disable mechanism.
+    if let Some(mechanism) = &decl.disable {
+        match mechanism {
+            SkillDisableMechanism::DenyList { selector } => {
+                let current_list = lookup(&current, selector).unwrap_or(Value::Array(Vec::new()));
+                let names: Vec<String> = current_list
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut new_list = names.clone();
+                if enabled {
+                    new_list.retain(|n| n != skill_id.as_str());
+                } else if !new_list.iter().any(|n| n == skill_id.as_str()) {
+                    new_list.push(skill_id.as_str().to_owned());
+                }
+                if new_list != names {
+                    apply_config_set(
+                        &surface_path,
+                        kind,
+                        selector,
+                        Value::Array(new_list.iter().map(|n| Value::String(n.clone())).collect()),
+                        lookup(&current, selector),
+                        &decl,
+                    )?;
+                    changes.push(format!(
+                        "{selector}: {} `{}`",
+                        if enabled { "removed" } else { "added" },
+                        skill_id
+                    ));
+                }
+            }
+            SkillDisableMechanism::Switch { selector } => {
+                let desired = !enabled;
+                let current_value = lookup(&current, selector);
+                if current_value.as_ref() != Some(&Value::Bool(desired)) {
+                    apply_config_set(
+                        &surface_path,
+                        kind,
+                        selector,
+                        Value::Bool(desired),
+                        current_value.clone(),
+                        &decl,
+                    )?;
+                    changes.push(format!(
+                        "{selector}: {}",
+                        if desired {
+                            "true (disabled)"
+                        } else {
+                            "false (enabled)"
+                        }
+                    ));
+                }
+                notes.push(format!(
+                    "{selector} is a documented switch: it disables the whole skill \
+                     source, not individual skills"
+                ));
+            }
+        }
+    }
+
+    // 2) Search path: enable adds the registry root, disable removes it.
+    if let Some(selector) = &decl.search_path {
+        let registry_root = registry.root().to_string_lossy().into_owned();
+        let current_value = lookup(&current, selector);
+        let new_value = match current_value.clone() {
+            Some(Value::Array(items)) => {
+                let strs: Vec<String> = items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                    .collect();
+                let mut next = strs.clone();
+                if enabled && !next.iter().any(|p| p == &registry_root) {
+                    next.push(registry_root.clone());
+                } else if !enabled {
+                    next.retain(|p| p != &registry_root);
+                }
+                if next == strs {
+                    None
+                } else {
+                    Some(Value::Array(
+                        next.iter().map(|p| Value::String(p.clone())).collect(),
+                    ))
+                }
+            }
+            Some(Value::String(existing)) => {
+                if enabled && existing != registry_root {
+                    // Preserve the existing path alongside the registry root.
+                    Some(Value::Array(vec![
+                        Value::String(existing),
+                        Value::String(registry_root.clone()),
+                    ]))
+                } else if !enabled && existing == registry_root {
+                    Some(Value::Array(Vec::new()))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                if enabled {
+                    Some(Value::String(registry_root.clone()))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(new_value) = new_value {
+            apply_config_set(
+                &surface_path,
+                kind,
+                selector,
+                new_value,
+                current_value,
+                &decl,
+            )?;
+            changes.push(format!(
+                "{selector}: {} the registry skills dir",
+                if enabled { "added" } else { "removed" }
+            ));
+        }
+    }
+
+    if changes.is_empty() {
+        notes.push("already in the requested state; no changes".to_owned());
+    }
+    Ok(SkillConfigOutcome {
+        surface_path,
+        changes,
+        notes,
+    })
+}
+
+/// Read a surface's semantic value fresh for config-driven skill edits.
+fn load_surface_value_for_config(
+    path: &Path,
+    kind: superai_config::document::DocumentKind,
+) -> Result<Value> {
+    match kind {
+        superai_config::document::DocumentKind::StrictJson => {
+            superai_config::json::load_value(path).map_err(CoreError::Config)
+        }
+        superai_config::document::DocumentKind::JsonC => {
+            superai_config::jsonc::load_value(path).map_err(CoreError::Config)
+        }
+        superai_config::document::DocumentKind::Yaml => {
+            superai_config::yaml::load_value(path).map_err(CoreError::Config)
+        }
+        superai_config::document::DocumentKind::Toml => {
+            let doc = superai_config::toml_file::load(path).map_err(CoreError::Config)?;
+            Ok(superai_config::executor::toml_document_to_value(&doc))
+        }
+        other => Err(CoreError::UnsupportedOperation {
+            harness: "skills".to_owned(),
+            operation: "set_skill_enabled_via_config".to_owned(),
+            reason: format!("surface kind {other} has no semantic read for skill config edits"),
+        }),
+    }
+}
+
+/// Apply one dotted-selector Set through the engine executor with the decl's
+/// ownership and the fresh expected-old value (EXT-04).
+fn apply_config_set(
+    path: &Path,
+    kind: superai_config::document::DocumentKind,
+    selector: &str,
+    value: Value,
+    expected_old: Option<Value>,
+    decl: &crate::adapter::SkillConfigDecl,
+) -> Result<()> {
+    let parsed =
+        superai_config::document::Selector::parse(selector).map_err(|e| CoreError::Validation {
+            field: "skill_config_decl".to_owned(),
+            reason: format!("selector `{selector}` invalid: {e}"),
+        })?;
+    let mut op =
+        superai_config::document::Operation::new(superai_config::document::EditOperation::Set {
+            selector: parsed,
+            value,
+        })
+        .with_owned_keys(decl.owned_selectors())
+        .with_create_parent(true);
+    op.expected_old = expected_old.map(Some);
+    superai_config::executor::apply(path, kind, &op).map_err(CoreError::Config)?;
+    Ok(())
+}
+
 /// Find consumers of a skill given a list of instance skills dirs.
 ///
 /// Scans each `instance_skills_dir` for links/copies that point to the registry skill.
@@ -3212,6 +3638,126 @@ pub fn check_drift(
         return Ok(DriftStatus::AlreadyUpdated);
     }
     Ok(DriftStatus::LocallyModified)
+}
+
+// ---------------------------------------------------------------------------
+// EXT-05 — drift-checked re-copy of copied destinations
+// ---------------------------------------------------------------------------
+
+/// Provenance path for `(skill, destination)` — stored beside the registry,
+/// derived deterministically from the destination (same derivation
+/// `apply_skill_mode` uses when recording provenance).
+pub fn provenance_path_for(
+    registry_root: &Path,
+    skill_id: &SkillId,
+    instance_skills_dir: &Path,
+) -> PathBuf {
+    let instance_name = instance_skills_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("instance");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    instance_skills_dir.to_string_lossy().hash(&mut hasher);
+    let hash = hasher.finish();
+    let prov_instance_name = format!("{instance_name}-{hash:016x}");
+    registry_root
+        .join(PROVENANCE_DIR_NAME)
+        .join(skill_id.as_str())
+        .join(format!("{prov_instance_name}.json"))
+}
+
+/// Load the recorded provenance for `(skill, destination)`, if any (EXT-05).
+fn load_provenance(
+    registry_root: &Path,
+    skill_id: &SkillId,
+    instance_skills_dir: &Path,
+) -> Option<CopyProvenance> {
+    let path = provenance_path_for(registry_root, skill_id, instance_skills_dir);
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Drift preview for re-copying selected skills to a destination (EXT-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyUpdatePreview {
+    /// Skill id.
+    pub skill_id: SkillId,
+    /// Three-way drift status for the destination.
+    pub drift: DriftStatus,
+    /// Whether the re-copy can apply automatically.
+    pub can_apply: bool,
+    /// Conflict/limitation description for non-applicable re-copies.
+    pub reason: Option<String>,
+}
+
+/// Preview the three-way update of copied destinations (EXT-05).
+///
+/// For each selected skill with recorded provenance, the destination digest
+/// is observed FRESH and classified: clean -> replace/update applies,
+/// locally modified -> explicit conflict (refused, caller must resolve),
+/// missing -> reinstall offer, already updated -> no-op.
+pub fn preview_reapply_copies(
+    registry: &SkillRegistry,
+    instance_skills_dir: &Path,
+    selected: &[SkillId],
+) -> Result<Vec<CopyUpdatePreview>> {
+    let mut previews = Vec::new();
+    for skill_id in selected {
+        if registry.get_by_id(skill_id).is_none() {
+            return Err(CoreError::Validation {
+                field: "skill_id".to_owned(),
+                reason: format!("skill `{skill_id}` not found in registry"),
+            });
+        }
+        let dest = instance_skills_dir.join(skill_id.as_str());
+        let Some(provenance) = load_provenance(&registry.root, skill_id, instance_skills_dir)
+        else {
+            previews.push(CopyUpdatePreview {
+                skill_id: skill_id.clone(),
+                drift: if dest.exists() {
+                    DriftStatus::LocallyModified
+                } else {
+                    DriftStatus::Missing
+                },
+                can_apply: dest.exists(),
+                reason: if dest.exists() {
+                    None
+                } else {
+                    Some("destination missing without recorded provenance".to_owned())
+                },
+            });
+            continue;
+        };
+        let drift = check_drift(&provenance, registry, &dest)?;
+        let (can_apply, reason) = match drift {
+            DriftStatus::Clean => (true, None),
+            DriftStatus::AlreadyUpdated => (
+                true,
+                Some("destination already matches the registry source".to_owned()),
+            ),
+            DriftStatus::Missing => (
+                true,
+                Some("destination missing; re-copy reinstalls it".to_owned()),
+            ),
+            DriftStatus::LocallyModified => (
+                false,
+                Some(format!(
+                    "destination `{}` was locally modified after copy (recorded {}, observed now); \
+                     refusing to overwrite — resolve manually or force",
+                    dest.display(),
+                    provenance.dest_digest_at_copy
+                )),
+            ),
+        };
+        previews.push(CopyUpdatePreview {
+            skill_id: skill_id.clone(),
+            drift,
+            can_apply,
+            reason,
+        });
+    }
+    Ok(previews)
 }
 
 // ---------------------------------------------------------------------------
@@ -4305,5 +4851,319 @@ mod tests {
 
         drop(std::fs::remove_dir_all(&root));
         drop(std::fs::remove_dir_all(&src_parent));
+    }
+    // -------------------------------------------------------------------
+    // EXT-02 pinned git checkout / EXT-04 config enable / EXT-05 re-copy
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn git_source_pins_revision_and_checkout_is_verified() {
+        // Build a real local git repo with two tagged revisions.
+        let repo = unique_root("git-skill-repo");
+        drop(std::fs::remove_dir_all(&repo));
+        std::fs::create_dir_all(&repo).unwrap();
+        write_skill_md(&repo, "git-skill", "skill from git v1");
+        let run_git = |args: &[&str], cwd: &Path| {
+            let opts = crate::process::ExecuteOpts {
+                timeout: Some(std::time::Duration::from_secs(30)),
+                cwd: Some(cwd.to_path_buf()),
+                env: vec![("GIT_AUTHOR_NAME".to_owned(), "t".to_owned())],
+                clear_env: false,
+                ..Default::default()
+            };
+            // also set committer env
+            let mut env = opts.env.clone();
+            env.push(("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()));
+            env.push(("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()));
+            env.push(("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()));
+            let full = crate::process::ExecuteOpts { env, ..opts };
+            let out = crate::process::run_command(
+                "git",
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                &full,
+            )
+            .unwrap();
+            assert!(out.success, "git {args:?} failed: {}", out.stderr);
+            out
+        };
+        run_git(&["init", "--quiet"], &repo);
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "--quiet", "-m", "v1"], &repo);
+        run_git(&["tag", "v1"], &repo);
+        write_skill_md(&repo, "git-skill", "skill from git v2");
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "--quiet", "-m", "v2"], &repo);
+        run_git(&["tag", "v2"], &repo);
+
+        let root = unique_root("git-skill-registry");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut reg = SkillRegistry::load(&root).unwrap();
+
+        // Install pinned at v1 (file:// test locator; production is https://).
+        let source = SkillSource {
+            kind: SkillSourceKind::GitHub,
+            locator: format!("file://{}", repo.display()),
+            pinned_revision: Some("v1".to_owned()),
+            license: None,
+        };
+        let rec = reg.install_skill(&source, true).unwrap();
+        assert_eq!(rec.pinned_revision.as_deref(), Some("v1"));
+        let skill_dir = root.join("git-skill");
+        let content = std::fs::read_to_string(skill_dir.join(SKILL_MD_NAME)).unwrap();
+        assert!(content.contains("skill from git v1"), "{content}");
+        // No repository metadata staged into the registry.
+        assert!(!skill_dir.join(".git").exists());
+
+        // Update to v2 changes the content; the record's digest advances.
+        let source_v2 = SkillSource {
+            pinned_revision: Some("v2".to_owned()),
+            ..source.clone()
+        };
+        let updated = reg
+            .update_skill(&SkillId::new("git-skill").unwrap(), Some(&source_v2))
+            .unwrap();
+        assert_ne!(updated.digest, rec.digest);
+        let after = std::fs::read_to_string(skill_dir.join(SKILL_MD_NAME)).unwrap();
+        assert!(after.contains("skill from git v2"), "{after}");
+
+        // A non-existent revision is a typed SourceFetch; registry unchanged.
+        let bad = SkillSource {
+            pinned_revision: Some("no-such-tag".to_owned()),
+            ..source.clone()
+        };
+        let err = reg
+            .update_skill(&SkillId::new("git-skill").unwrap(), Some(&bad))
+            .unwrap_err();
+        match err {
+            CoreError::SourceFetch { locator, .. } => {
+                assert!(locator.starts_with("file://"), "{locator}");
+            }
+            other => panic!("expected SourceFetch, got {other:?}"),
+        }
+        let still = std::fs::read_to_string(skill_dir.join(SKILL_MD_NAME)).unwrap();
+        assert!(still.contains("skill from git v2"));
+
+        drop(std::fs::remove_dir_all(&repo));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn set_skill_enabled_via_config_writes_declared_keys_and_refuses_undeclared() {
+        use crate::adapters::amp::AmpAdapter;
+        // Registry with one skill.
+        let root = unique_root("cfg-enable-reg");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let src_parent = unique_root("cfg-enable-src");
+        std::fs::create_dir_all(&src_parent).unwrap();
+        let src = make_skill_dir(&src_parent, "cfg-skill");
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        reg.install_skill(&SkillSource::local_dir(src.to_str().unwrap()), true)
+            .unwrap();
+        let skill_id = SkillId::new("cfg-skill").unwrap();
+
+        // Undeclared adapter -> honest refusal.
+        let adapter = adapter_full();
+        let err = set_skill_enabled_via_config(Path::new("/tmp"), &reg, &skill_id, &adapter, false)
+            .unwrap_err();
+        match err {
+            CoreError::UnsupportedOperation { operation, .. } => {
+                assert_eq!(operation, "set_skill_enabled_via_config");
+            }
+            other => panic!("expected UnsupportedOperation, got {other:?}"),
+        }
+
+        // Declared adapter (amp): comment-free JSONC settings write through
+        // the engine executor.
+        let cfg_root = unique_root("cfg-enable-instance");
+        drop(std::fs::remove_dir_all(&cfg_root));
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let settings = cfg_root.join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"amp":{"skills":{"disableClaudeCodeSkills":true},"other":"foreign"}}"#,
+        )
+        .unwrap();
+        let amp = AmpAdapter::new().unwrap();
+        let outcome = set_skill_enabled_via_config(&cfg_root, &reg, &skill_id, &amp, true).unwrap();
+        assert!(
+            outcome
+                .changes
+                .iter()
+                .any(|c| c.contains("disableClaudeCodeSkills")),
+            "{:?}",
+            outcome.changes
+        );
+        assert!(
+            outcome
+                .changes
+                .iter()
+                .any(|c| c.contains("amp.skills.path")),
+            "{:?}",
+            outcome.changes
+        );
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|n| n.contains("whole skill source")),
+            "{:?}",
+            outcome.notes
+        );
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(doc["amp"]["skills"]["disableClaudeCodeSkills"], false);
+        assert_eq!(
+            doc["amp"]["skills"]["path"].as_str(),
+            Some(root.to_string_lossy().as_ref()),
+            "{doc}"
+        );
+        assert_eq!(
+            doc["amp"]["other"], "foreign",
+            "foreign key preserved: {doc}"
+        );
+
+        // Disable flips the switch and removes the search path.
+        let outcome2 =
+            set_skill_enabled_via_config(&cfg_root, &reg, &skill_id, &amp, false).unwrap();
+        assert!(!outcome2.changes.is_empty());
+        let doc2: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(doc2["amp"]["skills"]["disableClaudeCodeSkills"], true);
+        assert!(
+            doc2["amp"]["skills"]
+                .get("path")
+                .map_or(true, |p| p.as_str()
+                    != Some(root.to_string_lossy().as_ref())),
+            "{doc2}"
+        );
+
+        // Idempotence: a second enable with nothing to change reports it.
+        let outcome3 =
+            set_skill_enabled_via_config(&cfg_root, &reg, &skill_id, &amp, true).unwrap();
+        drop(outcome3);
+
+        // JSONC with comments refuses typed LossyWrite (codec honesty).
+        let jsonc_root = unique_root("cfg-enable-jsonc");
+        drop(std::fs::remove_dir_all(&jsonc_root));
+        std::fs::create_dir_all(&jsonc_root).unwrap();
+        let jsonc = jsonc_root.join("settings.json");
+        let original = "{\"amp\": { // team note\n\"skills\": {}}}";
+        std::fs::write(&jsonc, original).unwrap();
+        let err2 =
+            set_skill_enabled_via_config(&jsonc_root, &reg, &skill_id, &amp, true).unwrap_err();
+        match err2 {
+            CoreError::Config(superai_config::ConfigError::LossyWrite { .. }) => {}
+            other => panic!("expected LossyWrite, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&jsonc).unwrap(),
+            original,
+            "refused write must leave bytes untouched"
+        );
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&cfg_root));
+        drop(std::fs::remove_dir_all(&jsonc_root));
+    }
+
+    #[test]
+    fn recopy_refuses_locally_modified_and_reinstalls_missing() {
+        let root = unique_root("recopy-root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let src_parent = unique_root("recopy-src");
+        std::fs::create_dir_all(&src_parent).unwrap();
+        let src = make_skill_dir(&src_parent, "recopy-skill");
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let _rec = reg
+            .install_skill(&SkillSource::local_dir(src.to_str().unwrap()), true)
+            .unwrap();
+        let instance_dir = unique_root("recopy-instance");
+        drop(std::fs::remove_dir_all(&instance_dir));
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let adapter = adapter_full();
+        let id = SkillId::new("recopy-skill").unwrap();
+        apply_skill_mode(
+            &reg,
+            &instance_dir,
+            SkillMode::CopySelected,
+            &[id.clone()],
+            &adapter,
+        )
+        .unwrap();
+        let dest = instance_dir.join("recopy-skill");
+
+        // Locally-modified destination: preview flags the conflict and the
+        // re-copy refuses instead of overwriting the user's edits.
+        let modified = "---\nname: recopy-skill\ndescription: edited locally\n---\nlocal edit\n";
+        std::fs::write(dest.join(SKILL_MD_NAME), modified).unwrap();
+        let previews = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].drift, DriftStatus::LocallyModified);
+        assert!(!previews[0].can_apply);
+        assert!(
+            previews[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("refusing to overwrite")),
+            "{:?}",
+            previews[0].reason
+        );
+        let err = apply_skill_mode(
+            &reg,
+            &instance_dir,
+            SkillMode::CopySelected,
+            &[id.clone()],
+            &adapter,
+        )
+        .unwrap_err();
+        match err {
+            CoreError::ConcurrentModification { path, .. } => assert_eq!(path, dest),
+            other => panic!("expected ConcurrentModification, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dest.join(SKILL_MD_NAME)).unwrap(),
+            modified,
+            "user's local edits must survive the refusal"
+        );
+
+        // Clean destination: re-copy replaces (unchanged copy -> update).
+        write_skill_md(&dest, "recopy-skill", "description for recopy-skill");
+        // (rewrite the canonical content so drift is clean again)
+        let canonical = std::fs::read_to_string(src.join(SKILL_MD_NAME)).unwrap();
+        std::fs::write(dest.join(SKILL_MD_NAME), canonical).unwrap();
+        let previews2 = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
+        assert_eq!(previews2[0].drift, DriftStatus::Clean);
+        assert!(previews2[0].can_apply);
+        apply_skill_mode(
+            &reg,
+            &instance_dir,
+            SkillMode::CopySelected,
+            &[id.clone()],
+            &adapter,
+        )
+        .unwrap();
+
+        // Missing destination: preview offers reinstall and the re-copy
+        // reinstalls it.
+        drop(std::fs::remove_dir_all(&dest));
+        let previews3 = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
+        assert_eq!(previews3[0].drift, DriftStatus::Missing);
+        assert!(previews3[0].can_apply);
+        apply_skill_mode(
+            &reg,
+            &instance_dir,
+            SkillMode::CopySelected,
+            &[id.clone()],
+            &adapter,
+        )
+        .unwrap();
+        assert!(dest.join(SKILL_MD_NAME).exists());
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&instance_dir));
     }
 }

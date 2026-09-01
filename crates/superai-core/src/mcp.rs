@@ -1477,6 +1477,532 @@ pub fn redacted_diff(server: &McpServerDef) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// EXT-10 — move/copy between scopes with conflict preview
+// ---------------------------------------------------------------------------
+
+/// Whether a scope transfer removes the source entry (move) or keeps it (copy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeTransfer {
+    /// Remove the source entry after the destination write succeeds.
+    Move,
+    /// Keep the source entry; the destination gains an identical server.
+    Copy,
+}
+
+impl std::fmt::Display for ScopeTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Move => "move",
+            Self::Copy => "copy",
+        })
+    }
+}
+
+/// Conflict preview for moving/copying a server between scopes (EXT-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpScopeTransferPreview {
+    /// Server id being transferred.
+    pub id: McpServerId,
+    /// Move or copy.
+    pub action: ScopeTransfer,
+    /// Declared scope of the source destination.
+    pub source_scope: crate::adapter::ConfigScope,
+    /// Declared scope of the target destination.
+    pub dest_scope: crate::adapter::ConfigScope,
+    /// Definition at the source (must exist).
+    pub source_existing: McpServerDef,
+    /// Definition already at the destination, if any.
+    pub dest_existing: Option<McpServerDef>,
+    /// Conflicts that block the transfer.
+    pub conflicts: Vec<String>,
+    /// Whether the transfer can apply without a forced decision.
+    pub can_auto_apply: bool,
+    /// Redacted summary of the planned change.
+    pub diff_redacted: String,
+}
+
+/// Preview moving/copying server `id` between two declared destinations
+/// (EXT-10). Both files are read fresh; scopes and conflicts surface before
+/// any write. Same-semantic destination entry is a no-op/adopt (no conflict);
+/// a different definition under the same id is an explicit conflict.
+pub fn preview_scope_transfer(
+    source_path: &Path,
+    source_decl: &McpAdapterDecl,
+    dest_path: &Path,
+    dest_decl: &McpAdapterDecl,
+    id: &McpServerId,
+    action: ScopeTransfer,
+) -> Result<McpScopeTransferPreview> {
+    let (_src_outer, src_inner) = read_outer_and_inner(source_path, source_decl)?;
+    let source_val = src_inner
+        .get(id.as_str())
+        .ok_or_else(|| CoreError::Validation {
+            field: "mcp.id".to_owned(),
+            reason: format!(
+                "mcp server `{id}` not found at source {}",
+                source_path.display()
+            ),
+        })?;
+    let source_existing = from_native_value(id.as_str(), source_val)?;
+    let (_dst_outer, dst_inner) = read_outer_and_inner(dest_path, dest_decl)?;
+    let dest_existing = dst_inner
+        .get(id.as_str())
+        .map(|v| from_native_value(id.as_str(), v))
+        .transpose()?;
+
+    let mut conflicts = Vec::new();
+    if let Some(dest) = &dest_existing
+        && !dest.semantic_eq(&source_existing)
+    {
+        conflicts.push(format!(
+            "destination already defines `{id}` differently ({} -> {}); remove or rename first",
+            dest.transport, source_existing.transport
+        ));
+    }
+    let can_auto_apply = conflicts.is_empty();
+    let diff_redacted = format!(
+        "{action} {id} {} -> {} (scope {:?} -> {:?})",
+        source_path.display(),
+        dest_path.display(),
+        source_decl.scope,
+        dest_decl.scope
+    );
+    Ok(McpScopeTransferPreview {
+        id: id.clone(),
+        action,
+        source_scope: source_decl.scope,
+        dest_scope: dest_decl.scope,
+        source_existing,
+        dest_existing,
+        conflicts,
+        can_auto_apply,
+        diff_redacted,
+    })
+}
+
+/// Move or copy server `id` between two declared destinations (EXT-10).
+///
+/// The destination is written FIRST (additive); the source entry is removed
+/// only for [`ScopeTransfer::Move`] after the destination write verified, so
+/// a mid-transfer failure never loses the server. A same-semantic destination
+/// entry short-circuits to the remove (move) or no-op (copy).
+pub fn transfer_between_scopes(
+    source_path: &Path,
+    source_decl: &McpAdapterDecl,
+    dest_path: &Path,
+    dest_decl: &McpAdapterDecl,
+    id: &McpServerId,
+    action: ScopeTransfer,
+) -> Result<Option<McpServerDef>> {
+    let preview =
+        preview_scope_transfer(source_path, source_decl, dest_path, dest_decl, id, action)?;
+    if !preview.can_auto_apply {
+        return Err(CoreError::NameCollision {
+            kind: "McpServerId".to_owned(),
+            name: id.to_string(),
+            reason: preview.conflicts.join("; "),
+        });
+    }
+    if let Some(dest) = &preview.dest_existing
+        && dest.semantic_eq(&preview.source_existing)
+    {
+        // Adopt: destination already carries the same definition.
+        if action == ScopeTransfer::Move {
+            write_server_entry(source_path, source_decl, id.as_str(), ServerWrite::Remove)?;
+        }
+        return Ok(Some(preview.source_existing));
+    }
+    // Destination write first (additive, foreign preserved).
+    let merged = merge_server_native(None, &to_native_value(&preview.source_existing));
+    write_server_entry(
+        dest_path,
+        dest_decl,
+        id.as_str(),
+        ServerWrite::Upsert(merged),
+    )?;
+    if action == ScopeTransfer::Move {
+        write_server_entry(source_path, source_decl, id.as_str(), ServerWrite::Remove)?;
+    }
+    Ok(Some(preview.source_existing))
+}
+
+// ---------------------------------------------------------------------------
+// EXT-11 — bulk cross-instance operations
+// ---------------------------------------------------------------------------
+
+/// One instance target of a bulk operation (EXT-11).
+pub struct BulkTarget {
+    /// Instance display name for reports.
+    pub instance: String,
+    /// Instance config root; the MCP destination is resolved inside it.
+    pub config_root: PathBuf,
+    /// Adapter for the instance (drives `mcp_decl` / absence reasons).
+    pub adapter: Box<dyn crate::adapter::Adapter>,
+}
+
+impl std::fmt::Debug for BulkTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Adapters are not Debug; identify by harness id + root instead.
+        f.debug_struct("BulkTarget")
+            .field("instance", &self.instance)
+            .field("config_root", &self.config_root)
+            .field("adapter", &self.adapter.id().to_string())
+            .finish()
+    }
+}
+
+/// Bulk action applied to every target (EXT-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkAction {
+    /// Enable or disable an existing server.
+    SetMcpEnabled {
+        /// Server id.
+        id: McpServerId,
+        /// Desired state.
+        enabled: bool,
+    },
+    /// Add or update one server definition.
+    InstallMcpServer {
+        /// Definition to install.
+        server: McpServerDef,
+    },
+    /// Remove an owned server.
+    RemoveMcpServer {
+        /// Server id.
+        id: McpServerId,
+    },
+}
+
+impl BulkAction {
+    /// The server id the action addresses, for per-target previews.
+    fn server_id(&self) -> &McpServerId {
+        match self {
+            Self::SetMcpEnabled { id, .. } | Self::RemoveMcpServer { id } => id,
+            Self::InstallMcpServer { server } => &server.id,
+        }
+    }
+}
+
+/// Per-target plan built FRESH from disk (EXT-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkTargetPlan {
+    /// Instance display name.
+    pub instance: String,
+    /// Resolved destination file.
+    pub dest_path: PathBuf,
+    /// Declared destination scope.
+    pub scope: Option<crate::adapter::ConfigScope>,
+    /// Whether the target supports the action at all.
+    pub supported: bool,
+    /// Why the target is unsupported (no decl, verified absence, read-only).
+    pub unsupported_reason: Option<String>,
+    /// Non-blocking notes (e.g. destination missing — it will be created).
+    pub constrained_notes: Vec<String>,
+    /// Existing definition for the addressed id, read fresh.
+    pub existing: Option<McpServerDef>,
+    /// Conflicts that will refuse the target at apply time.
+    pub conflicts: Vec<String>,
+    /// Plan-time conflict token (digest/metadata snapshot of the destination).
+    pub expected: Option<superai_config::snapshot::Snapshot>,
+}
+
+/// Bulk plan: every per-instance plan, built fresh before commit (EXT-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkPlan {
+    /// Action the plan was built for.
+    pub action_summary: String,
+    /// Per-target plans.
+    pub targets: Vec<BulkTargetPlan>,
+}
+
+impl BulkPlan {
+    /// Targets that would refuse (unsupported or conflicting) — surfaced
+    /// BEFORE commit so callers can decide.
+    pub fn refusing_targets(&self) -> Vec<&BulkTargetPlan> {
+        self.targets
+            .iter()
+            .filter(|t| !t.supported || !t.conflicts.is_empty())
+            .collect()
+    }
+}
+
+/// Build every per-instance plan fresh (EXT-11).
+///
+/// Each destination is read from disk at plan time; unsupported targets
+/// (verified MCP absence, no destination declared, read-only destinations)
+/// and per-target conflicts (name collisions, missing servers) are visible on
+/// the plan BEFORE anything is committed. Plan-time snapshots are captured so
+/// apply can detect external edits in the plan→apply window.
+pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
+    let mut plans = Vec::new();
+    for target in targets {
+        let Some(decl) = target.adapter.mcp_decl() else {
+            let reason = target
+                .adapter
+                .mcp_absence_reason()
+                .unwrap_or("no MCP destination declared for this harness")
+                .to_owned();
+            plans.push(BulkTargetPlan {
+                instance: target.instance.clone(),
+                dest_path: PathBuf::new(),
+                scope: None,
+                supported: false,
+                unsupported_reason: Some(reason),
+                constrained_notes: Vec::new(),
+                existing: None,
+                conflicts: Vec::new(),
+                expected: None,
+            });
+            continue;
+        };
+        let dest_path = target.config_root.join(&decl.dest_file);
+        let mut unsupported_reason = None;
+        if let Some(reason) = &decl.read_only {
+            unsupported_reason = Some(reason.clone());
+        }
+        let mut constrained_notes = Vec::new();
+        let mut existing = None;
+        let mut conflicts = Vec::new();
+        let mut expected = None;
+        if unsupported_reason.is_none() {
+            if dest_path.exists() {
+                expected = Some(superai_config::snapshot::snapshot(&dest_path));
+                match read_outer_and_inner(&dest_path, &decl) {
+                    Ok((_outer, inner)) => {
+                        if let Some(v) = inner.get(action.server_id().as_str()) {
+                            match from_native_value(action.server_id().as_str(), v) {
+                                Ok(def) => existing = Some(def),
+                                Err(e) => conflicts.push(format!(
+                                    "existing entry for `{}` does not parse: {e}",
+                                    action.server_id()
+                                )),
+                            }
+                        } else if !matches!(action, BulkAction::InstallMcpServer { .. }) {
+                            conflicts.push(format!(
+                                "mcp server `{}` not found at {}",
+                                action.server_id(),
+                                dest_path.display()
+                            ));
+                        }
+                        if let BulkAction::InstallMcpServer { server } = action {
+                            for key in inner.keys() {
+                                if key.to_lowercase() == server.id.as_str().to_lowercase()
+                                    && key != server.id.as_str()
+                                {
+                                    conflicts.push(format!(
+                                        "case-fold collision: `{}` vs existing `{}`",
+                                        server.id, key
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => conflicts.push(format!(
+                        "cannot read destination {}: {e}",
+                        dest_path.display()
+                    )),
+                }
+            } else {
+                constrained_notes.push(format!(
+                    "destination {} does not exist; it will be created",
+                    dest_path.display()
+                ));
+                if !matches!(action, BulkAction::InstallMcpServer { .. }) {
+                    conflicts.push(format!(
+                        "mcp destination {} missing for `{}`",
+                        dest_path.display(),
+                        action.server_id()
+                    ));
+                }
+            }
+        }
+        plans.push(BulkTargetPlan {
+            instance: target.instance.clone(),
+            dest_path,
+            scope: Some(decl.scope),
+            supported: unsupported_reason.is_none(),
+            unsupported_reason,
+            constrained_notes,
+            existing,
+            conflicts,
+            expected,
+        });
+    }
+    BulkPlan {
+        action_summary: match action {
+            BulkAction::SetMcpEnabled { id, enabled } => {
+                format!(
+                    "set_mcp_enabled {id} {}",
+                    if *enabled { "on" } else { "off" }
+                )
+            }
+            BulkAction::InstallMcpServer { server } => format!("install_mcp {}", server.id),
+            BulkAction::RemoveMcpServer { id } => format!("remove_mcp {id}"),
+        },
+        targets: plans,
+    }
+}
+
+/// Per-target outcome after a bulk apply (EXT-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkOutcome {
+    /// The target's mutation committed and verified.
+    Completed(String),
+    /// The target's mutation failed and its disk state was restored
+    /// (nothing from this operation remains on that target).
+    RolledBack(String),
+    /// The target was refused before any mutation (unsupported/conflict).
+    Refused(String),
+}
+
+impl std::fmt::Display for BulkOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed(m) => write!(f, "completed: {m}"),
+            Self::RolledBack(m) => write!(f, "rolled back: {m}"),
+            Self::Refused(m) => write!(f, "refused: {m}"),
+        }
+    }
+}
+
+/// Per-target result (EXT-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkTargetResult {
+    /// Instance display name.
+    pub instance: String,
+    /// Outcome for this target.
+    pub outcome: BulkOutcome,
+}
+
+/// Bulk apply result: per-target outcomes identifying completed vs
+/// rolled-back vs refused targets (EXT-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkResult {
+    /// One entry per planned target.
+    pub results: Vec<BulkTargetResult>,
+}
+
+impl BulkResult {
+    /// Instances whose mutation completed.
+    pub fn completed(&self) -> Vec<&str> {
+        self.results
+            .iter()
+            .filter(|r| matches!(r.outcome, BulkOutcome::Completed(_)))
+            .map(|r| r.instance.as_str())
+            .collect()
+    }
+
+    /// Instances whose mutation was rolled back.
+    pub fn rolled_back(&self) -> Vec<&str> {
+        self.results
+            .iter()
+            .filter(|r| matches!(r.outcome, BulkOutcome::RolledBack(_)))
+            .map(|r| r.instance.as_str())
+            .collect()
+    }
+
+    /// Instances that were refused.
+    pub fn refused(&self) -> Vec<&str> {
+        self.results
+            .iter()
+            .filter(|r| matches!(r.outcome, BulkOutcome::Refused(_)))
+            .map(|r| r.instance.as_str())
+            .collect()
+    }
+}
+
+/// Verify the destination still matches its plan-time snapshot (EXT-11
+/// external-edit detection between plan and apply).
+fn ensure_plan_token_unchanged(
+    path: &Path,
+    expected: &superai_config::snapshot::Snapshot,
+) -> Result<()> {
+    let current = superai_config::snapshot::snapshot(path);
+    if superai_config::snapshot::is_modified(expected, &current) {
+        let exp = expected.digest.as_deref().unwrap_or("missing");
+        let act = current.digest.as_deref().unwrap_or("missing");
+        return Err(CoreError::ConcurrentModification {
+            path: path.to_path_buf(),
+            expected: exp.to_owned(),
+            actual: act.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Apply a bulk action per the fresh plans (EXT-11).
+///
+/// Every target is applied through the compensated per-write MCP transaction
+/// (backup + atomic replace + read-back verify, area-2 machinery), so a
+/// failure on one target rolls back THAT TARGET only — other targets proceed
+/// and are reported independently. Refusals never touch disk. External edits
+/// between plan and apply surface as `RolledBack` with the digest evidence.
+pub fn bulk_apply(targets: &[BulkTarget], plan: &BulkPlan, action: &BulkAction) -> BulkResult {
+    let mut results = Vec::new();
+    for (target, target_plan) in targets.iter().zip(plan.targets.iter()) {
+        if let Some(reason) = &target_plan.unsupported_reason {
+            results.push(BulkTargetResult {
+                instance: target_plan.instance.clone(),
+                outcome: BulkOutcome::Refused(reason.clone()),
+            });
+            continue;
+        }
+        if !target_plan.conflicts.is_empty() {
+            results.push(BulkTargetResult {
+                instance: target_plan.instance.clone(),
+                outcome: BulkOutcome::Refused(target_plan.conflicts.join("; ")),
+            });
+            continue;
+        }
+        let Some(decl) = target.adapter.mcp_decl() else {
+            results.push(BulkTargetResult {
+                instance: target_plan.instance.clone(),
+                outcome: BulkOutcome::Refused(
+                    "no MCP destination declared for this harness".to_owned(),
+                ),
+            });
+            continue;
+        };
+        // Fresh per-target application with the plan-time token enforced.
+        let applied = (|| -> Result<String> {
+            if let Some(expected) = &target_plan.expected {
+                ensure_plan_token_unchanged(&target_plan.dest_path, expected)?;
+            }
+            match action {
+                BulkAction::SetMcpEnabled { id, enabled } => {
+                    let def = set_mcp_enabled(&target_plan.dest_path, &decl, id, *enabled)?;
+                    Ok(format!("`{}` disabled={}", def.id, def.disabled))
+                }
+                BulkAction::InstallMcpServer { server } => {
+                    let def = install_mcp_server(&target_plan.dest_path, &decl, server)?;
+                    Ok(format!("`{}` installed", def.id))
+                }
+                BulkAction::RemoveMcpServer { id } => {
+                    let removed = remove_mcp_server(&target_plan.dest_path, &decl, id)?;
+                    Ok(format!(
+                        "`{}` {}",
+                        id,
+                        if removed.is_some() {
+                            "removed"
+                        } else {
+                            "absent (no-op)"
+                        }
+                    ))
+                }
+            }
+        })();
+        results.push(BulkTargetResult {
+            instance: target_plan.instance.clone(),
+            outcome: match applied {
+                Ok(message) => BulkOutcome::Completed(message),
+                Err(e) => BulkOutcome::RolledBack(format!("{e}")),
+            },
+        });
+    }
+    BulkResult { results }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2113,5 +2639,481 @@ mod tests {
         let remote = serde_json::json!({"serverUrl": "https://example.com/mcp"});
         let def = from_native_value("remote", &remote).unwrap();
         assert_eq!(def.url.as_deref(), Some("https://example.com/mcp"));
+    }
+
+    // -------------------------------------------------------------------
+    // EXT-10 scope transfer + EXT-11 bulk operations
+    // -------------------------------------------------------------------
+
+    use crate::adapter::{
+        ConfigSurface, DetectionResult, PathResolver, ProductStatus, SurfaceOwnership,
+        VersionResolution,
+    };
+    use crate::instance::Instance;
+
+    /// Writable-JSON-MCP adapter for lifecycle tests.
+    #[derive(Debug)]
+    struct WritableMcpAdapter {
+        read_only: bool,
+    }
+
+    impl WritableMcpAdapter {
+        fn writable() -> Self {
+            Self { read_only: false }
+        }
+    }
+
+    impl crate::adapter::Adapter for WritableMcpAdapter {
+        fn id(&self) -> crate::ids::HarnessId {
+            crate::ids::HarnessId::new("claude-code").unwrap()
+        }
+        fn display_name(&self) -> &str {
+            "Claude Code"
+        }
+        fn product_status(&self) -> ProductStatus {
+            ProductStatus::Active
+        }
+        fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+            Vec::new()
+        }
+        fn adapter_revision(&self) -> &str {
+            "0.1.0"
+        }
+        fn research_doc_link(&self) -> &str {
+            "docs/harness-configs/claude-code.md"
+        }
+        fn last_verified_date(&self) -> &str {
+            "2026-08-25"
+        }
+        fn detection(&self) -> DetectionResult {
+            DetectionResult::absent(vec!["test".to_owned()])
+        }
+        fn version_resolution(&self) -> VersionResolution {
+            VersionResolution::new(Some("2.0.0".to_owned()), Some("2".to_owned()), true)
+        }
+        fn config_surfaces(&self) -> Vec<ConfigSurface> {
+            vec![ConfigSurface::new(
+                ".mcp.json",
+                PathResolver::fallback_only(".mcp.json"),
+                DocumentKind::Json,
+                ConfigScope::ProjectWorkspace,
+                SurfaceOwnership::UserEditable,
+            )]
+        }
+        fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+            Vec::new()
+        }
+        fn plan_mirror_exclusions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_wrapper(
+            &self,
+            _instance: &Instance,
+        ) -> std::result::Result<crate::adapter::WrapperPlan, CoreError> {
+            Ok(crate::adapter::WrapperPlan::new("test"))
+        }
+        fn scan_candidates(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn validate_instance(&self, _instance: &Instance) -> Result<()> {
+            Ok(())
+        }
+        fn mcp_decl(&self) -> Option<McpAdapterDecl> {
+            let decl = McpAdapterDecl::new(
+                ".mcp.json",
+                "mcpServers",
+                DocumentKind::Json,
+                ConfigScope::ProjectWorkspace,
+                RestartBehavior::None,
+            );
+            if self.read_only {
+                Some(decl.with_read_only("test read-only destination"))
+            } else {
+                Some(decl)
+            }
+        }
+    }
+
+    /// Adapter with verified MCP absence.
+    #[derive(Debug)]
+    struct NoMcpAdapter;
+
+    impl crate::adapter::Adapter for NoMcpAdapter {
+        fn id(&self) -> crate::ids::HarnessId {
+            crate::ids::HarnessId::new("pi").unwrap()
+        }
+        fn display_name(&self) -> &str {
+            "Pi"
+        }
+        fn product_status(&self) -> ProductStatus {
+            ProductStatus::Active
+        }
+        fn supported_platforms(&self) -> Vec<crate::adapter::Platform> {
+            Vec::new()
+        }
+        fn adapter_revision(&self) -> &str {
+            "0.1.0"
+        }
+        fn research_doc_link(&self) -> &str {
+            "docs/harness-configs/pi.md"
+        }
+        fn last_verified_date(&self) -> &str {
+            "2026-08-25"
+        }
+        fn detection(&self) -> DetectionResult {
+            DetectionResult::absent(vec!["test".to_owned()])
+        }
+        fn version_resolution(&self) -> VersionResolution {
+            VersionResolution::new(Some("1.0.0".to_owned()), Some("1".to_owned()), true)
+        }
+        fn config_surfaces(&self) -> Vec<ConfigSurface> {
+            Vec::new()
+        }
+        fn supported_operations(&self) -> Vec<(String, crate::state::AdapterSupport)> {
+            Vec::new()
+        }
+        fn plan_mirror_exclusions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_wrapper(
+            &self,
+            _instance: &Instance,
+        ) -> std::result::Result<crate::adapter::WrapperPlan, CoreError> {
+            Ok(crate::adapter::WrapperPlan::new("test"))
+        }
+        fn scan_candidates(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn validate_instance(&self, _instance: &Instance) -> Result<()> {
+            Ok(())
+        }
+        fn mcp_decl(&self) -> Option<McpAdapterDecl> {
+            None
+        }
+        fn mcp_absence_reason(&self) -> Option<&'static str> {
+            Some("pi intentionally does not include built-in MCP")
+        }
+    }
+
+    fn root_with_mcp(prefix: &str, servers: &Value) -> PathBuf {
+        let dir = crate::test_util::temp_dir_unique(prefix);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = serde_json::json!({
+            "note": "foreign top-level",
+            "mcpServers": servers,
+        });
+        std::fs::write(dir.join(".mcp.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scope_transfer_moves_and_copies_with_conflict_preview() {
+        let user_root = root_with_mcp(
+            "scope-user",
+            &serde_json::json!({
+                "shared": {"command": "uvx", "args": ["server-one"]}
+            }),
+        );
+        let project_root = root_with_mcp(
+            "scope-project",
+            &serde_json::json!({
+                "other": {"command": "uvx", "args": ["server-two"]}
+            }),
+        );
+        let user_decl = McpAdapterDecl::new(
+            ".mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::None,
+        );
+        let project_decl = McpAdapterDecl::new(
+            ".mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::ProjectWorkspace,
+            RestartBehavior::None,
+        );
+        let user_path = user_root.join(".mcp.json");
+        let project_path = project_root.join(".mcp.json");
+        let id = McpServerId::new("shared").unwrap();
+
+        // COPY: source keeps the server, destination gains it; foreign keys
+        // survive on both sides.
+        let copied = transfer_between_scopes(
+            &user_path,
+            &user_decl,
+            &project_path,
+            &project_decl,
+            &id,
+            ScopeTransfer::Copy,
+        )
+        .unwrap();
+        assert!(copied.is_some());
+        let user_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&user_path).unwrap()).unwrap();
+        assert!(user_doc["mcpServers"].get("shared").is_some(), "{user_doc}");
+        assert!(user_doc.get("note").is_some());
+        let project_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_path).unwrap()).unwrap();
+        assert!(project_doc["mcpServers"].get("shared").is_some());
+        assert!(
+            project_doc["mcpServers"].get("other").is_some(),
+            "{project_doc}"
+        );
+        assert!(project_doc.get("note").is_some());
+
+        // MOVE: destination (already carrying the same definition) adopts and
+        // the source entry is removed.
+        let moved = transfer_between_scopes(
+            &project_path,
+            &project_decl,
+            &user_path,
+            &user_decl,
+            &id,
+            ScopeTransfer::Move,
+        )
+        .unwrap();
+        assert!(moved.is_some());
+        let project_after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_path).unwrap()).unwrap();
+        assert!(
+            project_after["mcpServers"].get("shared").is_none(),
+            "move must remove the source entry: {project_after}"
+        );
+
+        // Conflict preview: a different definition under the same id blocks
+        // the transfer.
+        let conflicting_root = root_with_mcp(
+            "scope-conflict",
+            &serde_json::json!({
+                "shared": {"command": "uvx", "args": ["different-server"]}
+            }),
+        );
+        let preview = preview_scope_transfer(
+            &user_path,
+            &user_decl,
+            &conflicting_root.join(".mcp.json"),
+            &project_decl,
+            &id,
+            ScopeTransfer::Copy,
+        )
+        .unwrap();
+        assert!(!preview.can_auto_apply);
+        assert!(preview.conflicts.iter().any(|c| c.contains("differently")));
+        let err = transfer_between_scopes(
+            &user_path,
+            &user_decl,
+            &conflicting_root.join(".mcp.json"),
+            &project_decl,
+            &id,
+            ScopeTransfer::Copy,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("differently"));
+
+        drop(std::fs::remove_dir_all(&user_root));
+        drop(std::fs::remove_dir_all(&project_root));
+        drop(std::fs::remove_dir_all(&conflicting_root));
+    }
+
+    #[test]
+    fn bulk_plan_shows_unsupported_before_commit_and_reports_per_target() {
+        let servers = serde_json::json!({
+            "shared": {"command": "uvx", "args": ["server-one"]}
+        });
+        let root_a = root_with_mcp("bulk-a", &servers);
+        let root_b = root_with_mcp("bulk-b", &servers);
+        let root_absent = crate::test_util::temp_dir_unique("bulk-absent");
+        std::fs::create_dir_all(&root_absent).unwrap();
+
+        let targets = vec![
+            BulkTarget {
+                instance: "work".to_owned(),
+                config_root: root_a.clone(),
+                adapter: Box::new(WritableMcpAdapter::writable()),
+            },
+            BulkTarget {
+                instance: "lab".to_owned(),
+                config_root: root_b.clone(),
+                adapter: Box::new(WritableMcpAdapter::writable()),
+            },
+            BulkTarget {
+                instance: "pi-box".to_owned(),
+                config_root: root_absent.clone(),
+                adapter: Box::new(NoMcpAdapter),
+            },
+        ];
+        let id = McpServerId::new("shared").unwrap();
+        let action = BulkAction::SetMcpEnabled {
+            id: id,
+            enabled: false,
+        };
+        let plan = bulk_plan(&targets, &action);
+        // Unsupported target visible BEFORE commit with its absence reason.
+        let refusing = plan.refusing_targets();
+        assert_eq!(refusing.len(), 1, "{:?}", refusing);
+        assert_eq!(refusing[0].instance, "pi-box");
+        assert!(
+            refusing[0]
+                .unsupported_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("intentionally does not include")),
+            "{:?}",
+            refusing[0].unsupported_reason
+        );
+        // Supported targets carry fresh existing definitions + plan tokens.
+        for target_plan in &plan.targets[..2] {
+            assert!(target_plan.supported);
+            assert!(target_plan.existing.is_some());
+            assert!(target_plan.expected.is_some());
+        }
+
+        let result = bulk_apply(&targets, &plan, &action);
+        let mut completed = result.completed();
+        completed.sort_unstable();
+        assert_eq!(completed, vec!["lab", "work"]);
+        assert_eq!(result.refused(), vec!["pi-box"]);
+        assert!(result.rolled_back().is_empty());
+        // Both writable destinations now disable the server in place,
+        // preserving foreign entries.
+        for root in [&root_a, &root_b] {
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
+                    .unwrap();
+            assert_eq!(doc["mcpServers"]["shared"]["disabled"], true, "{doc}");
+            assert!(doc.get("note").is_some());
+        }
+
+        drop(std::fs::remove_dir_all(&root_a));
+        drop(std::fs::remove_dir_all(&root_b));
+        drop(std::fs::remove_dir_all(&root_absent));
+    }
+
+    #[test]
+    fn bulk_external_edit_conflict_rolls_back_only_that_target() {
+        let servers = serde_json::json!({
+            "shared": {"command": "uvx", "args": ["server-one"]}
+        });
+        let root_a = root_with_mcp("bulk-conf-a", &servers);
+        let root_b = root_with_mcp("bulk-conf-b", &servers);
+        let targets = vec![
+            BulkTarget {
+                instance: "work".to_owned(),
+                config_root: root_a.clone(),
+                adapter: Box::new(WritableMcpAdapter::writable()),
+            },
+            BulkTarget {
+                instance: "lab".to_owned(),
+                config_root: root_b.clone(),
+                adapter: Box::new(WritableMcpAdapter::writable()),
+            },
+        ];
+        let action = BulkAction::SetMcpEnabled {
+            id: McpServerId::new("shared").unwrap(),
+            enabled: false,
+        };
+        let plan = bulk_plan(&targets, &action);
+        // External edit on target B between plan and apply.
+        let b_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(root_b.join(".mcp.json")).unwrap())
+                .unwrap();
+        let mut edited = b_doc;
+        edited["note"] = "externally edited".into();
+        std::fs::write(
+            root_b.join(".mcp.json"),
+            serde_json::to_string(&edited).unwrap(),
+        )
+        .unwrap();
+
+        let result = bulk_apply(&targets, &plan, &action);
+        assert_eq!(result.completed(), vec!["work"], "{:?}", result.results);
+        assert_eq!(result.rolled_back(), vec!["lab"]);
+        // The rolled-back target keeps its externally edited bytes; only the
+        // completed target was mutated.
+        let a_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(root_a.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(a_doc["mcpServers"]["shared"]["disabled"], true);
+        let b_after: Value =
+            serde_json::from_str(&std::fs::read_to_string(root_b.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(b_after["note"], "externally edited");
+        assert!(
+            b_after["mcpServers"]["shared"].get("disabled").is_none(),
+            "rolled-back target must not be mutated: {b_after}"
+        );
+
+        drop(std::fs::remove_dir_all(&root_a));
+        drop(std::fs::remove_dir_all(&root_b));
+    }
+
+    #[test]
+    fn bulk_install_creates_missing_destinations_and_read_only_refuses() {
+        let fresh_root = crate::test_util::temp_dir_unique("bulk-fresh");
+        std::fs::create_dir_all(&fresh_root).unwrap();
+        let servers = serde_json::json!({
+            "shared": {"command": "uvx", "args": ["server-one"]}
+        });
+        let ro_root = root_with_mcp("bulk-ro", &servers);
+        let server = McpServerDef::stdio(
+            McpServerId::new("brand-new").unwrap(),
+            "uvx",
+            vec!["server-x".to_owned()],
+        )
+        .unwrap();
+        let action = BulkAction::InstallMcpServer { server: server };
+        let targets = vec![
+            BulkTarget {
+                instance: "fresh".to_owned(),
+                config_root: fresh_root.clone(),
+                adapter: Box::new(WritableMcpAdapter::writable()),
+            },
+            BulkTarget {
+                instance: "readonly".to_owned(),
+                config_root: ro_root.clone(),
+                adapter: Box::new(WritableMcpAdapter { read_only: true }),
+            },
+        ];
+        let plan = bulk_plan(&targets, &action);
+        // Read-only destination is surfaced as unsupported with its reason.
+        let ro_plan = plan
+            .targets
+            .iter()
+            .find(|t| t.instance == "readonly")
+            .unwrap();
+        assert!(!ro_plan.supported);
+        assert!(
+            ro_plan
+                .unsupported_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("read-only"))
+        );
+        // Missing destination is a constrained note, not a conflict, for installs.
+        let fresh_plan = plan.targets.iter().find(|t| t.instance == "fresh").unwrap();
+        assert!(fresh_plan.supported);
+        assert!(
+            fresh_plan
+                .constrained_notes
+                .iter()
+                .any(|n| n.contains("will be created"))
+        );
+
+        let result = bulk_apply(&targets, &plan, &action);
+        assert_eq!(result.completed(), vec!["fresh"]);
+        assert_eq!(result.refused(), vec!["readonly"]);
+        let created: Value =
+            serde_json::from_str(&std::fs::read_to_string(fresh_root.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            created["mcpServers"]["brand-new"]["command"], "uvx",
+            "{created}"
+        );
+        // Read-only destination bytes untouched.
+        let ro_after = std::fs::read_to_string(ro_root.join(".mcp.json")).unwrap();
+        assert!(ro_after.contains("server-one"));
+
+        drop(std::fs::remove_dir_all(&fresh_root));
+        drop(std::fs::remove_dir_all(&ro_root));
     }
 }
