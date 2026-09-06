@@ -787,6 +787,7 @@ mod tests {
     const DETECT_SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
     /// Heredoc delimiter for fake `--version` executables; never appears in
     /// generated fixtures (occurrences are stripped).
+    #[cfg(unix)]
     const HEREDOC_EOF: &str = "SUPERAI_FUZZ_EOF_7f3a";
 
     fn gen_version_output(prng: &mut Prng, iter: u64) -> String {

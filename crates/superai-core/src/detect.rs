@@ -1581,6 +1581,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// Entry exercising the pipx/uv/direct (system) methods.
+    #[cfg(unix)]
     fn pythonish_entry() -> InstallCatalogEntry {
         use crate::install_catalog::{DetectHints, InstallMethod, PlatformConstraints};
         InstallCatalogEntry {

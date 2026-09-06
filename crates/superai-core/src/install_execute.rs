@@ -3253,6 +3253,7 @@ mod tests {
     }
 
     /// Minimal instance helper for wrapper integration tests.
+    #[cfg(unix)]
     fn registry_instance_for(name: &str, root: &Path) -> crate::instance::Instance {
         crate::instance::Instance {
             id: crate::ids::InstanceId::new(format!("{name}-id").as_str()).unwrap(),
