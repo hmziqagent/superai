@@ -2036,6 +2036,7 @@ pub fn pin_wrapper_executable(pin: &BinaryPin) -> Result<crate::paths::Executabl
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::adapter::Adapter as _;
     use crate::install_catalog::{
         DetectHints, InstallCatalogEntry, InstallMethod, PlatformConstraints,
@@ -2995,6 +2996,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn external_plan_refuses_execution_typed() {
         // PKG-10: executing an external/direct plan is a typed state, not a
         // fabricated command run.

@@ -114,23 +114,16 @@ pub fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Process state character from `/proc/<pid>/stat` on Linux (e.g. `R`, `Z`).
+#[cfg(target_os = "linux")]
 #[must_use]
 fn proc_state(pid: u32) -> Option<char> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat =
-            std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
-        let after_parens = stat.rsplit(')').next()?;
-        after_parens
-            .split_whitespace()
-            .next()
-            .and_then(|state| state.chars().next())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
+    let stat =
+        std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let after_parens = stat.rsplit(')').next()?;
+    after_parens
+        .split_whitespace()
+        .next()
+        .and_then(|state| state.chars().next())
 }
 
 /// Kernel start time of `pid` from `/proc/<pid>/stat` (field 22) on Linux;
@@ -804,10 +797,14 @@ fn send_signal(pid: u32, force: bool) -> Result<()> {
         ],
     );
     #[cfg(windows)]
-    let (binary, args) = (
-        "taskkill",
-        vec!["/PID".to_owned(), pid.to_string(), "/F".to_owned()],
-    );
+    let binary = "taskkill";
+    #[cfg(windows)]
+    let mut args = vec!["/PID".to_owned(), pid.to_string()];
+    #[cfg(windows)]
+    if force {
+        // taskkill without /F posts a close message (graceful); /F force-kills.
+        args.push("/F".to_owned());
+    }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (pid, force);

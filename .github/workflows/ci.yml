@@ -129,7 +129,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-mutants --locked
       - name: Mutation tests (scoped baseline)
-        run: cargo mutants --in-place --output mutants.out --jobs 4 --no-times
+        run: cargo mutants --output mutants.out --jobs 4 --no-times
       - name: Mutation score summary
         if: always()
         run: |

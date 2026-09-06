@@ -809,7 +809,6 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
 /// Find `name` as an executable file on a `PATH`-shaped string (lookup
 /// only; nothing is executed). Pure over its inputs so tests can pass a
 /// synthetic PATH.
-#[expect(clippy::excessive_nesting, reason = "per-platform exec-bit probe")]
 pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
     let separator = if cfg!(windows) { ';' } else { ':' };
     for dir in path_var.split(separator) {
@@ -817,20 +816,23 @@ pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
             continue;
         }
         let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if let Ok(meta) = std::fs::metadata(&candidate)
-                    && meta.permissions().mode() & 0o111 == 0
-                {
-                    continue;
-                }
-            }
+        if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+/// Unix: any exec bit set. Non-unix: `is_file` is the whole check.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
 }
 
 /// [`binary_on_path`] over the process `PATH`.

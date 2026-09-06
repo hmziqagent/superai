@@ -1774,6 +1774,7 @@ fn disk_space_available(path: &Path) -> Option<u64> {
 
 /// Parse the available-bytes column of `df -k -P` output (4th field, 1 KiB
 /// units). Pure and tolerant: anything unexpected yields `None`.
+#[cfg(unix)]
 fn parse_df_available_bytes(stdout: &str) -> Option<u64> {
     let mut lines = stdout.lines().filter(|l| !l.trim().is_empty());
     let first = lines.next()?;
