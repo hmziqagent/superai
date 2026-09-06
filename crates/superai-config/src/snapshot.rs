@@ -441,6 +441,9 @@ mod tests {
             Some(crate::document::DocumentKind::StrictJson),
             "kind inference must land in the conflict token"
         );
+        // ctime is available on unix (stat) and most windows filesystems;
+        // assert only where the snapshot records it unconditionally.
+        #[cfg(unix)]
         assert!(snap.ctime.is_some(), "ctime hint where the platform has it");
         #[cfg(unix)]
         {

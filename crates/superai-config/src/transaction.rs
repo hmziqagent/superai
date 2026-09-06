@@ -2966,11 +2966,14 @@ mod tests {
         let bad3 = RemovePlan::new(RemoveKind::InstanceRoot, Path::new("/tmp/*.json"));
         assert!(bad3.is_err());
 
-        let ok = RemovePlan::new(RemoveKind::WrapperFile, Path::new("/tmp/wrapper"));
+        // Absolute paths that are valid on every platform (windows rejects
+        // drive-less "/tmp/..." as relative).
+        let base = std::env::temp_dir();
+        let ok = RemovePlan::new(RemoveKind::WrapperFile, &base.join("wrapper"));
         assert!(ok.is_ok());
         assert!(!ok.unwrap().requires_quarantine);
 
-        let ok2 = RemovePlan::new(RemoveKind::InstanceRoot, Path::new("/tmp/instance-root"));
+        let ok2 = RemovePlan::new(RemoveKind::InstanceRoot, &base.join("instance-root"));
         assert!(ok2.unwrap().requires_quarantine);
     }
 

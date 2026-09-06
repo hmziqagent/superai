@@ -53,7 +53,12 @@ fn is_broad_root(path: &Path) -> bool {
 /// Check for unresolved variable patterns.
 fn has_unresolved_variable(path: &Path) -> bool {
     let s = path.to_string_lossy();
-    s.contains('$') || s.contains('%') || s.contains('~')
+    if s.contains('$') || s.contains('%') {
+        return true;
+    }
+    // `~` counts only as a whole path component (unexpanded home shorthand).
+    // Windows 8.3 short names like `RUNNER~1` are legal and must pass.
+    path.components().any(|c| c.as_os_str() == "~")
 }
 
 /// Check for glob patterns.
