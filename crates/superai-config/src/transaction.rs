@@ -1809,7 +1809,24 @@ impl Transaction {
                 .filter(|joined| joined.is_absolute())
                 .unwrap_or_else(|| target.to_path_buf())
         };
-        std::fs::canonicalize(&absolute).unwrap_or(absolute)
+        if let Ok(canon) = std::fs::canonicalize(&absolute) {
+            return canon;
+        }
+        // The target usually does not exist yet (it is being planned).
+        // Canonicalize its longest existing ancestor so symlinked temp roots
+        // (/var -> /private/var on macOS) compare equal on both sides.
+        let mut prefix = absolute.clone();
+        let mut tail = PathBuf::new();
+        while let Some(parent) = prefix.parent() {
+            if let Some(last) = prefix.file_name() {
+                tail = Path::new(last).join(tail);
+            }
+            prefix = parent.to_path_buf();
+            if let Ok(canon) = std::fs::canonicalize(&prefix) {
+                return canon.join(&tail);
+            }
+        }
+        absolute
     }
 
     /// Invoke the attached injector, if any. Zero cost when `None`.

@@ -6266,6 +6266,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[cfg(unix)]
     fn parse_df_available_bytes_reads_the_available_column() {
         let stdout = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
                       /dev/disk1s1 1000 500 4096 50% /home\n";
