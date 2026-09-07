@@ -386,6 +386,21 @@ fn contains_shell_metachars(value: &str) -> bool {
     false
 }
 
+/// Remove a symlink regardless of whether it points at a directory.
+/// Windows rejects `remove_file` on a directory symlink (Access Denied);
+/// `remove_dir` removes the link itself without touching the target.
+fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if std::fs::symlink_metadata(path)
+            .is_ok_and(|meta| meta.file_type().is_symlink() && meta.is_dir())
+        {
+            return std::fs::remove_dir(path);
+        }
+    }
+    std::fs::remove_file(path)
+}
+
 /// Validate a fetch URL: HTTPS only, no shell metachars, no traversal, no control chars.
 pub fn validate_fetch_url(url: &str) -> Result<()> {
     if url.trim().is_empty() {
@@ -3185,7 +3200,7 @@ pub fn disable_skill(
         if let Ok(target) = std::fs::read_link(&dest) {
             let expected = registry.root.join(skill_id.as_str());
             if target == expected {
-                std::fs::remove_file(&dest).map_err(|e| CoreError::InvalidPath {
+                remove_symlink_any(&dest).map_err(|e| CoreError::InvalidPath {
                     kind: "skill_disable".to_owned(),
                     value: dest.display().to_string(),
                     reason: format!("cannot remove symlink: {e}"),
@@ -4656,7 +4671,8 @@ mod tests {
         let src_parent = unique_root("github_src_parent");
         std::fs::create_dir_all(&src_parent).unwrap();
         let src = make_skill_dir(&src_parent, "github-skill");
-        let file_url = format!("file://{}", src.display());
+        // file URLs use forward slashes even on windows.
+        let file_url = format!("file://{}", src.display().to_string().replace('\\', "/"));
         let source = SkillSource::github(&file_url, None);
         let rec = install_skill(&root, &source).unwrap();
         assert_eq!(rec.source_kind, SkillSourceKind::GitHub);
