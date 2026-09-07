@@ -823,15 +823,13 @@ pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
         // no extension, probe the core PATHEXT extensions so a lookup of
         // `claude` resolves the installed `claude.exe`/`claude.cmd`.
         #[cfg(windows)]
+        if Path::new(name).extension().is_none()
+            && let Some(found) = ["exe", "cmd", "bat", "com"]
+                .into_iter()
+                .map(|ext| Path::new(dir).join(format!("{name}.{ext}")))
+                .find(|candidate| candidate.is_file())
         {
-            if Path::new(name).extension().is_none() {
-                for ext in ["exe", "cmd", "bat", "com"] {
-                    let candidate = Path::new(dir).join(format!("{name}.{ext}"));
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-            }
+            return Some(found);
         }
     }
     None
