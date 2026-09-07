@@ -392,8 +392,9 @@ fn contains_shell_metachars(value: &str) -> bool {
 fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        if std::fs::symlink_metadata(path)
-            .is_ok_and(|meta| meta.file_type().is_symlink() && meta.is_dir())
+        // Follow the link: a symlink's own metadata is never `is_dir`.
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::metadata(path).is_ok_and(|m| m.is_dir())
         {
             return std::fs::remove_dir(path);
         }
