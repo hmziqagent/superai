@@ -191,23 +191,27 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
                 reason: "file url path must not be empty".to_owned(),
             });
         }
-        // Reject traversal in file path as well.
-        validate_template_path(path_part.trim_start_matches('/')).map_err(|e| {
-            TemplateFetchError::InvalidUrl {
-                template: context.to_owned(),
-                reason: format!("file path traversal: {e}"),
-            }
-        })?;
-        // For absolute file paths like file:///tmp/... the above strips leading /,
-        // but we still want to allow. So also check raw path via Path.
         let path = Path::new(path_part);
-        for comp in path.components() {
-            if matches!(comp, std::path::Component::ParentDir) {
-                return Err(TemplateFetchError::InvalidUrl {
+        if !path.is_absolute() {
+            // Reject traversal in a relative file path as well.
+            validate_template_path(path_part.trim_start_matches('/')).map_err(|e| {
+                TemplateFetchError::InvalidUrl {
                     template: context.to_owned(),
-                    reason: format!("file url must not contain '..': {url}"),
-                });
-            }
+                    reason: format!("file path traversal: {e}"),
+                }
+            })?;
+            return Ok(());
+        }
+        // An absolute local file-repo root is the fixture form. On Windows
+        // it legitimately contains a drive colon and native separators
+        // (`C:\...`), so only traversal is rejected here; the no-`:`/`\`
+        // rule above is for repo-relative template paths, not for the
+        // local root itself.
+        if has_parent_component(path) {
+            return Err(TemplateFetchError::InvalidUrl {
+                template: context.to_owned(),
+                reason: format!("file url must not contain '..': {url}"),
+            });
         }
         return Ok(());
     }
@@ -234,6 +238,12 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
         });
     }
     Ok(())
+}
+
+/// True when any component of `path` is `..` (lexical traversal check).
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|comp| matches!(comp, std::path::Component::ParentDir))
 }
 
 fn extract_host(url: &str) -> Option<String> {

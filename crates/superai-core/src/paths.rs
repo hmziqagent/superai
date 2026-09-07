@@ -868,6 +868,18 @@ impl<'de> Deserialize<'de> for ExecutableRef {
 mod tests {
     use super::*;
 
+    /// Platform-absolute literal for posix-style test strings: `C:\a\b` on
+    /// Windows, `/a/b` elsewhere. `/a/b` alone is not absolute on Windows
+    /// (no drive), so assertions like "join rejects an absolute segment"
+    /// must use this helper.
+    fn abs(s: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{}", s.replace('/', "\\"))
+        } else {
+            format!("/{s}")
+        }
+    }
+
     /// Platform: Linux, macOS, Windows — `/`-rooted absolute paths are valid on all hosts via `Component::RootDir` (Windows also accepts `C:\` via `Prefix`). This test exercises the Unix form canonical on Linux/macOS and also accepted on Windows.
     #[test]
     fn absolute_path_valid() {
@@ -983,7 +995,7 @@ mod tests {
         let joined = base.join("foo/bar").unwrap();
         assert_eq!(joined.as_path(), base.join("foo/bar").unwrap().as_path());
         base.join("../etc").unwrap_err();
-        base.join("/absolute").unwrap_err();
+        base.join(&abs("absolute")).unwrap_err();
         base.join("a\0b").unwrap_err();
         base.join("").unwrap_err();
     }
@@ -1007,7 +1019,9 @@ mod tests {
         let fixture = crate::test_util::tmp_abs_str("user/.claude");
         let p = AbsolutePath::new(&fixture).unwrap();
         let json = serde_json::to_string(&p).unwrap();
-        assert_eq!(json, format!("\"{fixture}\""));
+        // The serialized form is the JSON encoding of the fixture string
+        // (backslashes escaped on Windows), not the raw fixture.
+        assert_eq!(json, serde_json::to_string(&fixture).unwrap());
         let decoded: AbsolutePath = serde_json::from_str(&json).unwrap();
         assert_eq!(p, decoded);
         // Invalid deserialize

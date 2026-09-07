@@ -819,18 +819,45 @@ pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
         if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
+        // Windows executability is extension-based: when the bare name has
+        // no extension, probe the core PATHEXT extensions so a lookup of
+        // `claude` resolves the installed `claude.exe`/`claude.cmd`.
+        #[cfg(windows)]
+        {
+            if Path::new(name).extension().is_none() {
+                for ext in ["exe", "cmd", "bat", "com"] {
+                    let candidate = Path::new(dir).join(format!("{name}.{ext}"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
     }
     None
 }
 
-/// Unix: any exec bit set. Non-unix: `is_file` is the whole check.
+/// Unix: any exec bit set. Windows: extension-based (PATHEXT core set), so
+/// an extensionless data file never counts as a PATH binary.
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn is_executable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "exe" | "cmd" | "bat" | "com"
+            )
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn is_executable(_path: &Path) -> bool {
     true
 }
@@ -2671,7 +2698,15 @@ mod tests {
         // PATH adjacency: pure lookup over a synthetic PATH string.
         let bin_dir = home.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let claude = bin_dir.join("claude");
+        // Windows executability is extension-based, so the fixture binary
+        // carries a PATHEXT extension there and the lookup finds it through
+        // the extension probe.
+        let claude_name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        let claude = bin_dir.join(claude_name);
         std::fs::write(&claude, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -2694,7 +2729,8 @@ mod tests {
             "adjacency must find the binary by lookup"
         );
         assert_eq!(binary_on_path(&path_var, "codex"), None);
-        // Non-executable files never count.
+        // Non-executable files never count: an extensionless data file is
+        // not executable on Windows either.
         let plain = bin_dir.join("plain-tool");
         std::fs::write(&plain, "data").unwrap();
         #[cfg(unix)]

@@ -1600,7 +1600,16 @@ fn preserved_paths_for(registry: Option<&Registry>, harness: &HarnessId) -> Vec<
         }
     }
     // Preserve superai's own directories (best-effort, may not exist)
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // Windows has no `HOME` by convention; `USERPROFILE` is the home root
+    // there, so the preserved list is not silently empty on that platform.
+    let home_env = std::env::var_os("HOME").or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            None
+        }
+    });
+    if let Some(home) = home_env.map(PathBuf::from) {
         out.push(home.join(".superai"));
         out.push(home.join(".superai/instances.json"));
         out.push(home.join(".superai/backups"));

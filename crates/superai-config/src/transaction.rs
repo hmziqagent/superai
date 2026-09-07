@@ -2473,8 +2473,16 @@ impl Transaction {
                     .filter(|p| p.is_absolute())
                     .unwrap_or_else(|| target.to_path_buf())
             };
-            std::os::windows::fs::symlink_file(&resolved, link)
-                .map_err(|e| ConfigError::io(link, e))?;
+            // A directory target needs a directory symlink: a file symlink
+            // to a directory is not usable as one on Windows (directory
+            // enumeration and metadata-follow fail).
+            if resolved.is_dir() {
+                std::os::windows::fs::symlink_dir(&resolved, link)
+                    .map_err(|e| ConfigError::io(link, e))?;
+            } else {
+                std::os::windows::fs::symlink_file(&resolved, link)
+                    .map_err(|e| ConfigError::io(link, e))?;
+            }
         }
         self.inject(Point::ParentSync)?;
         sync_parent(link)?;

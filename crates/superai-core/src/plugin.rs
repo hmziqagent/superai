@@ -37,7 +37,7 @@ pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
 pub const REGISTRY_FILE_NAME: &str = "registry.json";
 
 const SHELL_PATTERNS: &[&str] = &[
-    "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\\", "\"", "'", "\n", "\r",
+    "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\"", "'", "\n", "\r",
 ];
 
 fn contains_shell_metachars(value: &str) -> bool {
@@ -45,6 +45,12 @@ fn contains_shell_metachars(value: &str) -> bool {
         if value.contains(pat) {
             return true;
         }
+    }
+    // On Windows, `\` is the native path separator that every absolute
+    // locator contains, not a shell escape; everywhere else it stays a
+    // quoting metachar and is rejected.
+    if !cfg!(windows) && value.contains('\\') {
+        return true;
     }
     false
 }
@@ -81,17 +87,23 @@ fn validate_plugin_locator(locator: &str, kind: PluginKind) -> Result<()> {
     match kind {
         PluginKind::DirectoryBundle | PluginKind::ConfigEntry | PluginKind::ExtensionScript => {
             if locator.contains(':') && !locator.starts_with("file://") {
-                // Allow Windows paths? Reject colon except file://
-                // For simplicity, reject colon in these kinds to avoid traversal via drive letters? But allow absolutes like /tmp/foo.
-                // We'll allow ':' only for file://
-                // If contains ':' and not file://, error
-                if !locator.contains("://") {
-                    // Could be Windows C:\ ; we treat as invalid for now to avoid traversal
-                    // Instead, allow if it's absolute path with colon? Simplify: reject if contains ':' and not file:// and not NpmRef
+                // Allow ':' only as a Windows drive/UNC prefix (e.g. `C:\`,
+                // `\\?\C:\`): the prefix component proves it is an absolute
+                // local path, not a scheme or traversal trick. A colon
+                // anywhere else in the path stays rejected.
+                let path = Path::new(locator);
+                let has_drive_prefix =
+                    matches!(path.components().next(), Some(Component::Prefix(_)));
+                let rest = if has_drive_prefix {
+                    path.iter().skip(1).collect::<PathBuf>()
+                } else {
+                    path.to_path_buf()
+                };
+                if !has_drive_prefix || rest.to_string_lossy().contains(':') {
                     return Err(CoreError::Validation {
                         field: "plugin.locator".to_owned(),
                         reason: format!(
-                            "locator for {kind:?} must not contain ':' unless file://: `{locator}`"
+                            "locator for {kind:?} must not contain ':' unless file:// or a Windows drive prefix: `{locator}`"
                         ),
                     });
                 }

@@ -93,8 +93,19 @@ pub(crate) fn tmp_abs(prefix: &str) -> PathBuf {
 
 /// String form of [`tmp_abs`] for call sites taking `&str` roots (instance
 /// roots, env-var value assertions, `AbsolutePath::new`, serde fixtures).
+///
+/// Rendered through `components` so `/` separators embedded in the prefix
+/// become native separators on Windows. Production path newtypes
+/// (`AbsolutePath` and friends) normalize the same way, so string-equality
+/// assertions against their output use the platform-native form on every
+/// platform (on Unix this is a no-op).
 pub(crate) fn tmp_abs_str(prefix: &str) -> String {
-    temp_dir_unique(prefix).to_string_lossy().into_owned()
+    let dir = temp_dir_unique(prefix);
+    let mut native = PathBuf::new();
+    for comp in dir.components() {
+        native.push(comp.as_os_str());
+    }
+    native.to_string_lossy().into_owned()
 }
 
 /// Clear the Windows readonly attribute from every file under `root`.

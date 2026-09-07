@@ -4598,14 +4598,15 @@ mod tests {
         // valid https
         assert!(validate_fetch_url("https://github.com/freeoxide/superai").is_ok());
         assert!(validate_fetch_url("https://example.com/skill/SKILL.md").is_ok());
-        // file url for tests
-        assert!(
-            validate_fetch_url(&format!(
-                "file://{}",
-                crate::test_util::tmp_abs("my").join("skill").display()
-            ))
-            .is_ok()
+        // file url for tests: a URL is `/`-shaped, so the platform path is
+        // rendered with forward slashes (native backslashes on Windows are
+        // not valid inside a URL).
+        let skill_dir = crate::test_util::tmp_abs("my").join("skill");
+        let file_url = format!(
+            "file://{}",
+            skill_dir.display().to_string().replace('\\', "/")
         );
+        assert!(validate_fetch_url(&file_url).is_ok());
         // invalid http
         let err = validate_fetch_url("http://github.com/freeoxide/superai").unwrap_err();
         let msg = format!("{err:?}");
