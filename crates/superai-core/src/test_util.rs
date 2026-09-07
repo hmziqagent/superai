@@ -80,6 +80,23 @@ pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     dir
 }
 
+/// Canonical cross-platform replacement for unix-only `/tmp/...` literals in
+/// tests: a unique, created absolute directory under the platform temp dir.
+///
+/// `/tmp/...` carries no drive prefix on Windows and is therefore rejected by
+/// `AbsolutePath` ("must be absolute"), while `std::env::temp_dir()` yields a
+/// valid absolute path on every platform (including `RUNNER~1` 8.3 short-name
+/// components on CI, which path validation accepts).
+pub(crate) fn tmp_abs(prefix: &str) -> PathBuf {
+    temp_dir_unique(prefix)
+}
+
+/// String form of [`tmp_abs`] for call sites taking `&str` roots (instance
+/// roots, env-var value assertions, `AbsolutePath::new`, serde fixtures).
+pub(crate) fn tmp_abs_str(prefix: &str) -> String {
+    temp_dir_unique(prefix).to_string_lossy().into_owned()
+}
+
 /// Clear the Windows readonly attribute from every file under `root`.
 ///
 /// `std::fs::remove_dir_all` cannot delete readonly files on Windows; the
@@ -236,6 +253,28 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
         assert_eq!(seen.len(), threads);
+    }
+
+    #[test]
+    fn tmp_abs_returns_absolute_created_dir() {
+        for dir in [tmp_abs("core-tmp-abs"), tmp_abs("core-tmp-abs")] {
+            assert!(dir.is_absolute(), "tmp_abs must be absolute: {dir:?}");
+            assert!(
+                dir.exists() && dir.is_dir(),
+                "tmp_abs must be created: {dir:?}"
+            );
+            drop(std::fs::remove_dir_all(&dir));
+        }
+        let s = tmp_abs_str("core-tmp-abs-str");
+        assert!(
+            Path::new(&s).is_absolute(),
+            "tmp_abs_str must be absolute: {s}"
+        );
+        assert!(
+            Path::new(&s).exists(),
+            "tmp_abs_str dir must be created: {s}"
+        );
+        drop(std::fs::remove_dir_all(&s));
     }
 
     // ---- QAL-01: retain-on-failure policy ----

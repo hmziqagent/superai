@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn plan_wrapper_sets_api_host_and_models_file() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.plandex-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".plandex-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
@@ -900,8 +900,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let root = crate::test_util::tmp_abs_str("my plandex work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my plandex work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let models_file = plan
             .env_vars
@@ -909,14 +910,14 @@ mod tests {
             .find(|(k, _)| k == "PLANDEX_MODELS_FILE")
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(models_file, "/tmp/my plandex work/models.json");
+        assert_eq!(models_file, format!("{root}/models.json"));
         assert!(models_file.contains(' '));
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.plandex-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".plandex-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -938,14 +939,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_env_only() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.plandex-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".plandex-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.plandex-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".plandex-work"));
         inst.isolation = Isolation::FixedPathSingle;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

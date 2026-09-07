@@ -834,18 +834,19 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_workspace_and_env() {
+        let root = crate::test_util::tmp_abs_str(".sculptor-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.sculptor-work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
-            plan.env_vars
-                .iter()
-                .any(|(k, v)| k == "SCULPTOR_WORKSPACE_PATH" && v == "/tmp/.sculptor-work/code")
+            plan.env_vars.iter().any(
+                |(k, v)| k == "SCULPTOR_WORKSPACE_PATH" && v == format!("{root}/code").as_str()
+            )
         );
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == "SCULPTOR_ENV_FILE" && v == "/tmp/.sculptor-work/.env")
+                .any(|(k, v)| k == "SCULPTOR_ENV_FILE" && v == format!("{root}/.env").as_str())
         );
         assert!(!plan.description.is_empty());
         assert!(plan.description.contains("SCULPTOR_WORKSPACE_PATH"));
@@ -854,8 +855,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let root = crate::test_util::tmp_abs_str("my sculptor work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my sculptor work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -863,14 +865,14 @@ mod tests {
             .find(|(k, _)| k == "SCULPTOR_WORKSPACE_PATH")
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my sculptor work/code");
+        assert_eq!(env_val, format!("{root}/code"));
         assert!(env_val.contains(' '));
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.sculptor-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".sculptor-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -892,14 +894,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_os_bound() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.sculptor-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".sculptor-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.sculptor-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".sculptor-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

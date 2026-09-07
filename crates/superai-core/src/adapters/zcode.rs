@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn plan_wrapper_succeeds_with_no_env() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.zcode-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zcode-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(plan.env_vars.is_empty());
         assert!(plan.description.contains("single instance"));
@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.zcode-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zcode-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn fixed_path_layout_declares_activation_target_and_boundary() {
-        let home = std::path::PathBuf::from("/home/tester");
+        let home = crate::test_util::tmp_abs("tester");
         let layout = super::fixed_path_layout(&home);
         // Target matches the declared fixed config path expansion.
         assert_eq!(
@@ -715,9 +715,9 @@ mod tests {
     #[test]
     fn validate_instance_accepts_fixed_path() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.zcode-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zcode-work"));
         a.validate_instance(&inst).unwrap();
-        let mut inst2 = sample_instance_with_root("/tmp/.zcode-work2");
+        let mut inst2 = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zcode-work2"));
         inst2.isolation = Isolation::RelocatedRoot;
         a.validate_instance(&inst2).unwrap();
     }
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.zcode-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zcode-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

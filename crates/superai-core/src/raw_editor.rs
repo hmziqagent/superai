@@ -1322,7 +1322,7 @@ mod tests {
         let adapter = SchemaEraAdapter;
         let diags = validate_for_adapter(
             &adapter,
-            Path::new("/tmp/whatever/config.toml"),
+            &crate::test_util::tmp_abs("whatever").join("config.toml"),
             b"model = 5\n",
         );
         assert!(
@@ -1334,16 +1334,21 @@ mod tests {
             "diags: {diags:?}"
         );
         // No matching surface: plain syntax diagnostics for the kind.
-        let plain = validate_for_adapter(&adapter, Path::new("/tmp/other.json"), b"{ bad");
+        let plain = validate_for_adapter(
+            &adapter,
+            &crate::test_util::tmp_abs("other").join("plain.json"),
+            b"{ bad",
+        );
         assert!(!plain.is_empty());
     }
 
     #[test]
     fn surface_for_path_matches_surface_id_in_path() {
         let adapter = SchemaEraAdapter;
-        let surface = surface_for_path(&adapter, Path::new("/tmp/root/config.toml")).unwrap();
+        let root = crate::test_util::tmp_abs("raw-surface-root");
+        let surface = surface_for_path(&adapter, &root.join("config.toml")).unwrap();
         assert_eq!(surface.id, "config.toml");
-        assert!(surface_for_path(&adapter, Path::new("/tmp/root/other.txt")).is_none());
+        assert!(surface_for_path(&adapter, &root.join("other.txt")).is_none());
     }
     // -------------------------------------------------------------------
     // RAW-01/02/03/05/07 — adapter-aware open/validate/diff/create/reopen

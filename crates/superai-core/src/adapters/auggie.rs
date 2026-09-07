@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn wrapper_has_workspace_and_session() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.augment-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".augment-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(plan.env_vars.iter().any(|(k, _)| k == SESSION_ENV_VAR));
         assert!(plan.args.contains(&WORKSPACE_FLAG.to_owned()));
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn wrapper_rejects_wrong_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.augment-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".augment-work"));
         inst.harness = HarnessId::new("cursor").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -778,14 +778,14 @@ mod tests {
     #[test]
     fn validate_accepts_project_scope() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.augment-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".augment-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.augment-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".augment-work"));
         inst.isolation = Isolation::IdeUserData;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

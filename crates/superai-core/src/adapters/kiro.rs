@@ -675,13 +675,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_succeeds_but_marks_readonly() {
+        let tmp_root = crate::test_util::tmp_abs_str(".kiro-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.kiro-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == "KIRO_HOME" && v == "/tmp/.kiro-work")
+                .any(|(k, v)| k == "KIRO_HOME" && v == tmp_root.as_str())
         );
         assert!(plan.description.contains("read-only"));
     }
@@ -697,14 +698,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_relocated_root() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.kiro-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".kiro-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.kiro-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".kiro-work"));
         inst.isolation = Isolation::FixedPathSingle;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

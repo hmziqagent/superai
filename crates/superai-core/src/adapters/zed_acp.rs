@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn wrapper_has_user_data_dir() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.zed-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zed-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(plan.args.contains(&USER_DATA_DIR_FLAG.to_owned()));
         let idx = plan
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn wrapper_rejects_wrong_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.zed-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zed-work"));
         inst.harness = HarnessId::new("cursor").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -723,14 +723,14 @@ mod tests {
     #[test]
     fn validate_accepts_ide_user_data() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.zed-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zed-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.zed-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".zed-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

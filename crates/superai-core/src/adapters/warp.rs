@@ -1029,18 +1029,19 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_xdg_and_api_key() {
+        let root = crate::test_util::tmp_abs_str(".warp-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.warp-work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
-            plan.env_vars
-                .iter()
-                .any(|(k, v)| k == XDG_CONFIG_HOME_ENV_VAR && v == "/tmp/.warp-work/config")
+            plan.env_vars.iter().any(
+                |(k, v)| k == XDG_CONFIG_HOME_ENV_VAR && v == format!("{root}/config").as_str()
+            )
         );
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == XDG_DATA_HOME_ENV_VAR && v == "/tmp/.warp-work/data")
+                .any(|(k, v)| k == XDG_DATA_HOME_ENV_VAR && v == format!("{root}/data").as_str())
         );
         assert!(plan.env_vars.iter().any(|(k, _)| k == API_KEY_ENV_VAR));
         assert!(!plan.description.is_empty());
@@ -1050,8 +1051,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let root = crate::test_util::tmp_abs_str("my warp work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my warp work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let xdg_val = plan
             .env_vars
@@ -1059,14 +1061,14 @@ mod tests {
             .find(|(k, _)| k == XDG_CONFIG_HOME_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(xdg_val, "/tmp/my warp work/config");
+        assert_eq!(xdg_val, format!("{root}/config"));
         assert!(xdg_val.contains(' '));
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.warp-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".warp-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -1094,14 +1096,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_os_bound() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.warp-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".warp-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.warp-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".warp-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

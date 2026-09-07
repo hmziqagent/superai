@@ -1082,7 +1082,9 @@ fn probe_cargo(
                     // Resolve cargo bin dir: `~/.cargo/bin/<exe>`
                     let home = opts.resolve_home();
                     let bin_path = home.map_or_else(
-                        || PathBuf::from(format!("/home/cargo/.cargo/bin/{exe_name}")),
+                        // Fallback anchor: platform temp dir keeps the path
+                        // absolute on Windows where `/home/...` is relative.
+                        || std::env::temp_dir().join(format!(".cargo/bin/{exe_name}")),
                         |h| h.join(".cargo/bin").join(&exe_name),
                     );
                     let mut d = Detection::new(

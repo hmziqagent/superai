@@ -2054,11 +2054,15 @@ mod tests {
     #[test]
     fn repo_config_base_url_file_scheme() {
         let mut cfg = TemplateRepoConfig::example();
-        cfg.base_url = Some("file:///tmp/templates".to_owned());
+        let base = format!(
+            "file://{}",
+            crate::test_util::tmp_abs("templates").display()
+        );
+        cfg.base_url = Some(base.clone());
         let url = cfg.catalog_url().unwrap();
-        assert_eq!(url, "file:///tmp/templates/catalog.json");
+        assert_eq!(url, format!("{base}/catalog.json"));
         let turl = cfg.template_url("claude-glm/1.2.0.json").unwrap();
-        assert_eq!(turl, "file:///tmp/templates/claude-glm/1.2.0.json");
+        assert_eq!(turl, format!("{base}/claude-glm/1.2.0.json"));
     }
 
     #[test]
@@ -2161,7 +2165,7 @@ mod tests {
             id: InstanceId::new("test-instance-001").unwrap(),
             name: InstanceName::new("work").unwrap(),
             harness: HarnessId::new(harness).unwrap(),
-            config_root: AbsolutePath::new("/tmp/.claude-work").unwrap(),
+            config_root: AbsolutePath::new(&crate::test_util::tmp_abs_str(".claude-work")).unwrap(),
             binary: None,
             wrapper: None,
             isolation: Isolation::RelocatedRoot,
@@ -2256,7 +2260,9 @@ mod tests {
         let catalog = minimal_catalog();
         let instance = sample_instance_with_template("claude-code", "claude-glm", "1.1.0", "0.1.0");
         let mut repo = TemplateRepoConfig::example();
-        repo.base_url = Some("file:///tmp/superai-offline-missing-xyz-12345".to_owned());
+        let missing = crate::test_util::tmp_abs("offline-missing-parent")
+            .join("superai-offline-missing-xyz-12345");
+        repo.base_url = Some(format!("file://{}", missing.display()));
         let status = check_update(&instance, &catalog, &repo);
         assert_eq!(status, UpdateStatus::Offline);
     }
@@ -2701,7 +2707,10 @@ mod tests {
             id: crate::ids::InstanceId::new("tpl-dep").unwrap(),
             name: crate::ids::InstanceName::new("dep").unwrap(),
             harness: HarnessId::new("claude-code").unwrap(),
-            config_root: crate::paths::AbsolutePath::from_path(Path::new("/tmp/none")).unwrap(),
+            config_root: crate::paths::AbsolutePath::from_path(Path::new(
+                &crate::test_util::tmp_abs_str("none"),
+            ))
+            .unwrap(),
             binary: None,
             wrapper: None,
             isolation: crate::state::Isolation::RelocatedRoot,

@@ -125,10 +125,12 @@ mod tests {
             id: InstanceId::new("test-id-1").unwrap(),
             name: InstanceName::new("work").unwrap(),
             harness: HarnessId::new("claude-code").unwrap(),
-            config_root: AbsolutePath::new("/home/user/.claude-work").unwrap(),
+            config_root: AbsolutePath::new(&crate::test_util::tmp_abs_str("user/.claude-work"))
+                .unwrap(),
             binary: Some(ExecutableRef::new("claude").unwrap()),
             wrapper: Some(WrapperRef {
-                path: WrapperPath::new("/home/user/.local/bin/work").unwrap(),
+                path: WrapperPath::new(&crate::test_util::tmp_abs_str("user/.local/bin/work"))
+                    .unwrap(),
                 command_name: InstanceName::new("work").unwrap(),
                 generator_version: "1.0.0".to_owned(),
                 content_digest: "abc123".to_owned(),
@@ -205,7 +207,7 @@ mod tests {
     #[test]
     fn wrapper_ref_round_trip() {
         let w = WrapperRef {
-            path: WrapperPath::new("/tmp/wrapper").unwrap(),
+            path: WrapperPath::new(&crate::test_util::tmp_abs_str("wrapper")).unwrap(),
             command_name: InstanceName::new("work").unwrap(),
             generator_version: "0.1.0".to_owned(),
             content_digest: "deadbeef".to_owned(),

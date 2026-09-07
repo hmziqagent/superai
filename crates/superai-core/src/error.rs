@@ -532,6 +532,7 @@ mod tests {
         reason = "exhaustive taxonomy coverage requires many variants"
     )]
     fn all_taxonomy_variants_carry_safe_identity() {
+        let tmp_root = crate::test_util::tmp_abs_str("user/.claude/settings.json");
         // Construct each variant with safe identity and ensure Display works.
         let variants: Vec<CoreError> = vec![
             CoreError::Validation {
@@ -568,35 +569,35 @@ mod tests {
                 reason: "research gaps".to_owned(),
             },
             CoreError::Parse {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root.clone()),
                 kind: "json".to_owned(),
                 message: "expected object".to_owned(),
             },
             CoreError::SchemaValidation {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root.clone()),
                 details: "missing required field".to_owned(),
             },
             CoreError::ConcurrentModification {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root.clone()),
                 expected: "abc123".to_owned(),
                 actual: "def456".to_owned(),
             },
             CoreError::Backup {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root.clone()),
                 backup_id: Some("backup-1".to_owned()),
                 reason: "io error".to_owned(),
             },
             CoreError::Commit {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root.clone()),
                 reason: "atomic replace failed".to_owned(),
             },
             CoreError::Verification {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root.clone()),
                 kind: "parse".to_owned(),
                 reason: "file not valid json after write".to_owned(),
             },
             CoreError::Rollback {
-                path: PathBuf::from("/home/user/.claude/settings.json"),
+                path: PathBuf::from(tmp_root),
                 backup_id: Some("backup-1".to_owned()),
                 reason: "restore failed".to_owned(),
             },
@@ -620,11 +621,11 @@ mod tests {
                 reason: "api key not present and provider needs auth".to_owned(),
             },
             CoreError::ForeignOwnership {
-                path: PathBuf::from("/home/user/.claude"),
+                path: PathBuf::from(crate::test_util::tmp_abs_str("user/.claude")),
                 owner: "claude-multi".to_owned(),
             },
             CoreError::InsufficientEvidence {
-                path: PathBuf::from("/home/user/.claude-notes"),
+                path: PathBuf::from(crate::test_util::tmp_abs_str("user/.claude-notes")),
                 required: "medium".to_owned(),
                 observed: "low".to_owned(),
                 evidence: vec!["path pattern matches .claude*".to_owned()],
@@ -639,9 +640,9 @@ mod tests {
                 reason: "health check timed out".to_owned(),
             },
             CoreError::ActivationLockHeld {
-                path: PathBuf::from(
-                    "/home/user/.superai/fixed-path-profiles/zcode/activation.lock",
-                ),
+                path: PathBuf::from(crate::test_util::tmp_abs_str(
+                    "user/.superai/fixed-path-profiles/zcode/activation.lock",
+                )),
                 holder_pid: Some(4242),
             },
             CoreError::ProcessIdentityMismatch {
@@ -649,14 +650,14 @@ mod tests {
                 reason: "recorded start time 111 but observed 999 — pid reuse suspected".to_owned(),
             },
             CoreError::AmbiguousOwnership {
-                path: PathBuf::from("/home/user/.local/bin/claude"),
+                path: PathBuf::from(crate::test_util::tmp_abs_str("user/.local/bin/claude")),
                 evidence: vec![
                     "file matches the mise shim recipe".to_owned(),
                     "no superai wrapper marker".to_owned(),
                 ],
             },
             CoreError::AppMayStillWrite {
-                path: PathBuf::from("/home/user/.zcode/v2/config.json"),
+                path: PathBuf::from(crate::test_util::tmp_abs_str("user/.zcode/v2/config.json")),
                 reason: "activation marked the app as running; confirm exit first".to_owned(),
             },
             CoreError::ExternalInstallRequired {

@@ -970,13 +970,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_persistence_and_runtime() {
+        let tmp_root = crate::test_util::tmp_abs_str(".openhands-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.openhands-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == PERSISTENCE_ENV_VAR && v == "/tmp/.openhands-work")
+                .any(|(k, v)| k == PERSISTENCE_ENV_VAR && v == tmp_root.as_str())
         );
         assert!(
             plan.env_vars
@@ -991,8 +992,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my openhands work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my openhands work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -1000,14 +1002,14 @@ mod tests {
             .find(|(k, _)| k == PERSISTENCE_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my openhands work");
+        assert_eq!(env_val, tmp_root.as_str());
         assert!(env_val.contains(' '));
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.openhands-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".openhands-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -1030,14 +1032,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_os_bound() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.openhands-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".openhands-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_accepts_env_only_for_cli() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.openhands-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".openhands-work"));
         inst.isolation = Isolation::EnvOnly;
         a.validate_instance(&inst).unwrap();
     }
@@ -1045,7 +1047,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.openhands-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".openhands-work"));
         inst.isolation = Isolation::FixedPathSingle;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

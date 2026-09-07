@@ -1419,10 +1419,11 @@ mod tests {
 
     #[test]
     fn activation_options_for_home_points_at_the_superai_journal() {
-        let opts = ActivationOptions::for_home(Path::new("/home/tester"));
+        let home = crate::test_util::tmp_abs("tester");
+        let opts = ActivationOptions::for_home(&home);
         assert_eq!(
             opts.journal_root,
-            Some(PathBuf::from("/home/tester/.superai/journal"))
+            Some(home.join(".superai").join("journal"))
         );
     }
     /// WRP-06 leftovers: "launch app if requested" (bounded, clean-env
@@ -1433,19 +1434,35 @@ mod tests {
     fn activation_launches_app_and_blocks_swap_while_writing() {
         let fx = Fixture::new("wrp06_launch");
         // A fake harness app: proves it ran and saw the swapped content.
-        let fake_app = fx.home.join("fake-app.sh");
-        fs::write(
-            &fake_app,
-            "#!/bin/sh\nprintf 'provider=%s\\n' \"$(cat \"$1\" | tr -d '\\n')\"\nexit 0\n",
-        )
-        .unwrap();
+        // Cross-platform lifecycle stub (mirrors provider.rs's fake-claude):
+        // `#!/bin/sh` on unix, a `.bat` answering the same probe via cmd.exe
+        // on Windows, which cannot exec a shebang script (os error 193).
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&fake_app).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&fake_app, perms).unwrap();
-        }
+        let fake_app = {
+            let path = fx.home.join("fake-app.sh");
+            fs::write(
+                &path,
+                "#!/bin/sh\nprintf 'provider=%s\\n' \"$(cat \"$1\" | tr -d '\\n')\"\nexit 0\n",
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&path, perms).unwrap();
+            }
+            path
+        };
+        #[cfg(not(unix))]
+        let fake_app = {
+            let path = fx.home.join("fake-app.bat");
+            fs::write(
+                &path,
+                "@echo off\r\necho provider=batch\r\ntype \"%~1\"\r\nexit /b 0\r\n",
+            )
+            .unwrap();
+            path
+        };
         fs::write(&fx.fixed_path, br#"{"provider": "p1"}"#).unwrap();
         fx.store
             .save_active_profile(&Fixture::name("p1"), &fx.fixed_path)

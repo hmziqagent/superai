@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn plan_wrapper_is_blocked() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.vscode-roo-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vscode-roo-work"));
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
             CoreError::UnsupportedOperation { reason, .. } => {
@@ -741,9 +741,10 @@ mod tests {
     #[test]
     fn validate_instance_accepts_ide_user_data() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.vscode-roo-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vscode-roo-work"));
         a.validate_instance(&inst).unwrap();
-        let mut inst2 = sample_instance_with_root("/tmp/.vscode-roo-work2");
+        let mut inst2 =
+            sample_instance_with_root(&crate::test_util::tmp_abs_str(".vscode-roo-work2"));
         inst2.isolation = Isolation::RelocatedRoot;
         a.validate_instance(&inst2).unwrap();
     }
@@ -751,7 +752,8 @@ mod tests {
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.vscode-roo-work");
+        let mut inst =
+            sample_instance_with_root(&crate::test_util::tmp_abs_str(".vscode-roo-work"));
         inst.isolation = Isolation::FixedPathSingle;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

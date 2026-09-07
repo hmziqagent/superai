@@ -818,13 +818,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_workspace() {
+        let tmp_root = crate::test_util::tmp_abs_str("gptme-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/gptme-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == WORKSPACE_ENV_VAR && v == "/tmp/gptme-work")
+                .any(|(k, v)| k == WORKSPACE_ENV_VAR && v == tmp_root.as_str())
         );
         assert!(plan.args.contains(&"--workspace".to_owned()));
         let ws = plan
@@ -833,14 +834,15 @@ mod tests {
             .find(|w| w[0] == "--workspace")
             .unwrap()[1]
             .clone();
-        assert_eq!(ws, "/tmp/gptme-work");
+        assert_eq!(ws, tmp_root.as_str());
         assert!(plan.description.contains(WORKSPACE_ENV_VAR));
     }
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my gptme work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my gptme work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let val = plan
             .env_vars
@@ -848,13 +850,13 @@ mod tests {
             .find(|(k, _)| k == WORKSPACE_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(val, "/tmp/my gptme work");
+        assert_eq!(val, tmp_root.as_str());
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/gptme-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("gptme-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -874,14 +876,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_project_scope() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/gptme-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("gptme-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/gptme-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("gptme-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -893,7 +895,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/gptme-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("gptme-work"));
         inst.harness = HarnessId::new("aider").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }

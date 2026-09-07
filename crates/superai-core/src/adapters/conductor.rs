@@ -885,13 +885,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_conductor_env() {
+        let tmp_root = crate::test_util::tmp_abs_str(".conductor-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.conductor-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == "CONDUCTOR_WORKSPACE_PATH" && v == "/tmp/.conductor-work")
+                .any(|(k, v)| k == "CONDUCTOR_WORKSPACE_PATH" && v == tmp_root.as_str())
         );
         assert!(plan.env_vars.iter().any(|(k, _)| k == "CONDUCTOR_PORT"));
         assert!(!plan.description.is_empty());
@@ -901,8 +902,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my conductor work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my conductor work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -910,14 +912,14 @@ mod tests {
             .find(|(k, _)| k == "CONDUCTOR_WORKSPACE_PATH")
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my conductor work");
+        assert_eq!(env_val, tmp_root.as_str());
         assert!(env_val.contains(' '));
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.conductor-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".conductor-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -943,14 +945,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_os_bound() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.conductor-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".conductor-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.conductor-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".conductor-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

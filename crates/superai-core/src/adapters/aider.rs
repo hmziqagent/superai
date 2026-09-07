@@ -908,13 +908,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_home_and_explicit_paths() {
+        let tmp_root = crate::test_util::tmp_abs_str(".aider-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.aider-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == "HOME" && v == "/tmp/.aider-work")
+                .any(|(k, v)| k == "HOME" && v == tmp_root.as_str())
         );
         assert!(plan.args.contains(&"--config".to_owned()));
         assert!(plan.args.contains(&"--env-file".to_owned()));
@@ -933,8 +934,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my aider work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my aider work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -942,7 +944,7 @@ mod tests {
             .find(|(k, _)| k == "HOME")
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my aider work");
+        assert_eq!(env_val, tmp_root.as_str());
         assert!(!env_val.contains('"'));
         assert!(env_val.contains(' '));
         // Args with spaces must be preserved verbatim (shell quoting handled by wrapper generator)
@@ -959,7 +961,7 @@ mod tests {
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.aider-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -980,14 +982,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_explicit_config() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.aider-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_accepts_home_relocation_variant() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.aider-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
         inst.isolation = Isolation::RelocatedRoot;
         a.validate_instance(&inst).unwrap();
         inst.isolation = Isolation::Unknown;
@@ -997,7 +999,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.aider-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -1009,7 +1011,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.aider-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }
@@ -1268,21 +1270,22 @@ mod tests {
         let r2 = a.detection();
         assert_eq!(r1.present, r2.present);
         assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root("/tmp/.aider-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".aider-work"));
         a.validate_instance(&inst).unwrap();
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn wrapper_env_var_isolation_is_explicit() {
+        let tmp_root = crate::test_util::tmp_abs_str("user/.aider-isolated");
         let a = adapter();
         assert!(a.scan_candidates().len() >= 3);
-        let inst = sample_instance_with_root("/home/user/.aider-isolated");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(!plan.env_vars.is_empty());
         let (key, val) = &plan.env_vars[0];
         assert_eq!(key, "HOME");
-        assert_eq!(val, "/home/user/.aider-isolated");
+        assert_eq!(val, tmp_root.as_str());
         assert!(plan.args.contains(&"--config".to_owned()));
     }
 

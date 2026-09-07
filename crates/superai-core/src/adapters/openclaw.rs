@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn plan_wrapper_is_research_blocked() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.openclaw-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".openclaw-work"));
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
             CoreError::ResearchBlocked { reason, .. } => {
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn validate_instance_is_research_blocked() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.openclaw-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".openclaw-work"));
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
             CoreError::ResearchBlocked { .. } => {}

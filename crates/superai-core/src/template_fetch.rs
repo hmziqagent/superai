@@ -703,7 +703,11 @@ mod tests {
     fn validate_fetch_url_rejects_http() {
         validate_fetch_url("http://example.com/catalog.json", "catalog").unwrap_err();
         validate_fetch_url("https://example.com/catalog.json", "catalog").unwrap();
-        validate_fetch_url("file:///tmp/catalog.json", "catalog").unwrap();
+        validate_fetch_url(
+            &format!("file://{}", crate::test_util::tmp_abs("catalog").display()),
+            "catalog",
+        )
+        .unwrap();
         validate_fetch_url("", "catalog").unwrap_err();
         validate_fetch_url("https://example.com/../evil", "catalog").unwrap_err();
     }
@@ -753,9 +757,10 @@ mod tests {
 
     #[test]
     fn fetch_catalog_from_path_rejects_missing() {
-        let missing = Path::new("/tmp/superai-missing-catalog-xyz-12345.json");
-        drop(std::fs::remove_file(missing));
-        let err = fetch_catalog_from_path(missing).unwrap_err();
+        let missing = crate::test_util::tmp_abs("missing-catalog-parent")
+            .join("superai-missing-catalog-xyz-12345.json");
+        drop(std::fs::remove_file(&missing));
+        let err = fetch_catalog_from_path(&missing).unwrap_err();
         match err {
             TemplateFetchError::NotFound { .. } => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -857,11 +862,11 @@ mod tests {
 
     #[test]
     fn ensure_path_safe_rejects_escape() {
-        let base = Path::new("/tmp/base");
-        ensure_path_safe(base, "a/b.json").unwrap();
-        ensure_path_safe(base, "../escape.json").unwrap_err();
-        ensure_path_safe(base, "/absolute.json").unwrap_err();
-        ensure_path_safe(base, "a\\b.json").unwrap_err();
+        let base = crate::test_util::tmp_abs("base");
+        ensure_path_safe(&base, "a/b.json").unwrap();
+        ensure_path_safe(&base, "../escape.json").unwrap_err();
+        ensure_path_safe(&base, "/absolute.json").unwrap_err();
+        ensure_path_safe(&base, "a\\b.json").unwrap_err();
     }
 
     #[test]

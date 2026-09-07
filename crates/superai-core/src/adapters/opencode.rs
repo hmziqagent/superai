@@ -1039,13 +1039,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_xdg_and_custom_config() {
+        let tmp_root = crate::test_util::tmp_abs_str(".opencode-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.opencode-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == CONFIG_ENV_VAR && v == "/tmp/.opencode-work")
+                .any(|(k, v)| k == CONFIG_ENV_VAR && v == tmp_root.as_str())
         );
         assert!(
             plan.env_vars
@@ -1059,8 +1060,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my opencode work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my opencode work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -1068,7 +1070,7 @@ mod tests {
             .find(|(k, _)| k == CONFIG_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my opencode work");
+        assert_eq!(env_val, tmp_root.as_str());
         assert!(!env_val.contains('"'));
         assert!(env_val.contains(' '));
         let custom_val = plan
@@ -1084,7 +1086,7 @@ mod tests {
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.opencode-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".opencode-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -1106,14 +1108,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_relocated_root() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.opencode-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".opencode-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.opencode-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".opencode-work"));
         inst.isolation = Isolation::FixedPathSingle;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -1125,7 +1127,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.opencode-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".opencode-work"));
         inst.harness = HarnessId::new("aider").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }
@@ -1348,20 +1350,21 @@ mod tests {
         let r2 = a.detection();
         assert_eq!(r1.present, r2.present);
         assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root("/tmp/.opencode-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".opencode-work"));
         a.validate_instance(&inst).unwrap();
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn wrapper_env_var_isolation_is_relocated_root() {
+        let tmp_root = crate::test_util::tmp_abs_str("user/.opencode-isolated");
         let a = adapter();
-        let inst = sample_instance_with_root("/home/user/.opencode-isolated");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(!plan.env_vars.is_empty());
         let (key, val) = &plan.env_vars[0];
         assert_eq!(key, CONFIG_ENV_VAR);
-        assert_eq!(val, "/home/user/.opencode-isolated");
+        assert_eq!(val, tmp_root.as_str());
     }
 
     #[test]

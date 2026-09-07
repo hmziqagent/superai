@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn plan_wrapper_sets_config_and_traj() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/swe-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("swe-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(plan.args.contains(&"--config".to_owned()));
         let cfg = plan.args.windows(2).find(|w| w[0] == "--config").unwrap()[1].clone();
@@ -806,17 +806,24 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let root = crate::test_util::tmp_abs_str("my swe work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my swe work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let cfg = plan.args.windows(2).find(|w| w[0] == "--config").unwrap()[1].clone();
-        assert_eq!(cfg, "/tmp/my swe work/config.yaml");
+        assert_eq!(
+            cfg,
+            std::path::Path::new(&root)
+                .join("config.yaml")
+                .display()
+                .to_string()
+        );
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/swe-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("swe-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -836,14 +843,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_explicit_config() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/swe-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("swe-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/swe-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("swe-work"));
         inst.isolation = Isolation::ProjectScope;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -855,7 +862,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/swe-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("swe-work"));
         inst.harness = HarnessId::new("aider").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }

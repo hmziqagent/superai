@@ -2177,7 +2177,7 @@ status: active
 
     #[test]
     fn load_nonexistent_path_errors() {
-        let p = PathBuf::from("/tmp/superai-nonexistent-xyz-9999/nope.json");
+        let p = crate::test_util::tmp_abs("superai-nonexistent-xyz-9999").join("nope.json");
         load_provider_defs(&p).unwrap_err();
     }
 

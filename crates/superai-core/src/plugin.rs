@@ -1754,10 +1754,11 @@ mod tests {
 
     #[test]
     fn plugin_definition_round_trip() {
+        let tmp_root = crate::test_util::tmp_abs_str("my-bundle");
         let src = PluginSource {
             id: PluginId::new("my-plugin").unwrap(),
             kind: PluginKind::DirectoryBundle,
-            locator: "/tmp/my-bundle".to_owned(),
+            locator: tmp_root.clone(),
             version: Some("1.2.3".to_owned()),
             digest: Some("a".repeat(64)),
         };
@@ -1771,7 +1772,7 @@ mod tests {
             kind: PluginKind::DirectoryBundle,
             version: Some("1.2.3".to_owned()),
             digest: Some("b".repeat(64)),
-            source_locator: "/tmp/my-bundle".to_owned(),
+            source_locator: tmp_root.clone(),
             installed_at: now_iso8601(),
             enabled: true,
             dependency_key: None,

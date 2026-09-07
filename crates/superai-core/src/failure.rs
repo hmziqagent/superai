@@ -1541,7 +1541,8 @@ mod tests {
         let mut config =
             crate::template::TemplateRepoConfig::new("example.com", "owner", "repo", "main")
                 .unwrap();
-        config.base_url = Some("file:///tmp/fake".to_owned());
+        let fake = crate::test_util::tmp_abs("fake-parent").join("fake");
+        config.base_url = Some(format!("file://{}", fake.display()));
         // Direct digest check
         let mismatch = TemplateFetchError::DigestMismatch {
             template: "claude-glm".to_owned(),

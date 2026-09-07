@@ -929,9 +929,10 @@ pub fn inspect_default_with_home(
     };
 
     let diffs = vec![RedactedDiff {
-        path: default_root_opt
-            .clone()
-            .unwrap_or_else(|| AbsolutePath::new("/tmp/superai-preview").expect("valid temp")),
+        path: default_root_opt.clone().unwrap_or_else(|| {
+            AbsolutePath::from_path(&std::env::temp_dir().join("superai-preview"))
+                .expect("platform temp dir is absolute")
+        }),
         surface: "instance-record".to_owned(),
         lexical_redacted: format!(
             "register default instance harness={} root={}",
@@ -953,9 +954,10 @@ pub fn inspect_default_with_home(
             vec![RollbackStep {
                 order: 0,
                 description: "remove registry record".to_owned(),
-                target: default_root_opt
-                    .clone()
-                    .unwrap_or_else(|| AbsolutePath::new("/tmp/superai-preview").unwrap()),
+                target: default_root_opt.clone().unwrap_or_else(|| {
+                    AbsolutePath::from_path(&std::env::temp_dir().join("superai-preview"))
+                        .expect("platform temp dir is absolute")
+                }),
                 backup_id: None,
             }]
         },
@@ -2561,7 +2563,7 @@ pub fn preview_create_mirrored(
         order += 1;
     }
     let registry_path_placeholder = home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
         .join(".superai/instances.json");
     actions.push(PlannedAction {
         order,
@@ -3118,8 +3120,10 @@ pub fn create_mirrored(
             verification: verification
                 .into_iter()
                 .map(|v| VerificationResult {
-                    path: AbsolutePath::from_path(&v.path)
-                        .unwrap_or_else(|_| AbsolutePath::new("/tmp/verification").unwrap()),
+                    path: AbsolutePath::from_path(&v.path).unwrap_or_else(|_| {
+                        AbsolutePath::from_path(&std::env::temp_dir().join("verification"))
+                            .expect("platform temp dir is absolute")
+                    }),
                     kind: VerificationKind::Parse,
                     passed: false,
                     message: v.message.clone(),
@@ -3273,8 +3277,10 @@ pub fn create_mirrored(
         actions_completed: vec![CompletedAction {
             order: 0,
             kind: ActionKind::CreateDir,
-            target: AbsolutePath::from_path(&target_root)
-                .unwrap_or_else(|_| AbsolutePath::new("/tmp").unwrap()),
+            target: AbsolutePath::from_path(&target_root).unwrap_or_else(|_| {
+                AbsolutePath::from_path(&std::env::temp_dir().join("mirror-target"))
+                    .expect("platform temp dir is absolute")
+            }),
             success: true,
             elapsed_ms: None,
         }],
@@ -5979,7 +5985,7 @@ pub fn resolve_orphan_wrapper(
                 .iter()
                 .find(|(k, _)| k.ends_with("CONFIG_DIR") || k == "HOME")
                 .map(|(_, v)| PathBuf::from(v))
-                .unwrap_or_else(|| PathBuf::from("/tmp/orphan-root"));
+                .unwrap_or_else(|| std::env::temp_dir().join("orphan-root"));
             let root_abs =
                 AbsolutePath::from_path(&config_root).map_err(|e| CoreError::InvalidPath {
                     kind: "config_root".to_owned(),

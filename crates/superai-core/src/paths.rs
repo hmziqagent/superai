@@ -871,27 +871,33 @@ mod tests {
     /// Platform: Linux, macOS, Windows — `/`-rooted absolute paths are valid on all hosts via `Component::RootDir` (Windows also accepts `C:\` via `Prefix`). This test exercises the Unix form canonical on Linux/macOS and also accepted on Windows.
     #[test]
     fn absolute_path_valid() {
-        let p = AbsolutePath::new("/home/user/.claude").unwrap();
-        assert_eq!(p.as_path(), Path::new("/home/user/.claude"));
-        let p2 = AbsolutePath::from_path(Path::new("/tmp/foo")).unwrap();
-        assert_eq!(p2.as_path(), Path::new("/tmp/foo"));
-        let p3: AbsolutePath = "/var/log".parse().unwrap();
-        assert_eq!(p3.as_path(), Path::new("/var/log"));
-        let p4 = AbsolutePath::try_from(String::from("/opt/bin")).unwrap();
-        assert_eq!(p4.to_string(), "/opt/bin");
+        let home_like = crate::test_util::tmp_abs_str("user/.claude");
+        let p = AbsolutePath::new(&home_like).unwrap();
+        assert_eq!(p.as_path(), Path::new(&home_like));
+        let tmp_like = crate::test_util::tmp_abs_str("foo");
+        let p2 = AbsolutePath::from_path(Path::new(&tmp_like)).unwrap();
+        assert_eq!(p2.as_path(), Path::new(&tmp_like));
+        let var_like = crate::test_util::tmp_abs_str("log");
+        let p3: AbsolutePath = var_like.parse().unwrap();
+        assert_eq!(p3.as_path(), Path::new(&var_like));
+        let opt_like = crate::test_util::tmp_abs_str("bin");
+        let p4 = AbsolutePath::try_from(opt_like.clone()).unwrap();
+        assert_eq!(p4.to_string(), opt_like);
     }
 
     /// Platform: Linux and macOS use `/` with `.` and `//` lexical normalization; Windows uses `\` and drive prefix `C:\` (handled via `Component::Prefix`). This test asserts Unix `/` normalization which holds on all platforms via `normalize_absolute`.
     #[test]
     fn absolute_path_normalizes_dot_and_slash() {
-        let p = AbsolutePath::new("/home//user/./.claude/").unwrap();
+        let base = crate::test_util::tmp_abs_str("home/user");
+        let p = AbsolutePath::new(&format!("{base}//.claude/./x/")).unwrap();
         // Normalized should not contain // or /./
-        assert_eq!(p.as_path(), Path::new("/home/user/.claude"));
-        let p2 = AbsolutePath::new("/a/b/./c").unwrap();
-        assert_eq!(p2.as_path(), Path::new("/a/b/c"));
-        // Root stays root
-        let root = AbsolutePath::new("/").unwrap();
-        assert_eq!(root.as_path(), Path::new("/"));
+        assert_eq!(p.as_path(), Path::new(&format!("{base}/.claude/x")));
+        let p2 = AbsolutePath::new(&format!("{base}/b/./c")).unwrap();
+        assert_eq!(p2.as_path(), Path::new(&format!("{base}/b/c")));
+        // Root stays root (`/` on Unix, `C:\` on Windows)
+        let root_str = if cfg!(windows) { "C:\\" } else { "/" };
+        let root = AbsolutePath::new(root_str).unwrap();
+        assert_eq!(root.as_path(), Path::new(root_str));
     }
 
     /// Platform: all — empty path is invalid on Linux, macOS, and Windows; no platform accepts empty as absolute.
@@ -904,8 +910,9 @@ mod tests {
     /// Platform: all — NUL (`\0`) is rejected on Linux, macOS, and Windows (Windows also rejects via OS APIs; we reject explicitly).
     #[test]
     fn absolute_path_rejects_nul() {
-        AbsolutePath::new("/tmp/a\0b").unwrap_err();
-        let path = Path::new("/tmp/a\0b");
+        let with_nul = format!("{}\0b", crate::test_util::tmp_abs_str("nul-a"));
+        AbsolutePath::new(&with_nul).unwrap_err();
+        let path = Path::new(&with_nul);
         AbsolutePath::from_path(path).unwrap_err();
     }
 
@@ -921,9 +928,13 @@ mod tests {
     /// Platform: all — `..` traversal is rejected on Linux, macOS, and Windows before normalization; `Component::ParentDir` check is platform-independent.
     #[test]
     fn absolute_path_rejects_traversal() {
-        AbsolutePath::new("/home/../etc").unwrap_err();
+        AbsolutePath::new(&format!(
+            "{}/../etc",
+            crate::test_util::tmp_abs_str("trav-home")
+        ))
+        .unwrap_err();
         AbsolutePath::new("/a/b/../c").unwrap_err();
-        AbsolutePath::new("/tmp/..").unwrap_err();
+        AbsolutePath::new(&format!("{}/..", crate::test_util::tmp_abs_str("dotdot"))).unwrap_err();
         AbsolutePath::new("/a/./../b").unwrap_err();
         // Even after normalization, traversal is rejected, not resolved
         let p = Path::new("/a/../b");
@@ -933,40 +944,44 @@ mod tests {
     /// Platform: Linux/macOS — `~/` and `$HOME/` expand via home dir; Windows — `%USERPROFILE%\` and `C:\Users\...` via same helper. This test covers Unix `~`/`$HOME` which is valid on Linux/macOS and mapped on Windows via `%USERPROFILE%` branch.
     #[test]
     fn absolute_path_expand_home_tilde() {
-        let home = Path::new("/home/user");
-        let p = AbsolutePath::expand_home("~/foo/bar", home).unwrap();
-        assert_eq!(p.as_path(), Path::new("/home/user/foo/bar"));
-        let p2 = AbsolutePath::expand_home("~", home).unwrap();
-        assert_eq!(p2.as_path(), home);
-        let p3 = AbsolutePath::expand_home("$HOME/.claude", home).unwrap();
-        assert_eq!(p3.as_path(), Path::new("/home/user/.claude"));
-        let p4 = AbsolutePath::expand_home("${HOME}/x", home).unwrap();
-        assert_eq!(p4.as_path(), Path::new("/home/user/x"));
+        let home = crate::test_util::tmp_abs("user");
+        let p = AbsolutePath::expand_home("~/foo/bar", &home).unwrap();
+        assert_eq!(p.as_path(), home.join("foo/bar"));
+        let p2 = AbsolutePath::expand_home("~", &home).unwrap();
+        assert_eq!(p2.as_path(), &home);
+        let p3 = AbsolutePath::expand_home("$HOME/.claude", &home).unwrap();
+        assert_eq!(p3.as_path(), home.join(".claude"));
+        let p4 = AbsolutePath::expand_home("${HOME}/x", &home).unwrap();
+        assert_eq!(p4.as_path(), home.join("x"));
     }
 
     /// Platform: all — after `~`/`$HOME`/`%USERPROFILE%` expansion, `..` traversal is still rejected on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_expand_home_rejects_traversal_after_expand() {
-        let home = Path::new("/home/user");
-        AbsolutePath::expand_home("~/../etc", home).unwrap_err();
-        AbsolutePath::expand_home("~/a/../b", home).unwrap_err();
+        let home = crate::test_util::tmp_abs("user");
+        AbsolutePath::expand_home("~/../etc", &home).unwrap_err();
+        AbsolutePath::expand_home("~/a/../b", &home).unwrap_err();
     }
 
     /// Platform: all — empty and NUL after home expansion are rejected on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_expand_home_rejects_nul_and_empty() {
-        let home = Path::new("/home/user");
-        AbsolutePath::expand_home("", home).unwrap_err();
-        AbsolutePath::expand_home("/tmp/a\0b", home).unwrap_err();
-        AbsolutePath::expand_home("~/a\0b", home).unwrap_err();
+        let home = crate::test_util::tmp_abs("user");
+        AbsolutePath::expand_home("", &home).unwrap_err();
+        AbsolutePath::expand_home(
+            &format!("{}\0b", crate::test_util::tmp_abs_str("nul-b")),
+            &home,
+        )
+        .unwrap_err();
+        AbsolutePath::expand_home("~/a\0b", &home).unwrap_err();
     }
 
     /// Platform: all — `join` rejects absolute and `..` on Linux, macOS, and Windows; lexical `normalize_absolute` handles both `/` and `\`.
     #[test]
     fn absolute_path_join() {
-        let base = AbsolutePath::new("/home/user").unwrap();
+        let base = AbsolutePath::from_path(&crate::test_util::tmp_abs("user")).unwrap();
         let joined = base.join("foo/bar").unwrap();
-        assert_eq!(joined.as_path(), Path::new("/home/user/foo/bar"));
+        assert_eq!(joined.as_path(), base.join("foo/bar").unwrap().as_path());
         base.join("../etc").unwrap_err();
         base.join("/absolute").unwrap_err();
         base.join("a\0b").unwrap_err();
@@ -977,41 +992,46 @@ mod tests {
     #[test]
     fn absolute_path_does_not_follow_symlinks() {
         // No canonicalization: path is stored as given, not resolved
-        let p = AbsolutePath::new("/tmp/link/to/file").unwrap();
-        assert_eq!(p.as_path(), Path::new("/tmp/link/to/file"));
+        let link_path = crate::test_util::tmp_abs_str("link/to/file");
+        let p = AbsolutePath::new(&link_path).unwrap();
+        assert_eq!(p.as_path(), Path::new(&link_path));
         // Even if symlink does not exist, we succeed (no canonicalize)
-        let p2 = AbsolutePath::new("/nonexistent/path/to/file").unwrap();
-        assert_eq!(p2.as_path(), Path::new("/nonexistent/path/to/file"));
+        let nonexistent = crate::test_util::tmp_abs_str("nonexistent-parent") + "/path/to/file";
+        let p2 = AbsolutePath::new(&nonexistent).unwrap();
+        assert_eq!(p2.as_path(), Path::new(&nonexistent));
     }
 
     /// Platform: all — serde round-trip preserves absolute form; `..` and NUL rejection holds on Linux, macOS, and Windows.
     #[test]
     fn absolute_path_serde_roundtrip() {
-        let p = AbsolutePath::new("/home/user/.claude").unwrap();
+        let fixture = crate::test_util::tmp_abs_str("user/.claude");
+        let p = AbsolutePath::new(&fixture).unwrap();
         let json = serde_json::to_string(&p).unwrap();
-        assert_eq!(json, "\"/home/user/.claude\"");
+        assert_eq!(json, format!("\"{fixture}\""));
         let decoded: AbsolutePath = serde_json::from_str(&json).unwrap();
         assert_eq!(p, decoded);
         // Invalid deserialize
         let bad = "\"../etc\"";
         let res: Result<AbsolutePath, _> = serde_json::from_str(bad);
         res.unwrap_err();
-        let bad2 = "\"/tmp/a\0b\"";
-        let res: Result<AbsolutePath, _> = serde_json::from_str(bad2);
+        let bad2 = format!("\"{}\0b\"", crate::test_util::tmp_abs_str("nul-c"));
+        let res: Result<AbsolutePath, _> = serde_json::from_str(&bad2);
         res.unwrap_err();
     }
 
     /// Platform: all — `ConfigRoot` wraps `AbsolutePath`; Linux/macOS use `/home/...`, Windows uses `C:\...` via prefix. Test covers Unix form; Windows prefix path accepted via same `AbsolutePath` validation.
     #[test]
     fn config_root_wraps_absolute() {
-        let r = ConfigRoot::new("/home/user/.claude").unwrap();
-        assert_eq!(r.as_path(), Path::new("/home/user/.claude"));
-        assert_eq!(r.to_string(), "/home/user/.claude");
-        let r2 = ConfigRoot::expand_home("~/.claude", Path::new("/home/user")).unwrap();
-        assert_eq!(r2.as_path(), Path::new("/home/user/.claude"));
+        let fixture = crate::test_util::tmp_abs_str("user/.claude");
+        let r = ConfigRoot::new(&fixture).unwrap();
+        assert_eq!(r.as_path(), Path::new(&fixture));
+        assert_eq!(r.to_string(), fixture);
+        let home = crate::test_util::tmp_abs("user");
+        let r2 = ConfigRoot::expand_home("~/.claude", &home).unwrap();
+        assert_eq!(r2.as_path(), home.join(".claude"));
         ConfigRoot::new("relative").unwrap_err();
         ConfigRoot::new("/a/../b").unwrap_err();
-        ConfigRoot::new("/tmp/a\0b").unwrap_err();
+        ConfigRoot::new(&format!("{}\0b", crate::test_util::tmp_abs_str("nul-d"))).unwrap_err();
         let json = serde_json::to_string(&r).unwrap();
         let decoded: ConfigRoot = serde_json::from_str(&json).unwrap();
         assert_eq!(r, decoded);
@@ -1020,11 +1040,12 @@ mod tests {
     /// Platform: all — `ConfigSurfacePath` is absolute file path; Linux/macOS `/home/.../settings.json`, Windows `C:\Users\...\settings.json` both via `AbsolutePath`.
     #[test]
     fn config_surface_path() {
-        let s = ConfigSurfacePath::new("/home/user/.claude/settings.json").unwrap();
-        assert_eq!(s.as_path(), Path::new("/home/user/.claude/settings.json"));
-        let s2 = ConfigSurfacePath::expand_home("~/.claude/settings.json", Path::new("/home/user"))
-            .unwrap();
-        assert_eq!(s2.as_path(), Path::new("/home/user/.claude/settings.json"));
+        let fixture = crate::test_util::tmp_abs_str("user/.claude/settings.json");
+        let s = ConfigSurfacePath::new(&fixture).unwrap();
+        assert_eq!(s.as_path(), Path::new(&fixture));
+        let home = crate::test_util::tmp_abs("user");
+        let s2 = ConfigSurfacePath::expand_home("~/.claude/settings.json", &home).unwrap();
+        assert_eq!(s2.as_path(), home.join(".claude").join("settings.json"));
         ConfigSurfacePath::new("../relative").unwrap_err();
         ConfigSurfacePath::new("/a/../b").unwrap_err();
         let json = serde_json::to_string(&s).unwrap();
@@ -1035,12 +1056,18 @@ mod tests {
     /// Platform: all — `WrapperPath` is absolute wrapper executable; Unix `/usr/local/bin/...` with `+x`, Windows `C:\bin\...\.exe` without Unix perms but same absolute validation.
     #[test]
     fn wrapper_path() {
-        let w = WrapperPath::new("/usr/local/bin/work").unwrap();
-        assert_eq!(w.as_path(), Path::new("/usr/local/bin/work"));
-        let w2 = WrapperPath::expand_home("~/.local/bin/work", Path::new("/home/user")).unwrap();
-        assert_eq!(w2.as_path(), Path::new("/home/user/.local/bin/work"));
+        let fixture = crate::test_util::tmp_abs_str("local/bin/work");
+        let w = WrapperPath::new(&fixture).unwrap();
+        assert_eq!(w.as_path(), Path::new(&fixture));
+        let home = crate::test_util::tmp_abs("user");
+        let w2 = WrapperPath::expand_home("~/.local/bin/work", &home).unwrap();
+        assert_eq!(w2.as_path(), home.join(".local").join("bin").join("work"));
         WrapperPath::new("relative/bin").unwrap_err();
-        WrapperPath::new("/tmp/../etc").unwrap_err();
+        WrapperPath::new(&format!(
+            "{}/../etc",
+            crate::test_util::tmp_abs_str("trav-w")
+        ))
+        .unwrap_err();
         let json = serde_json::to_string(&w).unwrap();
         let decoded: WrapperPath = serde_json::from_str(&json).unwrap();
         assert_eq!(w, decoded);
@@ -1066,13 +1093,12 @@ mod tests {
     /// Platform: Linux/macOS — `/usr/bin/...`; Windows — `C:\Program Files\...\.exe` via `Component::Prefix`. Test covers Unix absolute; Windows absolute validated via same `AbsolutePath` branch.
     #[test]
     fn executable_ref_absolute() {
-        let e = ExecutableRef::new("/usr/bin/claude").unwrap();
+        let fixture = crate::test_util::tmp_abs_str("usr/bin/claude");
+        let e = ExecutableRef::new(&fixture).unwrap();
         assert!(e.is_absolute());
-        assert_eq!(
-            e.as_absolute_path().unwrap().as_path(),
-            Path::new("/usr/bin/claude")
-        );
-        let e2 = ExecutableRef::new("/opt/homebrew/bin/code").unwrap();
+        assert_eq!(e.as_absolute_path().unwrap().as_path(), Path::new(&fixture));
+        let fixture2 = crate::test_util::tmp_abs_str("opt/homebrew/bin/code");
+        let e2 = ExecutableRef::new(&fixture2).unwrap();
         assert!(e2.is_absolute());
         let json = serde_json::to_string(&e).unwrap();
         let decoded: ExecutableRef = serde_json::from_str(&json).unwrap();
@@ -1090,8 +1116,12 @@ mod tests {
         ExecutableRef::new(".").unwrap_err();
         ExecutableRef::new("..").unwrap_err();
         ExecutableRef::new("foo/../bar").unwrap_err();
-        ExecutableRef::new("/tmp/../etc/passwd").unwrap_err();
-        ExecutableRef::new("/tmp/a\0b").unwrap_err();
+        ExecutableRef::new(&format!(
+            "{}/../etc/passwd",
+            crate::test_util::tmp_abs_str("trav-e")
+        ))
+        .unwrap_err();
+        ExecutableRef::new(&format!("{}\0b", crate::test_util::tmp_abs_str("nul-e"))).unwrap_err();
         // Traversal in absolute
         ExecutableRef::new("/a/../b").unwrap_err();
     }
@@ -1099,37 +1129,40 @@ mod tests {
     /// Platform: Linux/macOS — `~/bin/...` via `~`/`$HOME`; Windows — `%USERPROFILE%\bin\...` via same `expand_tilde`. Bare names stay `PATH`-resolved on all platforms.
     #[test]
     fn executable_ref_expand_home() {
-        let home = Path::new("/home/user");
-        let e = ExecutableRef::expand_home("~/bin/claude", home).unwrap();
+        let home = crate::test_util::tmp_abs("user");
+        let e = ExecutableRef::expand_home("~/bin/claude", &home).unwrap();
         assert!(e.is_absolute());
         assert_eq!(
             e.as_absolute_path().unwrap().as_path(),
-            Path::new("/home/user/bin/claude")
+            home.join("bin").join("claude")
         );
-        let e2 = ExecutableRef::expand_home("claude", home).unwrap();
+        let e2 = ExecutableRef::expand_home("claude", &home).unwrap();
         assert!(e2.is_named());
         assert_eq!(e2.as_name(), Some("claude"));
         // Traversal after expand should fail
-        ExecutableRef::expand_home("~/../etc", home).unwrap_err();
-        ExecutableRef::expand_home("", home).unwrap_err();
+        ExecutableRef::expand_home("~/../etc", &home).unwrap_err();
+        ExecutableRef::expand_home("", &home).unwrap_err();
     }
 
     /// Platform: Linux, macOS, Windows — no `canonicalize`; Unix symlinks and Windows junctions are preserved lexically. Test asserts lexical storage on all platforms.
     #[test]
     fn paths_preserve_symlink_semantics() {
         // Path types alone do not resolve symlinks; they store the lexical path.
-        let p = AbsolutePath::new("/tmp/mylink").unwrap();
+        let link = crate::test_util::tmp_abs_str("mylink");
+        let p = AbsolutePath::new(&link).unwrap();
         // No filesystem check, so this succeeds even if mylink is a symlink
         // or does not exist.
-        assert_eq!(p.as_path(), Path::new("/tmp/mylink"));
-        let w = WrapperPath::new("/usr/local/bin/my-wrapper").unwrap();
-        assert_eq!(w.as_path(), Path::new("/usr/local/bin/my-wrapper"));
+        assert_eq!(p.as_path(), Path::new(&link));
+        let wrapper = crate::test_util::tmp_abs_str("local/bin/my-wrapper");
+        let w = WrapperPath::new(&wrapper).unwrap();
+        assert_eq!(w.as_path(), Path::new(&wrapper));
     }
 
     /// Platform: all — NUL, empty, `..` rejected for every path newtype on Linux, macOS, and Windows via shared `validate_no_traversal`/`validate_no_nul`.
     #[test]
     fn all_path_types_reject_nul_and_empty_and_traversal() {
-        let cases = ["", "/tmp/a\0b", "/a/../b", "relative/path"];
+        let nul_abs = format!("{}\0b", crate::test_util::tmp_abs_str("nul-f"));
+        let cases: [&str; 4] = ["", &nul_abs, "/a/../b", "relative/path"];
         for c in cases {
             AbsolutePath::new(c).unwrap_err();
             ConfigRoot::new(c).unwrap_err();
@@ -1151,7 +1184,7 @@ mod tests {
         let back: ExecutableRef = serde_json::from_str(&json).unwrap();
         assert_eq!(named, back);
 
-        let abs = ExecutableRef::new("/usr/local/bin/claude").unwrap();
+        let abs = ExecutableRef::new(&crate::test_util::tmp_abs_str("local/bin/claude")).unwrap();
         let json = serde_json::to_string(&abs).unwrap();
         let back: ExecutableRef = serde_json::from_str(&json).unwrap();
         assert_eq!(abs, back);
@@ -1165,15 +1198,19 @@ mod tests {
     /// Platform: all — `Display`/`FromStr` preserve lexical form; Unix `/tmp/...` shown here, Windows `C:\...` via same `Display` impl.
     #[test]
     fn display_and_from_str() {
-        let p: AbsolutePath = "/tmp/foo".parse().unwrap();
-        assert_eq!(format!("{p}"), "/tmp/foo");
-        let c: ConfigRoot = "/tmp/root".parse().unwrap();
-        assert_eq!(format!("{c}"), "/tmp/root");
-        let w: WrapperPath = "/tmp/wrapper".parse().unwrap();
-        assert_eq!(format!("{w}"), "/tmp/wrapper");
+        let foo = crate::test_util::tmp_abs_str("foo");
+        let p: AbsolutePath = foo.parse().unwrap();
+        assert_eq!(format!("{p}"), foo);
+        let root = crate::test_util::tmp_abs_str("root");
+        let c: ConfigRoot = root.parse().unwrap();
+        assert_eq!(format!("{c}"), root);
+        let wrapper = crate::test_util::tmp_abs_str("wrapper");
+        let w: WrapperPath = wrapper.parse().unwrap();
+        assert_eq!(format!("{w}"), wrapper);
         let e: ExecutableRef = "mybin".parse().unwrap();
         assert_eq!(format!("{e}"), "mybin");
-        let e2: ExecutableRef = "/usr/bin/mybin".parse().unwrap();
-        assert_eq!(format!("{e2}"), "/usr/bin/mybin");
+        let mybin = crate::test_util::tmp_abs_str("bin/mybin");
+        let e2: ExecutableRef = mybin.parse().unwrap();
+        assert_eq!(format!("{e2}"), mybin);
     }
 }

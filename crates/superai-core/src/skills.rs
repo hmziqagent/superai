@@ -4599,7 +4599,13 @@ mod tests {
         assert!(validate_fetch_url("https://github.com/freeoxide/superai").is_ok());
         assert!(validate_fetch_url("https://example.com/skill/SKILL.md").is_ok());
         // file url for tests
-        assert!(validate_fetch_url("file:///tmp/my/skill").is_ok());
+        assert!(
+            validate_fetch_url(&format!(
+                "file://{}",
+                crate::test_util::tmp_abs("my").join("skill").display()
+            ))
+            .is_ok()
+        );
         // invalid http
         let err = validate_fetch_url("http://github.com/freeoxide/superai").unwrap_err();
         let msg = format!("{err:?}");
@@ -4635,7 +4641,11 @@ mod tests {
         let err = validate_fetch_url("").unwrap_err();
         assert!(format!("{err:?}").contains("must not be empty"));
         // file url with traversal
-        let err = validate_fetch_url("file:///tmp/../evil").unwrap_err();
+        let err = validate_fetch_url(&format!(
+            "file://{}/../evil",
+            crate::test_util::tmp_abs("evil-base").display()
+        ))
+        .unwrap_err();
         assert!(format!("{err:?}").contains(".."));
 
         // test GitHub source install via file://
@@ -4966,8 +4976,14 @@ mod tests {
 
         // Undeclared adapter -> honest refusal.
         let adapter = adapter_full();
-        let err = set_skill_enabled_via_config(Path::new("/tmp"), &reg, &skill_id, &adapter, false)
-            .unwrap_err();
+        let err = set_skill_enabled_via_config(
+            Path::new(&crate::test_util::tmp_abs_str("tmp")),
+            &reg,
+            &skill_id,
+            &adapter,
+            false,
+        )
+        .unwrap_err();
         match err {
             CoreError::UnsupportedOperation { operation, .. } => {
                 assert_eq!(operation, "set_skill_enabled_via_config");

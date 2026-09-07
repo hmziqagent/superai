@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn plan_wrapper_is_blocked_migration_only() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.vibe-kanban-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-kanban-work"));
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
             CoreError::UnsupportedOperation {
@@ -740,7 +740,8 @@ mod tests {
     #[test]
     fn plan_wrapper_rejects_mismatched_harness_but_blocked_first() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.vibe-kanban-work");
+        let mut inst =
+            sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-kanban-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -770,14 +771,15 @@ mod tests {
     #[test]
     fn validate_instance_accepts_project_scope() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.vibe-kanban-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-kanban-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.vibe-kanban-work");
+        let mut inst =
+            sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-kanban-work"));
         inst.isolation = Isolation::OsBound;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

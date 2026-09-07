@@ -788,8 +788,7 @@ fn derive_expected_executable(
         InstallMethodKind::Mise => {
             // mise installs to shims dir: ~/.local/share/mise/shims/<exe>
             // Use HOME if available, else fallback to /home/user
-            let home =
-                std::env::var_os("HOME").map_or_else(|| PathBuf::from("/home/user"), PathBuf::from);
+            let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
             home.join(".local/share/mise/shims").join(exe)
         }
         InstallMethodKind::Homebrew => PathBuf::from(format!("/opt/homebrew/bin/{exe}")),
@@ -798,18 +797,11 @@ fn derive_expected_executable(
         | InstallMethodKind::External
         | InstallMethodKind::HomebrewCask => PathBuf::from(format!("/usr/local/bin/{exe}")),
         InstallMethodKind::Cargo => {
-            let home =
-                std::env::var_os("HOME").map_or_else(|| PathBuf::from("/home/user"), PathBuf::from);
+            let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
             home.join(".cargo/bin").join(exe)
         }
-        InstallMethodKind::Pipx => {
-            let home =
-                std::env::var_os("HOME").map_or_else(|| PathBuf::from("/home/user"), PathBuf::from);
-            home.join(".local/bin").join(exe)
-        }
-        InstallMethodKind::Uv => {
-            let home =
-                std::env::var_os("HOME").map_or_else(|| PathBuf::from("/home/user"), PathBuf::from);
+        InstallMethodKind::Pipx | InstallMethodKind::Uv => {
+            let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
             home.join(".local/bin").join(exe)
         }
     }

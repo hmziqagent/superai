@@ -795,13 +795,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_env_and_user_data_dir() {
+        let tmp_root = crate::test_util::tmp_abs_str(".cursor-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.cursor-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == CONFIG_ENV_VAR && v == "/tmp/.cursor-work")
+                .any(|(k, v)| k == CONFIG_ENV_VAR && v == tmp_root.as_str())
         );
         assert!(plan.args.contains(&USER_DATA_DIR_FLAG.to_owned()));
         let idx = plan
@@ -818,7 +819,7 @@ mod tests {
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.cursor-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".cursor-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -839,14 +840,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_ide_user_data() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.cursor-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".cursor-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.cursor-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".cursor-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

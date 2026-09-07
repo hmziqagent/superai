@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn plan_wrapper_sets_env_and_args() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.letta-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".letta-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
@@ -916,8 +916,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my letta work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my letta work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -925,14 +926,14 @@ mod tests {
             .find(|(k, _)| k == super::LOCAL_BACKEND_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my letta work");
+        assert_eq!(env_val, tmp_root.as_str());
         assert!(!env_val.contains('"'));
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.letta-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".letta-work"));
         inst.harness = HarnessId::new("claude-code").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -956,11 +957,12 @@ mod tests {
 
     #[test]
     fn validate_instance_accepts_daemon_service() {
+        let tmp_root = crate::test_util::tmp_abs_str(".letta-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.letta-work");
+        let inst = sample_instance_with_root(&tmp_root);
         a.validate_instance(&inst).unwrap();
         let relocated = {
-            let mut r = sample_instance_with_root("/tmp/.letta-work");
+            let mut r = sample_instance_with_root(&tmp_root);
             r.isolation = Isolation::RelocatedRoot;
             r
         };
@@ -970,7 +972,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.letta-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".letta-work"));
         inst.isolation = Isolation::FixedPathSingle;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {

@@ -459,8 +459,8 @@ mod tests {
         }
 
         // Test ensure_path_safe rejects escape
-        let base = Path::new("/tmp/superai/base");
-        let err = crate::template_fetch::ensure_path_safe(base, "../escape.json");
+        let base = crate::test_util::tmp_abs("superai/base");
+        let err = crate::template_fetch::ensure_path_safe(&base, "../escape.json");
         assert!(err.is_err(), "ensure_path_safe should reject traversal");
     }
 
@@ -510,37 +510,48 @@ mod tests {
         use superai_config::transaction::RemoveKind;
         use superai_config::transaction::validate_remove_target;
 
-        // validate_quarantine_target rejects broad roots, home, globs, foreign
-        for p in ["/", "/home", "/tmp", "/usr", "/etc"] {
-            assert!(
-                validate_quarantine_target(Path::new(p)).is_err(),
-                "quarantine {p} should reject"
-            );
-        }
+        // validate_quarantine_target rejects broad roots, home, globs, foreign.
+        // The filesystem root is broad on every platform (unix `/` via the
+        // string match list, windows `C:\` via `windows_shaped_broad_root`).
+        let fs_root = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
+        let tmp = crate::test_util::tmp_abs("abuse-broad");
+        assert!(
+            validate_quarantine_target(&fs_root).is_err(),
+            "quarantine {fs_root:?} should reject"
+        );
         // Globs
         for p in [
-            "/tmp/*.json",
-            "/var/*.log",
-            "/home/user/[abc]",
-            "/tmp/foo?bar",
+            tmp.join("*.json"),
+            tmp.join("logs").join("*.log"),
+            tmp.join("user").join("[abc]"),
+            tmp.join("foo?bar"),
         ] {
             assert!(
-                validate_quarantine_target(Path::new(p)).is_err(),
-                "glob {p} should reject"
+                validate_quarantine_target(&p).is_err(),
+                "glob {p:?} should reject"
             );
         }
         // Unresolved vars
-        for p in ["/tmp/$HOME/foo", "/tmp/%USERPROFILE%/bar", "/tmp/${HOME}/x"] {
+        for p in [
+            tmp.join("$HOME/foo"),
+            tmp.join("%USERPROFILE%/bar"),
+            tmp.join("${HOME}/x"),
+        ] {
             assert!(
-                validate_quarantine_target(Path::new(p)).is_err(),
-                "var {p} should reject"
+                validate_quarantine_target(&p).is_err(),
+                "var {p:?} should reject"
             );
         }
         // Traversal
-        assert!(validate_quarantine_target(Path::new("/tmp/../etc")).is_err());
+        assert!(validate_quarantine_target(&tmp.join("../etc")).is_err());
         // Relative
         assert!(validate_quarantine_target(Path::new("relative")).is_err());
-        // Windows
+        // Windows-shaped broad root is refused on every platform (inert on
+        // unix where it is not absolute).
         assert!(validate_quarantine_target(Path::new("C:\\Windows")).is_err());
 
         // validate_remove_target also rejects broad
@@ -550,21 +561,20 @@ mod tests {
             RemoveKind::ConfigEntry,
             RemoveKind::Binary,
         ] {
-            assert!(validate_remove_target(Path::new("/"), kind).is_err());
-            assert!(validate_remove_target(Path::new("/home"), kind).is_err());
-            assert!(validate_remove_target(Path::new("/tmp/*.json"), kind).is_err());
-            assert!(validate_remove_target(Path::new("/tmp/$HOME/foo"), kind).is_err());
-            assert!(validate_remove_target(Path::new("/tmp/../etc"), kind).is_err());
+            assert!(validate_remove_target(&fs_root, kind).is_err());
+            assert!(validate_remove_target(&tmp.join("*.json"), kind).is_err());
+            assert!(validate_remove_target(&tmp.join("$HOME/foo"), kind).is_err());
+            assert!(validate_remove_target(&tmp.join("../etc"), kind).is_err());
             assert!(validate_remove_target(Path::new("relative/path"), kind).is_err());
         }
 
         // Foreign-managed simulation: quarantine should not be allowed for foreign path that is not superai-owned
         // We treat any path under /tmp that has a marker of foreign ownership as still rejected if it's home-like
         // Just ensure no panic and proper error
-        let foreign = Path::new("/tmp/.claude-multi/config.json");
+        let foreign = crate::test_util::tmp_abs("claude-multi").join("config.json");
         // This path itself is a file, not a directory to quarantine, but validate will check existence; may succeed if file exists?
         // We just ensure the validation doesn't panic
-        drop(validate_quarantine_target(foreign));
+        drop(validate_quarantine_target(&foreign));
     }
 
     #[test]
@@ -587,7 +597,10 @@ mod tests {
                 let _skill_dir = dir.join(sid.as_str());
                 // Attempt to create directory with shell name – on unix it's allowed as file name, but transaction should reject if it's used as path with metachars?
                 // Instead test path safety directly
-                let bad_path_str = format!("/tmp/superai-skills/{bad}");
+                let bad_path_str = format!(
+                    "{}/superai-skills/{bad}",
+                    crate::test_util::tmp_abs_str("skills")
+                );
                 let bad_path = Path::new(&bad_path_str);
                 let txn_res = superai_config::transaction::FileAction::Write {
                     path: bad_path.to_path_buf(),
@@ -682,8 +695,17 @@ mod tests {
         let cases = [
             ("http://example.com/catalog.json", true), // should reject (not https)
             ("https://example.com/catalog.json", false), // should accept
-            ("file:///tmp/../etc/passwd", true),       // should reject (traversal in file path)
-            ("file:///tmp/catalog.json", false),       // allowed for tests (fixture)
+            (
+                &format!(
+                    "file://{}/../etc/passwd",
+                    crate::test_util::tmp_abs("url-trav").display()
+                ),
+                true,
+            ), // should reject (traversal in file path)
+            (
+                &format!("file://{}", crate::test_util::tmp_abs("catalog").display()),
+                false,
+            ), // allowed for tests (fixture)
             ("https://192.168.1.1/evil.json", true),   // private
             ("https://10.0.0.1/evil.json", true),
             ("https://127.0.0.1/evil.json", true),
@@ -709,10 +731,10 @@ mod tests {
         }
 
         // Test ensure_path_safe rejects traversal
-        let base = Path::new("/tmp/base");
-        drop(crate::template_fetch::ensure_path_safe(base, "../escape.json").unwrap_err());
-        drop(crate::template_fetch::ensure_path_safe(base, "a/../../b.json").unwrap_err());
-        drop(crate::template_fetch::ensure_path_safe(base, "valid/path.json").unwrap());
+        let base = crate::test_util::tmp_abs("base");
+        drop(crate::template_fetch::ensure_path_safe(&base, "../escape.json").unwrap_err());
+        drop(crate::template_fetch::ensure_path_safe(&base, "a/../../b.json").unwrap_err());
+        drop(crate::template_fetch::ensure_path_safe(&base, "valid/path.json").unwrap());
 
         // Test redirect handling: cross-host redirect should strip auth and private should be rejected
         assert!(crate::failure::should_strip_auth_for_redirect(
@@ -957,7 +979,8 @@ description: test skill
             preconditions: vec![],
             actions: vec![],
             diffs: vec![crate::operation::RedactedDiff {
-                path: AbsolutePath::new("/tmp/scan.json").unwrap(),
+                path: AbsolutePath::from_path(&crate::test_util::tmp_abs("scan").join("scan.json"))
+                    .unwrap(),
                 surface: "settings.json".to_owned(),
                 lexical_redacted: "api_key: [REDACTED]".to_owned(),
                 semantic_redacted: "updated api_key to [REDACTED]".to_owned(),
@@ -1043,8 +1066,8 @@ description: test skill
         let h = HarnessId::new("claude-code").unwrap();
         let n1 = InstanceName::new("MyWork").unwrap();
         let n2 = InstanceName::new("mywork").unwrap();
-        let r1 = AbsolutePath::new("/tmp/case1").unwrap();
-        let r2 = AbsolutePath::new("/tmp/case2").unwrap();
+        let r1 = AbsolutePath::from_path(&crate::test_util::tmp_abs("case1")).unwrap();
+        let r2 = AbsolutePath::from_path(&crate::test_util::tmp_abs("case2")).unwrap();
         let inst1 = Instance {
             id: InstanceId::new("id-case-1").unwrap(),
             name: n1,
@@ -1131,15 +1154,14 @@ description: test skill
             }
         }
         // Broad deletion must reject traversal and absolute private redirects
-        for p in [
-            "/",
-            "/home",
-            "/tmp",
-            "/etc",
-            "/tmp/*.json",
-            "/tmp/$HOME/foo",
-        ] {
-            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
+        let fs_root2 = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
+        let tmp2 = crate::test_util::tmp_abs("abuse-scan-broad");
+        for p in [fs_root2, tmp2.join("*.json"), tmp2.join("$HOME/foo")] {
+            let r = superai_config::quarantine::validate_quarantine_target(&p);
             assert!(r.is_err(), "broad {p:?} must be rejected");
             assert!(!format!("{:?}", r.unwrap_err()).contains(SENTINEL));
         }

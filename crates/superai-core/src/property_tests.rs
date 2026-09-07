@@ -132,9 +132,8 @@ mod tests {
         );
         let id = InstanceId::new(&id_str).unwrap();
         let root_str = format!(
-            "/tmp/superai-prop-{}-{}/root{}",
-            iter,
-            idx,
+            "{}/root{}",
+            crate::test_util::tmp_abs_str(&format!("superai-prop-{iter}-{idx}")),
             rng.gen_string(2, 6, SIMPLE_CHARSET)
         );
         let config_root = AbsolutePath::new(&root_str).unwrap();
@@ -490,8 +489,9 @@ mod tests {
                 // Registry should reject collision.
                 let mut reg = Registry::default();
                 let harness = HarnessId::new("claude-code").unwrap();
-                let root1 = AbsolutePath::new(&format!("/tmp/coll-{}-1", iter)).unwrap();
-                let root2 = AbsolutePath::new(&format!("/tmp/coll-{}-2", iter)).unwrap();
+                let coll_base = crate::test_util::tmp_abs(&format!("coll-{iter}"));
+                let root1 = AbsolutePath::from_path(&coll_base.join("1")).unwrap();
+                let root2 = AbsolutePath::from_path(&coll_base.join("2")).unwrap();
                 let inst1 = Instance {
                     id: InstanceId::new(&format!("id-{}-1", iter)).unwrap(),
                     name: a.clone(),
@@ -550,7 +550,11 @@ mod tests {
     fn property_collision_safe_normalization_paths() {
         for iter in 0..100 {
             let mut rng = Prng::new(iter as u64 + 0x6666);
-            let base = format!("/tmp/base-{}", rng.gen_string(3, 8, SIMPLE_CHARSET));
+            let base = format!(
+                "{}/base-{}",
+                crate::test_util::tmp_abs_str("prop-base"),
+                rng.gen_string(3, 8, SIMPLE_CHARSET)
+            );
             // Generate noisy variations that should normalize to same.
             let noisy1 = format!("{base}//./sub//./dir");
             let noisy2 = format!("{base}/sub/dir");
@@ -1023,7 +1027,7 @@ mod tests {
         let mut reg = Registry::default();
         let h = HarnessId::new("claude-code").unwrap();
         let n1 = InstanceName::new("MyWork").unwrap();
-        let r1 = AbsolutePath::new("/tmp/mutant1").unwrap();
+        let r1 = AbsolutePath::from_path(&crate::test_util::tmp_abs("mutant1")).unwrap();
         let inst1 = Instance {
             id: InstanceId::new("id-mutant-1").unwrap(),
             name: n1.clone(),
@@ -1031,7 +1035,8 @@ mod tests {
             config_root: r1,
             binary: None,
             wrapper: Some(WrapperRef {
-                path: WrapperPath::new("/tmp/bin/mywork").unwrap(),
+                path: WrapperPath::from_path(&crate::test_util::tmp_abs("bin").join("mywork"))
+                    .unwrap(),
                 command_name: InstanceName::new("mywork").unwrap(),
                 generator_version: "0.1.0".to_owned(),
                 content_digest: "abc".to_owned(),
@@ -1046,7 +1051,7 @@ mod tests {
         reg.insert(inst1).unwrap();
         // Attempt to insert case-fold collision should be rejected
         let collision = crate::wrapper::check_wrapper_collisions(
-            &WrapperPath::new("/tmp/bin/MYWORK").unwrap(),
+            &WrapperPath::from_path(&crate::test_util::tmp_abs("bin").join("MYWORK")).unwrap(),
             &InstanceName::new("MYWORK").unwrap(),
             &reg,
         );

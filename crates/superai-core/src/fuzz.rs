@@ -71,17 +71,22 @@ fn seed_registry_corpus() -> Vec<Vec<u8>> {
         collect_recursive(&fixtures, &mut corpus);
     }
     // Hardcoded registry seeds
+    // Valid-root seeds anchor under the platform temp dir so the deep
+    // validation paths (path normalization, serde) are exercised on Windows
+    // too, where `/home/...` literals are rejected as non-absolute.
+    let valid_root = crate::test_util::tmp_abs_str("user/.claude-work");
+    let escape_root = crate::test_util::tmp_abs_str("escape");
     corpus.extend(vec![
         br#"{"schema_version":1,"instances":[]}"#.to_vec(),
-        br#"{"instances":[{"name":"work","harness":"claude-code","config_dir":"/home/user/.claude-work"}]}"#.to_vec(),
-        br#"{"schema_version":1,"instances":[{"id":"inst-1","name":"work","harness":"claude-code","config_root":"/home/user/.claude-work","isolation":"relocated_root","origin":"created","ownership":"superai_created","created_at":"2026-08-26T12:00:00Z","adapter_revision":"0.1.0"}]}"#.to_vec(),
+        format!(r#"{{"instances":[{{"name":"work","harness":"claude-code","config_dir":"{valid_root}"}}]}}"#).into_bytes(),
+        format!(r#"{{"schema_version":1,"instances":[{{"id":"inst-1","name":"work","harness":"claude-code","config_root":"{valid_root}","isolation":"relocated_root","origin":"created","ownership":"superai_created","created_at":"2026-08-26T12:00:00Z","adapter_revision":"0.1.0"}}]}}"#).into_bytes(),
         b"".to_vec(),
         b"{}".to_vec(),
         b"[]".to_vec(),
         br#"{"schema_version":999,"instances":[]}"#.to_vec(),
         br#"{"schema_version":"bad"}"#.to_vec(),
         br#"{"instances":"not an array"}"#.to_vec(),
-        br#"{"instances":[{"name":"../escape","harness":"claude-code","config_dir":"/tmp/../etc/passwd"}]}"#.to_vec(),
+        format!(r#"{{"instances":[{{"name":"../escape","harness":"claude-code","config_dir":"{escape_root}/../etc/passwd"}}]}}"#).into_bytes(),
         vec![0xff, 0xfe, 0xfd],
     ]);
     if corpus.len() > 200 {
@@ -133,13 +138,14 @@ fn gen_truncated(prng: &mut Prng, base: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 fn gen_huge_registry(prng: &mut Prng) -> Vec<u8> {
+    let base = crate::test_util::tmp_abs_str("cfg");
     let mut s = String::from("{\"schema_version\":1,\"instances\":[");
     for i in 0..300 {
         if i > 0 {
             s.push(',');
         }
         s.push_str(&format!(
-            "{{\"id\":\"id-{i}\",\"name\":\"name{i}\",\"harness\":\"claude-code\",\"config_root\":\"/tmp/cfg{i}\",\"isolation\":\"unknown\",\"origin\":\"created\",\"ownership\":\"superai_created\",\"created_at\":\"2026-01-01T00:00:00Z\",\"adapter_revision\":\"0.1.0\"}}"
+            "{{\"id\":\"id-{i}\",\"name\":\"name{i}\",\"harness\":\"claude-code\",\"config_root\":\"{base}/cfg{i}\",\"isolation\":\"unknown\",\"origin\":\"created\",\"ownership\":\"superai_created\",\"created_at\":\"2026-01-01T00:00:00Z\",\"adapter_revision\":\"0.1.0\"}}"
         ));
         if s.len() > MAX_INPUT_BYTES {
             break;
@@ -541,7 +547,11 @@ mod tests {
             let mut prng = Prng::new(iter + 0x5555);
             let variants: Vec<Vec<u8>> = vec![
                 format!("#!/bin/sh\nexec claude-code \"$@\" # superai wrapper {iter}").into_bytes(),
-                format!("#!/bin/sh\n# superai wrapper instance=work-{iter} digest=abc\nexport CLAUDE_CONFIG_DIR=/tmp/cfg{iter}\nexec \"$@\"").into_bytes(),
+                format!(
+                    "#!/bin/sh\n# superai wrapper instance=work-{iter} digest=abc\nexport CLAUDE_CONFIG_DIR={}/cfg{iter}\nexec \"$@\"",
+                    crate::test_util::tmp_abs_str("fuzz-cfg")
+                )
+                .into_bytes(),
                 // malformed
                 gen_truncated(&mut prng, br"#!/bin/sh\nexec wrapper"),
                 // huge wrapper
@@ -582,10 +592,9 @@ mod tests {
                 );
                 assert!(repr.len() <= MAX_OUTPUT_BYTES);
                 // Kind detection must not panic and be bounded
+                let probe_base = crate::test_util::tmp_abs("fuzz-wrapper-kind");
                 let kind = std::panic::catch_unwind(|| {
-                    crate::wrapper::detect_wrapper_kind(&PathBuf::from(format!(
-                        "/tmp/wrapper-{iter}"
-                    )))
+                    crate::wrapper::detect_wrapper_kind(&probe_base.join(format!("wrapper-{iter}")))
                 });
                 // Detect via file path not panicking is enough; bounded check via content already
                 drop(kind);
@@ -596,8 +605,10 @@ mod tests {
                     let id = crate::ids::InstanceId::new(&format!("id-wrapper-{iter}")).unwrap();
                     let name = crate::ids::InstanceName::new(&format!("work-{iter}")).unwrap();
                     let harness = crate::ids::HarnessId::new("claude-code").unwrap();
-                    let root = crate::paths::AbsolutePath::new(&format!("/tmp/wrapper-cfg-{iter}"))
-                        .unwrap();
+                    let root = crate::paths::AbsolutePath::from_path(
+                        &crate::test_util::tmp_abs("fuzz-wrapper-cfg").join(format!("cfg-{iter}")),
+                    )
+                    .unwrap();
                     crate::instance::Instance {
                         id,
                         name,
@@ -701,14 +712,15 @@ mod tests {
         // Direct path escape check: fuzzed config_root with traversal must not cause FS write outside temp dir
         for iter in 0u64..100u64 {
             let mut prng = Prng::new(iter + 0x4444);
+            let escape_base = crate::test_util::tmp_abs_str("fuzz-escape");
             let traversal_payloads = vec![
                 "../escape".to_owned(),
                 "../../etc/passwd".to_owned(),
-                "/tmp/../etc/shadow".to_owned(),
+                format!("{escape_base}/../etc/shadow"),
                 "/".to_owned(),
                 "C:\\Windows\\System32".to_owned(),
                 format!("traversal-{}-../..", iter),
-                format!("/tmp/fuzz-escape-{}-../../", iter),
+                format!("{escape_base}/fuzz-escape-{}-../../", iter),
             ];
             let payload = traversal_payloads
                 .get(prng.gen_range(0, traversal_payloads.len()))

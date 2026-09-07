@@ -1499,11 +1499,16 @@ mod tests {
     #[test]
     fn mutant_validate_quarantine_target_rejects_broad_roots_and_accepts_valid() {
         use std::path::Path;
-        // broad roots must be rejected (mutant that returns Ok would allow disastrous delete)
-        for p in ["/", "/home", "/tmp", "/usr", "/etc", "/var"] {
-            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
-            assert!(r.is_err(), "broad root {p} should be rejected");
-        }
+        // broad roots must be rejected (mutant that returns Ok would allow disastrous delete).
+        // The filesystem root is broad on every platform (unix `/` string-match,
+        // windows `C:\` via `windows_shaped_broad_root`).
+        let fs_root = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
+        let r = superai_config::quarantine::validate_quarantine_target(&fs_root);
+        assert!(r.is_err(), "broad root {fs_root:?} should be rejected");
         // home dir must be rejected
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
             && home.is_absolute()
@@ -1514,14 +1519,24 @@ mod tests {
             assert!(r.is_err(), "home {} should be rejected", home.display());
         }
         // globs must be rejected before existence check
-        for p in ["/tmp/*.json", "/var/*.log", "/tmp/foo?bar", "/tmp/[abc]"] {
-            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
-            assert!(r.is_err(), "glob {p} should be rejected");
+        let tmp = crate::test_util::tmp_abs("mutant-glob");
+        for p in [
+            tmp.join("*.json"),
+            tmp.join("logs").join("*.log"),
+            tmp.join("foo?bar"),
+            tmp.join("[abc]"),
+        ] {
+            let r = superai_config::quarantine::validate_quarantine_target(&p);
+            assert!(r.is_err(), "glob {p:?} should be rejected");
         }
         // unresolved variables must be rejected
-        for p in ["/tmp/$HOME/foo", "/tmp/%USERPROFILE%/bar", "/tmp/${HOME}/x"] {
-            let r = superai_config::quarantine::validate_quarantine_target(Path::new(p));
-            assert!(r.is_err(), "var {p} should be rejected");
+        for p in [
+            tmp.join("$HOME/foo"),
+            tmp.join("%USERPROFILE%/bar"),
+            tmp.join("${HOME}/x"),
+        ] {
+            let r = superai_config::quarantine::validate_quarantine_target(&p);
+            assert!(r.is_err(), "var {p:?} should be rejected");
         }
         // relative and traversal must be rejected
         assert!(
@@ -1530,8 +1545,7 @@ mod tests {
             "relative should be rejected"
         );
         assert!(
-            superai_config::quarantine::validate_quarantine_target(Path::new("/tmp/../etc"))
-                .is_err(),
+            superai_config::quarantine::validate_quarantine_target(&tmp.join("../etc")).is_err(),
             "traversal should be rejected"
         );
         // valid file must be accepted (mutant that always Err would fail here)

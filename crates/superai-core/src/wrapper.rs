@@ -397,13 +397,16 @@ pub fn preview_wrapper_content(
     let (content, digest) = generate_shell_wrapper(instance, plan);
     // Compute wrapper path as instance.wrapper if present, else placeholder
     let placeholder = instance.wrapper.as_ref().map_or_else(
-        || PathBuf::from("/tmp/superai-wrapper-preview"),
+        || std::env::temp_dir().join("superai-wrapper-preview"),
         |w| w.path.as_path().to_path_buf(),
     );
     let abs = AbsolutePath::from_path(&placeholder).unwrap_or_else(|_| {
-        // Fallback to /tmp
-        #[expect(clippy::unwrap_used, reason = "fallback is known valid in tests")]
-        AbsolutePath::new("/tmp/superai-wrapper-preview").unwrap()
+        // Fallback to the platform temp dir
+        #[expect(
+            clippy::unwrap_used,
+            reason = "temp_dir fallback is absolute by construction"
+        )]
+        AbsolutePath::from_path(&std::env::temp_dir().join("superai-wrapper-preview")).unwrap()
     });
     (content, digest, abs)
 }
@@ -1282,7 +1285,7 @@ mod tests {
     /// Platform: Linux and macOS — `#!/bin/sh` wrapper with `CLAUDE_CONFIG_DIR` and `exec`; Windows — same script via `bash`/`sh` (PowerShell/cmd wrapper not yet generated). Determinism holds on all platforms.
     #[test]
     fn generates_deterministic_sh_wrapper() {
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
@@ -1306,15 +1309,16 @@ mod tests {
     /// Platform: Linux, macOS, Windows — paths with spaces/`$`/`'` are single-quoted for POSIX `sh`; Windows `bash` also uses POSIX quoting, PowerShell differs (not covered here).
     #[test]
     fn quotes_special_paths_safely() {
-        let inst = sample_instance_with_root("/tmp/my work with $dollar");
+        let root = crate::test_util::tmp_abs_str("my work with $dollar");
+        let inst = sample_instance_with_root(&root);
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
         let (content, _) = generate_shell_wrapper(&inst, &plan);
         // Value with space and $ must be single-quoted, not expanded
-        assert!(content.contains("'/tmp/my work with $dollar'"));
+        assert!(content.contains(&format!("'{root}'")));
         // Ensure no unquoted export
-        assert!(!content.contains("export CLAUDE_CONFIG_DIR=/tmp/my work"));
+        assert!(!content.contains(&format!("export CLAUDE_CONFIG_DIR={root}")));
     }
 
     /// Platform: Linux/macOS — atomically writes wrapper and sets `0o755` via `PermissionsExt`; Windows — atomic write without Unix perms (`#[cfg(unix)]` gated). Test verifies atomic write on all, exec bit only on Unix.
@@ -1324,7 +1328,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let wrapper_path_str = dir.join("work-wrapper").to_string_lossy().into_owned();
         let wrapper_path = WrapperPath::new(&wrapper_path_str).unwrap();
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
@@ -1350,7 +1354,7 @@ mod tests {
     /// Platform: all — wrapper content must not embed secrets on Linux, macOS, or Windows; redaction is platform-independent.
     #[test]
     fn never_embeds_secret() {
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
@@ -1381,7 +1385,7 @@ mod tests {
     fn wrapper_dtype_detection_and_collision_and_digest() {
         let dir = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&dir).unwrap();
-        let inst = sample_instance_with_root("/tmp/.claude-work-x");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work-x"));
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
@@ -1417,7 +1421,10 @@ mod tests {
         let foreign_path = dir.join("foreign-wrapper");
         std::fs::write(
             &foreign_path,
-            "#!/bin/sh\nexport CLAUDE_CONFIG_DIR='/tmp/.claude-other'\nexec claude \"$@\"\n",
+            format!(
+                "#!/bin/sh\nexport CLAUDE_CONFIG_DIR='{}'\nexec claude \"$@\"\n",
+                crate::test_util::tmp_abs_str(".claude-other")
+            ),
         )
         .unwrap();
         match detect_wrapper_kind(&foreign_path) {
@@ -1449,14 +1456,16 @@ mod tests {
         use crate::registry::Registry;
         use crate::state::{InstanceOrigin, Isolation, Ownership};
         let mut reg = Registry::default();
+        let bin = crate::test_util::tmp_abs("bin");
         let inst = Instance {
             id: InstanceId::new("id-coll-1").unwrap(),
             name: InstanceName::new("work").unwrap(),
             harness: HarnessId::new("claude-code").unwrap(),
-            config_root: AbsolutePath::new("/tmp/.claude-work-coll").unwrap(),
+            config_root: AbsolutePath::from_path(&crate::test_util::tmp_abs(".claude-work-coll"))
+                .unwrap(),
             binary: None,
             wrapper: Some(crate::instance::WrapperRef {
-                path: WrapperPath::new("/tmp/bin/work").unwrap(),
+                path: WrapperPath::from_path(&bin.join("work")).unwrap(),
                 command_name: InstanceName::new("work").unwrap(),
                 generator_version: "0.1.0".to_owned(),
                 content_digest: "abc".to_owned(),
@@ -1473,7 +1482,7 @@ mod tests {
         assert!(is_name_collision_case_fold("WORK", &["work"]));
         assert!(!is_name_collision_case_fold("other", &["work"]));
         // Check wrapper collisions via registry helper
-        let new_path = WrapperPath::new("/tmp/bin/WORK").unwrap();
+        let new_path = WrapperPath::from_path(&bin.join("WORK")).unwrap();
         let cmd = InstanceName::new("WORK").unwrap();
         let err = check_wrapper_collisions(&new_path, &cmd, &reg).unwrap_err();
         match err {
@@ -1497,14 +1506,15 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("wrapper");
         std::fs::create_dir_all(&dir).unwrap();
         // Path with spaces, quotes, Unicode, dollar and percent
-        let tricky = "/tmp/my work with 'quote' $dollar %percent üñî";
-        let inst = sample_instance_with_root(tricky);
+        let tricky = crate::test_util::tmp_abs_str("my work with 'quote' $dollar %percent üñî");
+        let tricky_prefix = &tricky[..tricky.find('\'').expect("fixture contains a quote")];
+        let inst = sample_instance_with_root(&tricky);
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
         let (content, _) = generate_shell_wrapper(&inst, &plan);
         // Tricky chars must be quoted safely (single-quoted, dollar not expanded)
-        assert!(content.contains("'/tmp/my work"));
+        assert!(content.contains(&format!("'{tricky_prefix}")));
         assert!(content.contains("$dollar"));
         // Write and verify round-trip
         let wrapper_path_str = dir.join("special-wrapper").to_string_lossy().into_owned();
@@ -1520,12 +1530,11 @@ mod tests {
     /// credential must not leak into an isolated profile.
     #[test]
     fn posix_wrapper_unsets_declared_env() {
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let tmp_root = crate::test_util::tmp_abs_str(".claude-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let mut plan = WrapperPlan::new("test");
-        plan.env_vars.push((
-            "CLAUDE_CONFIG_DIR".to_owned(),
-            "/tmp/.claude-work".to_owned(),
-        ));
+        plan.env_vars
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
         plan.env_unset.push("ANTHROPIC_API_KEY".to_owned());
         let (content, digest) = generate_shell_wrapper(&inst, &plan);
         assert!(
@@ -1559,12 +1568,11 @@ mod tests {
     /// the goldens are strings.
     #[test]
     fn powershell_and_cmd_golden_launchers() {
-        let inst = sample_instance_with_root("/tmp/my claude work");
+        let tmp_root = crate::test_util::tmp_abs_str("my claude work");
+        let inst = sample_instance_with_root(&tmp_root);
         let mut plan = WrapperPlan::new("test");
-        plan.env_vars.push((
-            "CLAUDE_CONFIG_DIR".to_owned(),
-            "/tmp/my claude work".to_owned(),
-        ));
+        plan.env_vars
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root.clone()));
         plan.env_unset.push("ANTHROPIC_API_KEY".to_owned());
         plan.args.push("--settings".to_owned());
 
@@ -1576,7 +1584,7 @@ mod tests {
         assert!(ps1.contains(&ps1_digest), "digest embedded");
         assert!(ps1.contains("Set-StrictMode -Version Latest"));
         assert!(
-            ps1.contains("$env:CLAUDE_CONFIG_DIR = '/tmp/my claude work'"),
+            ps1.contains(&format!("$env:CLAUDE_CONFIG_DIR = '{tmp_root}'")),
             "single-quoted env: {ps1}"
         );
         assert!(
@@ -1598,7 +1606,7 @@ mod tests {
         assert!(cmd.contains("superai wrapper"));
         assert!(cmd.contains(&cmd_digest));
         assert!(
-            cmd.contains("set \"CLAUDE_CONFIG_DIR=/tmp/my claude work\""),
+            cmd.contains(&format!("set \"CLAUDE_CONFIG_DIR={tmp_root}\"")),
             "env set: {cmd}"
         );
         assert!(cmd.contains("set \"ANTHROPIC_API_KEY=\""), "unset: {cmd}");
@@ -1610,15 +1618,16 @@ mod tests {
         assert!(!cmd.contains("sk-"));
 
         // An apostrophe is doubled in PowerShell single quotes.
-        let tricky = "/tmp/it's here";
-        let inst2 = sample_instance_with_root(tricky);
+        let tricky = crate::test_util::tmp_abs_str("it's here");
+        let tricky_prefix = &tricky[..tricky.find('\'').expect("fixture contains a quote")];
+        let inst2 = sample_instance_with_root(&tricky);
         let mut plan2 = WrapperPlan::new("test");
         plan2
             .env_vars
-            .push(("CLAUDE_CONFIG_DIR".to_owned(), tricky.to_owned()));
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), tricky.clone()));
         let (ps2, _) = generate_powershell_wrapper(&inst2, &plan2);
         assert!(
-            ps2.contains("'/tmp/it''s here'"),
+            ps2.contains(&format!("'{tricky_prefix}''s here")),
             "PS quote doubling: {ps2}"
         );
     }
@@ -1627,6 +1636,7 @@ mod tests {
     /// of backing it up and overwriting.
     #[test]
     fn write_wrapper_refuses_foreign_file() {
+        let tmp_root = crate::test_util::tmp_abs_str(".claude-work");
         let dir = crate::test_util::temp_dir_unique("wrapper-refuse");
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("work");
@@ -1638,12 +1648,10 @@ mod tests {
         let before = std::fs::read(&target).unwrap();
         let wrapper_path = WrapperPath::new(&target.to_string_lossy()).unwrap();
 
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let mut plan = WrapperPlan::new("test");
-        plan.env_vars.push((
-            "CLAUDE_CONFIG_DIR".to_owned(),
-            "/tmp/.claude-work".to_owned(),
-        ));
+        plan.env_vars
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
         let (content, _) = generate_shell_wrapper(&inst, &plan);
 
         match write_wrapper(&wrapper_path, &content) {
@@ -1668,16 +1676,15 @@ mod tests {
     /// containing the marker substrings is NOT owned.
     #[test]
     fn is_owned_wrapper_requires_parseable_marker_and_digest() {
+        let tmp_root = crate::test_util::tmp_abs_str(".claude-work");
         let dir = crate::test_util::temp_dir_unique("wrapper-owned");
         std::fs::create_dir_all(&dir).unwrap();
 
         // A real generated wrapper verifies by digest.
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let mut plan = WrapperPlan::new("test");
-        plan.env_vars.push((
-            "CLAUDE_CONFIG_DIR".to_owned(),
-            "/tmp/.claude-work".to_owned(),
-        ));
+        plan.env_vars
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
         let (content, digest) = generate_shell_wrapper(&inst, &plan);
         let real = dir.join("real");
         std::fs::write(&real, &content).unwrap();
@@ -1704,7 +1711,7 @@ mod tests {
         let mut other_plan = WrapperPlan::new("test");
         other_plan.env_vars.push((
             "CLAUDE_CONFIG_DIR".to_owned(),
-            "/tmp/.claude-other".to_owned(),
+            crate::test_util::tmp_abs_str(".claude-other"),
         ));
         let (other_content, other_digest) = generate_shell_wrapper(&inst, &other_plan);
         assert_ne!(other_digest, digest);
@@ -1715,6 +1722,11 @@ mod tests {
     /// WRP-04: a bounded no-auth diagnostic launch runs the WRAPPER (which
     /// installs its own isolation env) against a fake binary, and proves the
     /// source/target trees are otherwise unchanged.
+    ///
+    /// Platform: Linux/macOS — the probe EXECUTES the POSIX `sh` wrapper
+    /// generated by `generate_shell_wrapper` (Windows generates PowerShell/cmd
+    /// launchers instead and cannot exec `#!/bin/sh`, os error 193).
+    #[cfg(unix)]
     #[test]
     fn diagnostic_probe_launches_wrapper_bounded_and_clean() {
         let dir = crate::test_util::temp_dir_unique("wrapper-probe");
@@ -1779,14 +1791,14 @@ mod tests {
     /// downgrades to constrained when shared state is declared.
     #[test]
     fn isolation_evidence_verifies_or_constrains() {
+        let tmp_root = crate::test_util::tmp_abs_str(".claude-work");
         // A claude-code plan (split env verified, no shared-state warning)
         // is FULL.
-        let inst = sample_instance_with_root("/tmp/.claude-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let mut full_plan = WrapperPlan::new("test");
-        full_plan.env_vars.push((
-            "CLAUDE_CONFIG_DIR".to_owned(),
-            "/tmp/.claude-work".to_owned(),
-        ));
+        full_plan
+            .env_vars
+            .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
         let evidence = isolation_evidence(&inst, &full_plan);
         assert_eq!(evidence.verdict, IsolationVerdict::Full);
         assert!(
@@ -1801,7 +1813,8 @@ mod tests {
         // A cline plan declares shared VS Code keychain state (WRP-05): the
         // claim is honestly CONSTRAINED even with split surfaces verified.
         let cline = crate::adapters::cline::ClineAdapter::new().unwrap();
-        let mut cline_inst = sample_instance_with_root("/tmp/.cline-work");
+        let mut cline_inst =
+            sample_instance_with_root(&crate::test_util::tmp_abs_str(".cline-work"));
         cline_inst.harness = cline.id();
         let cline_plan = cline.plan_wrapper(&cline_inst).unwrap();
         let cline_evidence = isolation_evidence(&cline_inst, &cline_plan);
@@ -1826,13 +1839,14 @@ mod tests {
     #[test]
     fn two_concurrent_ide_profiles_split_state_dirs() {
         let cline = crate::adapters::cline::ClineAdapter::new().unwrap();
-        let root_a = "/tmp/superai-profiles/cline-a";
-        let root_b = "/tmp/superai-profiles/cline-b";
+        let profiles = crate::test_util::tmp_abs("superai-profiles");
+        let root_a = profiles.join("cline-a").to_string_lossy().into_owned();
+        let root_b = profiles.join("cline-b").to_string_lossy().into_owned();
         let inst_a = Instance {
             id: InstanceId::new("ide-a").unwrap(),
             name: InstanceName::new("profile-a").unwrap(),
             harness: cline.id(),
-            config_root: AbsolutePath::new(root_a).unwrap(),
+            config_root: AbsolutePath::new(&root_a).unwrap(),
             binary: None,
             wrapper: None,
             isolation: Isolation::IdeUserData,
@@ -1845,7 +1859,7 @@ mod tests {
         let mut inst_b = inst_a.clone();
         inst_b.id = InstanceId::new("ide-b").unwrap();
         inst_b.name = InstanceName::new("profile-b").unwrap();
-        inst_b.config_root = AbsolutePath::new(root_b).unwrap();
+        inst_b.config_root = AbsolutePath::new(&root_b).unwrap();
 
         let plan_a = cline.plan_wrapper(&inst_a).unwrap();
         let plan_b = cline.plan_wrapper(&inst_b).unwrap();
@@ -1866,12 +1880,18 @@ mod tests {
         assert_ne!(env_a, env_b);
         assert_ne!(plan_a.args, plan_b.args, "editor dirs must differ");
         assert!(
-            plan_a.state_paths.iter().any(|p| p.contains(root_a)),
+            plan_a
+                .state_paths
+                .iter()
+                .any(|p| p.contains(root_a.as_str())),
             "{:?}",
             plan_a.state_paths
         );
         assert!(
-            plan_b.state_paths.iter().any(|p| p.contains(root_b)),
+            plan_b
+                .state_paths
+                .iter()
+                .any(|p| p.contains(root_b.as_str())),
             "{:?}",
             plan_b.state_paths
         );

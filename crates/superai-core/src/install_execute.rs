@@ -2454,7 +2454,7 @@ mod tests {
             executable: "exe".to_owned(),
             version: "1.0.0".to_owned(),
             timestamp: "2026-08-26T00:00:00Z".to_owned(),
-            path: PathBuf::from("/tmp/exe"),
+            path: crate::test_util::tmp_abs("exe"),
         };
         assert!(r.validate().is_err());
     }
@@ -3000,13 +3000,13 @@ mod tests {
     fn external_plan_refuses_execution_typed() {
         // PKG-10: executing an external/direct plan is a typed state, not a
         // fabricated command run.
-        let tmp = PathBuf::from("/tmp/superai-external-plan-test");
+        let tmp = crate::test_util::tmp_abs("superai-external-plan-test");
         let mut plan = marker_plan(&tmp, Path::new("/bin/true"));
         plan.external_install = Some(crate::install_plan::ExternalInstall {
             docs: "https://example.com/install".to_owned(),
             reason: "external install".to_owned(),
         });
-        let home = PathBuf::from("/tmp/superai-external-home-test");
+        let home = crate::test_util::tmp_abs("superai-external-home-test");
         let opts = DetectOptions {
             probe_mise: false,
             probe_brew: false,

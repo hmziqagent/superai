@@ -880,13 +880,14 @@ mod tests {
 
     #[test]
     fn plan_wrapper_sets_vibe_home() {
+        let tmp_root = crate::test_util::tmp_abs_str(".vibe-work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.vibe-work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == CONFIG_ENV_VAR && v == "/tmp/.vibe-work")
+                .any(|(k, v)| k == CONFIG_ENV_VAR && v == tmp_root.as_str())
         );
         assert!(!plan.description.is_empty());
         assert!(plan.description.contains(CONFIG_ENV_VAR));
@@ -895,8 +896,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let tmp_root = crate::test_util::tmp_abs_str("my vibe work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my vibe work");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
             .env_vars
@@ -904,7 +906,7 @@ mod tests {
             .find(|(k, _)| k == CONFIG_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(env_val, "/tmp/my vibe work");
+        assert_eq!(env_val, tmp_root.as_str());
         assert!(!env_val.contains('"'));
         assert!(env_val.contains(' '));
     }
@@ -912,7 +914,7 @@ mod tests {
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.vibe-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -933,14 +935,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_relocated_root() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.vibe-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.vibe-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -952,7 +954,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.vibe-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-work"));
         inst.harness = HarnessId::new("aider").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }
@@ -1089,26 +1091,27 @@ mod tests {
         let r2 = a.detection();
         assert_eq!(r1.present, r2.present);
         assert_eq!(r1.confidence, r2.confidence);
-        let inst = sample_instance_with_root("/tmp/.vibe-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-work"));
         a.validate_instance(&inst).unwrap();
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn wrapper_env_var_isolation_is_relocated_root() {
+        let tmp_root = crate::test_util::tmp_abs_str("user/.vibe-isolated");
         let a = adapter();
         assert!(a.scan_candidates().len() >= 3);
-        let inst = sample_instance_with_root("/home/user/.vibe-isolated");
+        let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(!plan.env_vars.is_empty());
         let (key, val) = &plan.env_vars[0];
         assert_eq!(key, CONFIG_ENV_VAR);
-        assert_eq!(val, "/home/user/.vibe-isolated");
+        assert_eq!(val, tmp_root.as_str());
     }
 
     #[test]
     fn registry_no_harness_value_leak() {
-        let inst = sample_instance_with_root("/tmp/.vibe-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".vibe-work"));
         let json = serde_json::to_string(&inst).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let forbidden = [

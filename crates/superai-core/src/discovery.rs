@@ -2490,7 +2490,8 @@ mod tests {
         let own3 = classify_ownership(&unmanaged_path, &reg, Some(&home));
         assert_eq!(own3, Ownership::Unmanaged);
 
-        let missing_path = PathBuf::from("/tmp/superai-missing-does-not-exist-zzz");
+        let missing_path = crate::test_util::tmp_abs("disc-missing-parent")
+            .join("superai-missing-does-not-exist-zzz");
         let own4 = classify_ownership(&missing_path, &reg, Some(&home));
         assert_eq!(own4, Ownership::Detached);
     }
@@ -2498,11 +2499,14 @@ mod tests {
     #[test]
     fn drift_report_covers_missing_config() {
         let home = tmp_home("drift_missing");
-        let missing_root = "/tmp/superai-drift-missing-config-root";
+        let missing_root = crate::test_util::tmp_abs("drift-missing-parent")
+            .join("superai-drift-missing-config-root")
+            .to_string_lossy()
+            .into_owned();
         let mut reg = Registry::default();
         reg.insert(sample_instance(
             "missing",
-            missing_root,
+            &missing_root,
             "id-drift-1",
             Ownership::SuperaiCreated,
         ))
@@ -2511,7 +2515,7 @@ mod tests {
         let found = report
             .findings
             .iter()
-            .find(|f| f.path.as_path() == Path::new(missing_root));
+            .find(|f| f.path.as_path() == Path::new(&missing_root));
         assert!(
             found.is_some(),
             "drift report must include missing recorded config root"
@@ -2676,8 +2680,11 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&claude, perms).unwrap();
         }
+        // PATH entries are ';'-separated on Windows; mirror the platform
+        // splitter used by `binary_on_path`.
+        let sep = if cfg!(windows) { ';' } else { ':' };
         let path_var = format!(
-            "{}:{}",
+            "{}{sep}{}",
             bin_dir.display(),
             Path::new("/nonexistent").display()
         );
@@ -2712,7 +2719,7 @@ mod tests {
         // A superai wrapper whose instance is recorded.
         let recorded_inst = sample_instance(
             "recorded",
-            "/tmp/.claude-recorded",
+            &crate::test_util::tmp_abs_str(".claude-recorded"),
             "id-scan-rec",
             Ownership::SuperaiCreated,
         );
@@ -2721,7 +2728,7 @@ mod tests {
         // An orphan superai wrapper for an unrecorded instance.
         let orphan_inst = sample_instance(
             "orphaned",
-            "/tmp/.claude-orphaned",
+            &crate::test_util::tmp_abs_str(".claude-orphaned"),
             "id-scan-orph",
             Ownership::SuperaiCreated,
         );
@@ -2746,7 +2753,10 @@ mod tests {
         // A foreign user wrapper (known recipe, no marker).
         std::fs::write(
             bin.join("user-tool"),
-            "#!/bin/sh\nexport CLAUDE_CONFIG_DIR='/tmp/.claude-user'\nexec claude \"$@\"\n",
+            format!(
+                "#!/bin/sh\nexport CLAUDE_CONFIG_DIR='{}'\nexec claude \"$@\"\n",
+                crate::test_util::tmp_abs_str(".claude-user")
+            ),
         )
         .unwrap();
 

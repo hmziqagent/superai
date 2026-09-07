@@ -1278,7 +1278,10 @@ mod tests {
                 id: crate::ids::InstanceId::new("test-id-catalog-1").unwrap(),
                 name: crate::ids::InstanceName::new("work").unwrap(),
                 harness: harness_id.clone(),
-                config_root: crate::paths::AbsolutePath::new("/tmp/.test-catalog-work").unwrap(),
+                config_root: crate::paths::AbsolutePath::new(&crate::test_util::tmp_abs_str(
+                    ".test-catalog-work",
+                ))
+                .unwrap(),
                 binary: None,
                 wrapper: None,
                 isolation: Isolation::RelocatedRoot,

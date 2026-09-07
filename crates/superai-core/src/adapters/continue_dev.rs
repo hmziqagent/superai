@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn plan_wrapper_sets_config_flag() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/.continue-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".continue-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(plan.args.contains(&"--config".to_owned()));
         let cfg = plan.args.windows(2).find(|w| w[0] == "--config").unwrap()[1].clone();
@@ -808,17 +808,24 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let root = crate::test_util::tmp_abs_str("my continue work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my continue work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let cfg = plan.args.windows(2).find(|w| w[0] == "--config").unwrap()[1].clone();
-        assert_eq!(cfg, "/tmp/my continue work/config.yaml");
+        assert_eq!(
+            cfg,
+            std::path::Path::new(&root)
+                .join("config.yaml")
+                .display()
+                .to_string()
+        );
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.continue-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".continue-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -838,7 +845,7 @@ mod tests {
     #[test]
     fn validate_instance_accepts_project_and_explicit() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.continue-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".continue-work"));
         inst.isolation = Isolation::ProjectScope;
         a.validate_instance(&inst).unwrap();
         inst.isolation = Isolation::ExplicitConfig;
@@ -850,7 +857,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.continue-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".continue-work"));
         inst.isolation = Isolation::EnvOnly;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -862,7 +869,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/.continue-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".continue-work"));
         inst.harness = HarnessId::new("aider").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }

@@ -555,10 +555,12 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn sample_preview() -> OperationPreview {
+    fn sample_preview() -> (OperationPreview, String) {
+        let tmp_root2 = crate::test_util::tmp_abs_str("user/.claude/settings.json");
+        let tmp_root = crate::test_util::tmp_abs_str("user/.claude-work");
         let id = OperationId::new("op-preview-1").unwrap();
         let backup_id = BackupId::new("backup-1").unwrap();
-        OperationPreview {
+        let preview = OperationPreview {
             id,
             kind: OperationKind::CreateInstance,
             requested_target: RequestedTarget {
@@ -568,25 +570,28 @@ mod tests {
             },
             resolved_resources: vec![ResolvedResource {
                 kind: "config_root".to_owned(),
-                path: AbsolutePath::new("/home/user/.claude-work").unwrap(),
+                path: AbsolutePath::new(&tmp_root).unwrap(),
                 description: "isolated config root".to_owned(),
                 owned_by_superai: true,
             }],
             preconditions: vec![Precondition {
                 kind: PreconditionKind::Absent,
                 description: "target path must be absent".to_owned(),
-                path: AbsolutePath::new("/home/user/.claude-work").ok(),
+                path: AbsolutePath::new(&tmp_root).ok(),
                 satisfied: true,
             }],
             actions: vec![PlannedAction {
                 order: 0,
                 kind: ActionKind::CreateDir,
-                target: AbsolutePath::new("/home/user/.claude-work").unwrap(),
+                target: AbsolutePath::new(&tmp_root).unwrap(),
                 description: "create isolated root".to_owned(),
                 requires_backup: false,
             }],
             diffs: vec![RedactedDiff {
-                path: AbsolutePath::new("/home/user/.claude-work/settings.json").unwrap(),
+                path: AbsolutePath::new(&crate::test_util::tmp_abs_str(
+                    "user/.claude-work/settings.json",
+                ))
+                .unwrap(),
                 surface: "settings.json".to_owned(),
                 lexical_redacted: "{\"model\":\"sonnet\",\"apiKey\":\"[REDACTED]\"}".to_owned(),
                 semantic_redacted: "set model to sonnet, set apiKey to [REDACTED]".to_owned(),
@@ -594,15 +599,18 @@ mod tests {
             }],
             backups: vec![BackupPlan {
                 backup_id,
-                source_path: AbsolutePath::new("/home/user/.claude/settings.json").unwrap(),
-                backup_path: AbsolutePath::new("/home/user/.claude/settings.json.bak.1").ok(),
+                source_path: AbsolutePath::new(&tmp_root2).unwrap(),
+                backup_path: AbsolutePath::new(&crate::test_util::tmp_abs_str(
+                    "user/.claude/settings.json.bak.1",
+                ))
+                .ok(),
                 reason: "preserve foreign file before write".to_owned(),
                 digest_before: Some("abc123".to_owned()),
             }],
             warnings: vec![Warning {
                 code: "permissions_existing".to_owned(),
                 message: "existing file has broad permissions".to_owned(),
-                path: AbsolutePath::new("/home/user/.claude/settings.json").ok(),
+                path: AbsolutePath::new(&tmp_root2).ok(),
             }],
             conflicts: vec![],
             limitations: vec![Limitation {
@@ -623,13 +631,14 @@ mod tests {
                 steps: vec![RollbackStep {
                     order: 0,
                     description: "remove created dir".to_owned(),
-                    target: AbsolutePath::new("/home/user/.claude-work").unwrap(),
+                    target: AbsolutePath::new(&tmp_root).unwrap(),
                     backup_id: None,
                 }],
                 will_restore_backups: false,
                 estimated_steps: 1,
             },
-        }
+        };
+        (preview, tmp_root)
     }
 
     fn sample_result() -> OperationResult {
@@ -641,19 +650,29 @@ mod tests {
             actions_completed: vec![CompletedAction {
                 order: 0,
                 kind: ActionKind::CreateDir,
-                target: AbsolutePath::new("/home/user/.claude-work").unwrap(),
+                target: AbsolutePath::new(&crate::test_util::tmp_abs_str("user/.claude-work"))
+                    .unwrap(),
                 success: true,
                 elapsed_ms: Some(12),
             }],
             backups: vec![BackupRecord {
                 backup_id,
-                source_path: AbsolutePath::new("/home/user/.claude/settings.json").unwrap(),
-                backup_path: AbsolutePath::new("/home/user/.claude/settings.json.bak.1").ok(),
+                source_path: AbsolutePath::new(&crate::test_util::tmp_abs_str(
+                    "user/.claude/settings.json",
+                ))
+                .unwrap(),
+                backup_path: AbsolutePath::new(&crate::test_util::tmp_abs_str(
+                    "user/.claude/settings.json.bak.1",
+                ))
+                .ok(),
                 digest_before: Some("abc123".to_owned()),
                 created: true,
             }],
             verification: vec![VerificationResult {
-                path: AbsolutePath::new("/home/user/.claude-work/settings.json").unwrap(),
+                path: AbsolutePath::new(&crate::test_util::tmp_abs_str(
+                    "user/.claude-work/settings.json",
+                ))
+                .unwrap(),
                 kind: VerificationKind::Parse,
                 passed: true,
                 message: "file parses and contains expected keys".to_owned(),
@@ -666,7 +685,7 @@ mod tests {
 
     #[test]
     fn preview_serializes_without_leaking_secret() {
-        let preview = sample_preview();
+        let (preview, _tmp_root) = sample_preview();
         let secret = "super-secret-sentinel-42";
         // Simulate that diff lexical was correctly redacted: it must not contain the secret,
         // and must contain the placeholder.
@@ -732,7 +751,7 @@ mod tests {
 
     #[test]
     fn preview_contains_all_required_fields() {
-        let preview = sample_preview();
+        let (preview, _tmp_root) = sample_preview();
         // Verify that all required FND-05 sections are present and non-empty where expected.
         assert!(!preview.actions.is_empty(), "actions must be ordered");
         assert_eq!(preview.actions[0].order, 0);
@@ -786,14 +805,14 @@ mod tests {
 
     #[test]
     fn operation_preview_and_result_use_validated_ids_and_paths() {
-        let preview = sample_preview();
+        let (preview, tmp_root) = sample_preview();
         assert_eq!(preview.id.as_str(), "op-preview-1");
         assert_eq!(
             preview.resolved_resources[0]
                 .path
                 .as_path()
                 .to_string_lossy(),
-            "/home/user/.claude-work"
+            tmp_root
         );
         // Ensure paths are normalized absolute (no traversal).
         for resource in &preview.resolved_resources {
@@ -820,7 +839,7 @@ mod tests {
 
     #[test]
     fn diffs_are_already_redacted() {
-        let preview = sample_preview();
+        let (preview, _tmp_root) = sample_preview();
         let secret = "s3cr3t-not-in-diff";
         for diff in &preview.diffs {
             assert!(

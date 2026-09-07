@@ -794,13 +794,18 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-1",
             None,
         ))
         .unwrap();
         // case-fold collision: "WORK" vs "work"
-        let dup = sample_instance("WORK", "/home/u/.claude-work2", "id-2", None);
+        let dup = sample_instance(
+            "WORK",
+            &crate::test_util::tmp_abs_str("u/.claude-work2"),
+            "id-2",
+            None,
+        );
         let err = r.insert(dup).unwrap_err();
         match err {
             CoreError::NameCollision { kind, .. } => assert_eq!(kind, "InstanceName"),
@@ -814,12 +819,17 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "dup-id",
             None,
         ))
         .unwrap();
-        let dup = sample_instance("other", "/home/u/.claude-other", "dup-id", None);
+        let dup = sample_instance(
+            "other",
+            &crate::test_util::tmp_abs_str("u/.claude-other"),
+            "dup-id",
+            None,
+        );
         let err = r.insert(dup).unwrap_err();
         match err {
             CoreError::NameCollision { kind, .. } => assert_eq!(kind, "InstanceId"),
@@ -829,16 +839,12 @@ mod tests {
 
     #[test]
     fn duplicate_config_roots_are_rejected() {
+        let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
         let mut r = Registry::default();
-        r.insert(sample_instance(
-            "work",
-            "/home/u/.claude-work",
-            "id-1",
-            None,
-        ))
-        .unwrap();
+        r.insert(sample_instance("work", tmp_root.as_str(), "id-1", None))
+            .unwrap();
         // Same path normalized differently with extra slash
-        let dup = sample_instance("other", "/home/u/.claude-work", "id-2", None);
+        let dup = sample_instance("other", tmp_root.as_str(), "id-2", None);
         let err = r.insert(dup).unwrap_err();
         match err {
             CoreError::Validation { field, .. } => assert_eq!(field, "config_root"),
@@ -848,19 +854,20 @@ mod tests {
 
     #[test]
     fn duplicate_wrapper_paths_are_rejected() {
+        let tmp_root = crate::test_util::tmp_abs_str("wrapper");
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-1",
-            Some("/tmp/wrapper"),
+            Some(tmp_root.as_str()),
         ))
         .unwrap();
         let dup = sample_instance(
             "other",
-            "/home/u/.claude-other",
+            &crate::test_util::tmp_abs_str(".claude-other"),
             "id-2",
-            Some("/tmp/wrapper"),
+            Some(tmp_root.as_str()),
         );
         let err = r.insert(dup).unwrap_err();
         match err {
@@ -874,17 +881,17 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-1",
-            Some("/tmp/wrapper1"),
+            Some(crate::test_util::tmp_abs_str("wrapper1").as_str()),
         ))
         .unwrap();
         // Different instance name but same wrapper command "work" (case-fold)
         let mut dup = sample_instance(
             "other",
-            "/home/u/.claude-other",
+            &crate::test_util::tmp_abs_str(".claude-other"),
             "id-2",
-            Some("/tmp/wrapper2"),
+            Some(crate::test_util::tmp_abs_str("wrapper2").as_str()),
         );
         // Force wrapper command to collide case-folded
         dup.wrapper.as_mut().unwrap().command_name = InstanceName::new("WORK").unwrap();
@@ -903,7 +910,7 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-1",
             None,
         ))
@@ -911,9 +918,9 @@ mod tests {
         // New instance whose wrapper command collides with existing instance name "work"
         let mut with_wrapper = sample_instance(
             "other",
-            "/home/u/.claude-other",
+            &crate::test_util::tmp_abs_str(".claude-other"),
             "id-2",
-            Some("/tmp/wrapper-other"),
+            Some(crate::test_util::tmp_abs_str("wrapper-other").as_str()),
         );
         with_wrapper.wrapper.as_mut().unwrap().command_name = InstanceName::new("work").unwrap();
         let err = r.insert(with_wrapper).unwrap_err();
@@ -926,7 +933,12 @@ mod tests {
     #[test]
     fn rename_preserves_id_and_template() {
         let mut r = Registry::default();
-        let inst = sample_instance("work", "/home/u/.claude-work", "stable-id-1", None);
+        let inst = sample_instance(
+            "work",
+            &crate::test_util::tmp_abs_str("u/.claude-work"),
+            "stable-id-1",
+            None,
+        );
         let original_id = inst.id.clone();
         let original_template = inst.template.clone();
         let original_root = inst.config_root.clone();
@@ -945,9 +957,9 @@ mod tests {
         let mut r = Registry::default();
         let inst = sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-work",
-            Some("/tmp/wrapper-work"),
+            Some(crate::test_util::tmp_abs_str("wrapper-work").as_str()),
         );
         r.insert(inst).unwrap();
         r.rename("work", InstanceName::new("work2").unwrap())
@@ -962,14 +974,14 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-1",
             None,
         ))
         .unwrap();
         r.insert(sample_instance(
             "other",
-            "/home/u/.claude-other",
+            &crate::test_util::tmp_abs_str(".claude-other"),
             "id-2",
             None,
         ))
@@ -993,7 +1005,7 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            &crate::test_util::tmp_abs_str(".claude-work"),
             "id-work-foreign",
             None,
         ))
@@ -1016,10 +1028,12 @@ mod tests {
 
     #[test]
     fn unmanaged_dirs_excludes_recorded_ones() {
+        let tmp_root2 = crate::test_util::tmp_abs_str("u/.claude-aaa");
+        let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
         let mut r = Registry::default();
         r.insert(sample_instance(
             "work",
-            "/home/u/.claude-work",
+            tmp_root.as_str(),
             "id-unmanaged-1",
             None,
         ))
@@ -1027,27 +1041,25 @@ mod tests {
 
         let found = unmanaged_dirs(
             &r,
-            &[
-                PathBuf::from("/home/u/.claude-work"),
-                PathBuf::from("/home/u/.claude-aaa"),
-            ],
+            &[PathBuf::from(tmp_root), PathBuf::from(tmp_root2.clone())],
         );
-        assert_eq!(found, vec![PathBuf::from("/home/u/.claude-aaa")]);
+        assert_eq!(found, vec![PathBuf::from(tmp_root2)]);
     }
 
     #[test]
     fn migration_from_old_vector_and_instances_key() {
+        let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
         // Test bare array migration
         let path = crate::test_util::temp_dir_unique("registry").join("migration_bare.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let old = vec![instance_legacy("work", "/home/u/.claude-work")];
+        let old = vec![instance_legacy("work", tmp_root.as_str())];
         std::fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
         let reg = Registry::load(&path).unwrap();
         assert_eq!(reg.instances().len(), 1);
         let inst = &reg.instances()[0];
         assert_eq!(inst.name.as_str(), "work");
         assert_eq!(inst.harness.as_str(), "claude-code");
-        assert_eq!(inst.config_root.to_string(), "/home/u/.claude-work");
+        assert_eq!(inst.config_root.to_string(), tmp_root.as_str());
         assert_eq!(inst.origin, InstanceOrigin::AdoptedLegacy);
         assert_eq!(inst.isolation, Isolation::Unknown);
         assert_eq!(inst.ownership, Ownership::ExplicitlyAdopted);
@@ -1061,7 +1073,7 @@ mod tests {
             "instances": [ {
                 "name": "oldie",
                 "harness": "claude-code",
-                "config_dir": "/home/u/.claude-oldie",
+                "config_dir": crate::test_util::tmp_abs_str("u/.claude-oldie"),
                 "template": {"name":"glm","version":"1.2.0"}
             } ],
             "keep": 123
@@ -1080,15 +1092,16 @@ mod tests {
 
     #[test]
     fn migration_validates_harness_name_and_config() {
+        let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
         let bad_old = OldInstance {
             name: "CON".to_owned(), // reserved
             harness: "claude-code".to_owned(),
-            config_dir: "/home/u/.claude-work".to_owned(),
+            config_dir: tmp_root.clone(),
             binary_path: None,
             template: None,
         };
-        let path = Path::new("/tmp/fake");
-        let err = migrate_old_instance(bad_old, path).unwrap_err();
+        let path = crate::test_util::tmp_abs("fake");
+        let err = migrate_old_instance(bad_old, &path).unwrap_err();
         match err {
             CoreError::Validation { field, .. } => assert_eq!(field, "name"),
             other => panic!("expected validation, got {other:?}"),
@@ -1097,11 +1110,11 @@ mod tests {
         let bad_old2 = OldInstance {
             name: "work".to_owned(),
             harness: "bad/harness".to_owned(),
-            config_dir: "/home/u/.claude-work".to_owned(),
+            config_dir: tmp_root,
             binary_path: None,
             template: None,
         };
-        let err2 = migrate_old_instance(bad_old2, path).unwrap_err();
+        let err2 = migrate_old_instance(bad_old2, &path).unwrap_err();
         match err2 {
             CoreError::Validation { field, .. } => assert_eq!(field, "harness"),
             other => panic!("expected validation, got {other:?}"),
@@ -1114,7 +1127,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let err3 = migrate_old_instance(bad_old3, path).unwrap_err();
+        let err3 = migrate_old_instance(bad_old3, &path).unwrap_err();
         match err3 {
             CoreError::Validation { field, .. } => assert_eq!(field, "config_root"),
             other => panic!("expected validation, got {other:?}"),
@@ -1123,7 +1136,12 @@ mod tests {
 
     #[test]
     fn serialization_never_emits_forbidden_fields() {
-        let inst = sample_instance("work", "/home/u/.claude-work", "id-forbidden", None);
+        let inst = sample_instance(
+            "work",
+            &crate::test_util::tmp_abs_str("u/.claude-work"),
+            "id-forbidden",
+            None,
+        );
         let reg = {
             let mut r = Registry::default();
             r.insert(inst).unwrap();
@@ -1167,7 +1185,7 @@ mod tests {
                 "id": "id-1",
                 "name": "work",
                 "harness": "claude-code",
-                "config_root": "/home/u/.claude-work",
+                "config_root": crate::test_util::tmp_abs_str("u/.claude-work"),
                 "isolation": "bogus_unknown",
                 "origin": "created",
                 "ownership": "superai_created",
@@ -1210,20 +1228,23 @@ mod tests {
 
     #[test]
     fn golden_fixtures_old_and_new_are_valid() {
+        let tmp_root2 = crate::test_util::tmp_abs_str("user/.local/bin/work");
+        let tmp_root = crate::test_util::tmp_abs_str("user/.claude-work");
+        let tmp_bin = crate::test_util::tmp_abs_str("usr/local/bin/claude");
         // Old fixture: minimal old shape without schema_version
         let old_fixture = serde_json::json!({
             "instances": [
                 {
                     "name": "work",
                     "harness": "claude-code",
-                    "config_dir": "/home/user/.claude-work",
-                    "binary_path": "/usr/local/bin/claude",
+                    "config_dir": tmp_root.as_str(),
+                    "binary_path": tmp_bin.as_str(),
                     "template": {"name": "claude-glm", "version": "1.2.0"}
                 },
                 {
                     "name": "personal",
                     "harness": "codex-cli",
-                    "config_dir": "/home/user/.codex-personal"
+                    "config_dir": crate::test_util::tmp_abs_str("user/.codex-personal")
                 }
             ],
             "foreign_key": "preserve-me"
@@ -1237,11 +1258,11 @@ mod tests {
         assert_eq!(reg.instances()[0].isolation, Isolation::Unknown);
         assert_eq!(
             reg.instances()[0].config_root.to_string(),
-            "/home/user/.claude-work"
+            tmp_root.as_str()
         );
         assert_eq!(
             reg.instances()[0].binary.as_ref().unwrap().to_string(),
-            "/usr/local/bin/claude"
+            tmp_bin.as_str()
         );
         assert_eq!(
             reg.instances()[0].template.as_ref().unwrap().name.as_str(),
@@ -1255,10 +1276,10 @@ mod tests {
                     "id": "inst-1",
                     "name": "work",
                     "harness": "claude-code",
-                    "config_root": "/home/user/.claude-work",
+                    "config_root": tmp_root.as_str(),
                     "binary": "claude",
                     "wrapper": {
-                        "path": "/home/user/.local/bin/work",
+                        "path": tmp_root2.as_str(),
                         "command_name": "work",
                         "generator_version": "0.1.0",
                         "content_digest": "abc123"
@@ -1286,7 +1307,7 @@ mod tests {
                 .unwrap()
                 .path
                 .to_string(),
-            "/home/user/.local/bin/work"
+            tmp_root2.as_str()
         );
         // Round-trip preserves foreign key
         reg2.store(&path2).unwrap();

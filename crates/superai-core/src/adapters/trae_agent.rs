@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn plan_wrapper_sets_env_and_args() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/trae-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("trae-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(
             plan.env_vars
@@ -758,8 +758,9 @@ mod tests {
 
     #[test]
     fn plan_wrapper_quoting_with_spaces() {
+        let root = crate::test_util::tmp_abs_str("my trae work");
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/my trae work");
+        let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let val = plan
             .env_vars
@@ -767,13 +768,19 @@ mod tests {
             .find(|(k, _)| k == CONFIG_ENV_VAR)
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(val, "/tmp/my trae work/trae_config.yaml");
+        assert_eq!(
+            val,
+            std::path::Path::new(&root)
+                .join("trae_config.yaml")
+                .display()
+                .to_string()
+        );
     }
 
     #[test]
     fn plan_wrapper_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/trae-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("trae-work"));
         inst.harness = HarnessId::new("codex-cli").unwrap();
         let err = a.plan_wrapper(&inst).unwrap_err();
         match err {
@@ -793,14 +800,14 @@ mod tests {
     #[test]
     fn validate_instance_accepts_explicit_config() {
         let a = adapter();
-        let inst = sample_instance_with_root("/tmp/trae-work");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("trae-work"));
         a.validate_instance(&inst).unwrap();
     }
 
     #[test]
     fn validate_instance_rejects_wrong_isolation() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/trae-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("trae-work"));
         inst.isolation = Isolation::ProjectScope;
         let err = a.validate_instance(&inst).unwrap_err();
         match err {
@@ -812,7 +819,7 @@ mod tests {
     #[test]
     fn validate_instance_rejects_mismatched_harness() {
         let a = adapter();
-        let mut inst = sample_instance_with_root("/tmp/trae-work");
+        let mut inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("trae-work"));
         inst.harness = HarnessId::new("aider").unwrap();
         assert!(a.validate_instance(&inst).is_err());
     }
