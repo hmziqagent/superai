@@ -172,14 +172,18 @@ impl WorkBuddyAdapter {
         None
     }
 
-    /// Run `binary arg` with a timeout, returning combined stdout/stderr.
-    fn run_with_timeout(binary: &Path, arg: &str) -> Option<String> {
+    /// Run `binary` with `args` and a timeout, returning combined
+    /// stdout/stderr.
+    fn run_with_timeout(binary: &Path, args: &[&str]) -> Option<String> {
         let binary_owned = binary.to_path_buf();
-        let arg_owned = arg.to_owned();
+        let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg(&arg_owned)
+            let mut command = Command::new(&binary_owned);
+            for arg in &args_owned {
+                command.arg(arg);
+            }
+            let output = command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output();
@@ -206,15 +210,21 @@ impl WorkBuddyAdapter {
     /// output format is UNVERIFIED (workbuddy.md §7), so this is best-effort
     /// and detection falls back to npm package metadata.
     fn probe_binary_version(binary: &Path) -> Option<String> {
-        Self::parse_version_output(&Self::run_with_timeout(binary, "--version")?)
+        Self::parse_version_output(&Self::run_with_timeout(binary, &["--version"])?)
     }
 
-    /// Probe npm metadata for the installed package version (the preferred
-    /// version source per HAD-02 because the CLI flag format is unverified).
+    /// Probe npm global metadata for the installed package version (the
+    /// preferred version source per HAD-02 because the CLI flag format is
+    /// unverified). The package is installed with `npm i -g`, so only the
+    /// global tree can see it.
     fn probe_npm_version() -> Option<String> {
-        let output = Self::run_with_timeout(Path::new("npm"), "ls")?;
-        // `npm ls` prints a package tree; harvest the first
-        // `@tencent-ai/codebuddy-code@<version>` mention.
+        let output = Self::run_with_timeout(Path::new("npm"), &["ls", "-g"])?;
+        Self::harvest_npm_version(&output)
+    }
+
+    /// Harvest the first `@tencent-ai/codebuddy-code@<version>` mention from
+    /// `npm ls -g` tree output.
+    fn harvest_npm_version(output: &str) -> Option<String> {
         let needle = format!("{NPM_PACKAGE}@");
         let line = output.lines().find(|l| l.contains(&needle))?;
         let at = line.find(&needle)?;
@@ -656,21 +666,34 @@ impl Adapter for WorkBuddyAdapter {
         surfaces.push(project_mcp);
 
         // Deprecated MCP locations (first-existing wins per scope; kept
-        // modelled so scans and mirrors see them, never preferred).
-        for (id, name, precedence) in [
-            ("deprecated.user.mcp.json", "~/.codebuddy/mcp.json", 8u8),
-            ("deprecated.user.codebuddy.json", "~/.codebuddy.json", 7u8),
+        // modelled so scans and mirrors see them, never preferred). The
+        // `~/.codebuddy/*` pair is user scope; the bare project `mcp.json`
+        // is project scope (workbuddy.md §1.1).
+        for (id, name, precedence, scope) in [
+            (
+                "deprecated.user.mcp.json",
+                "~/.codebuddy/mcp.json",
+                8u8,
+                ConfigScope::User,
+            ),
+            (
+                "deprecated.user.codebuddy.json",
+                "~/.codebuddy.json",
+                7u8,
+                ConfigScope::User,
+            ),
             (
                 "deprecated.project.mcp.json",
                 "mcp.json (project root, deprecated)",
                 9u8,
+                ConfigScope::ProjectWorkspace,
             ),
         ] {
             let mut surface = ConfigSurface::new(
                 id,
                 PathResolver::fallback_only(name),
                 DocumentKind::Json,
-                ConfigScope::User,
+                scope,
                 SurfaceOwnership::UserEditable,
             );
             surface.precedence = precedence;
@@ -928,6 +951,7 @@ mod tests {
         WorkBuddyAdapter,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
+    use crate::capability::{Capability, Support};
     use crate::error::CoreError;
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -1085,8 +1109,19 @@ mod tests {
         assert_eq!(mcp.kind, DocumentKind::Json);
         assert_eq!(mcp.owned_selectors, vec!["mcpServers".to_owned()]);
 
-        // Deprecated locations and the keychain stay modelled but secondary.
-        assert!(surfaces.iter().any(|s| s.id == "deprecated.user.mcp.json"));
+        // Deprecated locations and the keychain stay modelled but secondary;
+        // the bare project `mcp.json` is project scope, the `~/.codebuddy/*`
+        // pair user scope (workbuddy.md §1.1).
+        let deprecated_project = surfaces
+            .iter()
+            .find(|s| s.id == "deprecated.project.mcp.json")
+            .expect("deprecated project mcp surface");
+        assert_eq!(deprecated_project.scope, ConfigScope::ProjectWorkspace);
+        let deprecated_user = surfaces
+            .iter()
+            .find(|s| s.id == "deprecated.user.mcp.json")
+            .expect("deprecated user mcp surface");
+        assert_eq!(deprecated_user.scope, ConfigScope::User);
         let keychain = surfaces
             .iter()
             .find(|s| s.id == "credentials")
@@ -1399,11 +1434,70 @@ mod tests {
     }
 
     #[test]
-    fn capability_declarations_are_corpus_grounded() {
+    fn capability_declarations_cover_catalog_natively_without_duplicates() {
         let a = adapter();
         let decls = a.capability_declarations();
-        assert_eq!(decls.len(), 4);
-        assert!(decls.iter().all(|d| !d.explanation.is_empty()));
+        let mut seen: Vec<Capability> = Vec::new();
+        for decl in &decls {
+            assert_eq!(
+                decl.support,
+                Support::Native,
+                "{} must declare native transport",
+                decl.capability
+            );
+            assert!(
+                !decl.explanation.is_empty(),
+                "{} must carry corpus evidence",
+                decl.capability
+            );
+            assert!(
+                decl.version_req.is_none(),
+                "{}: no version-gated claims without a verified format",
+                decl.capability
+            );
+            assert!(
+                !seen.contains(&decl.capability),
+                "duplicate declaration for {}",
+                decl.capability
+            );
+            seen.push(decl.capability);
+        }
+        // Every catalog capability is claimed exactly once, including the
+        // deny-list-named tools (WebSearch, ComputerUse) and the
+        // supportsImages-driven image path (Vision).
+        for capability in [
+            Capability::Mcp,
+            Capability::WebSearch,
+            Capability::ComputerUse,
+            Capability::Vision,
+        ] {
+            assert!(
+                seen.contains(&capability),
+                "missing capability declaration for {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_version_harvest_reads_global_tree_output() {
+        // Shape mirrors `npm ls -g` output for a global install.
+        let global_tree =
+            "/usr/lib\n├── @tencent-ai/codebuddy-code@2.147.0\n└── typescript@5.6.2\n";
+        assert_eq!(
+            WorkBuddyAdapter::harvest_npm_version(global_tree).as_deref(),
+            Some("2.147.0")
+        );
+        // Tree without the package: no version claim.
+        let without = "/usr/lib\n└── typescript@5.6.2\n";
+        assert_eq!(WorkBuddyAdapter::harvest_npm_version(without), None);
+        // Empty or errored output: no version claim.
+        assert_eq!(WorkBuddyAdapter::harvest_npm_version(""), None);
+        // Trailing tree glyphs after the version do not leak into it.
+        let decorated = "└── @tencent-ai/codebuddy-code@2.147.4-beta.1\n";
+        assert_eq!(
+            WorkBuddyAdapter::harvest_npm_version(decorated).as_deref(),
+            Some("2.147.4-beta.1")
+        );
     }
 
     // -----------------------------------------------------------------------
