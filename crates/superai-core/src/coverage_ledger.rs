@@ -371,7 +371,7 @@ pub const DOD_ITEMS: &[DodItem] = &[
     },
     DodItem {
         number: 2,
-        label: "48 surfaces adapter support records",
+        label: "49 surfaces adapter support records",
         evidence: &[
             Evidence::Test {
                 file: "src/harness_catalog.rs",

@@ -18,7 +18,7 @@ pub mod discovery;
 mod error;
 /// Failure injection and fake process/network harness per QAL-06/07.
 pub mod failure;
-/// Registered harness catalog — the 48 planned product surfaces.
+/// Registered harness catalog — the 49 planned product surfaces.
 pub mod harness_catalog;
 /// Health probe — bounded, redacted, protocol-aware.
 pub mod health;

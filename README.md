@@ -2,7 +2,7 @@
 
 An all-in-one configurator for AI coding harnesses — instances, templates, skills, and providers. Rust, local only, one binary.
 
-**Status: filesystem layer boring — atomic commits, backups, rollback and conflict detection done; backend implemented through master-plan milestones A–H (document engine, safe mutation, adapters with 48-surface ledger, lifecycle, discovery, wrappers, providers, templates, capabilities, skills/plugins/MCP, install, raw editor, verification harness and platform gates); 1480+ tests, strict lints, fixtures and verification harness. Interface (GPUI) remains planned.**
+**Status: filesystem layer boring — atomic commits, backups, rollback and conflict detection done; backend implemented through master-plan milestones A–H (document engine, safe mutation, adapters with 49-surface ledger, lifecycle, discovery, wrappers, providers, templates, capabilities, skills/plugins/MCP, install, raw editor, verification harness and platform gates); 1480+ tests, strict lints, fixtures and verification harness. Interface (GPUI) remains planned.**
 
 - [docs/goal.md](docs/goal.md) — what this is and why
 - [docs/plans/master-plan.md](docs/plans/master-plan.md) — non-UI implementation index and subplans
@@ -10,7 +10,7 @@ An all-in-one configurator for AI coding harnesses — instances, templates, ski
 
 ## Supported harnesses
 
-The catalog tracks 48 harness surfaces. Every entry records where its config
+The catalog tracks 49 harness surfaces. Every entry records where its config
 lives, which isolation mechanism multi-instance setups use (relocated root,
 per-profile files, `--user-data-dir`, or fixed-path with activation), which
 platforms it runs on, and when its research was last verified — see
