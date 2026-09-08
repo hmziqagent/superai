@@ -160,6 +160,7 @@ gaps from source docs keep a surface read-only or research-blocked until closed.
 | Trae Agent | [trae-agent.md](../harness-configs/trae-agent.md) | YAML; deprecated JSON | explicit config/env | Full candidate |
 | Warp Agent CLI/app | [warp.md](../harness-configs/warp.md) | CLI TOML, MCP JSON, workflows YAML | Linux XDG/profile constrained | Constrained |
 | Windsurf/Devin Desktop | [windsurf.md](../harness-configs/windsurf.md) | MCP JSON, rules/skills; IDE storage | IDE user-data | Constrained |
+| WorkBuddy / CodeBuddy CLI (cbc) | [workbuddy.md](../harness-configs/workbuddy.md) | JSON models/settings/MCP under `~/.codebuddy`; env auth | relocated-root (`CODEBUDDY_CONFIG_DIR`) | Constrained; desktop app GUI-only, documented not mutated |
 | ZCode | [zcode.md](../harness-configs/zcode.md) | versioned-path JSON | fixed path | SingleInstance; schema research gate |
 | Zed AI/ACP | [zed-acp.md](../harness-configs/zed-acp.md) | JSON settings, ACP wrappers, MCP | wrapper registrations | Constrained; version gates required |
 | Vibe Kanban | [orchestrators.md](../harness-configs/orchestrators.md) | app profiles/env/MCP/worktrees | orchestrator profiles | MigrationOnly/community-maintained |

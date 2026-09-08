@@ -1,0 +1,32 @@
+{
+  "models": [
+    {
+      "id": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro (test)",
+      "vendor": "DeepSeek",
+      "url": "https://api.deepseek.com/v1/chat/completions",
+      "apiKey": "${DEEPSEEK_TEST_API_KEY}",
+      "maxInputTokens": 128000,
+      "maxOutputTokens": 8192,
+      "supportsToolCall": true,
+      "supportsImages": false,
+      "supportsReasoning": true,
+      "relatedModels": {
+        "lite": "deepseek-v4-flash",
+        "reasoning": "deepseek-v4-reasoner"
+      }
+    },
+    {
+      "id": "ollama-local",
+      "name": "Ollama local (test)",
+      "vendor": "Ollama",
+      "url": "http://127.0.0.1:11434/v1/chat/completions",
+      "apiKey": "${OLLAMA_TEST_KEY}",
+      "maxInputTokens": 32768,
+      "maxOutputTokens": 8192,
+      "supportsToolCall": true,
+      "supportsImages": true
+    }
+  ],
+  "availableModels": ["deepseek-v4-pro", "deepseek-v4-flash", "ollama-local"]
+}

@@ -34,6 +34,7 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Nanocoder | [nanocoder.md](nanocoder.md) | `NANOCODER_CONFIG_DIR` / `NANOCODER_PROVIDERS_FILE` |
 | Trae Agent (ByteDance) | [trae-agent.md](trae-agent.md) | `--config-file` + `TRAE_CONFIG_FILE` |
 | Plandex 2 | [plandex.md](plandex.md) | env-driven provider switching; per-server `PLANDEX_API_HOST` |
+| WorkBuddy / CodeBuddy CLI (cbc) | [workbuddy.md](workbuddy.md) | `CODEBUDDY_CONFIG_DIR`; desktop app GUI-only (documented, not mutated) |
 
 ### IDE / editor-integrated agents
 | Harness | File | Wrapper notes |
@@ -61,7 +62,7 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 
 ## Universal patterns (the cheat-sheet)
 
-1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`. Relocate → run its auth flow once → you have an independent instance.
+1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`, `CODEBUDDY_CONFIG_DIR`. Relocate → run its auth flow once → you have an independent instance.
 2. **Env beats config for providers** almost everywhere: every harness that speaks OpenAI-compatible takes `<PROVIDER>_API_KEY` + some base-URL override (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `COPILOT_PROVIDER_BASE_URL`, `OPENROUTER_API_KEY`…). Wrappers just export different values before `exec`.
 3. **Anthropic-compatible endpoints are a de-facto standard too** — Claude Code (`ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN`), Kimi Code (`anthropic` provider with custom `base_url`), Crush/Kilo/Cline ("anthropic" provider type) all repoint at GLM/OpenRouter-style Anthropic-format gateways.
 4. **Inline config injection** where supported: Codex `CODEX_CONFIG`, Grok `GROK_CONFIG` (JSON deep-merge), OpenCode `OPENCODE_CONFIG_CONTENT`, Amp `AMP_SETTINGS_FILE`, Nanocoder `NANOCODER_PROVIDERS_FILE`.

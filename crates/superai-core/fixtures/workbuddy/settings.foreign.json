@@ -1,0 +1,6 @@
+{
+  "alwaysThinkingEnabled": false,
+  "unknownSetting": "preserve-me",
+  "experimentalFlag": { "nested": [1, 2, 3] },
+  "futureKey": true
+}

@@ -1,0 +1,14 @@
+{
+  "models": [
+    {
+      "id": "test-model",
+      "name": "Test Model",
+      "vendor": "OpenAI",
+      "url": "https://api.example.com/v1/chat/completions",
+      "apiKey": "${CBC_TEST_API_KEY}",
+      "supportsToolCall": true,
+      "supportsImages": false
+    }
+  ],
+  "availableModels": ["test-model"]
+}

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": {
+        "FS_TEST_ROOT": "/tmp"
+      }
+    },
+    "remote-tools": {
+      "type": "http",
+      "url": "https://mcp.example-test.com/mcp",
+      "headers": {
+        "Authorization": "Bearer test-fake-token"
+      }
+    }
+  }
+}
