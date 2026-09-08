@@ -46,6 +46,7 @@ pub mod trae_agent;
 pub mod vibe_kanban;
 pub mod warp;
 pub mod windsurf;
+pub mod workbuddy;
 pub mod zcode;
 pub mod zed_acp;
 
@@ -95,6 +96,7 @@ mod decl_tests {
         ("trae-agent", "trae_config.yaml", "mcp_servers"),
         ("warp", ".mcp.json", "mcpServers"),
         ("windsurf", "mcp_config.json", "mcpServers"),
+        ("workbuddy", ".mcp.json", "mcpServers"),
         ("zed-acp", "settings.json", "context_servers"),
     ];
 
@@ -236,17 +238,17 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 48 MCP declarations (round-1 judge
-    /// recount): pins the exact writable/read-only/absence split so any
-    /// drift in either direction fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 15;
+    /// Verified corpus partition of the 49 MCP declarations (round-1 judge
+    /// recount plus workbuddy): pins the exact writable/read-only/absence
+    /// split so any drift in either direction fails with the real numbers.
+    const EXPECTED_MCP_WRITABLE: usize = 16;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
     const EXPECTED_MCP_ABSENT: usize = 15;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
         let adapters = harness_catalog::all_adapters();
-        assert_eq!(adapters.len(), 48, "catalog must list 48 adapters");
+        assert_eq!(adapters.len(), 49, "catalog must list 49 adapters");
         let mut writable = 0;
         let mut read_only = 0;
         let mut absent = 0;
@@ -279,11 +281,11 @@ mod decl_tests {
                 writable += usize::from(!is_read_only);
             }
         }
-        // The exact partition: sums to 48 AND matches the verified counts.
+        // The exact partition: sums to 49 AND matches the verified counts.
         assert_eq!(
             writable + read_only + absent,
-            48,
-            "writable {writable} + read-only {read_only} + absence {absent} must cover all 48"
+            49,
+            "writable {writable} + read-only {read_only} + absence {absent} must cover all 49"
         );
         assert_eq!(
             writable, EXPECTED_MCP_WRITABLE,
@@ -357,7 +359,7 @@ mod decl_tests {
             }
         }
         assert_eq!(declared, PLUGIN_DECLS.len());
-        assert_eq!(absent, 48 - PLUGIN_DECLS.len());
+        assert_eq!(absent, 49 - PLUGIN_DECLS.len());
     }
 
     #[test]

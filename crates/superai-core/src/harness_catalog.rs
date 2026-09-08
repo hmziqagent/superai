@@ -1,4 +1,4 @@
-//! Registered harness catalog — the 48 planned product surfaces.
+//! Registered harness catalog — the 49 planned product surfaces.
 //!
 //! Every row from `docs/plans/03-harness-adapters.md` provisional ledger is
 //! present with its entry gate, source link, and reason. This satisfies the
@@ -53,6 +53,7 @@ use crate::adapters::trae_agent::TraeAgentAdapter;
 use crate::adapters::vibe_kanban::VibeKanbanAdapter;
 use crate::adapters::warp::WarpAdapter;
 use crate::adapters::windsurf::WindsurfAdapter;
+use crate::adapters::workbuddy::WorkBuddyAdapter;
 use crate::adapters::zcode::ZcodeAdapter;
 use crate::adapters::zed_acp::ZedAcpAdapter;
 use crate::error::CoreError;
@@ -97,7 +98,7 @@ impl CatalogEntry {
 // Static catalog
 // ---------------------------------------------------------------------------
 
-/// All 48 provisional ledger rows.
+/// All 49 provisional ledger rows.
 ///
 /// Order follows the table in `docs/plans/03-harness-adapters.md` with the
 /// subsequent orchestrator additions. Every surface has a source link and
@@ -577,6 +578,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "workbuddy",
+        display_name: "WorkBuddy / CodeBuddy CLI (cbc)",
+        source: "docs/harness-configs/workbuddy.md",
+        support: AdapterSupport::Constrained,
+        reason: "CLI-only config surface under ~/.codebuddy; desktop app GUI-only, documented not mutated",
+        isolation: Isolation::RelocatedRoot,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/workbuddy.md",
+        last_verified: "2026-09-01",
+    },
+    CatalogEntry {
         id: "zcode",
         display_name: "ZCode",
         source: "docs/harness-configs/zcode.md",
@@ -665,7 +677,7 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 /// harness ids through here instead of duplicating per-adapter wiring.
 #[expect(
     clippy::too_many_lines,
-    reason = "catalog has 48 entries with per-adapter branching"
+    reason = "catalog has 49 entries with per-adapter branching"
 )]
 pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     if id == crate::adapters::claude_code::HARNESS_ID_STR
@@ -790,6 +802,11 @@ pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     }
     if id == crate::adapters::windsurf::HARNESS_ID_STR
         && let Ok(adapter) = WindsurfAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::workbuddy::HARNESS_ID_STR
+        && let Ok(adapter) = WorkBuddyAdapter::new()
     {
         return Some(Box::new(adapter) as Box<dyn Adapter>);
     }
@@ -1036,11 +1053,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_48_entries() {
-        assert_eq!(len(), 48, "catalog must contain exactly 48 ledger rows");
-        assert_eq!(ENTRIES.len(), 48);
-        assert_eq!(all_entries().len(), 48);
-        assert_eq!(all_ids().len(), 48);
+    fn catalog_has_49_entries() {
+        assert_eq!(len(), 49, "catalog must contain exactly 49 ledger rows");
+        assert_eq!(ENTRIES.len(), 49);
+        assert_eq!(all_entries().len(), 49);
+        assert_eq!(all_ids().len(), 49);
         assert!(!is_empty());
     }
 
@@ -1070,7 +1087,7 @@ mod tests {
                 entry.id
             );
         }
-        assert_eq!(seen.len(), 48);
+        assert_eq!(seen.len(), 49);
     }
 
     #[test]
@@ -1173,7 +1190,7 @@ mod tests {
         let adapters = all_adapters();
         assert_eq!(
             adapters.len(),
-            48,
+            49,
             "all_adapters must return an adapter for each catalog row"
         );
         let mut ids: Vec<String> = adapters
@@ -1229,7 +1246,7 @@ mod tests {
             }
         }
         assert_eq!(full, 20, "expected 20 Full per ledger");
-        assert_eq!(constrained, 15, "expected 15 Constrained per ledger");
+        assert_eq!(constrained, 16, "expected 16 Constrained per ledger");
         assert_eq!(single, 1, "expected 1 SingleInstance per ledger");
         assert_eq!(migration_only, 6, "expected 6 MigrationOnly per ledger");
         assert_eq!(research_blocked, 4, "expected 4 ResearchBlocked per ledger");
@@ -1242,7 +1259,7 @@ mod tests {
                 + research_blocked
                 + unsupported
                 + read_only,
-            48
+            49
         );
     }
 
@@ -1253,7 +1270,7 @@ mod tests {
     )]
     #[expect(
         clippy::too_many_lines,
-        reason = "test exercises every trait method for 48 adapters"
+        reason = "test exercises every trait method for 49 adapters"
     )]
     fn adapters_are_object_safe_and_usable_as_trait_objects() {
         let adapters = all_adapters();
