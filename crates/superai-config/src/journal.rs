@@ -624,4 +624,177 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&home));
     }
+
+    // -----------------------------------------------------------------
+    // Mutation-hardening behaviour tests (area D).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn journal_phase_display_matches_the_recorded_names() {
+        assert_eq!(JournalPhase::Plan.to_string(), "plan");
+        assert_eq!(JournalPhase::PrepareBackup.to_string(), "prepare_backup");
+        assert_eq!(JournalPhase::StageTemp.to_string(), "stage_temp");
+        assert_eq!(JournalPhase::Commit.to_string(), "commit");
+        assert_eq!(JournalPhase::Verify.to_string(), "verify");
+        assert_eq!(JournalPhase::Rollback.to_string(), "rollback");
+        assert_eq!(JournalPhase::Done.to_string(), "done");
+    }
+
+    #[test]
+    fn journal_write_to_creates_missing_parent_directories() {
+        let dir = home_dir();
+        let path = dir.join("deep/nested/parents/j.json");
+        CrashJournal::new("op-parents", JournalPhase::Plan, vec![])
+            .write_to(&path)
+            .unwrap();
+        assert_eq!(
+            CrashJournal::load_from(&path)
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "op-parents"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn journal_load_from_surfaces_non_notfound_read_errors() {
+        let dir = home_dir();
+        let occupied = dir.join("occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let res = CrashJournal::load_from(&occupied);
+        assert!(
+            res.is_err(),
+            "reading a directory is not NotFound: {:?}",
+            res.map(|o| o.map(|j| j.operation_id))
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn journal_remove_surfaces_non_notfound_errors() {
+        let dir = home_dir();
+        let occupied = dir.join("occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let res = CrashJournal::remove(&occupied);
+        assert!(
+            res.is_err(),
+            "removing a directory is not NotFound: {res:?}"
+        );
+        assert!(occupied.exists(), "the directory is still there");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn recover_pending_surfaces_journal_dir_read_errors() {
+        let home = home_dir();
+        let superai = home.join(".superai");
+        std::fs::create_dir_all(&superai).unwrap();
+        // The journal dir path occupied by a regular file: read_dir fails
+        // with ENOTDIR, which is not NotFound and must surface.
+        std::fs::write(superai.join("journal"), b"not a directory").unwrap();
+        assert!(
+            recover_pending(&home).is_err(),
+            "ENOTDIR on the journal dir is not a clean no-op"
+        );
+    }
+
+    #[test]
+    fn recover_pending_ignores_files_that_are_not_journals() {
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let stray = jroot.join("notes.txt");
+        std::fs::write(&stray, b"not json").unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        assert!(
+            report.journals.is_empty(),
+            "non-journal files are not recovered: {:?}",
+            report.journals
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stray).unwrap(),
+            "not json",
+            "non-journal files are left in place"
+        );
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn recover_journal_file_disposes_of_empty_stray_journals() {
+        let dir = home_dir();
+        let path = dir.join("empty.journal.json");
+        std::fs::write(&path, b"").unwrap();
+
+        let rec = recover_journal_file(&path).unwrap();
+        assert!(rec.recovered);
+        assert_eq!(rec.operation_id, "");
+        assert_eq!(rec.phase, JournalPhase::Done);
+        assert_eq!(rec.outcome, "no journal to recover");
+        assert!(!path.exists(), "the stray empty journal is removed");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_removes_staged_broken_symlink_temps() {
+        let home = home_dir();
+        // Deliberately NOT named `.tmp.*`: only the staged_temps loop owns it,
+        // so the lstat fallback in the exists() check is exercised directly.
+        let broken = home.join("staged-broken-link");
+        std::os::unix::fs::symlink("/definitely/not/present", &broken).unwrap();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let mut journal = CrashJournal::new(
+            "op-broken-staged",
+            JournalPhase::StageTemp,
+            vec![home.join("resource.json").to_string_lossy().into_owned()],
+        );
+        journal
+            .staged_temps
+            .push(broken.to_string_lossy().into_owned());
+        journal
+            .write_to(&journal_path(&jroot, "op-broken-staged"))
+            .unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        assert!(report.all_recovered(), "{:?}", report.journals);
+        assert!(
+            std::fs::symlink_metadata(&broken).is_err(),
+            "a staged broken symlink is a temp and must be removed"
+        );
+        let rec = report.journals.first().expect("one journal was found");
+        assert_eq!(rec.removed_temps, vec![broken]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_removes_committed_creations_that_are_broken_symlinks() {
+        let home = home_dir();
+        let created = home.join("created-link.json");
+        std::os::unix::fs::symlink("/definitely/not/present", &created).unwrap();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let mut journal = CrashJournal::new(
+            "op-link-creation",
+            JournalPhase::Verify,
+            vec![created.to_string_lossy().into_owned()],
+        );
+        journal
+            .completed
+            .push(created.to_string_lossy().into_owned());
+        journal
+            .write_to(&journal_path(&jroot, "op-link-creation"))
+            .unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        assert!(report.all_recovered(), "{:?}", report.journals);
+        assert!(
+            std::fs::symlink_metadata(&created).is_err(),
+            "a committed creation that is a broken symlink is removed"
+        );
+        let rec = report.journals.first().expect("one journal was found");
+        assert_eq!(rec.removed_creations, vec![created]);
+    }
 }

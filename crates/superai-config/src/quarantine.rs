@@ -649,4 +649,423 @@ mod tests {
         let qdir = quarantine_dir(&op).unwrap();
         drop(std::fs::remove_dir_all(&qdir));
     }
+
+    // -----------------------------------------------------------------
+    // Mutation-hardening behaviour tests (area D).
+    // -----------------------------------------------------------------
+
+    /// Whether chmod still denies the owner: root (`DAC_OVERRIDE`) bypasses
+    /// permission checks, so permission-driven scenarios must self-skip.
+    #[cfg(unix)]
+    fn permissions_are_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = crate::test_util::temp_dir_unique("quarantine-perm-probe");
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let denied = std::fs::File::create(probe.join("p")).is_err();
+        drop(std::fs::set_permissions(
+            &probe,
+            std::fs::Permissions::from_mode(0o755),
+        ));
+        drop(std::fs::remove_dir_all(&probe));
+        denied
+    }
+
+    #[cfg(unix)]
+    fn dev_of(path: &Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.dev())
+    }
+
+    /// A scratch directory on a filesystem other than the quarantine base's,
+    /// when one is available (/dev/shm tmpfs vs the home filesystem).
+    #[cfg(unix)]
+    fn cross_device_scratch() -> Option<PathBuf> {
+        let shm = PathBuf::from("/dev/shm");
+        if !shm.is_dir() {
+            return None;
+        }
+        let home = home_dir()?;
+        if dev_of(&shm)? == dev_of(&home)? {
+            return None; // same filesystem: rename would succeed, nothing to probe
+        }
+        let scratch = shm.join(format!("superai-quarantine-exdev-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).ok()?;
+        Some(scratch)
+    }
+
+    #[test]
+    fn quarantine_base_is_an_absolute_home_anchored_directory() {
+        let base = quarantine_base().unwrap();
+        assert!(
+            base.is_absolute(),
+            "quarantine base must be absolute: {base:?}"
+        );
+        let home = home_dir().expect("tests require a resolvable home directory");
+        assert_eq!(base, home.join(".superai").join("quarantine"));
+        assert_eq!(
+            quarantine_dir("anchored-op").unwrap(),
+            base.join("anchored-op")
+        );
+    }
+
+    #[test]
+    fn quarantine_dir_rejects_every_path_separator_shape() {
+        quarantine_dir("").unwrap_err();
+        quarantine_dir("a/b").unwrap_err();
+        quarantine_dir("a\\b").unwrap_err();
+        quarantine_dir("a:b").unwrap_err();
+    }
+
+    #[test]
+    fn validate_quarantine_rejects_trailing_slash_broad_roots() {
+        validate_quarantine_target(Path::new("/home/")).unwrap_err();
+        validate_quarantine_target(Path::new("/tmp/")).unwrap_err();
+    }
+
+    #[test]
+    fn validate_quarantine_rejects_existing_paths_containing_globs() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-glob");
+        for name in ["star*name", "quest?name", "brack[name"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let err = validate_quarantine_target(&path).unwrap_err();
+            assert!(err.to_string().contains("globs"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_quarantine_rejects_existing_paths_with_unresolved_variables() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-variables");
+        let dollar = dir.join("dollar$sign");
+        std::fs::write(&dollar, b"x").unwrap();
+        let percent = dir.join("percent%sign");
+        std::fs::write(&percent, b"x").unwrap();
+        std::fs::create_dir_all(dir.join("~")).unwrap();
+        let tilde = dir.join("~").join("file");
+        std::fs::write(&tilde, b"x").unwrap();
+        for path in [&dollar, &percent, &tilde] {
+            let err = validate_quarantine_target(path).unwrap_err();
+            assert!(
+                err.to_string().contains("unresolved variable"),
+                "{}: {err}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_entry_digest_is_sixteen_lowercase_hex_and_content_addressed() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-digest");
+        let op_a = unique_op("digest-a");
+        let src_a = dir.join("digest-a");
+        std::fs::write(&src_a, b"quarantine digest probe").unwrap();
+        let entry_a = move_to_quarantine(&src_a, &op_a).unwrap();
+        let digest_a = entry_a.digest.clone().expect("file moves record a digest");
+        assert_eq!(digest_a.len(), 16, "digest must be 16 hex characters");
+        assert!(
+            digest_a
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "digest must be lowercase hex: {digest_a}"
+        );
+        assert_eq!(entry_a.size, Some(23));
+
+        // Same bytes quarantine to the same digest; different bytes differ.
+        let op_b = unique_op("digest-bc");
+        let src_b = dir.join("digest-b");
+        std::fs::write(&src_b, b"quarantine digest probe").unwrap();
+        let src_c = dir.join("digest-c");
+        std::fs::write(&src_c, b"different bytes entirely").unwrap();
+        let entry_b = move_to_quarantine(&src_b, &op_b).unwrap();
+        let entry_c = move_to_quarantine(&src_c, &op_b).unwrap();
+        assert_eq!(entry_b.digest, entry_a.digest);
+        assert_ne!(entry_c.digest, entry_a.digest);
+
+        // The listing recomputes the same digest for the landed files.
+        let listed = list_quarantine(&op_b).unwrap();
+        let find = |name: &str| {
+            listed
+                .iter()
+                .find(|e| e.quarantine_path.ends_with(name))
+                .unwrap_or_else(|| panic!("listed entry {name} missing: {listed:?}"))
+        };
+        assert_eq!(find("digest-b").digest, entry_a.digest);
+        assert!(find("digest-b").recoverable);
+        assert_eq!(find("digest-c").digest, entry_c.digest);
+    }
+
+    #[test]
+    fn quarantine_dedups_colliding_destination_names_until_free() {
+        let op = unique_op("collide-ok");
+        let qdir = quarantine_dir(&op).unwrap();
+        std::fs::create_dir_all(&qdir).unwrap();
+        let dest = qdir.join("victim");
+        // Occupy dest plus the first 99 dedup candidates: the mover must
+        // still succeed by landing on `victim.100`.
+        std::fs::write(&dest, b"occupied").unwrap();
+        for i in 1..100 {
+            std::fs::write(qdir.join(format!("victim.{i}")), b"occupied").unwrap();
+        }
+        let src = crate::test_util::temp_dir_unique("quarantine-collide-src").join("victim");
+        std::fs::write(&src, b"colliding content").unwrap();
+
+        let entry = move_to_quarantine_with_dest(&src, &dest, &op).unwrap();
+        assert_eq!(entry.quarantine_path, qdir.join("victim.100"));
+        assert_eq!(
+            std::fs::read(qdir.join("victim.100")).unwrap(),
+            b"colliding content"
+        );
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn quarantine_gives_up_after_a_hundred_destination_collisions() {
+        let op = unique_op("collide-full");
+        let qdir = quarantine_dir(&op).unwrap();
+        std::fs::create_dir_all(&qdir).unwrap();
+        let dest = qdir.join("victim");
+        std::fs::write(&dest, b"occupied").unwrap();
+        for i in 1..=100 {
+            std::fs::write(qdir.join(format!("victim.{i}")), b"occupied").unwrap();
+        }
+        let src = crate::test_util::temp_dir_unique("quarantine-collide-full").join("victim");
+        std::fs::write(&src, b"never moved").unwrap();
+
+        let err = move_to_quarantine_with_dest(&src, &dest, &op).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io { ref source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "collision exhaustion must surface AlreadyExists: {err}"
+        );
+        assert!(
+            src.exists(),
+            "the source is untouched on collision exhaustion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_cross_device_move_copies_verifies_and_reports_other_filesystem() {
+        let Some(scratch) = cross_device_scratch() else {
+            return;
+        };
+        let op = unique_op("exdev-file");
+        let src = scratch.join(unique_op("src"));
+        std::fs::write(&src, b"cross-device content").unwrap();
+
+        let entry = move_to_quarantine(&src, &op).unwrap();
+        assert!(
+            !entry.same_filesystem,
+            "a cross-device move must report the copy path"
+        );
+        assert!(!src.exists());
+        assert_eq!(
+            std::fs::read(&entry.quarantine_path).unwrap(),
+            b"cross-device content"
+        );
+        assert!(entry.recoverable);
+
+        // Restoring crosses devices too: the copy-back path must return it.
+        restore_from_quarantine(&entry).unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"cross-device content");
+        assert!(!entry.quarantine_path.exists());
+        drop(std::fs::remove_dir_all(&scratch));
+        drop(std::fs::remove_dir_all(quarantine_dir(&op).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_cross_device_directory_move_copies_nested_content() {
+        let Some(scratch) = cross_device_scratch() else {
+            return;
+        };
+        let op = unique_op("exdev-dir");
+        let src = scratch.join(unique_op("dsrc"));
+        std::fs::create_dir_all(src.join("nested/deeper")).unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+        std::fs::write(src.join("nested/deeper/leaf.txt"), b"leaf").unwrap();
+
+        let entry = move_to_quarantine(&src, &op).unwrap();
+        assert!(!entry.same_filesystem);
+        assert!(!src.exists());
+        assert_eq!(
+            std::fs::read(entry.quarantine_path.join("top.txt")).unwrap(),
+            b"top"
+        );
+        assert_eq!(
+            std::fs::read(entry.quarantine_path.join("nested/deeper/leaf.txt")).unwrap(),
+            b"leaf"
+        );
+        assert!(entry.recoverable, "directory recoverability is existence");
+        let listed = list_quarantine(&op).unwrap();
+        assert!(
+            listed.first().is_some_and(|e| e.recoverable),
+            "a listed quarantined directory is recoverable: {listed:?}"
+        );
+
+        restore_from_quarantine(&entry).unwrap();
+        assert_eq!(
+            std::fs::read(src.join("nested/deeper/leaf.txt")).unwrap(),
+            b"leaf"
+        );
+        assert!(!entry.quarantine_path.exists());
+        drop(std::fs::remove_dir_all(&scratch));
+        drop(std::fs::remove_dir_all(quarantine_dir(&op).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_surfaces_rename_permission_errors_without_writing_the_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        if !permissions_are_enforced() {
+            return; // root bypasses permission checks
+        }
+        let op = unique_op("rename-deny");
+        // The source must share the quarantine dir's filesystem so that
+        // rename() fails with EACCES (not EXDEV) under the locked parent.
+        let dir = home_dir().unwrap().join(format!(".superai-qn-test-{op}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("victim");
+        std::fs::write(&src, b"locked").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = move_to_quarantine(&src, &op);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = err.unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io { ref source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied),
+            "rename out of an unwritable directory surfaces EACCES: {err}"
+        );
+        assert!(src.exists(), "the locked source is untouched");
+        let qdir = quarantine_dir(&op).unwrap();
+        assert!(
+            !qdir.join("victim").exists(),
+            "no partial copy may land in quarantine when the move failed"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_surfaces_rename_permission_errors_without_creating_the_original() {
+        use std::os::unix::fs::PermissionsExt;
+        if !permissions_are_enforced() {
+            return; // root bypasses permission checks
+        }
+        let op = unique_op("restore-deny");
+        // Same filesystem as the quarantine dir so rename() out of the
+        // read-only quarantine fails with EACCES, not EXDEV.
+        let dir = home_dir().unwrap().join(format!(".superai-qn-test-{op}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("victim");
+        std::fs::write(&src, b"locked restore").unwrap();
+        let entry = move_to_quarantine(&src, &op).unwrap();
+
+        // Lock the quarantine dir: renaming out of it fails EACCES, and no
+        // fallback may quietly recreate the original.
+        let qdir = quarantine_dir(&op).unwrap();
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = restore_from_quarantine(&entry);
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = err.unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io { ref source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied),
+            "rename out of a read-only quarantine surfaces EACCES: {err}"
+        );
+        assert!(
+            !src.exists(),
+            "a failed restore must not create the original"
+        );
+        assert!(
+            entry.quarantine_path.exists(),
+            "the quarantined copy stays put"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn restore_recreates_vanished_parent_directories() {
+        let op = unique_op("restore-parent");
+        let dir = crate::test_util::temp_dir_unique("quarantine-vanish");
+        let parent = dir.join("gone/soon");
+        std::fs::create_dir_all(&parent).unwrap();
+        let src = parent.join("file");
+        std::fs::write(&src, b"orphaned").unwrap();
+
+        let entry = move_to_quarantine(&src, &op).unwrap();
+        std::fs::remove_dir_all(dir.join("gone")).unwrap();
+        restore_from_quarantine(&entry).unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"orphaned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_when_the_original_path_exists_again_in_any_shape() {
+        let op = unique_op("restore-exists");
+        let dir = crate::test_util::temp_dir_unique("quarantine-reexists");
+        let src = dir.join("file");
+        std::fs::write(&src, b"first life").unwrap();
+        let entry = move_to_quarantine(&src, &op).unwrap();
+
+        // A regular file re-created at the original path blocks the restore.
+        std::fs::write(&src, b"second life").unwrap();
+        let err = restore_from_quarantine(&entry).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io { ref source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "an existing original blocks restore: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            b"second life",
+            "the re-created file is untouched"
+        );
+
+        // A broken symlink at the original path also blocks the restore:
+        // exists() is false but lstat still resolves.
+        std::fs::remove_file(&src).unwrap();
+        std::os::unix::fs::symlink("/nowhere/at-all", &src).unwrap();
+        let err = restore_from_quarantine(&entry).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io { ref source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "a broken symlink at the original still blocks restore: {err}"
+        );
+        assert!(src.is_symlink(), "the blocker is left in place");
+
+        drop(std::fs::remove_file(&src));
+        drop(std::fs::remove_file(&entry.quarantine_path));
+    }
+
+    #[test]
+    fn list_quarantine_reports_no_entries_for_an_unknown_operation() {
+        let listed = list_quarantine(&unique_op("never-created")).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_quarantine_surfaces_unreadable_quarantine_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        if !permissions_are_enforced() {
+            return; // root bypasses permission checks
+        }
+        let op = unique_op("list-deny");
+        let qdir = quarantine_dir(&op).unwrap();
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(qdir.join("entry"), b"x").unwrap();
+
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = list_quarantine(&op);
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            res.is_err(),
+            "a non-NotFound read_dir failure must surface, got {:?}",
+            res.map(|v| v.len())
+        );
+        drop(std::fs::remove_dir_all(&qdir));
+    }
 }
