@@ -5127,6 +5127,17 @@ mod tests {
         match err {
             ConfigError::Io { path, source } => {
                 assert_eq!(path, root, "the error must be attributed to the parent");
+                // ELOOP has no stable ErrorKind on this toolchain and its
+                // raw errno is platform-specific (40 on Linux, 62 on macOS);
+                // mirror the atomic.rs sync-parent precedent: require an OS
+                // error so a plain permission/not-found mixup cannot pass,
+                // and pin the exact errno on Linux where the mutation
+                // suite runs.
+                assert!(
+                    source.raw_os_error().is_some(),
+                    "the surfaced error is an OS error, got {source}"
+                );
+                #[cfg(target_os = "linux")]
                 assert_eq!(
                     source.raw_os_error(),
                     Some(40),
@@ -5235,11 +5246,14 @@ mod tests {
 
     /// A staged temp on another device (tmpfs) commits through the
     /// copy fallback: EXDEV is not a dead end.
+    ///
+    /// Platform: Linux/macOS — the `/dev/shm` cross-device staging ground is
+    /// unix-only; the dev-id guard below skips environments without it.
+    #[cfg(unix)]
     #[test]
     fn commit_staged_file_falls_back_to_copy_across_devices() {
         let shm = Path::new("/dev/shm");
         let root = tmp_root();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             let different = match (shm.metadata(), root.metadata()) {
@@ -5251,11 +5265,6 @@ mod tests {
                 drop(std::fs::remove_dir_all(&root));
                 return;
             }
-        }
-        #[cfg(not(unix))]
-        {
-            drop(std::fs::remove_dir_all(&root));
-            return;
         }
         let staged = shm.join(format!("superai-exdev-{}", std::process::id()));
         std::fs::write(&staged, b"cross-device payload").unwrap();
@@ -5275,6 +5284,19 @@ mod tests {
     #[test]
     fn case_fold_collision_reports_the_first_variant() {
         let dir = boundary_scratch("case-min");
+        // Filesystem case-sensitivity probe: on a case-insensitive
+        // filesystem (default macOS APFS, Windows NTFS) `Config.json` and
+        // `CONFIG.json` are ONE directory entry, so the two-variant fixture
+        // premise is absent (the report rightly names whichever single
+        // entry exists). Mirrors `perm_denies_dir_read_probe`: skip rather
+        // than assert a fixture the platform cannot provide.
+        std::fs::write(dir.join("case-probe-a"), b"{}").unwrap();
+        let case_insensitive = dir.join("CASE-PROBE-A").exists();
+        drop(std::fs::remove_file(dir.join("case-probe-a")));
+        if case_insensitive {
+            drop(std::fs::remove_dir_all(&dir));
+            return;
+        }
         std::fs::write(dir.join("Config.json"), b"{}").unwrap();
         std::fs::write(dir.join("CONFIG.json"), b"{}").unwrap();
         let res = commit_file(

@@ -580,29 +580,35 @@ mod tests {
     }
 
     /// A resolvable symlink chain deeper than the walk cutoff is reported as
-    /// a loop. Linux itself resolves chains up to 40 links deep, so a 25-link
-    /// chain to a real file is NOT an OS-level loop (`metadata` succeeds and
-    /// the errno fast-path cannot answer) — only the capped chain walk sees
-    /// it, and falling out of the walk without resolving reports true.
+    /// a loop. Linux resolves chains up to 40 links deep and macOS up to 32,
+    /// so a 25-link chain to a real file is NOT an OS-level loop (`metadata`
+    /// succeeds and the errno fast-path cannot answer) — only the capped
+    /// chain walk sees it, and falling out of the walk without resolving
+    /// reports true.
     #[cfg(unix)]
     #[test]
     fn deep_symlink_chain_beyond_walk_cutoff_is_reported_as_a_loop() {
-        /// Chain length: under the kernel's 40-link resolution limit but
-        /// over the walk's 20-iteration cutoff.
+        /// Chain length: over the walk's 20-iteration cutoff, under the
+        /// kernel resolution limits of both Linux (40) and macOS (32).
         const DEPTH: usize = 25;
         let root = crate::test_util::temp_dir_unique("config-snapshot-deep");
         std::fs::create_dir_all(&root).unwrap();
         let real = root.join("real.txt");
         std::fs::write(&real, b"deep").unwrap();
-        // Chain link-0 -> link-1 -> ... -> link-24 -> real.txt (25 hops,
-        // under the kernel's 40-link resolution limit but over the walk's
-        // 20-iteration cutoff).
-        let mut head = real;
+        // Chain link-0 -> link-1 -> ... -> link-24 -> real.txt (25 hops).
+        // Targets are RELATIVE so each hop costs exactly one symlink
+        // traversal at the OS level: an absolute target under the macOS
+        // temp root re-traverses the `/var -> /private/var` symlink on
+        // every hop (~2 budget per hop), which pushes a 25-link chain past
+        // macOS's MAXSYMLINKS (32) even though it fits the 32-link budget
+        // with room to spare when each hop costs one.
+        let mut next_target = std::ffi::OsString::from("real.txt");
         for i in (0..DEPTH).rev() {
-            let link = root.join(format!("link-{i}"));
-            std::os::unix::fs::symlink(&head, &link).unwrap();
-            head = link;
+            let link_name = format!("link-{i}");
+            std::os::unix::fs::symlink(&next_target, root.join(&link_name)).unwrap();
+            next_target = std::ffi::OsString::from(link_name);
         }
+        let head = root.join(next_target);
         assert!(
             std::fs::metadata(&head).is_ok(),
             "fixture guard: the chain must resolve at the OS level (no ELOOP)"

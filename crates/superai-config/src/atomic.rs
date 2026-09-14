@@ -674,13 +674,19 @@ mod tests {
     enum SabotageAction {
         /// Return an injected error at the point.
         Fail,
-        /// chmod the parent directory to read-denied (0o333).
+        /// chmod the parent directory to read-denied (0o333). Unix-only
+        /// premise (chmod modes); only unix-gated tests construct it.
+        #[cfg(unix)]
         DenyParentRead { parent: PathBuf },
-        /// chmod the parent directory to write-denied (0o555).
+        /// chmod the parent directory to write-denied (0o555). Unix-only
+        /// premise (chmod modes); only unix-gated tests construct it.
+        #[cfg(unix)]
         DenyParentWrite { parent: PathBuf },
         /// Remove the landed file and its parent directory.
         VanishParent { file: PathBuf, parent: PathBuf },
-        /// Replace the parent directory with a symlink loop.
+        /// Replace the parent directory with a symlink loop. Unix-only
+        /// premise (symlinks); only unix-gated tests construct it.
+        #[cfg(unix)]
         LoopParent {
             file: PathBuf,
             parent: PathBuf,
@@ -708,9 +714,12 @@ mod tests {
         fn fire(&self) {
             match &self.action {
                 SabotageAction::Fail => {}
+                #[cfg(unix)]
                 SabotageAction::DenyParentRead { parent } => set_dir_mode(parent, 0o333),
+                #[cfg(unix)]
                 SabotageAction::DenyParentWrite { parent } => set_dir_mode(parent, 0o555),
                 SabotageAction::VanishParent { file, parent } => remove_file_and_dir(file, parent),
+                #[cfg(unix)]
                 SabotageAction::LoopParent {
                     file,
                     parent,
@@ -721,19 +730,13 @@ mod tests {
     }
 
     /// chmod `dir` to `mode` (unix; a no-op elsewhere).
+    #[cfg(unix)]
     fn set_dir_mode(dir: &Path, mode: u32) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            drop(std::fs::set_permissions(
-                dir,
-                std::fs::Permissions::from_mode(mode),
-            ));
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (dir, mode);
-        }
+        use std::os::unix::fs::PermissionsExt;
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(mode),
+        ));
     }
 
     /// Remove `file` and then its (now empty) parent directory.
@@ -744,17 +747,11 @@ mod tests {
 
     /// Remove `file` and its parent directory, then leave a symlink loop in
     /// the parent's place so directory operations fail with ELOOP.
+    #[cfg(unix)]
     fn replace_dir_with_symlink_loop(file: &Path, parent: &Path, helper: &Path) {
         remove_file_and_dir(file, parent);
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(helper, parent).unwrap();
-            std::os::unix::fs::symlink(parent, helper).unwrap();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = helper;
-        }
+        std::os::unix::fs::symlink(helper, parent).unwrap();
+        std::os::unix::fs::symlink(parent, helper).unwrap();
     }
 
     /// Whether chmod 0o333 actually denies opening the directory for reading

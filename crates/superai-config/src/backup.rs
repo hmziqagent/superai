@@ -1423,13 +1423,16 @@ mod tests {
 
     /// Test injector that swaps the freshly copied backup file (the single
     /// `<name>.bak.*` entry in `dir`) for a symlink to `/dev/null` at the
-    /// flush boundary.
+    /// flush boundary. Only usable where `fsync` on `/dev/null` fails with
+    /// `EINVAL` (Linux); see the test below.
+    #[cfg(target_os = "linux")]
     #[derive(Debug)]
     struct SwapBackupForDevNull {
         dir: PathBuf,
         prefix: String,
     }
 
+    #[cfg(target_os = "linux")]
     impl Injector for SwapBackupForDevNull {
         fn inject(&self, point: Point) -> Result<()> {
             if point != Point::BackupFlush {
@@ -1517,11 +1520,15 @@ mod tests {
     }
 
     /// The backup flush is more than a no-op: `fsync` on `/dev/null` fails
-    /// with `EINVAL` through both a read-write and a read-only descriptor,
-    /// while reading `/dev/null` back succeeds (as empty). A stubbed flush
-    /// therefore surfaces a digest `BackupVerification` failure instead of
-    /// the flush's io error.
-    #[cfg(unix)]
+    /// with `EINVAL` (raw errno 22) through both a read-write and a
+    /// read-only descriptor, while reading `/dev/null` back succeeds (as
+    /// empty). A stubbed flush therefore surfaces a digest
+    /// `BackupVerification` failure instead of the flush's io error.
+    ///
+    /// Platform: Linux — `fsync` on `/dev/null` reporting `EINVAL` is
+    /// Linux's behavior; macOS reports `ENODEV` (19) there, so the errno
+    /// premise is asserted only where it holds.
+    #[cfg(target_os = "linux")]
     #[test]
     fn backup_surfaces_flush_sync_errors_before_digest_verification() {
         if !Path::new("/dev/null").exists() {
@@ -2168,8 +2175,9 @@ mod tests {
 
     /// Backing up a SYMLINK is the one input shape where the explicit
     /// permission re-apply in `backup_inner` is observable: the entry's mode
-    /// comes from `symlink_metadata` (the LINK's own 0o777) while `fs::copy`
-    /// follows the link and lands the REFERENT's 0o644 on the fresh backup.
+    /// comes from `symlink_metadata` (the LINK's own mode: 0o777 on Linux,
+    /// 0o755 on macOS) while `fs::copy` follows the link and lands the
+    /// REFERENT's 0o644 on the fresh backup.
     /// The re-apply must override the referent mode with the recorded link
     /// mode — a `set_permissions_u32 -> Ok(())` mutant leaves the backup at
     /// the referent's 0o644.
@@ -2189,15 +2197,25 @@ mod tests {
             .unwrap()
             .expect("backup of a symlink to a regular file must succeed");
 
+        // The link's own mode is platform-given, not a constant: Linux
+        // creates symlinks 0o777, macOS reports 0o755. Derive it from a
+        // fresh lstat; the distinguishing premise only needs link != referent.
         let link_mode = std::fs::symlink_metadata(&link)
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(
-            link_mode & 0o777,
-            0o777,
-            "linux creates symlinks 0o777; the premise distinguishing link from referent"
-        );
+        let referent_mode = std::fs::metadata(&referent).unwrap().permissions().mode();
+        if link_mode & 0o777 == referent_mode & 0o777 {
+            // A platform where the link carries the referent's mode: the
+            // premise separating "recorded link mode" from "copied referent
+            // mode" is absent; nothing to distinguish. (Not hit on Linux
+            // 0o777-vs-0o644 or macOS 0o755-vs-0o644.)
+            drop(std::fs::remove_file(&link));
+            drop(std::fs::remove_file(&entry.backup_path));
+            drop(std::fs::remove_file(&referent));
+            drop(std::fs::remove_dir(&dir));
+            return;
+        }
         assert_eq!(
             entry.permissions,
             Some(link_mode),
