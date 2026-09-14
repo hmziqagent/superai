@@ -578,4 +578,39 @@ mod tests {
         drop(std::fs::remove_file(&path));
         assert!(!is_symlink_loop(&path), "a missing path is not a loop");
     }
+
+    /// A resolvable symlink chain deeper than the walk cutoff is reported as
+    /// a loop. Linux itself resolves chains up to 40 links deep, so a 25-link
+    /// chain to a real file is NOT an OS-level loop (`metadata` succeeds and
+    /// the errno fast-path cannot answer) — only the capped chain walk sees
+    /// it, and falling out of the walk without resolving reports true.
+    #[cfg(unix)]
+    #[test]
+    fn deep_symlink_chain_beyond_walk_cutoff_is_reported_as_a_loop() {
+        /// Chain length: under the kernel's 40-link resolution limit but
+        /// over the walk's 20-iteration cutoff.
+        const DEPTH: usize = 25;
+        let root = crate::test_util::temp_dir_unique("config-snapshot-deep");
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real.txt");
+        std::fs::write(&real, b"deep").unwrap();
+        // Chain link-0 -> link-1 -> ... -> link-24 -> real.txt (25 hops,
+        // under the kernel's 40-link resolution limit but over the walk's
+        // 20-iteration cutoff).
+        let mut head = real;
+        for i in (0..DEPTH).rev() {
+            let link = root.join(format!("link-{i}"));
+            std::os::unix::fs::symlink(&head, &link).unwrap();
+            head = link;
+        }
+        assert!(
+            std::fs::metadata(&head).is_ok(),
+            "fixture guard: the chain must resolve at the OS level (no ELOOP)"
+        );
+        assert!(
+            is_symlink_loop(&head),
+            "a chain deeper than the walk cutoff must be reported as a loop"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
 }
