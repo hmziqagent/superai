@@ -791,6 +791,56 @@ mod tests {
         denied
     }
 
+    /// Watchdog bound for calls into the rename-retry loop: the real code
+    /// exhausts its three bounded retries in 10+20+30 = 60ms of sleeps, so
+    /// 5s leaves ~80x headroom over real completion (loaded CI runners
+    /// stretch the pipeline by tens of milliseconds, not seconds) while
+    /// sitting far below cargo-mutants' 30s scenario timeout
+    /// (`minimum_test_timeout`). A non-terminating retry loop therefore
+    /// fails the calling test at ~5s as an ordinary failure instead of
+    /// hanging the suite into the scenario timeout — cargo-mutants scores
+    /// a timed-out mutant as caught but still exits 3 ("tests timed out",
+    /// mutants.rs/exit-codes.html), which fails CI.
+    #[cfg(unix)]
+    const RENAME_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Run `op` — a call into the rename-retry loop against a permanently
+    /// write-denied `parent` — on a helper thread and demand its result
+    /// within `RENAME_WATCHDOG`; the real loop exhausts its bounded
+    /// retries and returns in milliseconds, while a mutated loop that
+    /// never terminates sends nothing and fails the calling test fast. On
+    /// the failure paths the parent's write mode is restored FIRST so the
+    /// abandoned retry's next rename succeeds and the helper thread runs
+    /// to completion instead of spinning (or sleeping forever) for the
+    /// rest of the process; only the scratch directory is leaked, and only
+    /// for the remainder of the already-failing test process.
+    #[cfg(unix)]
+    fn with_rename_watchdog<T: Send + 'static>(
+        parent: &Path,
+        op: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // A send error only means the watchdog already timed out and
+            // dropped the receiver; the calling test has already failed.
+            drop(tx.send(op()));
+        });
+        match rx.recv_timeout(RENAME_WATCHDOG) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                set_dir_mode(parent, 0o755);
+                panic!(
+                    "the rename retry loop did not terminate within {RENAME_WATCHDOG:?} of a \
+                     permanent PermissionDenied denial (bounded retries must exhaust)"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                set_dir_mode(parent, 0o755);
+                panic!("the watched write thread ended without reporting a result");
+            }
+        }
+    }
+
     // ---- Behaviour tests for the mutation-testing gate ----
 
     /// An expectation digest that matches the current file must let the
@@ -1068,8 +1118,11 @@ mod tests {
     /// a hard 20ms slack (a sleep never returns early, so its difference
     /// is always at least 60ms), while the shrinking mutant would need
     /// more than 22ms of cumulative sleep overshoot in its single best
-    /// round to cross the threshold. `+=` mutants never return at all and
-    /// are caught by the mutant timeout, not by this assertion.
+    /// round to cross the threshold. Retry-loop mutants that never
+    /// terminate (`guard -> true`, `&& -> ||`, `+= -> *=`) are failed fast
+    /// by the `with_rename_watchdog` wrapper rather than hanging into the
+    /// cargo-mutants scenario timeout, and `-=` panics on the u64
+    /// underflow inside the watched thread, surfacing as a missing result.
     #[cfg(unix)]
     #[test]
     fn atomic_write_rename_retry_backoff_spends_the_full_delay_budget() {
@@ -1117,6 +1170,8 @@ mod tests {
         };
         // Denied measurement: the rename itself fails with PermissionDenied
         // and every retry sleeps the backoff delay before the final error.
+        // The call runs under the rename watchdog so a non-terminating
+        // retry mutant fails this test fast instead of hanging the suite.
         let run_denied = |round: usize| {
             let path = unique_scratch(&format!("atomic-backoff-denied-{round}"));
             let parent = path.parent().unwrap().to_path_buf();
@@ -1126,15 +1181,17 @@ mod tests {
                     parent: parent.clone(),
                 },
             };
-            let start = Instant::now();
-            let res = atomic_write_expecting(
-                &path,
-                b"denied",
-                WriteExpectation::Any,
-                None,
-                Some(&sabotage),
-            );
-            let elapsed = start.elapsed();
+            let (elapsed, res) = with_rename_watchdog(&parent, move || {
+                let start = Instant::now();
+                let res = atomic_write_expecting(
+                    &path,
+                    b"denied",
+                    WriteExpectation::Any,
+                    None,
+                    Some(&sabotage),
+                );
+                (start.elapsed(), res)
+            });
             match res {
                 Err(ConfigError::Io { source, .. }) => assert_eq!(
                     source.kind(),
@@ -1184,7 +1241,9 @@ mod tests {
     }
 
     /// A rename denial that never clears is reported as an io
-    /// `PermissionDenied` error, and the target never appears.
+    /// `PermissionDenied` error, and the target never appears. The call
+    /// runs under the rename watchdog so a non-terminating retry mutant
+    /// fails this test fast instead of hanging the suite.
     #[cfg(unix)]
     #[test]
     fn atomic_write_reports_permanent_rename_permission_error() {
@@ -1201,13 +1260,16 @@ mod tests {
                 parent: parent.clone(),
             },
         };
-        let res = atomic_write_expecting(
-            &path,
-            b"never",
-            WriteExpectation::Any,
-            None,
-            Some(&sabotage),
-        );
+        let denied_path = path.clone();
+        let res = with_rename_watchdog(&parent, move || {
+            atomic_write_expecting(
+                &denied_path,
+                b"never",
+                WriteExpectation::Any,
+                None,
+                Some(&sabotage),
+            )
+        });
         match res {
             Err(ConfigError::Io { source, .. }) => assert_eq!(
                 source.kind(),
@@ -1220,6 +1282,60 @@ mod tests {
             !path.exists(),
             "the target must not appear when the rename never succeeds"
         );
+        set_dir_mode(&parent, 0o755);
+        drop(std::fs::remove_dir_all(&parent));
+    }
+
+    /// The rename-retry loop must TERMINATE: a `PermissionDenied` rename
+    /// that never clears exhausts its bounded retries (three) and surfaces
+    /// the io error — never spin forever. Three loop mutants (guard ->
+    /// `true`, `&&` -> `||`, `+=` -> `*=`) make the retry unconditional;
+    /// those used to hang the whole suite until cargo-mutants' 30s
+    /// scenario timeout, which scores the mutant as caught but still makes
+    /// the run exit 3 (mutants.rs/exit-codes.html: "tests timed out"),
+    /// failing CI. This dedicated watchdog asserts the loop's termination
+    /// contract end to end: the write's result must arrive within
+    /// `RENAME_WATCHDOG` AND carry the `PermissionDenied` rename error.
+    /// The earlier permanent-denial tests run under the same
+    /// `with_rename_watchdog` helper, so every suite path that enters the
+    /// retry loop terminates: real code after ~60ms of backoff sleeps
+    /// (~80x inside the 5s bound; loaded CI runners stretch the pipeline
+    /// by tens of milliseconds, not seconds), a non-terminating mutant as
+    /// a fast test failure at ~5s.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rename_retry_loop_terminates() {
+        let path = unique_scratch("atomic-rename-watchdog");
+        let parent = path.parent().unwrap().to_path_buf();
+        if !perm_denies_dir_write(&parent) {
+            // DAC_OVERRIDE (e.g. root): rename cannot be denied for this
+            // process; nothing to assert here.
+            drop(std::fs::remove_dir_all(&parent));
+            return;
+        }
+        let denied_parent = parent.clone();
+        let res = with_rename_watchdog(&parent, move || {
+            atomic_write_expecting(
+                &path,
+                b"payload",
+                WriteExpectation::Any,
+                None,
+                Some(&Sabotage {
+                    at: Point::AtomicReplace,
+                    action: SabotageAction::DenyParentWrite {
+                        parent: denied_parent,
+                    },
+                }),
+            )
+        });
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the exhausted rename retries surface the denial"
+            ),
+            other => panic!("expected Io error from the exhausted retries, got {other:?}"),
+        }
         set_dir_mode(&parent, 0o755);
         drop(std::fs::remove_dir_all(&parent));
     }
