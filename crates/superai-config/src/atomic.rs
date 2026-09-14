@@ -1045,49 +1045,142 @@ mod tests {
         drop(std::fs::remove_dir(&root));
     }
 
-    /// A rename that fails with `PermissionDenied` is retried: a transient
-    /// denial (Windows antivirus/indexer holds) clears and the write lands
-    /// without the caller ever seeing an error.
+    /// A rename that fails with `PermissionDenied` is retried on a GROWING
+    /// backoff (`10 * attempt` ms), so a denial that never clears must burn
+    /// the full budget — 10 + 20 + 30 = 60ms of sleeps — before the error
+    /// surfaces. A shrinking schedule such as `10 / attempt` (10 + 5 + 3 =
+    /// 18ms) gives up almost immediately, and a retry loop that never
+    /// retries measures no backoff at all.
+    ///
+    /// Timing-robust discriminator, replacing the earlier 20ms-restorer
+    /// race: loaded CI runners routinely spend more than 20ms on the write
+    /// pipeline before the first rename attempt, so the denial sometimes
+    /// cleared before any attempt and the shrinking-schedule mutant escaped
+    /// (missed on CI run 34895207523). Instead, the denied write is paired
+    /// with a CONTROL write that runs the identical pipeline (temp create,
+    /// write, flush, fsync, mode apply, digest recheck) and fails at the
+    /// very same `Point::AtomicReplace` via an injected error — zero
+    /// retries, zero sleeps. The minimum elapsed over several rounds whose
+    /// measurement order alternates converges both sides to the machine's
+    /// best-case setup, so fsync/scheduler jitter cancels in the
+    /// difference and only the sleep schedule remains. The 40ms threshold
+    /// sits at the midpoint of the 60ms vs 18ms totals: the real code has
+    /// a hard 20ms slack (a sleep never returns early, so its difference
+    /// is always at least 60ms), while the shrinking mutant would need
+    /// more than 22ms of cumulative sleep overshoot in its single best
+    /// round to cross the threshold. `+=` mutants never return at all and
+    /// are caught by the mutant timeout, not by this assertion.
     #[cfg(unix)]
     #[test]
-    fn atomic_write_retries_rename_through_transient_permission_error() {
-        let path = unique_scratch("atomic-rename-transient");
-        let parent = path.parent().unwrap().to_path_buf();
-        if !perm_denies_dir_write(&parent) {
+    fn atomic_write_rename_retry_backoff_spends_the_full_delay_budget() {
+        use std::time::{Duration, Instant};
+
+        const ROUNDS: usize = 6;
+        const BACKOFF_FLOOR: Duration = Duration::from_millis(40);
+
+        let probe_parent = unique_scratch("atomic-backoff-probe")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        if !perm_denies_dir_write(&probe_parent) {
             // DAC_OVERRIDE (e.g. root): rename cannot be denied for this
             // process; nothing to assert here.
+            drop(std::fs::remove_dir_all(&probe_parent));
             return;
         }
-        let restorer_parent = parent.clone();
-        let restorer = std::thread::spawn(move || {
-            use std::os::unix::fs::PermissionsExt;
-            // Sleep guarantees a minimum delay, so the restore always lands
-            // inside the retry window: after the first failed rename but
-            // before the attempts run out. Scheduling delays only push later
-            // attempts further out, which still succeeds.
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            drop(std::fs::set_permissions(
-                &restorer_parent,
-                std::fs::Permissions::from_mode(0o755),
-            ));
-        });
-        let sabotage = Sabotage {
-            at: Point::AtomicReplace,
-            action: SabotageAction::DenyParentWrite {
-                parent: parent.clone(),
-            },
+        drop(std::fs::remove_dir_all(&probe_parent));
+
+        // Control measurement: identical pipeline, injected failure exactly
+        // at the point the retry loop starts — no rename attempts, no sleeps.
+        let run_control = |round: usize| {
+            let path = unique_scratch(&format!("atomic-backoff-ctrl-{round}"));
+            let parent = path.parent().unwrap().to_path_buf();
+            let sabotage = Sabotage {
+                at: Point::AtomicReplace,
+                action: SabotageAction::Fail,
+            };
+            let start = Instant::now();
+            let res = atomic_write_expecting(
+                &path,
+                b"control",
+                WriteExpectation::Any,
+                None,
+                Some(&sabotage),
+            );
+            let elapsed = start.elapsed();
+            assert!(
+                res.is_err(),
+                "the injected AtomicReplace failure must surface"
+            );
+            drop(std::fs::remove_dir_all(&parent));
+            elapsed
         };
-        let res = atomic_write_expecting(
-            &path,
-            b"retried",
-            WriteExpectation::Any,
-            None,
-            Some(&sabotage),
+        // Denied measurement: the rename itself fails with PermissionDenied
+        // and every retry sleeps the backoff delay before the final error.
+        let run_denied = |round: usize| {
+            let path = unique_scratch(&format!("atomic-backoff-denied-{round}"));
+            let parent = path.parent().unwrap().to_path_buf();
+            let sabotage = Sabotage {
+                at: Point::AtomicReplace,
+                action: SabotageAction::DenyParentWrite {
+                    parent: parent.clone(),
+                },
+            };
+            let start = Instant::now();
+            let res = atomic_write_expecting(
+                &path,
+                b"denied",
+                WriteExpectation::Any,
+                None,
+                Some(&sabotage),
+            );
+            let elapsed = start.elapsed();
+            match res {
+                Err(ConfigError::Io { source, .. }) => assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "the exhausted retries surface the rename denial"
+                ),
+                other => panic!("expected Io error from rename, got {other:?}"),
+            }
+            set_dir_mode(&parent, 0o755);
+            drop(std::fs::remove_dir_all(&parent));
+            elapsed
+        };
+
+        // Discarded warmup: pays the one-time pipeline costs before timing.
+        let _ = run_control(ROUNDS);
+        let _ = run_denied(ROUNDS);
+
+        let mut best_control = Duration::MAX;
+        let mut best_denied = Duration::MAX;
+        for round in 0..ROUNDS {
+            // Alternating order cancels any run-first-of-the-round bias
+            // (cold caches, journal contention) that a fixed order would
+            // hand to one side's minimum.
+            let (control, denied) = if round % 2 == 0 {
+                let control = run_control(round);
+                let denied = run_denied(round);
+                (control, denied)
+            } else {
+                let denied = run_denied(round);
+                let control = run_control(round);
+                (control, denied)
+            };
+            best_control = best_control.min(control);
+            best_denied = best_denied.min(denied);
+        }
+
+        let backoff = best_denied
+            .checked_sub(best_control)
+            .expect("the denied pipeline contains the control pipeline plus retries");
+        assert!(
+            backoff >= BACKOFF_FLOOR,
+            "a permanent rename denial must spend the full growing backoff \
+             (10+20+30 = 60ms of sleeps) before failing; measured only \
+             {backoff:?} (best denied {best_denied:?} vs best control \
+             {best_control:?}): the retry delays are not growing"
         );
-        restorer.join().expect("restorer thread must not panic");
-        res.expect("rename must be retried until the transient denial clears");
-        assert_eq!(std::fs::read(&path).unwrap(), b"retried");
-        drop(std::fs::remove_dir_all(&parent));
     }
 
     /// A rename denial that never clears is reported as an io
