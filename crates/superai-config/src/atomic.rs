@@ -656,4 +656,481 @@ mod tests {
         }
         drop(std::fs::remove_file(&path));
     }
+
+    // ---- QAL-06 fault-injection helpers (test-only) ----
+
+    /// Test injector that either fails at one point or sabotages the
+    /// filesystem at one point, so the later pipeline phases run against the
+    /// sabotaged on-disk state.
+    #[derive(Debug)]
+    struct Sabotage {
+        /// The pipeline point the sabotage fires at.
+        at: Point,
+        /// What happens when it fires.
+        action: SabotageAction,
+    }
+
+    #[derive(Debug)]
+    enum SabotageAction {
+        /// Return an injected error at the point.
+        Fail,
+        /// chmod the parent directory to read-denied (0o333).
+        DenyParentRead { parent: PathBuf },
+        /// chmod the parent directory to write-denied (0o555).
+        DenyParentWrite { parent: PathBuf },
+        /// Remove the landed file and its parent directory.
+        VanishParent { file: PathBuf, parent: PathBuf },
+        /// Replace the parent directory with a symlink loop.
+        LoopParent {
+            file: PathBuf,
+            parent: PathBuf,
+            helper: PathBuf,
+        },
+    }
+
+    impl Injector for Sabotage {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point != self.at {
+                return Ok(());
+            }
+            if matches!(self.action, SabotageAction::Fail) {
+                return Err(ConfigError::io(
+                    Path::new("sabotage"),
+                    std::io::Error::other("injected failure"),
+                ));
+            }
+            self.fire();
+            Ok(())
+        }
+    }
+
+    impl Sabotage {
+        fn fire(&self) {
+            match &self.action {
+                SabotageAction::Fail => {}
+                SabotageAction::DenyParentRead { parent } => set_dir_mode(parent, 0o333),
+                SabotageAction::DenyParentWrite { parent } => set_dir_mode(parent, 0o555),
+                SabotageAction::VanishParent { file, parent } => remove_file_and_dir(file, parent),
+                SabotageAction::LoopParent {
+                    file,
+                    parent,
+                    helper,
+                } => replace_dir_with_symlink_loop(file, parent, helper),
+            }
+        }
+    }
+
+    /// chmod `dir` to `mode` (unix; a no-op elsewhere).
+    fn set_dir_mode(dir: &Path, mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            drop(std::fs::set_permissions(
+                dir,
+                std::fs::Permissions::from_mode(mode),
+            ));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (dir, mode);
+        }
+    }
+
+    /// Remove `file` and then its (now empty) parent directory.
+    fn remove_file_and_dir(file: &Path, parent: &Path) {
+        drop(std::fs::remove_file(file));
+        drop(std::fs::remove_dir(parent));
+    }
+
+    /// Remove `file` and its parent directory, then leave a symlink loop in
+    /// the parent's place so directory operations fail with ELOOP.
+    fn replace_dir_with_symlink_loop(file: &Path, parent: &Path, helper: &Path) {
+        remove_file_and_dir(file, parent);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(helper, parent).unwrap();
+            std::os::unix::fs::symlink(parent, helper).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = helper;
+        }
+    }
+
+    /// Whether chmod 0o333 actually denies opening the directory for reading
+    /// for this process. Root bypasses permission checks; callers skip the
+    /// denial-dependent assertions when it does.
+    #[cfg(unix)]
+    fn perm_denies_dir_read(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o333),
+        ));
+        let denied = std::fs::File::open(dir).is_err();
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o755),
+        ));
+        denied
+    }
+
+    /// Whether chmod 0o555 actually denies creating files in the directory
+    /// for this process (root bypasses permission checks).
+    #[cfg(unix)]
+    fn perm_denies_dir_write(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o555),
+        ));
+        let probe = dir.join("probe-write");
+        let denied = std::fs::File::create(&probe).is_err();
+        drop(std::fs::remove_file(&probe));
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o755),
+        ));
+        denied
+    }
+
+    // ---- Behaviour tests for the mutation-testing gate ----
+
+    /// An expectation digest that matches the current file must let the
+    /// write through: optimistic concurrency succeeds when nothing changed.
+    #[test]
+    fn atomic_write_succeeds_when_digest_expectation_matches_unchanged_file() {
+        let path = unique_scratch("atomic-digest-ok");
+        std::fs::write(&path, b"v1").unwrap();
+        let digest = crate::snapshot::snapshot(&path)
+            .digest
+            .expect("snapshot records a digest");
+        atomic_write_expecting(&path, b"v2", WriteExpectation::Digest(&digest), None, None)
+            .expect("a matching digest expectation must allow the write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"v2");
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// The write itself creates missing parent directories, so a target in
+    /// not-yet-existing nested directories lands successfully.
+    #[test]
+    fn atomic_write_creates_missing_parent_directories() {
+        let root = crate::test_util::temp_dir_unique("config-atomic-parents");
+        let target = root.join("nested/deeper/settings.json");
+        atomic_write(&target, b"parents").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"parents");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A directory target is rejected up front with an `InvalidInput` io
+    /// error (not some later filesystem error from trying to treat it as a
+    /// file).
+    #[test]
+    fn atomic_write_rejects_directory_with_invalid_input() {
+        let dir = crate::test_util::temp_dir_unique("config-atomic-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        match atomic_write(&dir, b"data") {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "directory targets are rejected up front with InvalidInput"
+            ),
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// Replacing an existing file derives the replacement's permission bits
+    /// from the current target: 0o644 in, 0o644 out.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_target_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_scratch("atomic-mode");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&path, b"new").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the replacement must carry the mode derived from the target"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// A target that cannot be read at all surfaces an io error instead of
+    /// being silently treated as absent.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_reports_io_error_when_target_becomes_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_scratch("atomic-unreadable");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // DAC_OVERRIDE (e.g. root): the unreadable-target arm is
+            // unreachable for this process; nothing to assert here.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        match atomic_write(&path, b"new") {
+            Err(ConfigError::Io { .. }) => {}
+            other => panic!("expected Io error for an unreadable target, got {other:?}"),
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// The temp file name embeds a current epoch-millis value and a compact
+    /// four-hex-char random suffix; both are part of the collision-avoidance
+    /// contract. A failed temp write leaves the temp behind, so the name is
+    /// observable.
+    #[test]
+    fn lingering_temp_name_carries_recent_millis_and_compact_hex_suffix() {
+        let path = unique_scratch("atomic-tempname");
+        let sabotage = Sabotage {
+            at: Point::TempWrite,
+            action: SabotageAction::Fail,
+        };
+        let res = atomic_write_expecting(
+            &path,
+            b"payload",
+            WriteExpectation::Any,
+            None,
+            Some(&sabotage),
+        );
+        assert!(res.is_err(), "the injected temp-write failure must surface");
+        let parent = path.parent().unwrap().to_path_buf();
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = format!(".tmp.{file_name}.");
+        let mut temps: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix.as_str()) {
+                temps.push(name);
+            }
+        }
+        assert_eq!(temps.len(), 1, "exactly one temp should linger: {temps:?}");
+        let name = temps.first().cloned().unwrap_or_default();
+        let mut segments = name.rsplit('.');
+        let millis = segments.next().unwrap_or_default().to_owned();
+        let suffix = segments.next().unwrap_or_default().to_owned();
+        let millis: u128 = millis.parse().unwrap_or(0);
+        assert!(
+            millis >= 1_600_000_000_000,
+            "temp name must embed a post-2020 epoch millis value, got {name}"
+        );
+        assert_eq!(
+            suffix.len(),
+            4,
+            "temp suffix must be four chars, got {name}"
+        );
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            "temp suffix must be lowercase hex, got {name}"
+        );
+        drop(std::fs::remove_dir_all(&parent));
+    }
+
+    /// The parent-directory sync after the rename tolerates an EACCES on
+    /// opening the parent (Windows opens directories without backup
+    /// semantics); the write as a whole still succeeds and the content is
+    /// readable back.
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_tolerates_permission_denied_on_parent_open() {
+        let path = unique_scratch("atomic-sync-eacces");
+        let parent = path.parent().unwrap().to_path_buf();
+        if !perm_denies_dir_read(&parent) {
+            // DAC_OVERRIDE (e.g. root): the PermissionDenied open arm is
+            // unreachable for this process; nothing to assert here.
+            return;
+        }
+        let sabotage = Sabotage {
+            at: Point::ParentSync,
+            action: SabotageAction::DenyParentRead {
+                parent: parent.clone(),
+            },
+        };
+        atomic_write_expecting(
+            &path,
+            b"payload",
+            WriteExpectation::Any,
+            None,
+            Some(&sabotage),
+        )
+        .expect("the parent sync must tolerate EACCES on the parent open");
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+        drop(std::fs::remove_dir_all(&parent));
+    }
+
+    /// The parent-directory sync tolerates the parent disappearing entirely
+    /// (the replacement itself already landed and was synced): the loss is
+    /// only noticed later, by the read-back of the landed file — reported
+    /// against the file path, never against the parent.
+    #[test]
+    fn sync_parent_tolerates_vanishing_parent() {
+        let path = unique_scratch("atomic-sync-enoent");
+        let parent = path.parent().unwrap().to_path_buf();
+        let sabotage = Sabotage {
+            at: Point::ParentSync,
+            action: SabotageAction::VanishParent {
+                file: path.clone(),
+                parent: parent.clone(),
+            },
+        };
+        let res =
+            atomic_write_expecting(&path, b"gone", WriteExpectation::Any, None, Some(&sabotage));
+        match res {
+            Err(ConfigError::Io {
+                path: reported,
+                source,
+            }) => {
+                assert_eq!(
+                    reported, path,
+                    "the vanished parent is tolerated; the loss surfaces at the file read-back"
+                );
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected the read-back to report the vanished file, got {other:?}"),
+        }
+        assert!(!parent.exists());
+    }
+
+    /// A parent-open error that is neither `PermissionDenied` nor `NotFound` is
+    /// surfaced as an io error reported against the parent path (here a
+    /// symlink loop, ELOOP).
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_surfaces_other_parent_open_errors() {
+        let root = crate::test_util::temp_dir_unique("config-atomic-loop");
+        let parent = root.join("inner");
+        std::fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("file.json");
+        let helper = root.join("inner-loop");
+        let sabotage = Sabotage {
+            at: Point::ParentSync,
+            action: SabotageAction::LoopParent {
+                file: target.clone(),
+                parent: parent.clone(),
+                helper: helper.clone(),
+            },
+        };
+        let res = atomic_write_expecting(
+            &target,
+            b"looped",
+            WriteExpectation::Any,
+            None,
+            Some(&sabotage),
+        );
+        match res {
+            Err(ConfigError::Io { path, source }) => {
+                assert_eq!(
+                    path, parent,
+                    "the parent-sync failure is reported against the parent"
+                );
+                // ELOOP has no stable ErrorKind; assert the OS error is set
+                // so a plain permission/not-found mixup cannot pass either.
+                assert!(
+                    source.raw_os_error().is_some(),
+                    "the surfaced error is an OS error, got {source}"
+                );
+            }
+            other => panic!("expected Io error from the parent sync, got {other:?}"),
+        }
+        drop(std::fs::remove_file(&parent));
+        drop(std::fs::remove_file(&helper));
+        drop(std::fs::remove_dir(&root));
+    }
+
+    /// A rename that fails with `PermissionDenied` is retried: a transient
+    /// denial (Windows antivirus/indexer holds) clears and the write lands
+    /// without the caller ever seeing an error.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_retries_rename_through_transient_permission_error() {
+        let path = unique_scratch("atomic-rename-transient");
+        let parent = path.parent().unwrap().to_path_buf();
+        if !perm_denies_dir_write(&parent) {
+            // DAC_OVERRIDE (e.g. root): rename cannot be denied for this
+            // process; nothing to assert here.
+            return;
+        }
+        let restorer_parent = parent.clone();
+        let restorer = std::thread::spawn(move || {
+            use std::os::unix::fs::PermissionsExt;
+            // Sleep guarantees a minimum delay, so the restore always lands
+            // inside the retry window: after the first failed rename but
+            // before the attempts run out. Scheduling delays only push later
+            // attempts further out, which still succeeds.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(std::fs::set_permissions(
+                &restorer_parent,
+                std::fs::Permissions::from_mode(0o755),
+            ));
+        });
+        let sabotage = Sabotage {
+            at: Point::AtomicReplace,
+            action: SabotageAction::DenyParentWrite {
+                parent: parent.clone(),
+            },
+        };
+        let res = atomic_write_expecting(
+            &path,
+            b"retried",
+            WriteExpectation::Any,
+            None,
+            Some(&sabotage),
+        );
+        restorer.join().expect("restorer thread must not panic");
+        res.expect("rename must be retried until the transient denial clears");
+        assert_eq!(std::fs::read(&path).unwrap(), b"retried");
+        drop(std::fs::remove_dir_all(&parent));
+    }
+
+    /// A rename denial that never clears is reported as an io
+    /// `PermissionDenied` error, and the target never appears.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_reports_permanent_rename_permission_error() {
+        let path = unique_scratch("atomic-rename-permanent");
+        let parent = path.parent().unwrap().to_path_buf();
+        if !perm_denies_dir_write(&parent) {
+            // DAC_OVERRIDE (e.g. root): rename cannot be denied for this
+            // process; nothing to assert here.
+            return;
+        }
+        let sabotage = Sabotage {
+            at: Point::AtomicReplace,
+            action: SabotageAction::DenyParentWrite {
+                parent: parent.clone(),
+            },
+        };
+        let res = atomic_write_expecting(
+            &path,
+            b"never",
+            WriteExpectation::Any,
+            None,
+            Some(&sabotage),
+        );
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "a permanent rename denial surfaces as PermissionDenied"
+            ),
+            other => panic!("expected Io error from rename, got {other:?}"),
+        }
+        assert!(
+            !path.exists(),
+            "the target must not appear when the rename never succeeds"
+        );
+        set_dir_mode(&parent, 0o755);
+        drop(std::fs::remove_dir_all(&parent));
+    }
 }
