@@ -5292,26 +5292,111 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// With several case-variant siblings the collision report names the
-    /// lexicographically first variant deterministically.
-    #[test]
-    fn case_fold_collision_reports_the_first_variant() {
-        let dir = boundary_scratch("case-min");
-        // Filesystem case-sensitivity probe: on a case-insensitive
-        // filesystem (default macOS APFS, Windows NTFS) `Config.json` and
-        // `CONFIG.json` are ONE directory entry, so the two-variant fixture
-        // premise is absent (the report rightly names whichever single
-        // entry exists). Mirrors `perm_denies_dir_read_probe`: skip rather
-        // than assert a fixture the platform cannot provide.
+    /// Every ASCII case variant of `config.json` except the all-lowercase
+    /// spelling itself (that is the probed name, not a sibling), in a fixed
+    /// order that stages a non-minimum variant FIRST and the lexicographic
+    /// minimum (every letter uppercased) SECOND, so even on a
+    /// creation-ordered readdir (tmpfs) the minimum starts interior.
+    fn case_variant_pool() -> Vec<String> {
+        let base = b"config.json";
+        let cased: Vec<usize> = (0..base.len())
+            .filter(|&i| base[i].is_ascii_alphabetic())
+            .collect();
+        let mut pool = Vec::new();
+        for bits in 1..(1usize << cased.len()) {
+            let mut name = base.to_vec();
+            for (k, &i) in cased.iter().enumerate() {
+                if bits & (1 << k) != 0 {
+                    name[i] = name[i].to_ascii_uppercase();
+                }
+            }
+            pool.push(String::from_utf8(name).expect("ascii stays valid utf-8"));
+        }
+        // `bits == all-ones` (the minimum) is generated last; move it behind
+        // the first non-minimum entry.
+        let last = pool.len() - 1;
+        pool.swap(1, last);
+        pool
+    }
+
+    /// The case-variant siblings of `config.json` currently staged in `dir`,
+    /// in the directory's own readdir order — the same order
+    /// `case_fold_collision_in_dir` iterates.
+    fn case_variants_in_readdir_order(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("the scratch directory must be readable")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.json" && name.eq_ignore_ascii_case("config.json"))
+            .collect()
+    }
+
+    /// Stage a scratch directory whose only entries are case-variant
+    /// siblings of `config.json`, adding variants until the directory's own
+    /// readdir order is DISCRIMINATING for the selection logic: the
+    /// lexicographic minimum sits strictly in the interior — neither the
+    /// first nor the last entry read back. Returns the directory and the
+    /// minimum variant's name.
+    ///
+    /// Why the interior requirement: the correct selection is
+    /// order-independent (always the minimum), but the `best`-update
+    /// mutants in `case_fold_collision_in_dir` are not — with the match
+    /// guard forced they return the first or the last readdir entry. A
+    /// two-variant fixture therefore only kills them when the filesystem's
+    /// iteration order happens to end (resp. start) with the minimum:
+    /// ext4/overlayfs readdir order is name-hash based and identical for
+    /// the same names in every directory on the volume, so staging the pair
+    /// in either creation order cannot fix it (the CI escape: the mutant's
+    /// last entry WAS the minimum). Observing the order here and requiring
+    /// the minimum to be interior makes the kill independent of whatever
+    /// order the host filesystem reports.
+    ///
+    /// Returns `None` on case-insensitive filesystems (default macOS APFS,
+    /// Windows NTFS), where all variants collapse to ONE directory entry
+    /// and the multi-variant premise is absent — the same `CASE-PROBE-A`
+    /// skip as `perm_denies_dir_read_probe`.
+    fn discriminating_case_variant_fixture(tag: &str) -> Option<(PathBuf, String)> {
+        let dir = boundary_scratch(tag);
         std::fs::write(dir.join("case-probe-a"), b"{}").unwrap();
         let case_insensitive = dir.join("CASE-PROBE-A").exists();
         drop(std::fs::remove_file(dir.join("case-probe-a")));
         if case_insensitive {
             drop(std::fs::remove_dir_all(&dir));
-            return;
+            return None;
         }
-        std::fs::write(dir.join("Config.json"), b"{}").unwrap();
-        std::fs::write(dir.join("CONFIG.json"), b"{}").unwrap();
+        let pool = case_variant_pool();
+        let min = pool[1].clone();
+        for (staged, name) in pool.iter().enumerate() {
+            std::fs::write(dir.join(name), b"{}").unwrap();
+            if staged < 2 {
+                continue;
+            }
+            let order = case_variants_in_readdir_order(&dir);
+            assert_eq!(
+                order.len(),
+                staged + 1,
+                "the staged variants must be the directory's only content"
+            );
+            if order.first() != Some(&min) && order.last() != Some(&min) {
+                return Some((dir, min));
+            }
+        }
+        // No mainstream filesystem sorts readdir output, so the loop finds
+        // an interior minimum long before the pool runs out (hash order: a
+        // handful of inserts; creation order: immediately). Fall through
+        // with the full pool regardless — the suite must never fail over an
+        // iteration order, only the kill strength would suffer.
+        Some((dir, min))
+    }
+
+    /// With several case-variant siblings the collision report names the
+    /// lexicographically first variant deterministically, whatever order the
+    /// filesystem reports the directory in.
+    #[test]
+    fn case_fold_collision_reports_the_first_variant() {
+        let Some((dir, min)) = discriminating_case_variant_fixture("case-min") else {
+            return; // case-insensitive filesystem: premise absent
+        };
         let res = commit_file(
             "case-min",
             &dir.join("config.json"),
@@ -5319,10 +5404,21 @@ mod tests {
             DocumentKind::StrictJson,
         );
         let err = res.expect_err("the case-fold collision must be refused");
+        let message = format!("{err}");
+        let reported = dir.join(&min).display().to_string();
         assert!(
-            format!("{err}").contains("CONFIG.json"),
-            "the report must name the first variant: {err}"
+            message.contains(&reported),
+            "the report must name the first variant {reported}: {err}"
         );
+        for name in case_variants_in_readdir_order(&dir) {
+            if name != min {
+                let other = dir.join(&name).display().to_string();
+                assert!(
+                    !message.contains(&other),
+                    "only the first variant may be named: {err}"
+                );
+            }
+        }
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -5971,40 +6067,22 @@ mod tests {
 
     /// The case-fold collision report is deterministic: with several variant
     /// siblings it names the lexicographically first one, independent of the
-    /// directory-creation order the filesystem happens to report.
-    #[cfg(unix)]
+    /// directory iteration order the filesystem happens to report (hash
+    /// order on ext4/overlayfs, creation order on tmpfs). The fixture
+    /// guarantees the minimum is interior to that order, so the selection is
+    /// observable rather than coincidental.
     #[test]
     fn case_fold_collision_picks_the_lexicographically_first_variant() {
-        use std::os::unix::fs::MetadataExt;
-        for (first, second) in [
-            ("Config.json", "CONFIG.json"),
-            ("CONFIG.json", "Config.json"),
-        ] {
-            let dir = boundary_scratch("fold-order");
-            std::fs::write(dir.join(first), b"{}").unwrap();
-            std::fs::write(dir.join(second), b"{}").unwrap();
-            // On a case-insensitive filesystem both names are one file; the
-            // min-selection contract is only observable with distinct entries.
-            let distinct = match (
-                std::fs::metadata(dir.join(first)),
-                std::fs::metadata(dir.join(second)),
-            ) {
-                (Ok(a), Ok(b)) => (a.dev(), a.ino()) != (b.dev(), b.ino()),
-                _ => false,
-            };
-            if !distinct {
-                drop(std::fs::remove_dir_all(&dir));
-                continue;
-            }
-            let min = if first < second { first } else { second };
-            let got = case_fold_collision_in_dir(&dir.join("config.json"))
-                .expect("a case-variant sibling must be detected");
-            assert_eq!(
-                got,
-                dir.join(min),
-                "the lexicographically first variant must be reported"
-            );
-            drop(std::fs::remove_dir_all(&dir));
-        }
+        let Some((dir, min)) = discriminating_case_variant_fixture("fold-order") else {
+            return; // case-insensitive filesystem: premise absent
+        };
+        let got = case_fold_collision_in_dir(&dir.join("config.json"))
+            .expect("a case-variant sibling must be detected");
+        assert_eq!(
+            got,
+            dir.join(&min),
+            "the lexicographically first variant must be reported"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }
