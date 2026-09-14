@@ -723,6 +723,12 @@ mod tests {
         validate_quarantine_target(Path::new("/tmp/")).unwrap_err();
     }
 
+    /// Platform: unix — the fixture must CREATE existing paths whose names
+    /// contain `*` and `?`, which Win32 filename rules reserve (creation
+    /// fails before any assertion runs). Unix filenames may contain glob
+    /// characters, so the "existing path containing globs" premise is
+    /// stageable only there.
+    #[cfg(unix)]
     #[test]
     fn validate_quarantine_rejects_existing_paths_containing_globs() {
         let dir = crate::test_util::temp_dir_unique("quarantine-glob");

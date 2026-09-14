@@ -4956,6 +4956,11 @@ mod tests {
         }
     }
 
+    /// Platform: unix — the control assertion needs `/usr/local/bin/...` to
+    /// be an absolute, validatable target; a `/`-rooted path is
+    /// drive-relative (never `is_absolute`) on Windows, so both the unix-root
+    /// refusals and the control hold only on unix.
+    #[cfg(unix)]
     #[test]
     fn remove_target_rejects_every_broad_unix_root() {
         for root in ["/", "/home", "/tmp", "/usr", "/etc"] {
@@ -4971,6 +4976,14 @@ mod tests {
         );
     }
 
+    /// Platform: unix — the `/data/...`, `//server/...` and
+    /// `/usr/local/bin/...` shapes require `/`-rooted paths to be absolute
+    /// (they are drive-relative on Windows, failing the control's `is_ok`),
+    /// so the whole fixture is unix-premised. The windows-shape STRING
+    /// semantics involved (`looks_windows_shaped`, folding, broad roots)
+    /// stay covered by the ungated cross-platform unit tests; the mutation
+    /// suite that this kill serves judges on ubuntu.
+    #[cfg(unix)]
     #[test]
     fn binary_remove_refuses_config_roots_in_every_shape() {
         for bad in [

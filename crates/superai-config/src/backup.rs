@@ -2243,6 +2243,12 @@ mod tests {
     /// treat EISDIR as absence, hand `WriteExpectation::Missing` to
     /// `atomic_write_expecting`, and surface that helper's `InvalidInput`
     /// pre-check instead — a different `ErrorKind`.
+    ///
+    /// Platform: unix — reading a directory reports `EISDIR`
+    /// (`ErrorKind::IsADirectory`) on Linux and macOS; Windows surfaces a
+    /// different error kind for a read through a directory path, so the
+    /// premise is asserted only where it holds.
+    #[cfg(unix)]
     #[test]
     fn restore_verified_surfaces_is_a_directory_when_the_original_became_a_directory() {
         let path = unique_scratch("verified-isdir");
