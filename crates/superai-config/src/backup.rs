@@ -2165,4 +2165,88 @@ mod tests {
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&entry.backup_path));
     }
+
+    /// Backing up a SYMLINK is the one input shape where the explicit
+    /// permission re-apply in `backup_inner` is observable: the entry's mode
+    /// comes from `symlink_metadata` (the LINK's own 0o777) while `fs::copy`
+    /// follows the link and lands the REFERENT's 0o644 on the fresh backup.
+    /// The re-apply must override the referent mode with the recorded link
+    /// mode — a `set_permissions_u32 -> Ok(())` mutant leaves the backup at
+    /// the referent's 0o644.
+    #[cfg(unix)]
+    #[test]
+    fn backup_of_a_symlink_lands_the_link_mode_not_the_referent_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("config-backup-link-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let referent = dir.join("referent.json");
+        std::fs::write(&referent, b"symlinked content").unwrap();
+        std::fs::set_permissions(&referent, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        let entry = backup(&link)
+            .unwrap()
+            .expect("backup of a symlink to a regular file must succeed");
+
+        let link_mode = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            link_mode & 0o777,
+            0o777,
+            "linux creates symlinks 0o777; the premise distinguishing link from referent"
+        );
+        assert_eq!(
+            entry.permissions,
+            Some(link_mode),
+            "the entry records the link's own mode from symlink_metadata"
+        );
+        let backup_mode = std::fs::metadata(&entry.backup_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            backup_mode & 0o777,
+            link_mode & 0o777,
+            "the landed backup must carry the recorded link mode, not the referent's 0o644"
+        );
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_file(&referent));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// A DIRECTORY that replaced the original path must surface the raw
+    /// `IsADirectory` read error, not be masked to "missing": the NotFound-only
+    /// guard keeps non-NotFound read errors visible (`verify_backup_relation`
+    /// is name-based and cannot catch this). The guard->true mutant would
+    /// treat EISDIR as absence, hand `WriteExpectation::Missing` to
+    /// `atomic_write_expecting`, and surface that helper's `InvalidInput`
+    /// pre-check instead — a different `ErrorKind`.
+    #[test]
+    fn restore_verified_surfaces_is_a_directory_when_the_original_became_a_directory() {
+        let path = unique_scratch("verified-isdir");
+        std::fs::write(&path, b"backed up").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        drop(std::fs::remove_file(&path));
+        std::fs::create_dir(&path).unwrap();
+
+        let res = restore_verified(&entry);
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::IsADirectory,
+                "EISDIR from the fresh read must surface, not be masked to missing"
+            ),
+            other => panic!("expected io error for a directory at the original, got {other:?}"),
+        }
+        assert!(
+            path.is_dir(),
+            "the aborted restore must leave the directory untouched"
+        );
+        drop(std::fs::remove_dir(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
 }
