@@ -644,11 +644,18 @@ impl Adapter for GrokBuildAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
-    fn mcp_absence_reason(&self) -> Option<&'static str> {
-        Some(
-            "MCP servers documented as a config.toml section but the table key spelling is not shown in the corpus (grok-build.md 6)",
-        )
+    /// EXT-08/09: MCP destination (live-verified 2026-09-18, grok 1.0.34:
+    /// `grok mcp add` writes `[mcp_servers.<name>]` tables into
+    /// `$GROK_HOME/config.toml`; shipped user-guide 07-mcp-servers.md,
+    /// evidence live/grok-build/mcp-probe.txt).
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            "config.toml",
+            "mcp_servers",
+            DocumentKind::Toml,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
     }
 
     /// EXT-06/07: plugin mechanism (grok-build.md: `~/.grok/plugins/` user scope and `.grok/plugins/` project scope)

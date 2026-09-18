@@ -1,0 +1,24 @@
+# Provenance: source=docs/harness-configs/grok-build.md last_verified=2026-09-18 sanitized fake sk-fake- mcp variant
+# Live-verified format (grok 1.0.34, `grok mcp add` writer): [mcp_servers.<name>] tables in $GROK_HOME/config.toml.
+
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+enabled = true
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+env = { API_KEY = "sk-fake-mcp-2222" }
+
+[mcp_servers.my_server]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+enabled = true
+
+[mcp_servers.internal-tools]
+url = "https://mcp.internal.example.com/mcp"
+headers = { Authorization = "Bearer sk-fake-mcp-token" }

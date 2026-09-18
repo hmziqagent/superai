@@ -78,6 +78,7 @@ mod decl_tests {
         ("forge", ".mcp.json", "mcpServers"),
         ("gemini-cli", "settings.json", "mcpServers"),
         ("goose", "config.yaml", "extensions"),
+        ("grok-build", "config.toml", "mcp_servers"),
         ("hermes-agent", "config.yaml", "mcp_servers"),
         ("iflow-cli", "settings.json (user)", "mcpServers"),
         ("junie-cli", "mcp/mcp.json", "mcpServers"),
@@ -104,7 +105,6 @@ mod decl_tests {
     const MCP_ABSENT: &[&str] = &[
         "aider",
         "factory-droid",
-        "grok-build",
         "conductor",
         "copilot-coding-agent",
         "deepseek-harness",
@@ -239,11 +239,12 @@ mod decl_tests {
     }
 
     /// Verified corpus partition of the 49 MCP declarations (round-1 judge
-    /// recount plus workbuddy): pins the exact writable/read-only/absence
-    /// split so any drift in either direction fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 16;
+    /// recount plus workbuddy, corrected round 5 by the live grok-build
+    /// probe): pins the exact writable/read-only/absence split so any drift
+    /// in either direction fails with the real numbers.
+    const EXPECTED_MCP_WRITABLE: usize = 17;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
-    const EXPECTED_MCP_ABSENT: usize = 15;
+    const EXPECTED_MCP_ABSENT: usize = 14;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
