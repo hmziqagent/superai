@@ -118,6 +118,11 @@ exclude_re = [
     '^crates/superai-config/src/transaction\.rs:2590:32: delete ! in Transaction::verify$',
     '^crates/superai-config/src/transaction\.rs:2594:12: delete ! in Transaction::verify$',
     '^crates/superai-config/src/journal\.rs:116:16: delete ! in CrashJournal::write_to$',
-    '^crates/superai-config/src/quarantine\.rs:361:63: replace \|\| with && in move_to_quarantine_with_dest$',
-    '^crates/superai-config/src/quarantine\.rs:474:63: replace \|\| with && in restore_from_quarantine$',
+    # run-4 round-4: re-anchored after the alias-quarantine fix inserted the
+    # *_under family + base-containment guard above these arms (line shift +
+    # fn rename move_to_quarantine_with_dest -> ..._in_base); same adjudicated
+    # Linux-equivalent EXDEV mutants (kind==CrossesDevices and raw==Some(18)
+    # hold simultaneously on Linux, so || <-> && is equivalent).
+    '^crates/superai-config/src/quarantine\.rs:450:63: replace \|\| with && in move_to_quarantine_with_dest_in_base$',
+    '^crates/superai-config/src/quarantine\.rs:563:63: replace \|\| with && in restore_from_quarantine$',
 ]

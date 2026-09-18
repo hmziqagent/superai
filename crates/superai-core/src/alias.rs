@@ -16,6 +16,7 @@
 //! <base>/<harness>/<alias-name>/                       alias config root
 //! <base>/<harness>/<alias-name>/.superai-alias         ownership marker
 //! <base>/<harness>/<alias-name>/.superai/plugins/      per-alias plugin registry
+//! <base>/.superai/quarantine/<operation_id>/           quarantined alias roots
 //! ```
 //!
 //! The on-disk manifest is the only registry: it is read fresh on every
@@ -492,7 +493,7 @@ pub fn create_alias(
     let wrapper_ref = match seeded {
         Ok(wrapper_ref) => wrapper_ref,
         Err(e) => {
-            drop(quarantine_alias_root(root.as_path()));
+            drop(quarantine_alias_root(base_dir, root.as_path()));
             return Err(e);
         }
     };
@@ -596,9 +597,11 @@ fn generate_alias_wrapper(
     }))
 }
 
-fn quarantine_alias_root(root: &Path) -> std::result::Result<PathBuf, CoreError> {
+/// Quarantine a half-created alias root. Recovery state stays under the
+/// alias base (`<base>/.superai/quarantine/...`), never the user's home.
+fn quarantine_alias_root(base_dir: &Path, root: &Path) -> std::result::Result<PathBuf, CoreError> {
     let op = unique_operation_string("alias-failure");
-    superai_config::quarantine::move_to_quarantine(root, &op)
+    superai_config::quarantine::move_to_quarantine_under(base_dir, root, &op)
         .map(|entry| entry.quarantine_path)
         .map_err(CoreError::Config)
 }
@@ -756,9 +759,14 @@ pub fn remove_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<
         })?;
     }
     if record.root.as_path().exists() {
+        // Recovery state stays under the alias base, never the user's home.
         let op = unique_operation_string("alias-remove");
-        superai_config::quarantine::move_to_quarantine(record.root.as_path(), &op)
-            .map_err(CoreError::Config)?;
+        superai_config::quarantine::move_to_quarantine_under(
+            base.as_path(),
+            record.root.as_path(),
+            &op,
+        )
+        .map_err(CoreError::Config)?;
     }
     remove_manifest_record(base_dir, harness, name)?;
     Ok(record)
@@ -852,6 +860,7 @@ mod tests {
             ("workbuddy", ".mcp.json"),
             ("qwen-code", "settings.json"),
             ("grok-build", "config.toml"),
+            ("factory-droid", ".factory/mcp.json"),
         ] {
             let base = base(&format!("mcp-{harness_id}"));
             let adapter = adapter(harness_id);
@@ -990,6 +999,27 @@ mod tests {
             other => panic!("expected honest plugin refusal, got {other:?}"),
         }
         assert!(!base.join("kimi-code-cli").join("mk").exists());
+        // The half-created root is recoverable UNDER THE ALIAS BASE, not in
+        // the user's home (run-4 round-3 finding 2).
+        let qbase = base.join(".superai").join("quarantine");
+        let recovered: Vec<std::ffi::OsString> = std::fs::read_dir(&qbase)
+            .map(|rd| {
+                rd.filter_map(std::result::Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("alias-failure-")
+                    })
+                    .map(|e| e.file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "exactly one alias-failure quarantine op under the base"
+        );
+        assert!(qbase.join(&recovered[0]).join("mk").is_dir());
     }
 
     #[test]
@@ -1052,6 +1082,68 @@ mod tests {
             Err(CoreError::Validation { field, .. }) => assert_eq!(field, "alias"),
             other => panic!("expected not-found validation, got {other:?}"),
         }
+    }
+
+    /// Alias quarantine ops currently recorded under the REAL home (prefix
+    /// filtering is race-free: only alias.rs mints `alias-*` operation ids,
+    /// and after the fix none of them target the home base at all).
+    fn home_quarantine_alias_ops() -> Vec<String> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        let dir = PathBuf::from(home).join(".superai").join("quarantine");
+        std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(std::result::Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("alias-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Quarantine for alias removal lives under the alias base
+    /// (`<base>/.superai/quarantine/...`), never the user's real home.
+    #[test]
+    fn remove_quarantines_under_the_alias_base_not_the_user_home() {
+        let base = base("quar-under");
+        let workbuddy = adapter("workbuddy");
+        let record = create_alias(
+            &base,
+            &AliasSpec::new(harness("workbuddy"), name("gone"))
+                .with_mcp_servers(vec![server("only-a")]),
+            workbuddy.as_ref(),
+            None,
+        )
+        .unwrap();
+        let root = record.root;
+        let home_ops_before = home_quarantine_alias_ops();
+
+        remove_alias(&base, &harness("workbuddy"), "gone").unwrap();
+
+        assert!(!root.as_path().exists(), "root must be gone");
+        let qbase = base.join(".superai").join("quarantine");
+        let ops: Vec<String> = std::fs::read_dir(&qbase)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("alias-remove-"))
+            .collect();
+        assert_eq!(ops.len(), 1, "one alias-remove op under the base");
+        let moved = qbase.join(&ops[0]).join("gone");
+        assert!(
+            moved.join(ALIAS_MARKER_FILE).is_file(),
+            "the moved root stays recoverable under the alias base"
+        );
+        assert!(
+            moved.join(".mcp.json").is_file(),
+            "seeded content moved with the root"
+        );
+        assert_eq!(
+            home_quarantine_alias_ops(),
+            home_ops_before,
+            "no alias quarantine entry may appear under the real home"
+        );
     }
 
     #[test]

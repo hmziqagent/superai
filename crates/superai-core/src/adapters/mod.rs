@@ -75,7 +75,7 @@ mod decl_tests {
         ("copilot-cli", "mcp-config.json", "mcpServers"),
         ("crush", "crush.json (global)", "mcp"),
         ("cursor", "mcp.json", "mcpServers"),
-        ("factory-droid", "mcp.json", "mcpServers"),
+        ("factory-droid", ".factory/mcp.json", "mcpServers"),
         ("forge", ".mcp.json", "mcpServers"),
         ("gemini-cli", "settings.json", "mcpServers"),
         ("goose", "config.yaml", "extensions"),

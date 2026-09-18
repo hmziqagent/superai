@@ -1,9 +1,15 @@
 //! Quarantine for recoverable deletion (MUT-08).
 //!
 //! Material directory removal first moves the exact validated target into a
-//! superai quarantine area on the same filesystem where possible. The
+//! superai quarantine area on the same filesystem where possible. The default
 //! quarantine path is `~/.superai/quarantine/<operation_id>/` and the move
 //! reports recoverability and retention.
+//!
+//! Operations that own a relocated superai root (alias bases outside the
+//! user's home) pass that root explicitly through the `*_under` functions, so
+//! their recovery state lands at `<root>/.superai/quarantine/<operation_id>/`
+//! — under the root the operation targets, never in the real home
+//! (run-4 round-3 finding 2).
 
 use std::path::{Path, PathBuf};
 
@@ -72,6 +78,10 @@ fn has_glob(path: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Returns the base quarantine directory: `~/.superai/quarantine`.
+///
+/// Operations with their own relocated root must use
+/// [`quarantine_base_under`] instead, so recovery state stays under the root
+/// the operation targets.
 pub fn quarantine_base() -> Result<PathBuf> {
     let home = home_dir().ok_or_else(|| {
         ConfigError::io(
@@ -85,9 +95,27 @@ pub fn quarantine_base() -> Result<PathBuf> {
     Ok(home.join(".superai").join("quarantine"))
 }
 
-/// Returns the quarantine directory for a given operation id:
-/// `~/.superai/quarantine/<operation_id>/`.
-pub fn quarantine_dir(operation_id: &str) -> Result<PathBuf> {
+/// Returns the base quarantine directory under an explicit superai-owned
+/// root: `<root>/.superai/quarantine`.
+///
+/// The root must be absolute; relative roots are refused before any
+/// filesystem work.
+pub fn quarantine_base_under(root: &Path) -> Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err(ConfigError::io(
+            root,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "quarantine root must be absolute",
+            ),
+        ));
+    }
+    Ok(root.join(".superai").join("quarantine"))
+}
+
+/// Compute the operation quarantine directory inside an already-resolved
+/// base, validating the operation id shape.
+fn quarantine_dir_in_base(base: &Path, operation_id: &str) -> Result<PathBuf> {
     if operation_id.is_empty() {
         return Err(ConfigError::io(
             Path::new(operation_id),
@@ -106,8 +134,19 @@ pub fn quarantine_dir(operation_id: &str) -> Result<PathBuf> {
             ),
         ));
     }
-    let base = quarantine_base()?;
     Ok(base.join(operation_id))
+}
+
+/// Returns the quarantine directory for a given operation id:
+/// `~/.superai/quarantine/<operation_id>/`.
+pub fn quarantine_dir(operation_id: &str) -> Result<PathBuf> {
+    quarantine_dir_in_base(&quarantine_base()?, operation_id)
+}
+
+/// Returns the quarantine directory for a given operation id under an
+/// explicit superai-owned root: `<root>/.superai/quarantine/<operation_id>/`.
+pub fn quarantine_dir_under(root: &Path, operation_id: &str) -> Result<PathBuf> {
+    quarantine_dir_in_base(&quarantine_base_under(root)?, operation_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +308,31 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
 /// rename where same-filesystem, otherwise copy-then-delete, verifies digest,
 /// and reports recoverability.
 pub fn move_to_quarantine(path: &Path, operation_id: &str) -> Result<QuarantineEntry> {
-    let qdir = quarantine_dir(operation_id)?;
+    move_to_quarantine_in_base(&quarantine_base()?, path, operation_id)
+}
+
+/// Move `path` into the quarantine directory for `operation_id` under the
+/// explicit superai-owned `root` (see [`quarantine_base_under`]).
+///
+/// Same semantics as [`move_to_quarantine`], with the quarantine tree rooted
+/// at `<root>/.superai/quarantine` so relocated operations keep recovery
+/// state out of the user's home.
+pub fn move_to_quarantine_under(
+    root: &Path,
+    path: &Path,
+    operation_id: &str,
+) -> Result<QuarantineEntry> {
+    move_to_quarantine_in_base(&quarantine_base_under(root)?, path, operation_id)
+}
+
+/// Core of [`move_to_quarantine`]/[`move_to_quarantine_under`] against an
+/// already-resolved quarantine `base`.
+fn move_to_quarantine_in_base(
+    base: &Path,
+    path: &Path,
+    operation_id: &str,
+) -> Result<QuarantineEntry> {
+    let qdir = quarantine_dir_in_base(base, operation_id)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| {
@@ -280,24 +343,50 @@ pub fn move_to_quarantine(path: &Path, operation_id: &str) -> Result<QuarantineE
         })?
         .to_os_string();
     let dest = qdir.join(file_name);
-    move_to_quarantine_with_dest(path, &dest, operation_id)
+    move_to_quarantine_with_dest_in_base(base, path, &dest, operation_id)
 }
 
 /// Move `path` to an explicit `dest` inside quarantine, validating `path`.
 ///
 /// `dest` must be inside the quarantine directory for `operation_id`.
+pub fn move_to_quarantine_with_dest(
+    path: &Path,
+    dest: &Path,
+    operation_id: &str,
+) -> Result<QuarantineEntry> {
+    move_to_quarantine_with_dest_in_base(&quarantine_base()?, path, dest, operation_id)
+}
+
+/// Core of [`move_to_quarantine_with_dest`] against an already-resolved
+/// quarantine `base`.
 #[expect(
     clippy::too_many_lines,
     reason = "quarantine move validates, copies, and verifies"
 )]
-pub fn move_to_quarantine_with_dest(
+fn move_to_quarantine_with_dest_in_base(
+    base: &Path,
     path: &Path,
     dest: &Path,
     operation_id: &str,
 ) -> Result<QuarantineEntry> {
     validate_quarantine_target(path)?;
 
-    let qdir = quarantine_dir(operation_id)?;
+    // A target that is the base itself or one of its ancestors would
+    // swallow the quarantine tree: create_dir_all would build the
+    // destination inside the victim and the move would then fail (rename
+    // EINVAL on moving a directory into itself), leaving partial state.
+    // Refuse before any filesystem work.
+    if base.starts_with(path) {
+        return Err(ConfigError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to quarantine a path containing the quarantine base",
+            ),
+        ));
+    }
+
+    let qdir = quarantine_dir_in_base(base, operation_id)?;
     if !dest.starts_with(&qdir) {
         return Err(ConfigError::io(
             dest,
@@ -316,7 +405,7 @@ pub fn move_to_quarantine_with_dest(
         let perm = std::fs::Permissions::from_mode(0o700);
         drop(std::fs::set_permissions(&qdir, perm.clone()));
         if let Some(parent) = qdir.parent() {
-            // Ensure ~/.superai exists with 0o700 as well
+            // Ensure the `.superai` state dir exists with 0o700 as well
             let superai = parent;
             if superai.exists() {
                 drop(std::fs::set_permissions(superai, perm));
@@ -551,6 +640,103 @@ mod tests {
         let base = quarantine_base().unwrap();
         assert!(dir.starts_with(&base));
         assert!(dir.ends_with(&op));
+    }
+
+    /// Relocated operations resolve their quarantine tree under their own
+    /// superai-owned root: `<root>/.superai/quarantine`, with the same
+    /// operation-id shape rules as the home-based family.
+    #[test]
+    fn quarantine_base_under_nests_the_state_root() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-under-base");
+        let base = quarantine_base_under(&dir).unwrap();
+        assert_eq!(base, dir.join(".superai").join("quarantine"));
+        assert_eq!(
+            quarantine_dir_under(&dir, "under-op").unwrap(),
+            base.join("under-op")
+        );
+        quarantine_dir_under(&dir, "").unwrap_err();
+        quarantine_dir_under(&dir, "a/b").unwrap_err();
+        quarantine_dir_under(&dir, "a:b").unwrap_err();
+    }
+
+    #[test]
+    fn quarantine_base_under_rejects_relative_roots() {
+        let err = quarantine_base_under(Path::new("relative/root")).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute"),
+            "relative quarantine root must be refused: {err}"
+        );
+    }
+
+    /// Quarantining the base itself (or an ancestor of it) must be refused
+    /// before any filesystem work: the move would otherwise create the
+    /// quarantine tree inside the victim and then fail (rename EINVAL),
+    /// leaving partial state behind.
+    #[test]
+    fn quarantine_refuses_targets_containing_the_quarantine_base() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-self");
+        let op = unique_op("self-base");
+        let base = dir.join("owned-base");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The base itself.
+        let err = move_to_quarantine_under(&base, &base, &op).unwrap_err();
+        assert!(
+            err.to_string().contains("containing the quarantine base"),
+            "quarantining the base must be refused: {err}"
+        );
+
+        // An ancestor of the base (not a broad root, exists on disk).
+        let err = move_to_quarantine_under(&base, &dir, &op).unwrap_err();
+        assert!(
+            err.to_string().contains("containing the quarantine base"),
+            "quarantining an ancestor of the base must be refused: {err}"
+        );
+        assert!(
+            !base.join(".superai").exists(),
+            "the refusal happens before any quarantine tree is created"
+        );
+        assert!(base.exists(), "the victim is untouched");
+    }
+
+    /// The headline regression (run-4 round-3 finding 2): quarantining for a
+    /// relocated operation must never touch the user's real-home quarantine
+    /// tree, and recovery must round-trip from the relocated base.
+    #[test]
+    fn move_to_quarantine_under_keeps_recovery_state_out_of_the_user_home() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-under-move");
+        let op = unique_op("under-move");
+        let src = dir.join("victim-root");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("mcp.json"), b"seeded").unwrap();
+
+        let entry = move_to_quarantine_under(&dir, &src, &op).unwrap();
+        assert!(!src.exists(), "original should be moved");
+        let expected = quarantine_base_under(&dir)
+            .unwrap()
+            .join(&op)
+            .join("victim-root");
+        assert_eq!(entry.quarantine_path, expected);
+        assert_eq!(
+            std::fs::read(expected.join("mcp.json")).unwrap(),
+            b"seeded",
+            "the quarantined tree carries the original content"
+        );
+        assert!(entry.recoverable);
+        if let Some(home) = home_dir() {
+            assert!(
+                !home.join(".superai").join("quarantine").join(&op).exists(),
+                "the real-home quarantine tree must not gain this operation"
+            );
+        }
+
+        restore_from_quarantine(&entry).unwrap();
+        assert_eq!(
+            std::fs::read(src.join("mcp.json")).unwrap(),
+            b"seeded",
+            "recovery round-trips from the relocated base"
+        );
+        drop(std::fs::remove_dir_all(dir.join(".superai")));
     }
 
     #[test]
