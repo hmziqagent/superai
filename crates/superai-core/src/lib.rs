@@ -87,6 +87,10 @@ pub mod activation;
 /// Daemon lifecycle: port allocation, identity, readiness, start/stop (WRP-07).
 pub mod daemon;
 
+/// Multi-instance alias core: per-alias relocated roots, seeded MCP/plugin
+/// sets, and launch composition (run-4 area a).
+pub mod alias;
+
 #[cfg(test)]
 mod test_util;
 
