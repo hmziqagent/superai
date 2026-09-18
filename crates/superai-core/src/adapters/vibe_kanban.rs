@@ -56,6 +56,18 @@ pub const MIGRATION_TIP: &str = "Vibe Kanban sunsetting as company product, cont
 /// Community maintained flag.
 pub const COMMUNITY_MAINTAINED: &str = "community-maintained OSS (Apache-2.0)";
 
+/// Version-probe budget for the npx-backed entrypoint. The catalog launch
+/// command is `npx vibe-kanban`, so the probe crosses a bash wrapper + npx +
+/// node. Observed timing distribution (arena VPS, 2026-09-18; area-5 evidence
+/// `.z-workflow/evidence/live/vibe-kanban/detect.out`): warm 0.55–0.66s,
+/// fresh-npm-cache cold start 0.70–0.99s — yet the uniform 2s budget used by
+/// the native-binary adapters WAS exceeded under the driver while concurrent
+/// batch installs loaded the disk, yielding an honest-but-avoidable
+/// `UnknownVersion` (direct run proved 0.1.44, rc=0). 5s ≈ 5× the worst
+/// observed cold start: covers npx cold-start under I/O load without letting
+/// a hung entrypoint stall detection.
+pub const VERSION_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Adapter struct
 // ---------------------------------------------------------------------------
@@ -130,7 +142,7 @@ impl VibeKanbanAdapter {
                 .output();
             drop(tx.send(output));
         });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
+        let Ok(Ok(output)) = rx.recv_timeout(VERSION_PROBE_BUDGET) else {
             return None;
         };
         if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
@@ -552,7 +564,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, MIGRATION_TIP, RESEARCH_DOC, VibeKanbanAdapter,
+        DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, MIGRATION_TIP, RESEARCH_DOC,
+        VERSION_PROBE_BUDGET, VibeKanbanAdapter,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus};
     use crate::error::CoreError;
@@ -563,6 +576,16 @@ mod tests {
 
     fn adapter() -> VibeKanbanAdapter {
         VibeKanbanAdapter::new().unwrap()
+    }
+
+    /// The npx entrypoint needs a warmer probe than the uniform 2s
+    /// native-binary budget: observed warm 0.55–0.66s / cold 0.70–0.99s, and
+    /// 2s was exceeded under the driver during batch installs (area-5
+    /// evidence, `.z-workflow/evidence/live/vibe-kanban/detect.out`). 5s
+    /// stays pinned so a regression to 2s fails here.
+    #[test]
+    fn version_probe_budget_covers_npx_cold_start() {
+        assert_eq!(VERSION_PROBE_BUDGET, std::time::Duration::from_secs(5));
     }
 
     fn sample_instance_with_root(root: &str) -> Instance {

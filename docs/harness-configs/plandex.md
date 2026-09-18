@@ -14,6 +14,8 @@ Plan-first coding agent with a client/server split (Go CLI + server), version-co
 - **Custom models file**: `plandex models custom` (or `\models custom` in REPL) opens/creates a JSON file (schema: `https://plandex.ai/schemas/models-input.schema.json`) defining custom providers/models/packs.
 - **Server** (self-host): configured via env vars in `app/docker-compose.yml` or your own environment.
 
+> **Live-verified v2 paths (plandex cli/v2.2.1, 2026-09-18, area-5 evidence `.z-workflow/evidence/live/plandex/`)** — the CLI keeps its per-user state in `~/.plandex-home-v2/` (materialized by the binary: `cache/`, `plandex.log`; binary strings carry `.plandex-home-v2` joined with `custom-models.json`, `settings-v2.json`, `projects-v2.json`, plus a dev-build variant `plandex-home-dev-v2`). The custom models file is therefore `~/.plandex-home-v2/custom-models.json`. There is **no** relocation env (`PLANDEX_HOME`/`PLANDEX_MODELS_FILE` absent from the binary) and **no** `.config/plandex` or `~/.plandex/models.json` path anywhere in the binary — per-instance isolation is HOME relocation (the home is `$HOME`-relative). Note: every CLI command incl. `--version` and `models custom` is wrapped by the first-run account picker (cloud trial / sign-in) until a account is configured.
+
 ## 2. Environment variables
 
 ### CLI — providers
@@ -94,7 +96,7 @@ Provider fields: `name`, `baseUrl` (must be OpenAI-compatible), `apiKeyEnvVar`, 
 
 ## MULTI-INSTANCE WRAPPERS
 
-Mechanisms: all-provider state is env-driven → per-instance env switching is trivial; custom models JSON is per-user-file (edit per profile); self-hosted servers are per-deploy (`PLANDEX_API_HOST` points the CLI at any server).
+Mechanisms: all-provider state is env-driven → per-instance env switching is trivial; custom models JSON is per-user-file at `~/.plandex-home-v2/custom-models.json` (HOME-relative — relocate `HOME` per profile, live-verified v2.2.1); self-hosted servers are per-deploy (`PLANDEX_API_HOST` points the CLI at any server).
 
 ```bash
 #!/usr/bin/env bash

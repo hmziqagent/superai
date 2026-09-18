@@ -5,5 +5,8 @@ set -eu
 export PLANDEX_API_HOST='http://localhost:8099'
 export PLANDEX_ENV='production'
 export OPENROUTER_API_KEY='sk-fake-openrouter-123456'
-export PLANDEX_MODELS_FILE='/tmp/superai-test-plandex-isolated-123/models.json'
+# plandex v2 has no relocation env; its home (~/.plandex-home-v2 with
+# custom-models.json) is HOME-relative, so isolation relocates HOME
+# (live cli/v2.2.1 — docs/harness-configs/plandex.md §1).
+export HOME='/tmp/superai-test-plandex-isolated-123'
 exec 'plandex' "$@"
