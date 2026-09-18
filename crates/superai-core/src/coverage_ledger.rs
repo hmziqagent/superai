@@ -23,7 +23,7 @@ use std::path::PathBuf;
 /// workflow updates this constant after re-verifying the catalog against the
 /// research docs; entries older than [`MAX_ENTRY_AGE_DAYS`] as of this date
 /// fail the freshness test.
-pub const FRESHNESS_AS_OF: &str = "2026-09-01";
+pub const FRESHNESS_AS_OF: &str = "2026-09-18";
 
 /// Maximum tolerated age of a catalog `last_verified` date, in days, at the
 /// last recorded recheck.
@@ -371,7 +371,7 @@ pub const DOD_ITEMS: &[DodItem] = &[
     },
     DodItem {
         number: 2,
-        label: "49 surfaces adapter support records",
+        label: "51 surfaces adapter support records",
         evidence: &[
             Evidence::Test {
                 file: "src/harness_catalog.rs",

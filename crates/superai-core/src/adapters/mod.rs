@@ -5,7 +5,9 @@ pub mod amazon_q;
 pub mod amp;
 pub mod antigravity;
 pub mod auggie;
+pub mod chatgpt_desktop;
 pub mod claude_code;
+pub mod claude_desktop;
 pub mod cline;
 pub mod codex_cli;
 pub mod conductor;
@@ -69,6 +71,7 @@ mod decl_tests {
         ("antigravity-cli", "mcp_config.json", "mcpServers"),
         ("auggie", "settings.json", "mcpServers"),
         ("claude-code", ".mcp.json", "mcpServers"),
+        ("claude-desktop", "claude_desktop_config.json", "mcpServers"),
         ("cline", "cline_mcp_settings.json", "mcpServers"),
         ("codex-cli", "config.toml", "mcp_servers"),
         ("continue-dev", "config.yaml", "mcpServers"),
@@ -105,6 +108,7 @@ mod decl_tests {
     /// Harnesses whose corpus documents NO MCP mechanism (explicit absence).
     const MCP_ABSENT: &[&str] = &[
         "aider",
+        "chatgpt-desktop",
         "conductor",
         "copilot-coding-agent",
         "deepseek-harness",
@@ -238,19 +242,20 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 49 MCP declarations (round-1 judge
+    /// Verified corpus partition of the 51 MCP declarations (round-1 judge
     /// recount plus workbuddy, corrected round 5 by the live grok-build
-    /// probe and round 6 by the live factory-droid probe): pins the exact
-    /// writable/read-only/absence split so any drift in either direction
-    /// fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 18;
+    /// probe and round 6 by the live factory-droid probe; claude-desktop
+    /// added writable round 5, chatgpt-desktop added absent round 5): pins
+    /// the exact writable/read-only/absence split so any drift in either
+    /// direction fails with the real numbers.
+    const EXPECTED_MCP_WRITABLE: usize = 19;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
-    const EXPECTED_MCP_ABSENT: usize = 13;
+    const EXPECTED_MCP_ABSENT: usize = 14;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
         let adapters = harness_catalog::all_adapters();
-        assert_eq!(adapters.len(), 49, "catalog must list 49 adapters");
+        assert_eq!(adapters.len(), 51, "catalog must list 51 adapters");
         let mut writable = 0;
         let mut read_only = 0;
         let mut absent = 0;
@@ -283,11 +288,11 @@ mod decl_tests {
                 writable += usize::from(!is_read_only);
             }
         }
-        // The exact partition: sums to 49 AND matches the verified counts.
+        // The exact partition: sums to 51 AND matches the verified counts.
         assert_eq!(
             writable + read_only + absent,
-            49,
-            "writable {writable} + read-only {read_only} + absence {absent} must cover all 49"
+            51,
+            "writable {writable} + read-only {read_only} + absence {absent} must cover all 51"
         );
         assert_eq!(
             writable, EXPECTED_MCP_WRITABLE,
@@ -361,7 +366,7 @@ mod decl_tests {
             }
         }
         assert_eq!(declared, PLUGIN_DECLS.len());
-        assert_eq!(absent, 49 - PLUGIN_DECLS.len());
+        assert_eq!(absent, 51 - PLUGIN_DECLS.len());
     }
 
     #[test]

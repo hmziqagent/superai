@@ -1,6 +1,6 @@
 # Agent Harness Configuration Bible — Master Index
 
-Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date. Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (49 surfaces: 20 Full, 16 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 1 ReadOnly; last_verified 2026-08-25 except workbuddy 2026-09-01).
+Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date (claude-desktop + chatgpt-desktop added 2026-09-18). Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (51 surfaces: 20 Full, 17 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 2 ReadOnly; last_verified 2026-08-25 except workbuddy 2026-09-01 and the two desktop apps 2026-09-18).
 
 ## The Documents
 
@@ -51,6 +51,12 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Hermes Agent (Nous) | [hermes-agent.md](hermes-agent.md) | `HERMES_HOME` + `--profile`; local-install-verified `[L]` tags |
 | OpenClaw | [openclaw.md](openclaw.md) | `OPENCLAW_HOME` / `OPENCLAW_CONFIG_PATH`. Daemon, so instances mean running services |
 
+### Desktop apps
+| Harness | File | Wrapper notes |
+|---|---|---|
+| Claude Desktop (Anthropic) | [claude-desktop.md](claude-desktop.md) | **no relocation knob (verified-absent)** — writable `mcpServers` at the fixed per-OS default root; aliasing honestly refused; Linux beta |
+| ChatGPT Desktop (Chat + Work + Codex) | [chatgpt-desktop.md](chatgpt-desktop.md) | **no app-level relocation**; read-only on `~/.codex` which belongs to [codex-cli.md](codex-cli.md) — alias via `CODEX_HOME` there; Linux preview |
+
 ### Self-hosted / cloud platforms & frameworks
 | Harness | File | Wrapper notes |
 |---|---|---|
@@ -66,7 +72,7 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 2. **Env beats config for providers** almost everywhere: every harness that speaks OpenAI-compatible takes `<PROVIDER>_API_KEY` + some base-URL override (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `COPILOT_PROVIDER_BASE_URL`, `OPENROUTER_API_KEY`…). Wrappers just export different values before `exec`.
 3. **Anthropic-compatible endpoints are a de-facto standard too** — Claude Code (`ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN`), Kimi Code (`anthropic` provider with custom `base_url`), Crush/Kilo/Cline ("anthropic" provider type) all repoint at GLM/OpenRouter-style Anthropic-format gateways.
 4. **Inline config injection** where supported: Codex `CODEX_CONFIG`, Grok `GROK_CONFIG` (JSON deep-merge), OpenCode `OPENCODE_CONFIG_CONTENT`, Amp `AMP_SETTINGS_FILE`, Nanocoder `NANOCODER_PROVIDERS_FILE`.
-4b. **GUI desktop apps have no relocation knob at all** — Claude Desktop, ZCode (`~/.zcode/v2/config.json`), Windsurf. Config must be written in place; "instances" mean swapping files, not isolating them.
+4b. **GUI desktop apps have no relocation knob at all** — [Claude Desktop](claude-desktop.md) (writable `mcpServers`, but at a fixed per-OS root — aliasing honestly refused), [ChatGPT Desktop](chatgpt-desktop.md) (read-only on `~/.codex`; alias via codex-cli's `CODEX_HOME`), ZCode (`~/.zcode/v2/config.json`), Windsurf. Config must be written in place; "instances" mean swapping files, not isolating them.
 5. **IDE extensions can't be env-isolated** — wrap VS Code itself: `code --user-data-dir <dir>` gives fully separate extension state (Cline/Roo/Kilo pattern).
 6. **Orchestrators are prebuilt wrappers**: Vibe Kanban injects per-profile `ANTHROPIC_BASE_URL`/`AUTH_TOKEN`; Conductor overrides executable paths + Bedrock/Vertex; Sculptor passes env through to containerized Claude Code sessions — see orchestrators.md before rolling your own.
 

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "keep-me": {
+      "command": "/opt/foreign/foreign-mcp",
+      "args": ["--flag"]
+    }
+  },
+  "pwaStartUrl": "https://claude.ai/chat",
+  "unmodelledFutureKey": {
+    "nested": true
+  }
+}

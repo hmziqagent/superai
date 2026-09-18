@@ -1350,4 +1350,97 @@ mod tests {
             composition.script
         );
     }
+
+    /// Run-5 desktop harnesses: both apps have NO relocation mechanism
+    /// (verified-absent), so their plans carry no env vars and alias
+    /// creation is refused up front — before any root, marker, or manifest
+    /// write. Refusing is the honest outcome, not a missing feature.
+    #[test]
+    fn desktop_harnesses_refuse_alias_creation_at_the_relocation_guard() {
+        for harness_id in ["claude-desktop", "chatgpt-desktop"] {
+            let base = base(&format!("desktop-{harness_id}"));
+            let desktop = adapter(harness_id);
+            let spec = AliasSpec::new(harness(harness_id), name("work"))
+                .with_mcp_servers(vec![server("echo-test")]);
+
+            let err = create_alias(&base, &spec, desktop.as_ref(), None).unwrap_err();
+            match &err {
+                CoreError::Validation { field, reason } => {
+                    assert_eq!(field, "wrapper_plan.env_vars", "{harness_id}");
+                    assert!(
+                        reason.contains("no relocation env vars"),
+                        "{harness_id}: refusal must name the missing relocation: {reason}"
+                    );
+                }
+                other => panic!("{harness_id}: expected relocation refusal, got {other:?}"),
+            }
+            assert!(
+                !base.join(harness_id).join("work").exists(),
+                "{harness_id}: refused alias must leave no root"
+            );
+            assert!(
+                list_aliases(&base).unwrap().is_empty(),
+                "{harness_id}: refused alias must not be recorded"
+            );
+        }
+    }
+
+    /// The redirected refusal (chatgpt-desktop): the store it reads belongs
+    /// to codex-cli, so its MCP surface is declared absent with the
+    /// remote-only + shared-store citation, and the wrapper plan points
+    /// aliasing at codex-cli. Seeding still refuses with the absence reason
+    /// even when a plan could be composed.
+    #[test]
+    fn chatgpt_desktop_alias_story_redirects_to_codex_cli() {
+        let desktop = adapter("chatgpt-desktop");
+        let absence = desktop
+            .mcp_absence_reason()
+            .unwrap_or_else(|| panic!("chatgpt-desktop must declare MCP absence"));
+        let lowered = absence.to_ascii_lowercase();
+        assert!(
+            lowered.contains("remote mcp servers"),
+            "absence must cite the remote-only position: {absence}"
+        );
+        assert!(
+            absence.contains("codex-cli"),
+            "absence must name the owning harness: {absence}"
+        );
+
+        let instance = AliasRecord {
+            harness: harness("chatgpt-desktop"),
+            name: name("work"),
+            root: AbsolutePath::new(&crate::test_util::tmp_abs_str(".cgd-alias")).unwrap(),
+            binary: None,
+            wrapper: None,
+            created_at: "2026-09-18T00:00:00Z".to_owned(),
+            adapter_revision: desktop.adapter_revision().to_owned(),
+        }
+        .to_instance()
+        .unwrap();
+        let plan = desktop.plan_wrapper(&instance).unwrap();
+        assert!(
+            plan.env_vars.is_empty(),
+            "no GUI-level relocation may be fabricated: {:?}",
+            plan.env_vars
+        );
+        assert!(
+            plan.description.contains("codex-cli"),
+            "plan must redirect aliasing to codex-cli: {}",
+            plan.description
+        );
+        assert!(
+            plan.shared_state_warnings
+                .iter()
+                .any(|w| w.contains("shares ~/.codex with codex-cli")),
+            "shared-state warning must name the shared store: {:?}",
+            plan.shared_state_warnings
+        );
+
+        // Direct seeding through the absent surface refuses with the reason.
+        let decl = writable_mcp_decl(&harness("chatgpt-desktop"), desktop.as_ref());
+        match decl {
+            Err(CoreError::UnsupportedOperation { reason, .. }) => assert_eq!(reason, absence),
+            other => panic!("expected MCP-absence refusal, got {other:?}"),
+        }
+    }
 }

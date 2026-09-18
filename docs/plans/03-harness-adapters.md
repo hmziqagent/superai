@@ -122,7 +122,9 @@ gaps from source docs keep a surface read-only or research-blocked until closed.
 | Amp | [amp.md](../harness-configs/amp.md) | JSON/JSONC settings; explicit settings file | explicit-config, account constrained | Constrained |
 | Antigravity CLI | [antigravity-cli.md](../harness-configs/antigravity-cli.md) | settings plus harness-owned auth; incomplete paths | HOME workaround | ResearchBlocked |
 | Auggie | [auggie.md](../harness-configs/auggie.md) | JSON settings, .augment rules/commands | account/workspace constrained | Constrained |
+| ChatGPT Desktop (Codex) | [chatgpt-desktop.md](../harness-configs/chatgpt-desktop.md) | read-only on `~/.codex` (owned by codex-cli); no app-level relocation | fixed-path shared store | ReadOnly; alias via codex-cli |
 | Claude Code | [claude-code.md](../harness-configs/claude-code.md) | JSON/JSONC settings, env, MCP, skills/plugins | relocated-root | Full candidate |
+| Claude Desktop | [claude-desktop.md](../harness-configs/claude-desktop.md) | writable `mcpServers` JSON at the per-OS default root | fixed-path (relocation verified-absent) | Constrained; aliasing refused |
 | Cline | [cline.md](../harness-configs/cline.md) | JSON settings/MCP/rules plus VS Code storage | IDE user-data | Full candidate after OS verification |
 | Codex CLI | [codex-cli.md](../harness-configs/codex-cli.md) | TOML, rules, skills, MCP, profile files | relocated-root/profile | Full candidate |
 | Continue | [continue-dev.md](../harness-configs/continue-dev.md) | YAML, env, rules/prompts/MCP; legacy JSON | project/explicit CLI | Constrained; hosted features excluded |

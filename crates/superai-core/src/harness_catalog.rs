@@ -1,4 +1,4 @@
-//! Registered harness catalog — the 49 planned product surfaces.
+//! Registered harness catalog — the 51 planned product surfaces.
 //!
 //! Every row from `docs/plans/03-harness-adapters.md` provisional ledger is
 //! present with its entry gate, source link, and reason. This satisfies the
@@ -12,7 +12,9 @@ use crate::adapters::amazon_q::AmazonQAdapter;
 use crate::adapters::amp::AmpAdapter;
 use crate::adapters::antigravity::AntigravityAdapter;
 use crate::adapters::auggie::AuggieAdapter;
+use crate::adapters::chatgpt_desktop::ChatGptDesktopAdapter;
 use crate::adapters::claude_code::ClaudeCodeAdapter;
+use crate::adapters::claude_desktop::ClaudeDesktopAdapter;
 use crate::adapters::cline::ClineAdapter;
 use crate::adapters::codex_cli::CodexCliAdapter;
 use crate::adapters::conductor::ConductorAdapter;
@@ -98,7 +100,7 @@ impl CatalogEntry {
 // Static catalog
 // ---------------------------------------------------------------------------
 
-/// All 49 provisional ledger rows.
+/// All 51 provisional ledger rows.
 ///
 /// Order follows the table in `docs/plans/03-harness-adapters.md` with the
 /// subsequent orchestrator additions. Every surface has a source link and
@@ -160,6 +162,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         last_verified: "2026-08-25",
     },
     CatalogEntry {
+        id: "chatgpt-desktop",
+        display_name: "ChatGPT Desktop (Codex)",
+        source: "docs/harness-configs/chatgpt-desktop.md",
+        support: AdapterSupport::ReadOnly,
+        reason: "read-only on ~/.codex, which belongs to codex-cli (shared store)",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/chatgpt-desktop.md",
+        last_verified: "2026-09-18",
+    },
+    CatalogEntry {
         id: "claude-code",
         display_name: "Claude Code",
         source: "docs/harness-configs/claude-code.md",
@@ -169,6 +182,17 @@ pub const ENTRIES: &[CatalogEntry] = &[
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/claude-code.md",
         last_verified: "2026-08-25",
+    },
+    CatalogEntry {
+        id: "claude-desktop",
+        display_name: "Claude Desktop",
+        source: "docs/harness-configs/claude-desktop.md",
+        support: AdapterSupport::Constrained,
+        reason: "writable mcpServers at the fixed default root; relocation verified-absent",
+        isolation: Isolation::FixedPathSingle,
+        product_status: ProductStatus::Active,
+        research_doc: "docs/harness-configs/claude-desktop.md",
+        last_verified: "2026-09-18",
     },
     CatalogEntry {
         id: "cline",
@@ -677,7 +701,7 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 /// harness ids through here instead of duplicating per-adapter wiring.
 #[expect(
     clippy::too_many_lines,
-    reason = "catalog has 49 entries with per-adapter branching"
+    reason = "catalog has 51 entries with per-adapter branching"
 )]
 pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     if id == crate::adapters::claude_code::HARNESS_ID_STR
@@ -687,6 +711,16 @@ pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
     }
     if id == crate::adapters::codex_cli::HARNESS_ID_STR
         && let Ok(adapter) = CodexCliAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::claude_desktop::HARNESS_ID_STR
+        && let Ok(adapter) = ClaudeDesktopAdapter::new()
+    {
+        return Some(Box::new(adapter) as Box<dyn Adapter>);
+    }
+    if id == crate::adapters::chatgpt_desktop::HARNESS_ID_STR
+        && let Ok(adapter) = ChatGptDesktopAdapter::new()
     {
         return Some(Box::new(adapter) as Box<dyn Adapter>);
     }
@@ -1053,11 +1087,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_49_entries() {
-        assert_eq!(len(), 49, "catalog must contain exactly 49 ledger rows");
-        assert_eq!(ENTRIES.len(), 49);
-        assert_eq!(all_entries().len(), 49);
-        assert_eq!(all_ids().len(), 49);
+    fn catalog_has_51_entries() {
+        assert_eq!(len(), 51, "catalog must contain exactly 51 ledger rows");
+        assert_eq!(ENTRIES.len(), 51);
+        assert_eq!(all_entries().len(), 51);
+        assert_eq!(all_ids().len(), 51);
         assert!(!is_empty());
     }
 
@@ -1087,7 +1121,7 @@ mod tests {
                 entry.id
             );
         }
-        assert_eq!(seen.len(), 49);
+        assert_eq!(seen.len(), 51);
     }
 
     #[test]
@@ -1190,7 +1224,7 @@ mod tests {
         let adapters = all_adapters();
         assert_eq!(
             adapters.len(),
-            49,
+            51,
             "all_adapters must return an adapter for each catalog row"
         );
         let mut ids: Vec<String> = adapters
@@ -1246,12 +1280,12 @@ mod tests {
             }
         }
         assert_eq!(full, 20, "expected 20 Full per ledger");
-        assert_eq!(constrained, 16, "expected 16 Constrained per ledger");
+        assert_eq!(constrained, 17, "expected 17 Constrained per ledger");
         assert_eq!(single, 1, "expected 1 SingleInstance per ledger");
         assert_eq!(migration_only, 6, "expected 6 MigrationOnly per ledger");
         assert_eq!(research_blocked, 4, "expected 4 ResearchBlocked per ledger");
         assert_eq!(unsupported, 1, "expected 1 Unsupported per ledger");
-        assert_eq!(read_only, 1, "expected 1 ReadOnly per ledger");
+        assert_eq!(read_only, 2, "expected 2 ReadOnly per ledger");
         assert_eq!(
             full + constrained
                 + single
@@ -1259,7 +1293,7 @@ mod tests {
                 + research_blocked
                 + unsupported
                 + read_only,
-            49
+            51
         );
     }
 
@@ -1270,7 +1304,7 @@ mod tests {
     )]
     #[expect(
         clippy::too_many_lines,
-        reason = "test exercises every trait method for 49 adapters"
+        reason = "test exercises every trait method for 51 adapters"
     )]
     fn adapters_are_object_safe_and_usable_as_trait_objects() {
         let adapters = all_adapters();
