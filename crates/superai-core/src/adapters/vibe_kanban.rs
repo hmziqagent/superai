@@ -161,6 +161,15 @@ impl VibeKanbanAdapter {
     }
 
     /// Parse version output like `vibe-kanban 0.1.44` into `0.1.44`.
+    ///
+    /// The real npx-backed entrypoint prints an npm-style `name/version`
+    /// first token — `vibe-kanban/0.1.44 linux-x64 node-v22.23.2` (judge
+    /// round 7, evidence `vibe-kanban/vibe-kanban-r7.out`) — so every
+    /// whitespace token is additionally split on `/` and each segment tried:
+    /// without the split, the `vibe-kanban` name segment has its leading 'v'
+    /// consumed as a version prefix (`ibe-kanban/0.1.44`, never
+    /// digit-started) and the whole probe returns `None` regardless of the
+    /// 5s budget, yielding a bogus `UnknownVersion`.
     #[expect(
         clippy::excessive_nesting,
         reason = "version parsing branches are explicit"
@@ -171,35 +180,37 @@ impl VibeKanbanAdapter {
             return None;
         }
         for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
+            for segment in token.split('/') {
+                let mut candidate = segment;
+                if let Some(stripped) = candidate.strip_prefix('v') {
+                    candidate = stripped;
+                } else if let Some(stripped) = candidate.strip_prefix('V') {
+                    candidate = stripped;
                 }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
+                let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let has_dot = cleaned.contains('.');
+                let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
+                if has_dot && starts_digit {
+                    let is_version_like = cleaned
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
+                    if is_version_like {
+                        return Some(cleaned.to_owned());
                     }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
+                    let mut version_part = String::new();
+                    for ch in cleaned.chars() {
+                        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
+                            version_part.push(ch);
+                        } else {
+                            break;
+                        }
+                    }
+                    if version_part.contains('.') && !version_part.is_empty() {
+                        return Some(version_part);
+                    }
                 }
             }
         }
@@ -689,6 +700,31 @@ mod tests {
             let got = VibeKanbanAdapter::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
+    }
+
+    /// Regression (judge run 3 round 7, `.z-workflow/evidence/live/vibe-kanban/
+    /// vibe-kanban-r7.out`): the real binary prints the npm-style
+    /// `name/version` first token `vibe-kanban/0.1.44 …` — the old
+    /// leading-'v'-strip mangled it into `ibe-kanban/0.1.44` (never
+    /// digit-started), so detect returned `UnknownVersion` even with the 5s
+    /// probe budget. The exact live output must parse to `0.1.44`.
+    #[test]
+    fn parse_version_output_handles_real_name_slash_version_token() {
+        let real = "vibe-kanban/0.1.44 linux-x64 node-v22.23.2";
+        assert_eq!(
+            VibeKanbanAdapter::parse_version_output(real).as_deref(),
+            Some("0.1.44")
+        );
+        // Bare `name/version` token and newline-terminated output too.
+        assert_eq!(
+            VibeKanbanAdapter::parse_version_output("vibe-kanban/0.1.44\n").as_deref(),
+            Some("0.1.44")
+        );
+        // The `node-v22.23.2` runtime tail alone must NOT yield `22.23.2`.
+        assert_eq!(
+            VibeKanbanAdapter::parse_version_output("linux-x64 node-v22.23.2"),
+            None
+        );
     }
 
     #[test]
