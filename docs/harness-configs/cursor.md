@@ -1,7 +1,7 @@
 # Cursor — Complete Configuration Reference
 
 **Scope:** Cursor IDE (editor agent) + Cursor Agent CLI (`agent`, historical binary name `cursor-agent`).
-**Compiled:** 2026-08-25. Primary sources: [cursor.com/docs](https://cursor.com/docs), [cursor.com/help](https://cursor.com/help), plus forum/GitHub sources where the docs are silent (flagged inline).
+**Compiled:** 2026-08-25 (MCP read paths live-verified 2026-09-18). Primary sources: [cursor.com/docs](https://cursor.com/docs), [cursor.com/help](https://cursor.com/help), plus forum/GitHub sources where the docs are silent (flagged inline).
 
 ---
 
@@ -21,6 +21,8 @@ Cursor is a VS Code fork, so it inherits the standard VS Code settings stack (Us
 ### 1.2 MCP — `~/.cursor/mcp.json` (global) and `<project>/.cursor/mcp.json`
 
 Source: [MCP docs](https://cursor.com/docs/context/mcp)
+
+**Live-verified 2026-09-18 against the agent CLI 2026.09.15-d2fe57e** (evidence: `.z-workflow/evidence/live/cursor/mcp-readpath-r6.log`): `agent mcp list` reads the user file **only** at `$HOME/.cursor/mcp.json` and the project file at `$PWD/.cursor/mcp.json`. A copy at `$CURSOR_CONFIG_DIR/mcp.json` or `$XDG_CONFIG_HOME/cursor/mcp.json` is **ignored** (`No MCP servers configured (expected in .cursor/mcp.json or ~/.cursor/mcp.json)`) — the env relocation covers `cli-config.json` only (the binary wrote its own `cli-config.json` into `CURSOR_CONFIG_DIR` in the same probe). Wrappers that need MCP isolation must relocate `HOME` (or use per-project `.cursor/mcp.json`), not `CURSOR_CONFIG_DIR`.
 
 - Configure servers via JSON file or one-click install from the Cursor Marketplace / team marketplace (team-distributed servers appear alongside personal and workspace ones).
 - Transports: `stdio` (local, single user, manual auth), `SSE` and Streamable `HTTP` (remote, multi-user, OAuth).
@@ -127,7 +129,7 @@ Source: [CLI Configuration](https://cursor.com/docs/cli/reference/configuration)
 | Project | All | `<project>/.cursor/cli.json` |
 
 - **Only `permissions` may be set at project level**; everything else must be global.
-- Directory overrides: `CURSOR_CONFIG_DIR=<dir>` (custom dir), or `XDG_CONFIG_HOME` on Linux/BSD → `$XDG_CONFIG_HOME/cursor/cli-config.json`.
+- Directory overrides: `CURSOR_CONFIG_DIR=<dir>` (custom dir), or `XDG_CONFIG_HOME` on Linux/BSD → `$XDG_CONFIG_HOME/cursor/cli-config.json`. **Scope: `cli-config.json` only** — `mcp.json` does NOT follow these vars (live-verified 2026-09-18, §1.2).
 - Pure JSON, no comments; missing fields self-repair; corrupted file backed up as `.bad` and recreated (recovery: `mv ~/.cursor/cli-config.json ~/.cursor/cli-config.json.bad`).
 
 **Schema (current `version: 1`)**
@@ -297,7 +299,7 @@ Auth: `agent login` (browser flow; `NO_OPEN_BROWSER=1` for headless hosts), `age
 | Lever | Mechanism | Verified? |
 |---|---|---|
 | Separate accounts | Different `CURSOR_API_KEY` per process (or `--api-key`) | ✅ docs |
-| Separate config dirs | `CURSOR_CONFIG_DIR=$HOME/.cursor-profileB` → isolated `cli-config.json`, permissions, preferences | ✅ docs (path isolation documented; whether cached credentials/session state fully follow this dir is **not documented** — verify empirically per version) |
+| Separate config dirs | `CURSOR_CONFIG_DIR=$HOME/.cursor-profileB` → isolated `cli-config.json`, permissions, preferences | ✅ docs (path isolation documented; whether cached credentials/session state fully follow this dir is **not documented** — verify empirically per version). ⚠️ live-verified 2026-09-18: `mcp.json` does **not** follow `CURSOR_CONFIG_DIR` (§1.2) |
 | XDG layout | `XDG_CONFIG_HOME` respected on Linux/BSD | ✅ docs |
 | Inside-Cursor-terminal fix | `unset CURSOR_CLI` before invoking the binary | ⚠️ community gist (§2.1) |
 | MCP isolation | Per-project `.cursor/mcp.json` merges with global `~/.cursor/mcp.json`; `agent mcp enable/disable` maintains local approved list | ✅ docs |

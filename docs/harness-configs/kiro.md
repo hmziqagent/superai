@@ -2,7 +2,7 @@
 
 AWS's agentic IDE and CLI, and the **replacement for Amazon Q Developer** — not a rebrand of the IDE product, though the Amazon Q Developer CLI itself was rebranded into Kiro CLI. Relevant to superai twice over: as a harness in its own right, and because [amazon-q-cli.md](amazon-q-cli.md) now documents a sunsetting product.
 
-Verified 2026-08-26 against kiro.dev docs and the AWS end-of-support announcement.
+Verified 2026-08-26 against kiro.dev docs and the AWS end-of-support announcement. Binary name and installer layout live-verified 2026-09-18 against kiro-cli 2.22.0 (§5).
 
 ## 0. Migration status of Amazon Q Developer
 
@@ -75,8 +75,10 @@ For superai this means Kiro is an **install-and-configure target only, not a rou
 export KIRO_HOME="$HOME/.kiro-work"
 export AWS_CONFIG_FILE="$HOME/.aws/kiro-work/config"
 export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/kiro-work/credentials"
-exec kiro "$@"
+exec kiro-cli "$@"
 ```
+
+**Binary name (live-verified 2026-09-18)**: the vendor installer ([cli.kiro.dev/install](https://cli.kiro.dev/install), kiro-cli 2.22.0) ships `kiro-cli`, `kiro-cli-chat`, `kiro-cli-term` — and **no `kiro` binary** (evidence: `.z-workflow/evidence/live/kiro/executable-r6.log`; `KIRO_HOME` relocation itself was live-verified by the binary's own writer, `settings/cli.json` materialized under it). Wrappers should `exec kiro-cli "$@"`; a bare `kiro` exists only where an alias/bridge creates one, so treat `kiro` as a fallback name, not the install contract. `kiro-cli mcp add` is login-walled pre-auth (`error: You are not logged in, please log in with kiro-cli login`).
 
 Because auth is AWS-side rather than a per-instance API key, separating instances means separating AWS profiles — pair `KIRO_HOME` with the AWS credential variables above, or with `AWS_PROFILE`.
 

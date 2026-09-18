@@ -75,6 +75,7 @@ mod decl_tests {
         ("copilot-cli", "mcp-config.json", "mcpServers"),
         ("crush", "crush.json (global)", "mcp"),
         ("cursor", "mcp.json", "mcpServers"),
+        ("factory-droid", "mcp.json", "mcpServers"),
         ("forge", ".mcp.json", "mcpServers"),
         ("gemini-cli", "settings.json", "mcpServers"),
         ("goose", "config.yaml", "extensions"),
@@ -104,7 +105,6 @@ mod decl_tests {
     /// Harnesses whose corpus documents NO MCP mechanism (explicit absence).
     const MCP_ABSENT: &[&str] = &[
         "aider",
-        "factory-droid",
         "conductor",
         "copilot-coding-agent",
         "deepseek-harness",
@@ -240,11 +240,12 @@ mod decl_tests {
 
     /// Verified corpus partition of the 49 MCP declarations (round-1 judge
     /// recount plus workbuddy, corrected round 5 by the live grok-build
-    /// probe): pins the exact writable/read-only/absence split so any drift
-    /// in either direction fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 17;
+    /// probe and round 6 by the live factory-droid probe): pins the exact
+    /// writable/read-only/absence split so any drift in either direction
+    /// fails with the real numbers.
+    const EXPECTED_MCP_WRITABLE: usize = 18;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
-    const EXPECTED_MCP_ABSENT: usize = 14;
+    const EXPECTED_MCP_ABSENT: usize = 13;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
