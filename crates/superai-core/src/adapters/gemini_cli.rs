@@ -1,7 +1,8 @@
 //! Gemini CLI adapter — relocated-root via `GEMINI_CLI_HOME`, retired 2026-06-18.
 //!
 //! Research source: `docs/harness-configs/gemini-cli.md` (last verified 2026-08-25).
-//! Executable `gemini`, config root `~/.gemini` or `$GEMINI_CLI_HOME`,
+//! Executable `gemini`, config root `~/.gemini` or `$GEMINI_CLI_HOME/.gemini`
+//! (the CLI nests a `.gemini/` dir inside `GEMINI_CLI_HOME`),
 //! primary writable surface `settings.json` (JSON), isolation `relocated-root`.
 //! Product status `retired`, successor `antigravity-cli` (`agy`).
 //! Support `MigrationOnly`: detect/inspect/backup/export with tip, no new defaults, no deletion.
@@ -40,6 +41,13 @@ pub const CONFIG_ENV_VAR: &str = "GEMINI_CLI_HOME";
 
 /// Default config root when `GEMINI_CLI_HOME` is unset.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.gemini";
+
+/// Config root when `GEMINI_CLI_HOME` is set: the CLI creates a `.gemini/`
+/// directory *inside* the env-var dir (gemini-cli.md:18 "User settings file —
+/// `$GEMINI_CLI_HOME/.gemini/settings.json`" and :78 "CLI creates `.gemini/`
+/// inside it"; live gemini 0.60.0 materialized `$GEMINI_CLI_HOME/.gemini/` on
+/// 2026-09-18, see `.z-workflow/evidence/live/gemini-cli/`).
+pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GEMINI_CLI_HOME/.gemini";
 
 /// Research document link.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/gemini-cli.md";
@@ -204,12 +212,15 @@ impl GeminiCliAdapter {
         None
     }
 
-    /// Resolve the default config root: `$GEMINI_CLI_HOME` or `~/.gemini`.
+    /// Resolve the default config root: `$GEMINI_CLI_HOME/.gemini` or `~/.gemini`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
         {
-            return Some(PathBuf::from(dir));
+            // The CLI nests a `.gemini/` dir inside $GEMINI_CLI_HOME
+            // (gemini-cli.md:18/:78); user settings live one level deeper
+            // than the env-var dir itself.
+            return Some(PathBuf::from(dir).join(".gemini"));
         }
         let home = std::env::var("HOME")
             .ok()
@@ -376,9 +387,9 @@ impl Adapter for GeminiCliAdapter {
         let mut surfaces = Vec::new();
 
         let settings_resolver = PathResolver::new(
-            Some("$GEMINI_CLI_HOME/settings.json"),
-            Some("$GEMINI_CLI_HOME/settings.json"),
-            Some("%GEMINI_CLI_HOME%\\settings.json"),
+            Some("$GEMINI_CLI_HOME/.gemini/settings.json"),
+            Some("$GEMINI_CLI_HOME/.gemini/settings.json"),
+            Some("%GEMINI_CLI_HOME%\\.gemini\\settings.json"),
             "~/.gemini/settings.json",
         );
         let mut settings_surface = ConfigSurface::new(
@@ -395,9 +406,9 @@ impl Adapter for GeminiCliAdapter {
         surfaces.push(settings_surface);
 
         let trusted_resolver = PathResolver::new(
-            Some("$GEMINI_CLI_HOME/trustedFolders.json"),
-            Some("$GEMINI_CLI_HOME/trustedFolders.json"),
-            Some("%GEMINI_CLI_HOME%\\trustedFolders.json"),
+            Some("$GEMINI_CLI_HOME/.gemini/trustedFolders.json"),
+            Some("$GEMINI_CLI_HOME/.gemini/trustedFolders.json"),
+            Some("%GEMINI_CLI_HOME%\\.gemini\\trustedFolders.json"),
             "~/.gemini/trustedFolders.json",
         );
         let mut trusted_surface = ConfigSurface::new(
@@ -412,9 +423,9 @@ impl Adapter for GeminiCliAdapter {
         surfaces.push(trusted_surface);
 
         let extensions_resolver = PathResolver::new(
-            Some("$GEMINI_CLI_HOME/extensions/<name>/extension.toml"),
-            Some("$GEMINI_CLI_HOME/extensions/<name>/extension.toml"),
-            Some("%GEMINI_CLI_HOME%\\extensions\\<name>\\extension.toml"),
+            Some("$GEMINI_CLI_HOME/.gemini/extensions/<name>/extension.toml"),
+            Some("$GEMINI_CLI_HOME/.gemini/extensions/<name>/extension.toml"),
+            Some("%GEMINI_CLI_HOME%\\.gemini\\extensions\\<name>\\extension.toml"),
             "~/.gemini/extensions/<name>/extension.toml",
         );
         let mut extensions_surface = ConfigSurface::new(
@@ -487,7 +498,7 @@ impl Adapter for GeminiCliAdapter {
             "~/.gemini/settings.json".to_owned(),
             "~/.gemini/trustedFolders.json".to_owned(),
             "~/.gemini/extensions".to_owned(),
-            "$GEMINI_CLI_HOME/settings.json via GEMINI_CLI_HOME".to_owned(),
+            "$GEMINI_CLI_HOME/.gemini/settings.json via GEMINI_CLI_HOME".to_owned(),
         ]
     }
 
@@ -543,8 +554,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        DISPLAY_NAME, EXECUTABLE, GeminiCliAdapter, HARNESS_ID_STR, MIGRATION_TIP, RESEARCH_DOC,
-        SUCCESSOR_ID,
+        DISPLAY_NAME, EXECUTABLE, GeminiCliAdapter, HARNESS_ID_STR, ISOLATED_CONFIG_ROOT_HINT,
+        MIGRATION_TIP, RESEARCH_DOC, SUCCESSOR_ID,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -703,11 +714,46 @@ mod tests {
     }
 
     #[test]
+    fn env_relocated_surface_hints_nest_gemini_segment() {
+        // Real gemini nests `.gemini/` inside $GEMINI_CLI_HOME (gemini-cli.md:18/:78;
+        // live 0.60.0 materialized `$GEMINI_CLI_HOME/.gemini/`). An env-based hint
+        // without that segment targets a file the real CLI never reads.
+        let a = adapter();
+        let env_prefix = format!("{ISOLATED_CONFIG_ROOT_HINT}/");
+        let win_prefix = "%GEMINI_CLI_HOME%\\.gemini\\";
+        for surface in a.config_surfaces() {
+            for hint in surface
+                .path_resolver
+                .linux
+                .iter()
+                .chain(surface.path_resolver.macos.iter())
+            {
+                assert!(
+                    hint.starts_with(&env_prefix),
+                    "surface {} env hint misses `.gemini` segment: {hint}",
+                    surface.id
+                );
+            }
+            let windows = surface.path_resolver.windows.as_deref().unwrap_or_default();
+            assert!(
+                windows.starts_with(win_prefix),
+                "surface {} windows env hint misses `.gemini` segment: {windows}",
+                surface.id
+            );
+        }
+    }
+
+    #[test]
     fn scan_candidates_include_gemini_paths() {
         let a = adapter();
         let candidates = a.scan_candidates();
         assert!(candidates.iter().any(|c| c.contains("settings.json")));
-        assert!(candidates.iter().any(|c| c.contains("GEMINI_CLI_HOME")));
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.contains("GEMINI_CLI_HOME") && c.contains(".gemini/settings.json")),
+            "env-relocated candidate must point inside the nested `.gemini` dir: {candidates:?}"
+        );
     }
 
     #[test]

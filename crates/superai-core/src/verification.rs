@@ -902,37 +902,43 @@ mod tests {
     /// three flagship relocated-root adapters carry BOTH layout variants, and
     /// each variant is machine-checked against the adapter's own code — the
     /// default layout root must equal `DEFAULT_CONFIG_ROOT_FALLBACK` and the
-    /// isolated layout env must equal `CONFIG_ENV_VAR`. A drift in either
-    /// direction (adapter code or fixture) fails here.
+    /// isolated layout env must equal `CONFIG_ENV_VAR`. The isolated root is
+    /// the env-var dir itself, EXCEPT for harnesses whose CLI nests its state
+    /// dir inside the relocation root (gemini-cli creates `.gemini/` inside
+    /// `GEMINI_CLI_HOME`). A drift in either direction fails here.
     #[test]
     fn fixture_layout_variants_match_adapter_constants() {
         let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let cases: Vec<(&str, &str, &str)> = vec![
+        // (fixture dir, default root, env var, expected isolated root)
+        let cases: Vec<(&str, &str, &str, String)> = vec![
             (
                 "claude_code",
                 crate::adapters::claude_code::DEFAULT_CONFIG_ROOT_FALLBACK,
                 crate::adapters::claude_code::CONFIG_ENV_VAR,
+                format!("${}", crate::adapters::claude_code::CONFIG_ENV_VAR),
             ),
             (
                 "codex_cli",
                 crate::adapters::codex_cli::DEFAULT_CONFIG_ROOT_FALLBACK,
                 crate::adapters::codex_cli::CONFIG_ENV_VAR,
+                format!("${}", crate::adapters::codex_cli::CONFIG_ENV_VAR),
             ),
             (
                 "gemini_cli",
                 crate::adapters::gemini_cli::DEFAULT_CONFIG_ROOT_FALLBACK,
                 crate::adapters::gemini_cli::CONFIG_ENV_VAR,
+                crate::adapters::gemini_cli::ISOLATED_CONFIG_ROOT_HINT.to_owned(),
             ),
         ];
         assert!(
             cases.len() >= 3,
             "layout fixtures must cover at least three adapters"
         );
-        for (dir_name, default_root, env_var) in cases {
+        for (dir_name, default_root, env_var, isolated_root) in cases {
             let dir = fixtures_root.join(dir_name);
             let default = layout_value(&dir, "layout.default", "root");
             let isolated_env = layout_value(&dir, "layout.isolated", "env");
-            let isolated_root = layout_value(&dir, "layout.isolated", "root");
+            let isolated_root_value = layout_value(&dir, "layout.isolated", "root");
             let example = layout_value(&dir, "layout.isolated", "example");
             assert_eq!(
                 default.as_deref(),
@@ -945,8 +951,8 @@ mod tests {
                 "{dir_name}: layout.isolated env must match CONFIG_ENV_VAR"
             );
             assert_eq!(
-                isolated_root.as_deref(),
-                Some(format!("${env_var}").as_str()),
+                isolated_root_value.as_deref(),
+                Some(isolated_root.as_str()),
                 "{dir_name}: layout.isolated root must relocate through the env var"
             );
             assert!(
