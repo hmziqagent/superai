@@ -382,7 +382,12 @@ pub fn active_profile(base_dir: &Path, harness: &HarnessId) -> Result<Option<Str
 
 /// Create a symlink `link` pointing at `target`.
 ///
-/// Windows note (research A.1): creating directory symlinks may require
+/// Windows requires the symlink KIND to match the target's kind: a link to a
+/// directory must be a directory symlink (`symlink_dir`), one to a file a
+/// file symlink (`symlink_file`). The kind is decided from the target's
+/// actual metadata — the profile root is a directory today, but this stays
+/// correct for any file target without hardcoding. Unrelated Windows
+/// caveats (research A.1): creating directory symlinks may require
 /// privileges, and MSIX-packaged apps virtualize `AppData` anyway — the
 /// symlink-swap alternative is a Linux/macOS mechanism; failures map to the
 /// typed error rather than being papered over.
@@ -390,7 +395,15 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
-    let result = std::os::windows::fs::symlink_dir(target, link);
+    let result = {
+        // Follow to the target's real kind; a missing target falls through
+        // to `symlink_file`, whose error is mapped below.
+        if std::fs::metadata(target).is_ok_and(|meta| meta.is_dir()) {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    };
     result.map_err(|e| CoreError::InvalidPath {
         kind: "symlink".to_owned(),
         value: link.display().to_string(),
@@ -400,6 +413,23 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
             target.display()
         ),
     })
+}
+
+/// Remove a symlink regardless of whether it points at a directory.
+/// Windows rejects `remove_file` on a directory symlink (Access Denied);
+/// `remove_dir` removes the link itself without touching the target.
+/// Same pattern as `skills::remove_symlink_any` (commits b1ab4a7/cabe192).
+fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // Follow the link: a symlink's own metadata is never `is_dir`.
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::metadata(path).is_ok_and(|m| m.is_dir())
+        {
+            return std::fs::remove_dir(path);
+        }
+    }
+    std::fs::remove_file(path)
 }
 
 /// Resolve what `path` currently is: a symlink (payload = resolved target),
@@ -732,7 +762,7 @@ pub fn activate_profile(
     create_symlink(record.root.as_path(), &temp_link)?;
     if let Err(e) = std::fs::rename(&temp_link, fixed_path) {
         // Best-effort cleanup of the temporary link; the swap did not happen.
-        drop(std::fs::remove_file(&temp_link));
+        drop(remove_symlink_any(&temp_link));
         return Err(CoreError::Commit {
             path: fixed_path.to_path_buf(),
             reason: format!(
@@ -810,7 +840,7 @@ pub fn deactivate_profile(
             });
         }
     }
-    std::fs::remove_file(fixed_path).map_err(|e| CoreError::Commit {
+    remove_symlink_any(fixed_path).map_err(|e| CoreError::Commit {
         path: fixed_path.to_path_buf(),
         reason: format!("cannot remove managed symlink: {e}"),
     })?;
@@ -1171,8 +1201,10 @@ mod tests {
         std::fs::write(fixed.join("claude_desktop_config.json"), b"original").unwrap();
         let first = activate_profile(&b, &harness("claude-desktop"), "one", &fixed).unwrap();
 
-        // Someone replaces our symlink with real content mid-swap.
-        std::fs::remove_file(&fixed).unwrap();
+        // Someone replaces our symlink with real content mid-swap
+        // (kind-correct removal: the managed link is a directory symlink
+        // on Windows, where plain `remove_file` is Access-Denied).
+        remove_symlink_any(&fixed).unwrap();
         std::fs::create_dir_all(&fixed).unwrap();
         std::fs::write(fixed.join("alien.txt"), b"alien").unwrap();
 
