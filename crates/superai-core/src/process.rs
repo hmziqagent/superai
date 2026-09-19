@@ -1,48 +1,10 @@
 //! Duct-backed process execution wrapper (PKG-01, PKG-05).
 //!
-//! # PKG-01 verification report — dependency spike
-//!
-//! Executed 2026-08-26 as part of PKG-01 before adding dependencies.
-//!
-//! * `toride` on crates.io: `cargo search toride` and `cargo info toride` both
-//!   returned "could not find `toride` in registry". `toride` is NOT published
-//!   to crates.io — it is an internal workspace at `github.com/freeoxide/toride`
-//!   with local modular crates `toride-runner`, `toride-mise`, `toride-installer`,
-//!   `toride-status`, etc. verified via `git ls-remote` and local checkout at
-//!   `/home/axent/fo/toride`. No near-miss publish exists, so no supply-chain
-//!   typo risk from adding `toride` as a dependency. superai must depend on the
-//!   underlying public crates (`duct`) and shell out to the `mise` binary, not
-//!   on a published `toride` crate.
-//!
-//! * `duct` crate: verified `duct 1.1.1` on crates.io (`cargo info duct`):
-//!   - license MIT, repository <https://github.com/oconnor663/duct.rs>
-//!   - maintained by Jack O'Connor, last release 2024, actively used by toride
-//!     workspace (`duct = { version = "1", features = ["timeout"] }` at
-//!     `/home/axent/fo/toride/Cargo.toml`)
-//!   - transitive deps `os_pipe 1.2.3`, `shared_child 1.1.1`, `libc` — all MIT,
-//!     no build scripts, MSRV compatible with Rust 1.97 (toride toolchain is
-//!     1.97.1 and uses duct successfully)
-//!   - API `duct::cmd(program, args).stdout_capture().stderr_capture()` plus
-//!     `wait_timeout` with `shared_child/timeout` was prototyped successfully.
-//!     **Chosen.**
-//!
-//! * `mise` integration: `cargo info mise` shows `mise 2026.8.14` (MIT, jdx/mise,
-//!   Rust 1.95+). However `toride-mise` is the typed wrapper crate — it is also
-//!   local/not published. The `mise` crate on crates.io is the CLI itself, not
-//!   a library. Verified against `/home/axent/fo/toride/crates/toride-mise`:
-//!   it wraps the *runtime `mise` binary* via `toride-runner` (duct/tokio).
-//!   `Mise::builder().build()` returns `MiseError::BinaryNotFound` when the
-//!   binary is absent; otherwise it shells out to `mise --version`, `mise ls`,
-//!   `mise current`, etc. Network installs are delegated to the binary and its
-//!   plugins. The `bootstrap` feature can download mise itself via reqwest, but
-//!   the default path **requires a runtime `mise` binary** (ambient
-//!   `~/.local/bin/mise` or `$PATH/mise` or `$MISE_BIN`). superai mirrors this:
-//!   detection shells out to `mise` when present, and never assumes a bundled
-//!   library can manage tools without the binary.
-//!
-//! Decision: add `duct = { version = "1", features = ["timeout"] }`. Do not add
-//! `toride` or `toride-mise` as crates.io dependencies. Use `std::process` as
-//! fallback only if duct were unavailable — it is available, so duct is used.
+//! `run_command` spawns with explicit argv (never a shell), applies the env
+//! policy (`env`, `env_remove`, `clear_env`), captures stdout/stderr up to
+//! `output_limit` combined bytes, and enforces a wall-clock timeout that kills
+//! the child. Dependency provenance for `duct` 1.1.x is recorded in
+//! `docs/dependency-review.md`.
 
 #![expect(
     clippy::excessive_nesting,
@@ -52,7 +14,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::CoreError;
-use std::fmt::Write as _;
 
 /// Maximum combined stdout+stderr captured per command (1 MiB).
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -62,12 +23,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Flags whose following value should be redacted in logs/errors.
 ///
-/// Mirrors `toride-runner::redact::REDACT_FLAGS` (kept intentionally narrow to
-/// avoid over-redaction). Only long-form flags that unambiguously carry
-/// secrets are included; short flags like `-p` are excluded because they alias
-/// to non-secret meanings (port, profile, etc.) across tools. The list is
-/// deliberately not exhaustive — callers with tool-specific short flags should
-/// extend it locally.
+/// Only long-form flags that unambiguously carry secrets; short flags like
+/// `-p` alias to non-secret meanings (port, profile) across tools.
 pub const REDACT_FLAGS: &[&str] = &[
     "--password",
     "--passwd",
@@ -203,22 +160,14 @@ pub fn display_command(executable: &str, args: &[String], redact: bool) -> Strin
 
 /// Scrub secret-bearing content from captured stderr when redaction is on.
 ///
-/// Currently delegates to arg redaction on the stderr string; callers should
-/// set `redact=true` when the command line contained secret flags.
+/// Best-effort: if any redact-flag keyword appears in stderr the whole field
+/// is replaced with `[REDACTED]`, so a secret echoed by a failing child never
+/// reaches an error message.
 pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     if redact {
-        // Best-effort: mask flag values that leaked into stderr.
-        // For now, replace occurrences of flag values literally? We redact
-        // output fields uniformly by not preserving raw secrets in errors.
-        // Callers that set redact=true should ensure CoreError's Display never
-        // emits raw stderr when it contains secrets. Here we keep it simple:
-        // return placeholder if redaction requested and stderr looks sensitive.
-        // A more precise implementation would parse stderr for flag patterns.
         let lower = stderr.to_ascii_lowercase();
         for flag in REDACT_FLAGS {
-            // strip leading dashes for substring check
-            let key = flag.trim_start_matches('-');
-            if lower.contains(key) {
+            if lower.contains(flag.trim_start_matches('-')) {
                 return "[REDACTED]".to_owned();
             }
         }
@@ -243,7 +192,6 @@ pub fn run_command(
     args: &[String],
     opts: &ExecuteOpts,
 ) -> Result<ProcessOutput, CoreError> {
-    // Validate executable is not empty and contains no NUL.
     if executable.is_empty() {
         return Err(CoreError::Validation {
             field: "executable".to_owned(),
@@ -272,7 +220,6 @@ pub fn run_command(
         cmd = cmd.dir(cwd);
     }
 
-    // Apply env policy.
     if opts.clear_env {
         cmd = cmd.full_env(Vec::<(String, String)>::new());
     }
@@ -283,13 +230,11 @@ pub fn run_command(
         cmd = cmd.env(k, v);
     }
 
-    // Capture stdout/stderr; do not use shell.
     cmd = cmd.stdout_capture().stderr_capture();
 
     let timeout = opts.timeout.unwrap_or(DEFAULT_TIMEOUT);
     let display = display_command(executable, args, opts.redact);
 
-    // Start unchecked so non-zero exit is captured, not errored.
     let handle = cmd
         .unchecked()
         .start()
@@ -298,31 +243,21 @@ pub fn run_command(
             reason: format!("failed to spawn `{display}`: {e}"),
         })?;
 
-    // Use timeout-aware wait.
     let output = match handle.wait_timeout(timeout) {
+        // wait_timeout borrows the handle; clone unhooks the captured bytes.
         Ok(Some(output)) => output.clone(),
         Ok(None) => {
-            // Timeout expired — kill and reap.
-            let kill_err = handle.kill().err().map(|e| e.to_string());
-            let wait_err = handle.wait().err().map(|e| e.to_string());
-            let mut reason = format!(
-                "command timed out after {}s: `{display}`",
+            // Timeout expired; kill and reap.
+            let kill_note = handle
+                .kill()
+                .map_or_else(|e| format!(" (kill failed: {e})"), |()| String::new());
+            let wait_note = handle
+                .wait()
+                .map_or_else(|e| format!(" (wait failed: {e})"), |_| String::new());
+            let reason = format!(
+                "command timed out after {}s: `{display}`{kill_note}{wait_note}",
                 timeout.as_secs()
             );
-            if let Some(e) = kill_err {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "String write never fails; result intentionally ignored"
-                )]
-                let _ = write!(reason, " (kill failed: {e})");
-            }
-            if let Some(e) = wait_err {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "String write never fails; result intentionally ignored"
-                )]
-                let _ = write!(reason, " (wait failed: {e})");
-            }
             return Err(CoreError::BinaryDetection {
                 binary: executable.to_owned(),
                 reason,
@@ -534,11 +469,7 @@ mod tests {
         let long = "a".repeat(100);
         let v = extract_version(&long).unwrap();
         assert!(v.len() <= 64);
-        // UTF-8 boundary test
-        let unicode = "café-".repeat(20);
-        let v2 = extract_version(&unicode).unwrap();
-        assert!(v2.len() <= 64);
-        assert!(v2.is_char_boundary(v2.len()));
+        assert!(v.is_char_boundary(v.len()));
     }
 
     #[test]

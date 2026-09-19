@@ -8,8 +8,8 @@ use crate::state::{InstanceOrigin, Isolation, Ownership};
 
 /// The template an instance came from, and the version it was built at.
 ///
-/// The template name alone cannot answer "is this instance behind?" — that needs
-/// the version, tracked separately from the harness's own version.
+/// The template name alone cannot answer "is this instance behind?" because
+/// that needs the version, tracked separately from the harness's own version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateRef {
     /// Template identifier, e.g. `claude-code-glm`.
@@ -39,9 +39,10 @@ pub struct WrapperRef {
 
 /// A named, isolated setup of a harness: its own config dir, wrapper, and provenance.
 ///
-/// This record is superai's own data — the harness has never heard of it, so there is
-/// nothing here to conflict with what the harness writes. Anything the harness owns
-/// (model, base URL, key) is read fresh from its config file instead of mirrored here.
+/// This record is superai's own data. The harness has never heard of it, so
+/// there is nothing here to conflict with what the harness writes. Anything
+/// the harness owns (model, base URL, key) is read fresh from its config file
+/// instead of mirrored here.
 ///
 /// Forbidden fields (never serialized): `model`, `endpoint`, `api_key`, `key`,
 /// `skill`, `plugin`, `mcp`, capability results, or copied harness config.

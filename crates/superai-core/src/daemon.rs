@@ -5,7 +5,7 @@
 //! fresh conflict check at start (a recorded port is never trusted as
 //! unquestionably free), the pid/service identity lives in a superai-owned
 //! file, readiness is a bounded poll of a command probe, and stop signals a
-//! pid only after its start identity has been re-verified — a stale or reused
+//! pid only after its start identity has been re-verified: a stale or reused
 //! pid file never authorizes killing a process.
 //!
 //! The machinery is generic on purpose: which harness daemons superai may
@@ -27,6 +27,7 @@ use superai_config::transaction::commit_file;
 
 use crate::error::{CoreError, Result};
 use crate::process::{ExecuteOpts, run_command};
+use crate::registry::now_iso8601;
 
 /// Default bind address used when a harness does not pin one.
 pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -40,10 +41,6 @@ pub const DEFAULT_PORT_RANGE_END: u16 = 65535;
 /// Upper bound on bind probes per allocation attempt (keeps worst-case
 /// allocation bounded even over the full ephemeral range).
 const MAX_PORT_PROBES: usize = 512;
-
-// ---------------------------------------------------------------------------
-// Process probing
-// ---------------------------------------------------------------------------
 
 /// Evidence source for the liveness and identity of an OS process.
 ///
@@ -66,7 +63,7 @@ pub trait ProcessProbe: Send + Sync {
 ///
 /// Linux reads `/proc` directly. On platforms without a std-visible process
 /// table the probe reports no evidence (`start_time`/`executable` `None`) and
-/// conservative liveness — which makes identity verification refuse rather
+/// conservative liveness, which makes identity verification refuse rather
 /// than guess, per the "never kill an unverified pid" rule. Signaling itself
 /// goes through the platform `kill`/`taskkill` binary (no unsafe code).
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,10 +85,10 @@ impl ProcessProbe for SystemProcessProbe {
 
 /// Whether `pid` names a live process.
 ///
-/// Linux: `/proc/<pid>` existence, with a zombie (state `Z`) counted as dead
-/// — an exited-but-unreaped daemon must not hold locks or ports. Other
-/// platforms: conservatively `true` — liveness can never be disproven with
-/// std alone, and a false "dead" would authorize removing another process's
+/// Linux: `/proc/<pid>` existence, with a zombie (state `Z`) counted as dead:
+/// an exited-but-unreaped daemon must not hold locks or ports. Other
+/// platforms: conservatively `true`, because liveness cannot be disproven with
+/// std alone and a false "dead" would authorize removing another process's
 /// identity state.
 #[must_use]
 pub fn pid_is_alive(pid: u32) -> bool {
@@ -163,10 +160,6 @@ pub fn proc_executable(pid: u32) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Daemon identity (superai-owned)
-// ---------------------------------------------------------------------------
-
 /// Default superai-owned root for daemon identity files (`<home>/.superai/daemons`).
 #[must_use]
 pub fn default_identity_root(home: &Path) -> PathBuf {
@@ -197,7 +190,7 @@ pub struct DaemonIdentity {
     pub bind_addr: String,
     /// Executable path as recorded at start.
     pub executable: String,
-    /// Kernel start time of the pid at start, when the platform provides it —
+    /// Kernel start time of the pid at start, when the platform provides it;
     /// the token that detects pid reuse before any signal is sent.
     pub start_time: Option<u64>,
     /// ISO-8601 start timestamp.
@@ -241,10 +234,6 @@ pub fn read_identities(root: &Path) -> Vec<(PathBuf, DaemonIdentity)> {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Port allocation
-// ---------------------------------------------------------------------------
 
 /// Whether a TCP port can be bound right now on `addr`.
 ///
@@ -297,7 +286,7 @@ pub fn check_port_free(
 ///
 /// Ports held by live recorded daemons are skipped first; each remaining
 /// candidate is bind-probed. Exhausting the probes yields the typed
-/// [`CoreError::PortConflict`] — allocation never falls back to an unprobed
+/// [`CoreError::PortConflict`]; allocation never falls back to an unprobed
 /// port.
 pub fn allocate_port(
     addr: IpAddr,
@@ -329,10 +318,6 @@ pub fn allocate_port(
         ),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Readiness
-// ---------------------------------------------------------------------------
 
 /// How a daemon announces readiness (WRP-07): a command probe, polled
 /// bounded, executed through the process module (argv tokens, no shell).
@@ -417,10 +402,6 @@ pub fn wait_for_ready(harness: &str, spec: &ReadinessSpec, port: u16) -> Result<
     }
 }
 
-// ---------------------------------------------------------------------------
-// Start / stop
-// ---------------------------------------------------------------------------
-
 /// Everything needed to start one daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonStartConfig {
@@ -453,7 +434,7 @@ pub struct DaemonStartConfig {
     /// WRP-07 foreground/background launch. Background (default) spawns the
     /// daemon detached with nulled stdio and returns once ready; foreground
     /// spawns it with INHERITED stdio and BLOCKS until it exits, cleaning the
-    /// identity afterwards — the caller's terminal fronts the daemon.
+    /// identity afterwards; the caller's terminal fronts the daemon.
     pub foreground: bool,
     /// WRP-07 graceful shutdown command: when set, [`stop_daemon`] runs this
     /// argv (a `{port}` placeholder receives the daemon's port) instead of
@@ -559,40 +540,6 @@ pub enum DaemonStopOutcome {
     },
 }
 
-fn now_iso8601() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let days = i64::try_from(secs / 86400).unwrap_or(0);
-    let secs_of_day = secs % 86400;
-    let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
-    )
-}
-
-/// Calendar conversion for the identity timestamp (days since 1970-01-01 to
-/// y/m/d; civil-from-days algorithm).
-fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (
-        if m <= 2 { y + 1 } else { y },
-        u32::try_from(m).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
-    )
-}
-
 fn identity_token(pid: u32) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -616,7 +563,7 @@ fn identity_token(pid: u32) -> String {
 /// BLOCKS until the daemon exits, cleaning the identity afterwards.
 ///
 /// On readiness timeout the just-spawned process is killed (it is our own
-/// child, killed by handle — never by pid), the identity file is removed, and
+/// child, killed by handle, never by pid), the identity file is removed, and
 /// the typed [`CoreError::DaemonNotReady`] is returned.
 pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Result<DaemonLaunch> {
     if config.executable.is_empty() || config.executable.contains('\0') {
@@ -754,7 +701,7 @@ fn spawn_daemon_process(config: &DaemonStartConfig, port: u16) -> Result<(duct::
 
     let mut cmd = if config.foreground {
         // WRP-07 foreground: inherited stdio so the daemon fronts the
-        // caller's terminal (stdin stays null — the daemon is not
+        // caller's terminal (stdin stays null; the daemon is not
         // interactive through superai).
         duct::cmd(&config.executable, &args).stdin_null()
     } else {
@@ -834,7 +781,7 @@ fn send_signal(pid: u32, force: bool) -> Result<()> {
 ///
 /// Requires matching process start times when both are known, falls back to
 /// the executable when start times are unavailable, and refuses when no
-/// platform evidence exists — a stale or reused pid file never authorizes
+/// platform evidence exists: a stale or reused pid file never authorizes
 /// signaling the process that now owns the pid.
 pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) -> Result<()> {
     if let (Some(expected), Some(observed)) = (id.start_time, probe.start_time(id.pid)) {
@@ -842,7 +789,7 @@ pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) ->
             return Err(CoreError::ProcessIdentityMismatch {
                 pid: id.pid,
                 reason: format!(
-                    "recorded start time {expected} but observed {observed} — pid reuse suspected"
+                    "recorded start time {expected} but observed {observed} (pid reuse suspected)"
                 ),
             });
         }
@@ -870,8 +817,8 @@ pub fn verify_process_identity(id: &DaemonIdentity, probe: &dyn ProcessProbe) ->
 /// Stop a daemon recorded at `identity_path`.
 ///
 /// Fresh-reads the identity (disk is truth), refuses when the pid cannot be
-/// proven to still be the process superai started, then — when a graceful
-/// [`ShutdownCommand`] is supplied (WRP-07) — runs that command INSTEAD of
+/// proven to still be the process superai started, then, when a graceful
+/// [`ShutdownCommand`] is supplied (WRP-07), runs that command INSTEAD of
 /// signaling first; the TERM-then-KILL escalation remains the fallback when
 /// the daemon does not exit. The identity file is removed only once the
 /// process is confirmed dead (or was already dead).
@@ -1017,10 +964,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Port allocation / conflict
-    // ------------------------------------------------------------------
-
     #[test]
     fn port_conflict_detected_and_refused_with_live_holder() {
         let dir = tmp_dir("daemon-port-holder");
@@ -1135,10 +1078,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // ------------------------------------------------------------------
-    // Identity verification / stop refusals
-    // ------------------------------------------------------------------
-
     #[test]
     fn stop_refuses_when_start_time_mismatched() {
         let dir = tmp_dir("daemon-stop-mismatch");
@@ -1249,10 +1188,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // ------------------------------------------------------------------
-    // System probe facts (linux)
-    // ------------------------------------------------------------------
-
     #[cfg(target_os = "linux")]
     #[test]
     fn system_probe_sees_the_current_process_identity() {
@@ -1299,10 +1234,6 @@ mod tests {
         assert!(!SystemProcessProbe.is_alive(u32::MAX));
         assert!(SystemProcessProbe.start_time(u32::MAX).is_none());
     }
-
-    // ------------------------------------------------------------------
-    // Start/stop round trip with a real process (linux)
-    // ------------------------------------------------------------------
 
     #[cfg(target_os = "linux")]
     fn sh_available() -> bool {
@@ -1449,7 +1380,7 @@ mod tests {
     }
 
     /// WRP-07 graceful shutdown command: stop runs the declared command
-    /// INSTEAD of signaling — proven by a daemon that exits on the command's
+    /// INSTEAD of signaling, proven by a daemon that exits on the command's
     /// own trigger and writes a graceful-exit marker before exiting 0 (a
     /// TERM'd `sh` never writes it).
     #[cfg(target_os = "linux")]
@@ -1520,7 +1451,7 @@ mod tests {
     }
 
     /// WRP-07 fallback: a shutdown command that does NOT stop the daemon is
-    /// not fatal — the TERM/KILL escalation still stops it.
+    /// not fatal; the TERM/KILL escalation still stops it.
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_command_that_does_not_stop_falls_back_to_signals() {
@@ -1676,10 +1607,6 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // ------------------------------------------------------------------
-    // Misc
-    // ------------------------------------------------------------------
 
     #[test]
     fn readiness_substitutes_port_placeholder() {

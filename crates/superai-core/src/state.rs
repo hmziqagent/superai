@@ -7,10 +7,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// InstallPresence
-// ---------------------------------------------------------------------------
-
 /// Whether the harness binary is present on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,10 +32,6 @@ impl fmt::Display for InstallPresence {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// InstanceOrigin
-// ---------------------------------------------------------------------------
 
 /// How the instance record came to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +62,6 @@ impl fmt::Display for InstanceOrigin {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Ownership
-// ---------------------------------------------------------------------------
-
 /// Who owns the config directory on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,10 +90,6 @@ impl fmt::Display for Ownership {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 /// Operational lifecycle state of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,10 +122,6 @@ impl fmt::Display for Lifecycle {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Isolation
-// ---------------------------------------------------------------------------
 
 /// How an instance's config is isolated from the default location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,10 +166,6 @@ impl fmt::Display for Isolation {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// AdapterSupport
-// ---------------------------------------------------------------------------
 
 /// What the adapter can do for a harness on this platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

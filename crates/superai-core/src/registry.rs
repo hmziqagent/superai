@@ -37,10 +37,6 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Adapter revision written into new records (crate version).
 const ADAPTER_REVISION: &str = env!("CARGO_PKG_VERSION");
 
-// ---------------------------------------------------------------------------
-// helpers: time, stable id
-// ---------------------------------------------------------------------------
-
 fn unix_secs_to_rfc3339(secs: u64) -> String {
     #[expect(
         clippy::cast_possible_wrap,
@@ -78,7 +74,8 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     (year as i32, m as u32, d as u32)
 }
 
-fn now_iso8601() -> String {
+/// Shared with `daemon.rs` for identity timestamps.
+pub(crate) fn now_iso8601() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -98,10 +95,6 @@ fn stable_id_for_legacy(name: &str, config_root: &str) -> Result<InstanceId> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Old shape for migration
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Serialize, Deserialize)]
 struct OldInstance {
     name: String,
@@ -120,8 +113,7 @@ struct OldTemplateRef {
 }
 
 #[expect(clippy::unnecessary_to_owned, reason = "need owned string for hash")]
-fn migrate_old_instance(old: OldInstance, path: &Path) -> Result<Instance> {
-    // Validate harness/name/config_root using the same validators the new types use.
+fn migrate_old_instance(old: OldInstance) -> Result<Instance> {
     let name = InstanceName::new(&old.name).map_err(|e| CoreError::Validation {
         field: "name".to_owned(),
         reason: format!("invalid old instance name `{}`: {e}", old.name),
@@ -162,7 +154,7 @@ fn migrate_old_instance(old: OldInstance, path: &Path) -> Result<Instance> {
     } else {
         None
     };
-    let id = stable_id_for_legacy(name.as_str(), &config_root.to_string())?; // expect(clippy::unnecessary_to_owned) suppressed below
+    let id = stable_id_for_legacy(name.as_str(), &config_root.to_string())?;
     let created_at = now_iso8601();
     let inst = Instance {
         id,
@@ -178,16 +170,9 @@ fn migrate_old_instance(old: OldInstance, path: &Path) -> Result<Instance> {
         created_at,
         adapter_revision: ADAPTER_REVISION.to_owned(),
     };
-    // Ensure the generated instance validates (created_at non-empty etc.)
     inst.validate()?;
-    // Also ensure paths themselves are valid (already validated).
-    let _ = path;
     Ok(inst)
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
 
 /// The set of instances superai knows about, stored in its own records file.
 ///
@@ -249,7 +234,6 @@ impl Registry {
                 if map.is_empty() {
                     return Ok(Self::default());
                 }
-                // Check schema_version first.
                 if let Some(sv) = map.get(SCHEMA_VERSION_KEY) {
                     let sv_num = u32::try_from(sv.as_u64().ok_or_else(|| CoreError::SchemaValidation {
                         path: path.to_path_buf(),
@@ -287,8 +271,7 @@ impl Registry {
                     reg.validate()?;
                     Ok(reg)
                 } else if let Some(instances_raw) = map.get(INSTANCES_KEY) {
-                    // No schema_version, but has instances.
-                    // Try new shape first (covers files written by newer code that forgot version, or manual edits).
+                    // Files written without schema_version: try the v1 shape, fall back to legacy migration.
                     let try_new: std::result::Result<Vec<Instance>, _> =
                         serde_json::from_value(instances_raw.clone());
                     if let Ok(instances) = try_new {
@@ -296,11 +279,9 @@ impl Registry {
                             schema_version: SCHEMA_VERSION,
                             instances,
                         };
-                        // Validate duplicates etc.; if validation fails with duplicate, surface it.
                         reg.validate()?;
                         return Ok(reg);
                     }
-                    // Fallback to old shape migration.
                     let old_instances: Vec<OldInstance> = serde_json::from_value(instances_raw.clone())
                         .map_err(|e| CoreError::SchemaValidation {
                             path: path.to_path_buf(),
@@ -311,7 +292,7 @@ impl Registry {
                         })?;
                     let mut instances = Vec::with_capacity(old_instances.len());
                     for old in old_instances {
-                        instances.push(migrate_old_instance(old, path)?);
+                        instances.push(migrate_old_instance(old)?);
                     }
                     let reg = Self {
                         schema_version: SCHEMA_VERSION,
@@ -320,7 +301,6 @@ impl Registry {
                     reg.validate()?;
                     Ok(reg)
                 } else {
-                    // Object with no instances and no schema_version: only foreign keys.
                     Ok(Self::default())
                 }
             }
@@ -328,7 +308,6 @@ impl Registry {
                 if arr.is_empty() {
                     return Ok(Self::default());
                 }
-                // Bare array root: could be new or old.
                 let try_new: std::result::Result<Vec<Instance>, _> =
                     serde_json::from_value(Value::Array(arr.clone()));
                 if let Ok(instances) = try_new {
@@ -348,7 +327,7 @@ impl Registry {
                     })?;
                 let mut instances = Vec::with_capacity(old_instances.len());
                 for old in old_instances {
-                    instances.push(migrate_old_instance(old, path)?);
+                    instances.push(migrate_old_instance(old)?);
                 }
                 let reg = Self {
                     schema_version: SCHEMA_VERSION,
@@ -378,7 +357,6 @@ impl Registry {
     /// Only `schema_version` and `instances` are written; foreign keys are preserved
     /// by loading the existing map fresh and merging.
     pub fn store(&self, path: &Path) -> Result<()> {
-        // Validate before writing.
         self.validate()?;
         for inst in &self.instances {
             inst.validate()?;
@@ -417,15 +395,12 @@ impl Registry {
         self.instances.iter().find(|i| i.id.as_str() == id)
     }
 
-    /// Validate duplicate invariants.
+    /// Checks normalized-name, id, config-root, wrapper-path, and wrapper-command
+    /// collisions, including wrapper commands colliding with instance names.
     #[expect(
         clippy::excessive_nesting,
         reason = "validation checks multiple collision kinds"
     )]
-    ///
-    /// Checks: normalized name collisions, duplicate ids, duplicate `config_roots`,
-    /// duplicate wrapper paths and wrapper command collisions (including collision
-    /// between wrapper commands and instance names).
     fn validate(&self) -> Result<()> {
         let mut names: HashMap<String, &Instance> = HashMap::new();
         let mut ids: HashSet<String> = HashSet::new();
@@ -434,7 +409,6 @@ impl Registry {
         let mut wrapper_commands: HashMap<String, &Instance> = HashMap::new();
 
         for inst in &self.instances {
-            // name (case-folded)
             let normalized = inst.name.normalized();
             if let Some(prev) = names.get(&normalized) {
                 return Err(CoreError::NameCollision {
@@ -448,7 +422,6 @@ impl Registry {
             }
             names.insert(normalized.clone(), inst);
 
-            // id
             let id_str = inst.id.as_str().to_owned();
             if !ids.insert(id_str.clone()) {
                 return Err(CoreError::NameCollision {
@@ -458,7 +431,6 @@ impl Registry {
                 });
             }
 
-            // config_root (normalized absolute path string)
             let root_str = inst.config_root.to_string();
             if !roots.insert(root_str.clone()) {
                 return Err(CoreError::Validation {
@@ -469,7 +441,6 @@ impl Registry {
                 });
             }
 
-            // wrapper
             if let Some(wrapper) = &inst.wrapper {
                 let wp = wrapper.path.to_string();
                 if !wrapper_paths.insert(wp.clone()) {
@@ -523,7 +494,7 @@ impl Registry {
     )]
     pub fn insert(&mut self, instance: Instance) -> Result<()> {
         instance.validate()?;
-        // Quick pre-check for normalized name collision before push to give better error.
+        // Pre-check gives insert-specific error text; validate() after push is the safety net.
         let new_norm = instance.name.normalized();
         for existing in &self.instances {
             if existing.name.normalized() == new_norm {
@@ -573,7 +544,6 @@ impl Registry {
                     });
                 }
             }
-            // wrapper command vs instance name cross-check
             if let Some(new_w) = &instance.wrapper
                 && existing.name.normalized() == new_w.command_name.normalized()
                 && existing.id.as_str() != instance.id.as_str()
@@ -603,7 +573,6 @@ impl Registry {
         }
 
         self.instances.push(instance);
-        // Full validation as safety net (covers edge cases).
         if let Err(e) = self.validate() {
             self.instances.pop();
             return Err(e);
@@ -676,30 +645,16 @@ impl Registry {
                 });
             }
         }
-        // Also check new wrapper command after rename would collide with existing names.
-        // If the renamed instance has a wrapper, its command_name may be updated to new_name,
-        // so we must ensure that new command doesn't collide with another instance's name.
-        // The loop above already checks that.
-
-        // Preserve id for assertion.
-        let preserved_id = self.instances[idx].id.clone();
-        let preserved_root = self.instances[idx].config_root.clone();
-        let preserved_template = self.instances[idx].template.clone();
-
-        // Perform rename.
         let inst = &mut self.instances[idx];
         let old_name_owned = inst.name.to_string();
         let old_command = inst.wrapper.as_ref().map(|w| w.command_name.clone());
         inst.name = new_name.clone();
-        // Update wrapper command_name if it matches old name (case-folded).
         if let Some(wrapper) = &mut inst.wrapper
-            && (wrapper.command_name.normalized() == old_name_owned.to_lowercase()
-                || wrapper.command_name.as_str() == old_name_owned)
+            && wrapper.command_name.normalized() == old_name_owned.to_lowercase()
         {
             wrapper.command_name = new_name.clone();
         }
 
-        // Validate whole registry after rename.
         if let Err(e) = self.validate() {
             // Roll back the name and any wrapper command the rename touched.
             let inst = &mut self.instances[idx];
@@ -710,18 +665,13 @@ impl Registry {
             return Err(e);
         }
 
-        // Ensure id/template/root preserved.
-        debug_assert_eq!(self.instances[idx].id, preserved_id);
-        debug_assert_eq!(self.instances[idx].config_root, preserved_root);
-        debug_assert_eq!(self.instances[idx].template, preserved_template);
-
         Ok(())
     }
 }
 
 /// Config dirs on disk that no record and no wrapper accounts for.
 ///
-/// Adoption or removal is the user's call — superai only reports what it found.
+/// Adoption or removal is the user's call; superai only reports what it found.
 pub fn unmanaged_dirs(registry: &Registry, candidates: &[PathBuf]) -> Vec<PathBuf> {
     candidates
         .iter()
@@ -735,10 +685,6 @@ pub fn unmanaged_dirs(registry: &Registry, candidates: &[PathBuf]) -> Vec<PathBu
         .cloned()
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1104,8 +1050,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let path = crate::test_util::tmp_abs("fake");
-        let err = migrate_old_instance(bad_old, &path).unwrap_err();
+        let err = migrate_old_instance(bad_old).unwrap_err();
         match err {
             CoreError::Validation { field, .. } => assert_eq!(field, "name"),
             other => panic!("expected validation, got {other:?}"),
@@ -1118,7 +1063,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let err2 = migrate_old_instance(bad_old2, &path).unwrap_err();
+        let err2 = migrate_old_instance(bad_old2).unwrap_err();
         match err2 {
             CoreError::Validation { field, .. } => assert_eq!(field, "harness"),
             other => panic!("expected validation, got {other:?}"),
@@ -1131,7 +1076,7 @@ mod tests {
             binary_path: None,
             template: None,
         };
-        let err3 = migrate_old_instance(bad_old3, &path).unwrap_err();
+        let err3 = migrate_old_instance(bad_old3).unwrap_err();
         match err3 {
             CoreError::Validation { field, .. } => assert_eq!(field, "config_root"),
             other => panic!("expected validation, got {other:?}"),

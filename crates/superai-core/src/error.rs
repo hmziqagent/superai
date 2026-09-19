@@ -9,10 +9,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-// ---------------------------------------------------------------------------
-// Redacted helper for secret-bearing error context
-// ---------------------------------------------------------------------------
-
 /// Wrapper for secret-bearing values in errors.
 ///
 /// Debug, Display, and Serialize all emit `[REDACTED]`. The raw secret is
@@ -68,10 +64,6 @@ impl<'de> Deserialize<'de> for RedactedString {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CoreError
-// ---------------------------------------------------------------------------
-
 /// Everything that can go wrong in the core layer.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -116,9 +108,6 @@ pub enum CoreError {
         reason: String,
     },
 
-    // -----------------------------------------------------------------------
-    // FND-06 taxonomy
-    // -----------------------------------------------------------------------
     /// Generic validation failure for a field.
     #[error("validation failed for {field}: {reason}")]
     Validation {
@@ -285,11 +274,8 @@ pub enum CoreError {
         context_redacted: Option<RedactedString>,
     },
 
-    /// Fetching a remote source (e.g., a skill over HTTPS) failed.
-    ///
-    /// Content is never fabricated in place of a successful fetch: the
-    /// operation fails with the failing locator so the caller can retry or
-    /// report honestly.
+    /// Fetching a remote source (e.g., a skill over HTTPS) failed. Content is
+    /// never fabricated in place of a successful fetch.
     #[error("source fetch failed for {kind} `{locator}`: {reason}")]
     SourceFetch {
         /// Kind of source that failed, e.g., `skill_source`.
@@ -321,12 +307,8 @@ pub enum CoreError {
     },
 
     /// The evidence collected for a candidate is too weak to act on it.
-    ///
-    /// Raised when a proof is asked to justify an operation it cannot
-    /// support, e.g. adoption on a name-pattern-only fingerprint where a
-    /// canonical config file is required. Carries what the operation
-    /// required, what was observed, and the evidence lines behind it —
-    /// paths and markers only, never file content or secrets.
+    /// Carries what the operation required, what was observed, and the
+    /// evidence lines behind it: paths and markers only, never content.
     #[error(
         "insufficient evidence for {path}: requires {required}, observed {observed}: {evidence:?}"
     )]
@@ -382,7 +364,7 @@ pub enum CoreError {
     },
 
     /// OAuth/subscription/keychain login must happen in the harness itself
-    /// (PRV-04): superai never proxies or performs the external login flow.
+    /// (PRV-04): superai never performs the external login flow.
     #[error("external auth required for harness `{harness}`: {instructions}")]
     ExternalAuthRequired {
         /// Harness identifier.
@@ -412,9 +394,8 @@ pub enum CoreError {
     },
 
     /// A recorded daemon pid cannot be proven to be the process superai
-    /// started (WRP-07: start-time/executable mismatch — pid reuse suspected,
-    /// or the platform offers no identity evidence). Never a signal
-    /// authorization.
+    /// started (WRP-07: start-time or executable mismatch, or no platform
+    /// evidence). Never a signal authorization.
     #[error("process identity mismatch for pid {pid}: {reason}")]
     ProcessIdentityMismatch {
         /// Pid that failed identity verification.
@@ -424,9 +405,8 @@ pub enum CoreError {
     },
 
     /// Evidence about a candidate's owner is ambiguous (DRF-04): more than
-    /// one manager plausibly owns it, or a package-manager shim cannot be
-    /// distinguished from an instance wrapper. Ambiguity BLOCKS adopt and
-    /// remove — it never silently resolves to unmanaged.
+    /// one manager plausibly owns it. Ambiguity BLOCKS adopt and remove; it
+    /// never silently resolves to unmanaged.
     #[error("ambiguous ownership for {path}: {evidence:?}")]
     AmbiguousOwnership {
         /// Path with ambiguous ownership.
@@ -436,9 +416,8 @@ pub enum CoreError {
     },
 
     /// A fixed-path activation cannot swap profiles because the app may
-    /// still be writing the active path (WRP-06 "never auto-swap back while
-    /// app may still write"). The caller must confirm the app has exited
-    /// before re-activating.
+    /// still be writing the active path (WRP-06). The caller must confirm
+    /// the app has exited before re-activating.
     #[error("app may still write {path}: {reason}")]
     AppMayStillWrite {
         /// Active harness path the app may still be writing.
@@ -448,10 +427,9 @@ pub enum CoreError {
     },
 
     /// Installing or updating this harness has no safe non-interactive path
-    /// (PKG-10): desktop apps, marketplace flows, and undocumented direct
-    /// installers require the user to act (open a URL, run a GUI installer).
-    /// This is a supported workflow state, not an excuse to download unknown
-    /// binaries — the instructions name the documented install path.
+    /// (PKG-10): desktop apps and marketplace flows need the user to act.
+    /// The instructions name the documented install path; superai never
+    /// downloads unknown binaries in their place.
     #[error("external install required for harness `{harness}`: {instructions}")]
     ExternalInstallRequired {
         /// Harness identifier.
@@ -505,11 +483,6 @@ mod tests {
                 "error output must not contain secret: {output}"
             );
         }
-        // The redacted placeholder appears only if the error's Debug/Display
-        // chooses to include the redacted field. Our NetworkTemplate Display
-        // does not directly print context_redacted, but its Debug does via
-        // derived Debug which uses RedactedString's redacted Debug. Either way
-        // secret must not leak.
         let json_err = CoreError::SecretValidation {
             field: "apiKey".to_owned(),
             reason: "must be non-empty".to_owned(),
@@ -647,7 +620,7 @@ mod tests {
             },
             CoreError::ProcessIdentityMismatch {
                 pid: 4242,
-                reason: "recorded start time 111 but observed 999 — pid reuse suspected".to_owned(),
+                reason: "recorded start time 111 but observed 999 (pid reuse suspected)".to_owned(),
             },
             CoreError::AmbiguousOwnership {
                 path: PathBuf::from(crate::test_util::tmp_abs_str("user/.local/bin/claude")),
