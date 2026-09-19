@@ -1213,6 +1213,10 @@ mod tests {
         }
     }
 
+    // Unix-only: the premise is a foreign symlink at the fixed path, created
+    // with `std::os::unix::fs::symlink`; Windows directory symlinks need
+    // privileges (and the swap mechanism itself is documented Linux/macOS).
+    #[cfg(unix)]
     #[test]
     fn foreign_symlink_target_is_refused_without_touching_it() {
         let b = base("foreign-link");
