@@ -1,9 +1,10 @@
 //! Duct-backed process execution wrapper (PKG-01, PKG-05).
 //!
 //! `run_command` spawns with explicit argv (never a shell), applies the env
-//! policy (`env`, `env_remove`, `clear_env`), captures stdout/stderr up to
-//! `output_limit` combined bytes, and enforces a wall-clock timeout that kills
-//! the child. Dependency provenance for `duct` 1.1.x is recorded in
+//! options, captures stdout/stderr up to `output_limit` combined bytes, and
+//! enforces a wall-clock timeout that kills the child. Duct composes env
+//! wrappers in reverse build order; see [`run_command`] for the composition
+//! hazard that implies. Dependency provenance for `duct` 1.1.x is recorded in
 //! `docs/dependency-review.md`.
 
 #![expect(
@@ -178,7 +179,7 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
 }
 
 /// Run a command with explicit argv (no shell interpolation), bounded capture,
-/// timeout, and optional redaction. Uses `duct` when available.
+/// timeout, and optional redaction.
 ///
 /// - No shell is ever invoked; `executable` and `args` are passed as argv
 ///   tokens directly.
@@ -187,6 +188,20 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
 ///   is killed.
 /// - Timeout kills the child and returns `CoreError::BinaryDetection` with
 ///   timeout context (caller can map to install-specific errors).
+///
+/// # Env composition hazard
+///
+/// Duct applies env wrappers in reverse build order and `full_env` replaces
+/// the whole map. As the source below is ordered (`full_env`, `env_remove`,
+/// `env`), the child actually sees: `env` additions applied first, then
+/// `env_remove`, then `full_env(empty)` running LAST. So with `clear_env:
+/// true` every `env` addition is silently discarded, and a key listed in both
+/// `env_remove` and `env` ends up removed. Callers that need additions to
+/// reach the child must not set `clear_env`. Affected call-site families
+/// today (all pass `clear_env: true` plus `env` entries): activation
+/// instruction envs, `install_execute` structured/probe envs, detect package
+/// probes (HOME), skills, wrapper generation. Fixing the composition order
+/// is a behaviour change at those sites and is deferred.
 pub fn run_command(
     executable: &str,
     args: &[String],
@@ -220,6 +235,8 @@ pub fn run_command(
         cmd = cmd.dir(cwd);
     }
 
+    // Reverse-order composition: full_env(empty) runs after the env/env_remove
+    // wraps and replaces the map; see the Env composition hazard above.
     if opts.clear_env {
         cmd = cmd.full_env(Vec::<(String, String)>::new());
     }
@@ -466,10 +483,12 @@ mod tests {
 
     #[test]
     fn extract_version_fallback_truncates() {
-        let long = "a".repeat(100);
-        let v = extract_version(&long).unwrap();
-        assert!(v.len() <= 64);
-        assert!(v.is_char_boundary(v.len()));
+        let v = extract_version(&"a".repeat(100)).unwrap();
+        assert_eq!(v.len(), 64);
+        // 64 bytes lands mid-é (6 bytes per "café-"); the cut backs off to
+        // the previous boundary at 63.
+        let unicode = extract_version(&"café-".repeat(20)).unwrap();
+        assert_eq!(unicode.len(), 63);
     }
 
     #[test]
@@ -485,7 +504,6 @@ mod tests {
             "extracted version must be byte-bounded, got {} bytes: {v:?}",
             v.len()
         );
-        assert!(v.is_char_boundary(v.len()));
     }
 
     #[test]
@@ -566,6 +584,36 @@ mod tests {
         assert_eq!(
             out.stdout, "yes\n",
             "HOME must be removed from the child environment"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_env_remove_beats_env_on_same_key() {
+        // Pins duct's reverse-order composition: the env_remove wrap runs
+        // after the env wrap, so an explicit removal wins. If the deferred
+        // composition reorder ever lands, this flips and must be re-decided.
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![
+                ("SUPERAI_TEST_DUP".to_owned(), "leaked".to_owned()),
+                ("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned()),
+            ],
+            env_remove: vec!["SUPERAI_TEST_DUP".to_owned()],
+            ..Default::default()
+        };
+        let out = run_command(
+            "printenv",
+            &[
+                "SUPERAI_TEST_DUP".to_owned(),
+                "SUPERAI_TEST_KEEP".to_owned(),
+            ],
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            out.stdout, "yes\n",
+            "a key in both env and env_remove must not reach the child"
         );
     }
 }
