@@ -5,7 +5,9 @@ pub mod amazon_q;
 pub mod amp;
 pub mod antigravity;
 pub mod auggie;
+pub mod chatgpt_desktop;
 pub mod claude_code;
+pub mod claude_desktop;
 pub mod cline;
 pub mod codex_cli;
 pub mod conductor;
@@ -46,6 +48,7 @@ pub mod trae_agent;
 pub mod vibe_kanban;
 pub mod warp;
 pub mod windsurf;
+pub mod workbuddy;
 pub mod zcode;
 pub mod zed_acp;
 
@@ -68,15 +71,18 @@ mod decl_tests {
         ("antigravity-cli", "mcp_config.json", "mcpServers"),
         ("auggie", "settings.json", "mcpServers"),
         ("claude-code", ".mcp.json", "mcpServers"),
+        ("claude-desktop", "claude_desktop_config.json", "mcpServers"),
         ("cline", "cline_mcp_settings.json", "mcpServers"),
         ("codex-cli", "config.toml", "mcp_servers"),
         ("continue-dev", "config.yaml", "mcpServers"),
         ("copilot-cli", "mcp-config.json", "mcpServers"),
         ("crush", "crush.json (global)", "mcp"),
         ("cursor", "mcp.json", "mcpServers"),
+        ("factory-droid", ".factory/mcp.json", "mcpServers"),
         ("forge", ".mcp.json", "mcpServers"),
         ("gemini-cli", "settings.json", "mcpServers"),
         ("goose", "config.yaml", "extensions"),
+        ("grok-build", "config.toml", "mcp_servers"),
         ("hermes-agent", "config.yaml", "mcp_servers"),
         ("iflow-cli", "settings.json (user)", "mcpServers"),
         ("junie-cli", "mcp/mcp.json", "mcpServers"),
@@ -95,14 +101,14 @@ mod decl_tests {
         ("trae-agent", "trae_config.yaml", "mcp_servers"),
         ("warp", ".mcp.json", "mcpServers"),
         ("windsurf", "mcp_config.json", "mcpServers"),
+        ("workbuddy", ".mcp.json", "mcpServers"),
         ("zed-acp", "settings.json", "context_servers"),
     ];
 
     /// Harnesses whose corpus documents NO MCP mechanism (explicit absence).
     const MCP_ABSENT: &[&str] = &[
         "aider",
-        "factory-droid",
-        "grok-build",
+        "chatgpt-desktop",
         "conductor",
         "copilot-coding-agent",
         "deepseek-harness",
@@ -236,17 +242,20 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 48 MCP declarations (round-1 judge
-    /// recount): pins the exact writable/read-only/absence split so any
-    /// drift in either direction fails with the real numbers.
-    const EXPECTED_MCP_WRITABLE: usize = 15;
+    /// Verified corpus partition of the 51 MCP declarations (round-1 judge
+    /// recount plus workbuddy, corrected round 5 by the live grok-build
+    /// probe and round 6 by the live factory-droid probe; claude-desktop
+    /// added writable round 5, chatgpt-desktop added absent round 5): pins
+    /// the exact writable/read-only/absence split so any drift in either
+    /// direction fails with the real numbers.
+    const EXPECTED_MCP_WRITABLE: usize = 19;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
-    const EXPECTED_MCP_ABSENT: usize = 15;
+    const EXPECTED_MCP_ABSENT: usize = 14;
 
     #[test]
     fn every_adapter_declares_mcp_dest_or_explicit_absence() {
         let adapters = harness_catalog::all_adapters();
-        assert_eq!(adapters.len(), 48, "catalog must list 48 adapters");
+        assert_eq!(adapters.len(), 51, "catalog must list 51 adapters");
         let mut writable = 0;
         let mut read_only = 0;
         let mut absent = 0;
@@ -279,11 +288,11 @@ mod decl_tests {
                 writable += usize::from(!is_read_only);
             }
         }
-        // The exact partition: sums to 48 AND matches the verified counts.
+        // The exact partition: sums to 51 AND matches the verified counts.
         assert_eq!(
             writable + read_only + absent,
-            48,
-            "writable {writable} + read-only {read_only} + absence {absent} must cover all 48"
+            51,
+            "writable {writable} + read-only {read_only} + absence {absent} must cover all 51"
         );
         assert_eq!(
             writable, EXPECTED_MCP_WRITABLE,
@@ -357,7 +366,7 @@ mod decl_tests {
             }
         }
         assert_eq!(declared, PLUGIN_DECLS.len());
-        assert_eq!(absent, 48 - PLUGIN_DECLS.len());
+        assert_eq!(absent, 51 - PLUGIN_DECLS.len());
     }
 
     #[test]

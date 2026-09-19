@@ -1,0 +1,10 @@
+# populated ~/.codex/config.toml as the ChatGPT desktop app's Codex reads it
+# (desktop-only key + shared CLI mcp_servers). Schema per learn.chatgpt.com
+# config-reference; desktop.custom_file_handlers value shape unverified -> empty.
+
+[desktop]
+custom_file_handlers = []
+
+[mcp_servers.echo]
+command = "echo"
+args = ["mcp-fixture"]

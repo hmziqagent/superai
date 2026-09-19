@@ -479,4 +479,144 @@ mod tests {
             drop(std::fs::remove_file(&target_b));
         }
     }
+
+    // ---- Behaviour tests for the mutation-testing gate ----
+
+    /// `is_missing` is the existence accessor of the conflict token: absent
+    /// paths report missing, existing ones do not.
+    #[test]
+    fn is_missing_reports_existence() {
+        let path = unique_scratch("missing-flag");
+        drop(std::fs::remove_file(&path));
+        let absent = snapshot(&path);
+        assert!(absent.is_missing(), "an absent path reports missing");
+        std::fs::write(&path, b"present").unwrap();
+        let present = snapshot(&path);
+        assert!(
+            !present.is_missing(),
+            "an existing path reports not missing"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// Same-size content changes must be detected: the digest, not the size,
+    /// is what separates them, and identical bytes must compare unmodified.
+    #[test]
+    fn snapshot_detects_same_size_content_changes() {
+        let path = unique_scratch("same-size");
+        std::fs::write(&path, b"aaa").unwrap();
+        let before = snapshot(&path);
+        std::fs::write(&path, b"bbb").unwrap();
+        let after = snapshot(&path);
+        assert_eq!(before.size, after.size, "fixture guard: sizes are equal");
+        assert_ne!(
+            before.digest, after.digest,
+            "equal-size content changes must change the digest"
+        );
+        assert!(
+            is_modified(&before, &after),
+            "a same-size content change is a modification"
+        );
+        std::fs::write(&path, b"bbb").unwrap();
+        let reread = snapshot(&path);
+        assert!(
+            !is_modified(&after, &reread),
+            "identical bytes are not a modification"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// The snapshot records the target's unix permission bits (masked to the
+    /// rwx bits), so permission-restoring restores have a source of truth.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_records_target_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_scratch("perm-bits");
+        std::fs::write(&path, b"perms").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let snap = snapshot(&path);
+        let mode = snap.permissions.expect("permissions recorded on unix");
+        assert_eq!(
+            mode & 0o777,
+            0o640,
+            "the snapshot records the file's permission bits"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// The ctime hint is a plausible recent instant: after 2020 and before
+    /// tomorrow, not a fabricated constant like the epoch.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_ctime_is_a_plausible_recent_instant() {
+        /// 2020-01-01T00:00:00Z in seconds since the unix epoch.
+        const SECS_AT_2020: u64 = 1_577_836_800;
+        /// One day of seconds.
+        const DAY_SECS: u64 = 24 * 60 * 60;
+        let path = unique_scratch("ctime-window");
+        std::fs::write(&path, b"ctime").unwrap();
+        let snap = snapshot(&path);
+        let ctime = snap.ctime.expect("ctime recorded on unix");
+        let epoch_2020 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(SECS_AT_2020);
+        assert!(
+            ctime > epoch_2020,
+            "ctime must be after 2020, got {ctime:?}"
+        );
+        let horizon = SystemTime::now() + std::time::Duration::from_secs(DAY_SECS);
+        assert!(
+            ctime < horizon,
+            "ctime must not be in the far future, got {ctime:?}"
+        );
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// A missing path is not a symlink loop: absence is not a cycle.
+    #[test]
+    fn is_symlink_loop_is_false_for_missing_path() {
+        let path = unique_scratch("loop-missing");
+        drop(std::fs::remove_file(&path));
+        assert!(!is_symlink_loop(&path), "a missing path is not a loop");
+    }
+
+    /// A resolvable symlink chain deeper than the walk cutoff is reported as
+    /// a loop. Linux resolves chains up to 40 links deep and macOS up to 32,
+    /// so a 25-link chain to a real file is NOT an OS-level loop (`metadata`
+    /// succeeds and the errno fast-path cannot answer) — only the capped
+    /// chain walk sees it, and falling out of the walk without resolving
+    /// reports true.
+    #[cfg(unix)]
+    #[test]
+    fn deep_symlink_chain_beyond_walk_cutoff_is_reported_as_a_loop() {
+        /// Chain length: over the walk's 20-iteration cutoff, under the
+        /// kernel resolution limits of both Linux (40) and macOS (32).
+        const DEPTH: usize = 25;
+        let root = crate::test_util::temp_dir_unique("config-snapshot-deep");
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real.txt");
+        std::fs::write(&real, b"deep").unwrap();
+        // Chain link-0 -> link-1 -> ... -> link-24 -> real.txt (25 hops).
+        // Targets are RELATIVE so each hop costs exactly one symlink
+        // traversal at the OS level: an absolute target under the macOS
+        // temp root re-traverses the `/var -> /private/var` symlink on
+        // every hop (~2 budget per hop), which pushes a 25-link chain past
+        // macOS's MAXSYMLINKS (32) even though it fits the 32-link budget
+        // with room to spare when each hop costs one.
+        let mut next_target = std::ffi::OsString::from("real.txt");
+        for i in (0..DEPTH).rev() {
+            let link_name = format!("link-{i}");
+            std::os::unix::fs::symlink(&next_target, root.join(&link_name)).unwrap();
+            next_target = std::ffi::OsString::from(link_name);
+        }
+        let head = root.join(next_target);
+        assert!(
+            std::fs::metadata(&head).is_ok(),
+            "fixture guard: the chain must resolve at the OS level (no ELOOP)"
+        );
+        assert!(
+            is_symlink_loop(&head),
+            "a chain deeper than the walk cutoff must be reported as a loop"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
 }

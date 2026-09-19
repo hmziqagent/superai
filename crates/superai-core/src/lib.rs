@@ -18,7 +18,7 @@ pub mod discovery;
 mod error;
 /// Failure injection and fake process/network harness per QAL-06/07.
 pub mod failure;
-/// Registered harness catalog — the 48 planned product surfaces.
+/// Registered harness catalog — the 51 planned product surfaces.
 pub mod harness_catalog;
 /// Health probe — bounded, redacted, protocol-aware.
 pub mod health;
@@ -86,6 +86,15 @@ pub mod activation;
 
 /// Daemon lifecycle: port allocation, identity, readiness, start/stop (WRP-07).
 pub mod daemon;
+
+/// Multi-instance alias core: per-alias relocated roots, seeded MCP/plugin
+/// sets, third-party provider overrides, HOME-virtualized desktop
+/// instances, and launch composition (run-4 area a, run-5 area A).
+pub mod alias;
+
+/// Symlink-swap profiles over parameterized fixed config paths: the
+/// desktop alternative for unrelocatable harnesses (run-5 area A).
+pub mod profile;
 
 #[cfg(test)]
 mod test_util;

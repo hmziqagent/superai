@@ -1,9 +1,18 @@
 //! Factory Droid adapter — project/HOME via `~/.factory/settings.json`.
 //!
-//! Research source: `docs/harness-configs/factory-droid.md` (last verified 2026-08-25).
+//! Research source: `docs/harness-configs/factory-droid.md` (last verified
+//! 2026-08-25; MCP destination live-verified 2026-09-18).
 //! Executable `droid` (`factory` alias), layered JSON `~/.factory/settings.json`
-//! with project `.factory/settings.json` overlay, isolation `project-scope` with
-//! HOME relocation hack. Hosted Factory account features use `FACTORY_API_KEY`.
+//! with project `.factory/settings.json` overlay, MCP servers in
+//! `~/.factory/mcp.json` under top-level `mcpServers` (`droid mcp add` own
+//! writer, live-verified), isolation `project-scope` with HOME relocation
+//! hack. Hosted Factory account features use `FACTORY_API_KEY`.
+//!
+//! Isolation contract (self-consistent): the wrapper sets `HOME` to the
+//! instance/alias root, so the binary's `$HOME/.factory/...` tree resolves to
+//! `<root>/.factory/...`. Every dest modeled relative to the root (the MCP
+//! `dest_file`) therefore nests under `.factory/` — a flat dest would write a
+//! file the live binary never reads (run-4 round-3 alias bug 1).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -595,11 +604,26 @@ impl Adapter for FactoryDroidAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
-    fn mcp_absence_reason(&self) -> Option<&'static str> {
-        Some(
-            "~/.factory/mcp.json documented (third-party-reported path, consistent with /mcp) but the inner schema is unverified in corpus (factory-droid.md)",
-        )
+    /// EXT-08/09: MCP destination — `droid mcp add` (own writer) writes
+    /// top-level `mcpServers` into `~/.factory/mcp.json` and `droid mcp list`
+    /// reads it back (live-verified droid 0.222.0, 2026-09-18, evidence
+    /// live/factory-droid/mcp-dest-r6.log; factory-droid.md §6a).
+    ///
+    /// The dest is nested under `.factory/` because the wrapper relocates
+    /// `HOME` to the instance/alias root (see [`FactoryDroidAdapter::plan_wrapper`]
+    /// env): every caller resolves `dest_file` relative to that root, so a
+    /// flat `mcp.json` would land beside the fake home where the binary never
+    /// looks. `droid` demonstrably reads `<root>/.factory/mcp.json` and never
+    /// `<root>/mcp.json` under `HOME=<root>` (re-probed live 2026-09-18,
+    /// run-4 evidence aliases/factory-droid/round4-live-probe.txt).
+    fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
+        Some(crate::adapter::McpAdapterDecl::new(
+            ".factory/mcp.json",
+            "mcpServers",
+            DocumentKind::Json,
+            ConfigScope::User,
+            RestartBehavior::Reload,
+        ))
     }
 
     /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
@@ -611,7 +635,7 @@ impl Adapter for FactoryDroidAdapter {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         DISPLAY_NAME, EXECUTABLE, FactoryDroidAdapter, HARNESS_ID_STR, OWNED_SELECTORS,
@@ -901,5 +925,86 @@ mod tests {
         assert!(path.exists(), "mcp minimal missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
         assert!(map.is_empty() || map.contains_key("mcpServers") || !map.is_empty());
+    }
+
+    /// Live-probe regression pin (2026-09-18, droid 0.222.0): `droid mcp add`
+    /// (own writer) writes top-level `mcpServers` into `~/.factory/mcp.json`.
+    /// Under the wrapper's `HOME=<root>` relocation the same file is
+    /// `<root>/.factory/mcp.json`, so the dest must nest under `.factory/`.
+    #[test]
+    fn mcp_decl_pins_live_writer_destination() {
+        let a = adapter();
+        let decl = a.mcp_decl().expect("factory-droid declares an MCP dest");
+        assert_eq!(decl.dest_file, ".factory/mcp.json");
+        assert_eq!(decl.dest_key, "mcpServers");
+        assert!(
+            decl.read_only.is_none(),
+            "dest is writable — the binary's own writer verified it"
+        );
+        assert!(a.mcp_absence_reason().is_none());
+    }
+
+    /// Plan env and MCP dest must agree with the live binary: the wrapper
+    /// relocates `HOME` to the instance root and `droid` reads
+    /// `$HOME/.factory/mcp.json` (never a flat `$HOME/mcp.json`), so
+    /// `root.join(dest_file)` must land inside `root/.factory/`.
+    #[test]
+    fn plan_env_and_mcp_dest_agree_under_relocated_home() {
+        let tmp_root = crate::test_util::tmp_abs_str(".factory-live");
+        let a = adapter();
+        let inst = sample_instance_with_root(&tmp_root);
+        let plan = a.plan_wrapper(&inst).unwrap();
+        let home = plan
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == "HOME")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(home, tmp_root.as_str());
+
+        let decl = a.mcp_decl().unwrap();
+        let dest = inst.config_root.join(&decl.dest_file).unwrap();
+        assert_eq!(
+            dest.as_path(),
+            Path::new(home).join(".factory").join("mcp.json"),
+            "seeded dest must be exactly what the binary reads under HOME=<root>"
+        );
+        // The user-scope surface models the same file HOME-relative.
+        let mcp = a
+            .config_surfaces()
+            .into_iter()
+            .find(|s| s.id == "mcp.json")
+            .expect("mcp surface");
+        assert!(
+            mcp.path_resolver
+                .linux
+                .as_deref()
+                .is_some_and(|p| p == "~/.factory/mcp.json")
+        );
+    }
+
+    /// The populated MCP fixture documents the live writer's entry shape.
+    #[test]
+    fn fixture_mcp_populated_matches_live_writer_shape() {
+        let path = fixture_path("mcp.populated.json");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+        let map = superai_config::json::load(&path).unwrap();
+        let servers = map.get("mcpServers").expect("top-level mcpServers key");
+        let entries = servers
+            .as_object()
+            .expect("mcpServers is a server-name map");
+        assert!(!entries.is_empty());
+        for (name, entry) in entries {
+            let fields = entry
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} entry not an object"));
+            assert!(
+                fields.contains_key("command"),
+                "{name} stdio entry needs `command` (live writer shape)"
+            );
+        }
+        let report = crate::verification::fixture_report(path.parent().unwrap());
+        assert!(report.validity_pass, "factory_droid corpus validity");
+        assert!(report.secret_free_pass, "factory_droid corpus secret-free");
     }
 }

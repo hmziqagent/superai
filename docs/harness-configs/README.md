@@ -1,6 +1,6 @@
 # Agent Harness Configuration Bible — Master Index
 
-Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date. Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (48 surfaces: 20 Full, 15 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 1 ReadOnly; all last_verified 2026-08-25).
+Research catalog of known harness config surfaces — config files, env vars, provider integration, and multi-instance wrapper techniques — compiled 2026-08-25 by parallel research agents against official docs and repos at that date (claude-desktop + chatgpt-desktop added 2026-09-18). Each file cites its sources inline; where docs are thin or a surface could not be verified, the file flags the gap explicitly rather than inferring. Where a capability is absent (e.g., no BYO endpoint), the file states that explicitly. Ledger support states and last-verified dates live in [03-harness-adapters.md](../plans/03-harness-adapters.md) and `crates/superai-core/src/harness_catalog.rs` (51 surfaces: 20 Full, 17 Constrained, 1 SingleInstance, 6 MigrationOnly, 4 ResearchBlocked, 1 Unsupported, 2 ReadOnly; last_verified 2026-08-25 except workbuddy 2026-09-01 and the two desktop apps 2026-09-18).
 
 ## The Documents
 
@@ -34,6 +34,7 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Nanocoder | [nanocoder.md](nanocoder.md) | `NANOCODER_CONFIG_DIR` / `NANOCODER_PROVIDERS_FILE` |
 | Trae Agent (ByteDance) | [trae-agent.md](trae-agent.md) | `--config-file` + `TRAE_CONFIG_FILE` |
 | Plandex 2 | [plandex.md](plandex.md) | env-driven provider switching; per-server `PLANDEX_API_HOST` |
+| WorkBuddy / CodeBuddy CLI (cbc) | [workbuddy.md](workbuddy.md) | `CODEBUDDY_CONFIG_DIR`; desktop app GUI-only (documented, not mutated) |
 
 ### IDE / editor-integrated agents
 | Harness | File | Wrapper notes |
@@ -50,6 +51,12 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 | Hermes Agent (Nous) | [hermes-agent.md](hermes-agent.md) | `HERMES_HOME` + `--profile`; local-install-verified `[L]` tags |
 | OpenClaw | [openclaw.md](openclaw.md) | `OPENCLAW_HOME` / `OPENCLAW_CONFIG_PATH`. Daemon, so instances mean running services |
 
+### Desktop apps
+| Harness | File | Wrapper notes |
+|---|---|---|
+| Claude Desktop (Anthropic) | [claude-desktop.md](claude-desktop.md) | **no relocation knob (verified-absent)** — writable `mcpServers` at the fixed per-OS default root; aliasing honestly refused; Linux beta |
+| ChatGPT Desktop (Chat + Work + Codex) | [chatgpt-desktop.md](chatgpt-desktop.md) | **no app-level relocation**; read-only on `~/.codex` which belongs to [codex-cli.md](codex-cli.md) — alias via `CODEX_HOME` there; Linux preview |
+
 ### Self-hosted / cloud platforms & frameworks
 | Harness | File | Wrapper notes |
 |---|---|---|
@@ -61,11 +68,11 @@ Research catalog of known harness config surfaces — config files, env vars, pr
 
 ## Universal patterns (the cheat-sheet)
 
-1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`. Relocate → run its auth flow once → you have an independent instance.
+1. **Config-dir relocation** is the standard isolation mechanism: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `KIMI_CODE_HOME`, `JUNIE_HOME`, `GROK_HOME`, `GOOSE_PATH_ROOT`, `FORGE_CONFIG`, `KODE_CONFIG_DIR`, `NANOCODER_CONFIG_DIR`, `VIBE_HOME`, `COPILOT_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CURSOR_CONFIG_DIR`, `OPENCLAW_HOME`, `KIRO_HOME`, `DSH_HOME`, `CODEBUDDY_CONFIG_DIR`. Relocate → run its auth flow once → you have an independent instance.
 2. **Env beats config for providers** almost everywhere: every harness that speaks OpenAI-compatible takes `<PROVIDER>_API_KEY` + some base-URL override (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `COPILOT_PROVIDER_BASE_URL`, `OPENROUTER_API_KEY`…). Wrappers just export different values before `exec`.
 3. **Anthropic-compatible endpoints are a de-facto standard too** — Claude Code (`ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN`), Kimi Code (`anthropic` provider with custom `base_url`), Crush/Kilo/Cline ("anthropic" provider type) all repoint at GLM/OpenRouter-style Anthropic-format gateways.
 4. **Inline config injection** where supported: Codex `CODEX_CONFIG`, Grok `GROK_CONFIG` (JSON deep-merge), OpenCode `OPENCODE_CONFIG_CONTENT`, Amp `AMP_SETTINGS_FILE`, Nanocoder `NANOCODER_PROVIDERS_FILE`.
-4b. **GUI desktop apps have no relocation knob at all** — Claude Desktop, ZCode (`~/.zcode/v2/config.json`), Windsurf. Config must be written in place; "instances" mean swapping files, not isolating them.
+4b. **GUI desktop apps have no relocation knob at all** — [Claude Desktop](claude-desktop.md) (writable `mcpServers`, but at a fixed per-OS root — aliasing honestly refused), [ChatGPT Desktop](chatgpt-desktop.md) (read-only on `~/.codex`; alias via codex-cli's `CODEX_HOME`), ZCode (`~/.zcode/v2/config.json`), Windsurf. Config must be written in place; "instances" mean swapping files, not isolating them.
 5. **IDE extensions can't be env-isolated** — wrap VS Code itself: `code --user-data-dir <dir>` gives fully separate extension state (Cline/Roo/Kilo pattern).
 6. **Orchestrators are prebuilt wrappers**: Vibe Kanban injects per-profile `ANTHROPIC_BASE_URL`/`AUTH_TOKEN`; Conductor overrides executable paths + Bedrock/Vertex; Sculptor passes env through to containerized Claude Code sessions — see orchestrators.md before rolling your own.
 

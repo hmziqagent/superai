@@ -1,8 +1,9 @@
 //! Goose adapter — relocated-root via `GOOSE_PATH_ROOT` with YAML config/recipes.
 //!
 //! Research source: `docs/harness-configs/goose.md` (last verified 2026-08-25).
-//! Executable `goose`, config root `~/.config/goose` or `$GOOSE_PATH_ROOT`,
-//! primary writable surface `config.yaml` (YAML), isolation `relocated-root`.
+//! Executable `goose`, config root `~/.config/goose` or `$GOOSE_PATH_ROOT/config`
+//! (goose nests a `config/` dir inside `GOOSE_PATH_ROOT`), primary writable
+//! surface `config.yaml` (YAML), isolation `relocated-root`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,6 +36,16 @@ pub const EXECUTABLE: &str = "goose";
 
 /// Environment variable that relocates the config root.
 pub const CONFIG_ENV_VAR: &str = "GOOSE_PATH_ROOT";
+
+/// Config root when `GOOSE_PATH_ROOT` is set: goose nests a `config/` dir
+/// inside the relocation root (goose.md §1: goose creates `config/`, `data/`,
+/// `state/` subdirectories under `GOOSE_PATH_ROOT`). Live-verified against
+/// goose 1.51.0: `goose info` reports Config dir `$GOOSE_PATH_ROOT/config` and
+/// Config yaml `$GOOSE_PATH_ROOT/config/config.yaml`, while a provider config
+/// seeded at the flat `$GOOSE_PATH_ROOT/config.yaml` is ignored
+/// (`goose doctor`: "No provider configured") — see
+/// `.z-workflow/evidence/live/goose/` (area-5 round 5, fixed round 6).
+pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GOOSE_PATH_ROOT/config";
 
 /// Default config root when `GOOSE_PATH_ROOT` is unset.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.config/goose";
@@ -196,12 +207,16 @@ impl GooseAdapter {
         None
     }
 
-    /// Resolve the default config root: `$GOOSE_PATH_ROOT` or `~/.config/goose`.
+    /// Resolve the default config root: `$GOOSE_PATH_ROOT/config` or `~/.config/goose`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
         {
-            return Some(PathBuf::from(dir));
+            // goose nests a `config/` dir inside $GOOSE_PATH_ROOT (goose.md §1:
+            // "creates config/, data/, state/ subdirectories under it"); live
+            // goose 1.51.0 `goose info` reports Config dir
+            // $GOOSE_PATH_ROOT/config, Config yaml …/config/config.yaml.
+            return Some(PathBuf::from(dir).join("config"));
         }
         let home = std::env::var("HOME")
             .ok()
@@ -394,9 +409,9 @@ impl Adapter for GooseAdapter {
         let mut surfaces = Vec::new();
 
         let config_resolver = PathResolver::new(
-            Some("$GOOSE_PATH_ROOT/config.yaml"),
-            Some("$GOOSE_PATH_ROOT/config.yaml"),
-            Some("%GOOSE_PATH_ROOT%\\config.yaml"),
+            Some("$GOOSE_PATH_ROOT/config/config.yaml"),
+            Some("$GOOSE_PATH_ROOT/config/config.yaml"),
+            Some("%GOOSE_PATH_ROOT%\\config\\config.yaml"),
             "~/.config/goose/config.yaml",
         );
         let mut config_surface = ConfigSurface::new(
@@ -413,9 +428,9 @@ impl Adapter for GooseAdapter {
         surfaces.push(config_surface);
 
         let secrets_resolver = PathResolver::new(
-            Some("$GOOSE_PATH_ROOT/secrets.yaml"),
-            Some("$GOOSE_PATH_ROOT/secrets.yaml"),
-            Some("%GOOSE_PATH_ROOT%\\secrets.yaml"),
+            Some("$GOOSE_PATH_ROOT/config/secrets.yaml"),
+            Some("$GOOSE_PATH_ROOT/config/secrets.yaml"),
+            Some("%GOOSE_PATH_ROOT%\\config\\secrets.yaml"),
             "~/.config/goose/secrets.yaml",
         );
         let mut secrets = ConfigSurface::new(
@@ -431,9 +446,9 @@ impl Adapter for GooseAdapter {
         surfaces.push(secrets);
 
         let recipe_resolver = PathResolver::new(
-            Some("$GOOSE_PATH_ROOT/recipes/<name>.yaml"),
-            Some("$GOOSE_PATH_ROOT/recipes/<name>.yaml"),
-            Some("%GOOSE_PATH_ROOT%\\recipes\\<name>.yaml"),
+            Some("$GOOSE_PATH_ROOT/config/recipes/<name>.yaml"),
+            Some("$GOOSE_PATH_ROOT/config/recipes/<name>.yaml"),
+            Some("%GOOSE_PATH_ROOT%\\config\\recipes\\<name>.yaml"),
             "~/.config/goose/recipes/<name>.yaml",
         );
         let mut recipe = ConfigSurface::new(
@@ -448,9 +463,9 @@ impl Adapter for GooseAdapter {
         surfaces.push(recipe);
 
         let ext_resolver = PathResolver::new(
-            Some("$GOOSE_PATH_ROOT/config.yaml (extensions key)"),
-            Some("$GOOSE_PATH_ROOT/config.yaml (extensions key)"),
-            Some("%GOOSE_PATH_ROOT%\\config.yaml (extensions key)"),
+            Some("$GOOSE_PATH_ROOT/config/config.yaml (extensions key)"),
+            Some("$GOOSE_PATH_ROOT/config/config.yaml (extensions key)"),
+            Some("%GOOSE_PATH_ROOT%\\config\\config.yaml (extensions key)"),
             "~/.config/goose/config.yaml (extensions key)",
         );
         let mut extensions = ConfigSurface::new(
@@ -465,16 +480,20 @@ impl Adapter for GooseAdapter {
         extensions.backup_required = true;
         surfaces.push(extensions);
 
+        // Live goose 1.51.0 stores sessions in a sqlite DB, not per-session
+        // jsonl: `goose info` reports "Sessions DB (sqlite):
+        // $GOOSE_PATH_ROOT/data/sessions/sessions.db" (relocated) and
+        // ~/.local/share/goose/sessions/sessions.db (default home layout).
         let session_resolver = PathResolver::new(
-            Some("$GOOSE_PATH_ROOT/sessions/<id>.jsonl"),
-            Some("$GOOSE_PATH_ROOT/sessions/<id>.jsonl"),
-            Some("%GOOSE_PATH_ROOT%\\sessions\\<id>.jsonl"),
-            "~/.config/goose/sessions/<id>.jsonl",
+            Some("$GOOSE_PATH_ROOT/data/sessions/sessions.db"),
+            Some("$GOOSE_PATH_ROOT/data/sessions/sessions.db"),
+            Some("%GOOSE_PATH_ROOT%\\data\\sessions\\sessions.db"),
+            "~/.local/share/goose/sessions/sessions.db",
         );
         let mut sessions = ConfigSurface::new(
             "sessions",
             session_resolver,
-            DocumentKind::Json,
+            DocumentKind::Sqlite,
             ConfigScope::User,
             SurfaceOwnership::HarnessManaged,
         );
@@ -484,9 +503,9 @@ impl Adapter for GooseAdapter {
         surfaces.push(sessions);
 
         let skills_resolver = PathResolver::new(
-            Some("$GOOSE_PATH_ROOT/skills/<name>/SKILL.md"),
-            Some("$GOOSE_PATH_ROOT/skills/<name>/SKILL.md"),
-            Some("%GOOSE_PATH_ROOT%\\skills\\<name>\\SKILL.md"),
+            Some("$GOOSE_PATH_ROOT/config/skills/<name>/SKILL.md"),
+            Some("$GOOSE_PATH_ROOT/config/skills/<name>/SKILL.md"),
+            Some("%GOOSE_PATH_ROOT%\\config\\skills\\<name>\\SKILL.md"),
             "~/.config/goose/skills/<name>/SKILL.md",
         );
         let mut skills = ConfigSurface::new(
@@ -563,7 +582,8 @@ impl Adapter for GooseAdapter {
             "~/.config/goose".to_owned(),
             "~/.config/goose-work".to_owned(),
             "~/.goose".to_owned(),
-            "$GOOSE_PATH_ROOT".to_owned(),
+            "$GOOSE_PATH_ROOT/config".to_owned(),
+            "~/.local/share/goose".to_owned(),
         ]
     }
 
@@ -615,8 +635,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, GooseAdapter, HARNESS_ID_STR, OWNED_SELECTORS,
-        RESEARCH_DOC,
+        CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, GooseAdapter, HARNESS_ID_STR,
+        ISOLATED_CONFIG_ROOT_HINT, OWNED_SELECTORS, RESEARCH_DOC,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -881,6 +901,89 @@ mod tests {
         assert!(!candidates.is_empty());
         assert!(candidates.iter().any(|c| c.contains("goose")));
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
+    }
+
+    /// Real goose nests a `config/` dir inside `$GOOSE_PATH_ROOT` (goose.md §1;
+    /// live goose 1.51.0 `goose info`: Config dir `$GOOSE_PATH_ROOT/config`,
+    /// Config yaml `…/config/config.yaml`; a provider config seeded at the
+    /// flat root is ignored — area-5 evidence, `.z-workflow/evidence/live/
+    /// goose/`). Every config-file surface hint must carry the segment; the
+    /// sessions DB lives under `data/`, not `config/`.
+    #[test]
+    fn env_relocated_surface_hints_nest_config_segment() {
+        let a = adapter();
+        let env_prefix = format!("{ISOLATED_CONFIG_ROOT_HINT}/");
+        let win_prefix = "%GOOSE_PATH_ROOT%\\config\\";
+        let sessions = a
+            .config_surfaces()
+            .into_iter()
+            .find(|s| s.id == "sessions")
+            .expect("sessions surface must exist");
+        // sqlite sessions DB under data/ (live `goose info`)
+        assert_eq!(
+            sessions.path_resolver.linux.as_deref(),
+            Some("$GOOSE_PATH_ROOT/data/sessions/sessions.db")
+        );
+        assert_eq!(
+            sessions.path_resolver.macos.as_deref(),
+            Some("$GOOSE_PATH_ROOT/data/sessions/sessions.db")
+        );
+        assert_eq!(
+            sessions.path_resolver.windows.as_deref(),
+            Some("%GOOSE_PATH_ROOT%\\data\\sessions\\sessions.db")
+        );
+        assert_eq!(
+            sessions.path_resolver.fallback,
+            "~/.local/share/goose/sessions/sessions.db"
+        );
+        for surface in a.config_surfaces() {
+            if surface.id == "sessions" {
+                continue;
+            }
+            let resolver = &surface.path_resolver;
+            for hint in [resolver.linux.as_deref(), resolver.macos.as_deref()] {
+                assert!(
+                    hint.is_some_and(|h| h.starts_with(&env_prefix)),
+                    "surface `{}` env hint must start with {env_prefix:?}, got {hint:?}",
+                    surface.id
+                );
+            }
+            assert!(
+                resolver
+                    .windows
+                    .as_deref()
+                    .is_some_and(|h| h.starts_with(win_prefix)),
+                "surface `{}` windows hint must start with {win_prefix:?}",
+                surface.id
+            );
+        }
+        // scan candidates must relocate through the nested root as well
+        assert!(
+            a.scan_candidates()
+                .iter()
+                .any(|c| c == "$GOOSE_PATH_ROOT/config")
+        );
+    }
+
+    /// The sessions surface models the live sqlite DB, not per-session jsonl
+    /// (live goose 1.51.0 `goose info`: "Sessions DB (sqlite): …
+    /// data/sessions/sessions.db"; default home layout keeps it under
+    /// ~/.local/share/goose/, NOT ~/.config/goose/).
+    #[test]
+    fn sessions_surface_models_sqlite_db_under_data() {
+        let a = adapter();
+        let sessions = a
+            .config_surfaces()
+            .into_iter()
+            .find(|s| s.id == "sessions")
+            .expect("sessions surface must exist");
+        assert_eq!(sessions.kind, DocumentKind::Sqlite);
+        assert_eq!(sessions.ownership, SurfaceOwnership::HarnessManaged);
+        assert!(!sessions.backup_required);
+        assert_eq!(
+            sessions.path_resolver.fallback,
+            "~/.local/share/goose/sessions/sessions.db"
+        );
     }
 
     #[test]

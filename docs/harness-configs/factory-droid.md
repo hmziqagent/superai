@@ -1,6 +1,6 @@
 # Factory Droid CLI — Configurable Options Reference
 
-Compiled 2026-08-25. Primary sources: `docs.factory.ai` (Settings, CLI Reference, Droid Exec, BYOK/Custom Models, Quickstart pages), cross-checked against an independent sandbox analysis (agent-safehouse.dev) where noted. Items that could **not** be verified in official docs are explicitly flagged.
+Compiled 2026-08-25 (MCP destination live-verified 2026-09-18, §6a). Primary sources: `docs.factory.ai` (Settings, CLI Reference, Droid Exec, BYOK/Custom Models, Quickstart pages), cross-checked against an independent sandbox analysis (agent-safehouse.dev) where noted. Items that could **not** be verified in official docs are explicitly flagged.
 
 ---
 
@@ -15,7 +15,7 @@ Compiled 2026-08-25. Primary sources: `docs.factory.ai` (Settings, CLI Reference
 | `<project>/.factory/settings.json` and `<project>/.factory/settings.local.json` | Project-level settings + local overrides, same merge semantics ([settings](https://docs.factory.ai/droid-cli/settings)) |
 | `~/.factory/config.json` | **Legacy** custom-models file with snake_case fields (`custom_models`, `base_url`). Still loaded and merged with `settings.json` (settings.json wins). ⚠️ `${VAR}` expansion does **not** apply here ([byok](https://docs.factory.ai/model-independence/byok)) |
 | `.droid.yaml` | **Legacy/deprecated** project config surface → replaced by `.factory/` files + AGENTS.md ([settings](https://docs.factory.ai/droid-cli/settings)) |
-| `~/.factory/mcp.json` | User MCP servers; `~/.factory/AGENTS.md` personal instructions; `~/.factory/skills/<n>/SKILL.md`; `~/.factory/droids/<n>.md` subagents; `~/.factory/commands/<n>.md` (legacy slash commands) *(paths reported by third-party analysis, consistent with docs' `/mcp`,`/skills`,`/droids` commands)* ([agent-safehouse](https://agent-safehouse.dev/docs/agent-investigations/droid)) |
+| `~/.factory/mcp.json` | User MCP servers — **live-verified 2026-09-18** (§6a): top-level `mcpServers`, written by the binary's own `droid mcp add` writer (droid 0.222.0; evidence `.z-workflow/evidence/live/factory-droid/mcp-dest-r6.log`). `~/.factory/AGENTS.md` personal instructions; `~/.factory/skills/<n>/SKILL.md`; `~/.factory/droids/<n>.md` subagents; `~/.factory/commands/<n>.md` (legacy slash commands) *(paths reported by third-party analysis, consistent with docs' `/mcp`,`/skills`,`/droids` commands)* ([agent-safehouse](https://agent-safehouse.dev/docs/agent-investigations/droid)) |
 | `~/.factory/specs` | Default `specSaveDir` for Spec Mode; `~/.factory/worktrees` default parent for `--worktree` (both official defaults) ([settings](https://docs.factory.ai/droid-cli/settings)) |
 
 ### `settings.json` schema — core (personal)
@@ -279,6 +279,19 @@ Precedence: **blocklist > denylist > allowlist**; anything unlisted falls throug
 
 ---
 
+## 6a) MCP servers — `~/.factory/mcp.json` top-level `mcpServers` ✅ writable
+
+**Live-verified 2026-09-18 against droid 0.222.0** (evidence: `.z-workflow/evidence/live/factory-droid/mcp-dest-r6.log` and round-5 `mcp-add.log`/`mcp-roundtrip.txt`). Corrects the earlier corpus gap that recorded the inner schema as unverified (MCP declared absent).
+
+- **Destination**: user-scope `~/.factory/mcp.json` (HOME-relocatable — the whole `~/.factory` tree follows a faked `$HOME`, probe-verified) under a single top-level `mcpServers` object keyed by server name → dest key `mcpServers`, name-map shape.
+- **HOME-relocated dest (superai aliases/wrappers)**: the wrapper sets `HOME` to the superai instance/alias root, and the binary then reads/writes `<root>/.factory/mcp.json` — re-probed live 2026-09-18 (run 4, droid 0.222.0): under `HOME=<root>` `droid mcp list` lists servers from `<root>/.factory/mcp.json` and never reads a flat `<root>/mcp.json` (evidence `.z-workflow/evidence/aliases/factory-droid/round4-live-probe.txt`). The adapter's `mcp_decl` therefore models the dest as `.factory/mcp.json` relative to the relocated root so seeded files land exactly where the binary reads them.
+- **stdio entry shape** (verbatim from the binary's own writer, `droid mcp add <name> --type stdio -- cmd args…`): `{"type": "stdio", "command": <string>, "args": [<string>…], "disabled": <bool>}`.
+- **CLI (own writer, probe-verified)**: `droid mcp add <name> --type stdio -- <cmd> <args…>` (exit 0, prints `Added stdio MCP server <name>…`, materializes `~/.factory/mcp.json` plus sibling `certs/`, `logs/`, `telemetry/`, `host.json`, `cache/`, `sessions/`); `droid mcp list` connects and reports each configured server (scope tag `[user]`).
+- **Pickup without restart**: `droid mcp list` re-reads the file on each invocation — `RestartBehavior::Reload`.
+- Gated by org `mcpPolicy {enabled, allowlist}` in enterprise settings (§1); superai writes only the local `mcpServers` map.
+
+---
+
 ## Sources
 
 1. https://docs.factory.ai/droid-cli/settings — settings.json paths, full schema, allowlists, enterprise keys
@@ -289,3 +302,4 @@ Precedence: **blocklist > denylist > allowlist**; anything unlisted falls throug
 6. https://docs.factory.ai/droid-cli/overview — Slack/Linear/Jira/PagerDuty integration claim
 7. https://docs.factory.ai/software-factory/code-review-ci + https://github.com/Factory-AI/droid-action — CI touchpoints
 8. https://agent-safehouse.dev/docs/agent-investigations/droid — third-party sandbox analysis (env vars, exit codes, `--delegation-url`; flagged inline wherever used)
+9. Live probe 2026-09-18: droid 0.222.0 `droid mcp add`/`mcp list` under a fake `$HOME` — `.z-workflow/evidence/live/factory-droid/mcp-dest-r6.log` (§6a, `~/.factory/mcp.json` `mcpServers` writer + read path)

@@ -4821,4 +4821,1268 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&dir));
     }
+
+    // ------------------------------------------------------------------
+    // Behaviour tests for the mutation-testing gate (area C)
+    // ------------------------------------------------------------------
+
+    /// Whether chmod 0o333 actually denies opening this directory for
+    /// reading for this process. Root bypasses permission checks; callers
+    /// skip the denial-dependent assertions when it does not.
+    #[cfg(unix)]
+    fn perm_denies_dir_read_probe(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o333),
+        ));
+        let denied = std::fs::File::open(dir).is_err();
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o755),
+        ));
+        denied
+    }
+
+    /// What to do with the target's parent directory when the commit's
+    /// `ParentSync` boundary fires (after the rename landed, right before
+    /// the parent fsync).
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy)]
+    enum ParentSabotage {
+        /// Replace the parent with a self-referential symlink loop (ELOOP).
+        Loop,
+        /// Make the parent unreadable (EACCES on open).
+        DenyRead,
+        /// Remove the parent entirely (ENOENT).
+        Vanish,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct SabotageParentAtSync {
+        parent: PathBuf,
+        action: ParentSabotage,
+    }
+
+    #[cfg(unix)]
+    impl Injector for SabotageParentAtSync {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point != Point::ParentSync {
+                return Ok(());
+            }
+            match self.action {
+                ParentSabotage::DenyRead => {
+                    use std::os::unix::fs::PermissionsExt;
+                    drop(std::fs::set_permissions(
+                        &self.parent,
+                        std::fs::Permissions::from_mode(0o333),
+                    ));
+                }
+                ParentSabotage::Loop | ParentSabotage::Vanish => {
+                    for entry in std::fs::read_dir(&self.parent)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        let path = entry.path();
+                        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                            drop(std::fs::remove_dir_all(&path));
+                        } else {
+                            drop(std::fs::remove_file(&path));
+                        }
+                    }
+                    drop(std::fs::remove_dir(&self.parent));
+                    if matches!(self.action, ParentSabotage::Loop) {
+                        drop(std::os::unix::fs::symlink(&self.parent, &self.parent));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Rewrites the committed target at the `JournalVerify` boundary (after
+    /// the journal advanced to verify, before `Transaction::verify` reads
+    /// the file fresh): simulates foreign content drift in the guarded
+    /// commit→verify window.
+    #[derive(Debug)]
+    struct TamperTargetAtJournalVerify {
+        target: PathBuf,
+        bytes: Vec<u8>,
+    }
+
+    impl Injector for TamperTargetAtJournalVerify {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == Point::JournalVerify {
+                drop(std::fs::write(&self.target, &self.bytes));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn operation_id_accessors_and_display_preserve_the_string() {
+        let id = OperationId::new("op-accessors").unwrap();
+        assert_eq!(id.as_str(), "op-accessors");
+        assert_eq!(id.to_string(), "op-accessors");
+        assert_eq!(format!("{id}"), "op-accessors");
+        assert_eq!(id.into_string(), "op-accessors");
+    }
+
+    #[test]
+    fn remove_kind_display_spells_every_variant() {
+        assert_eq!(RemoveKind::ConfigEntry.to_string(), "config_entry");
+        assert_eq!(RemoveKind::WrapperFile.to_string(), "wrapper_file");
+        assert_eq!(RemoveKind::InstanceRoot.to_string(), "instance_root");
+        assert_eq!(RemoveKind::Binary.to_string(), "binary");
+        assert_eq!(RemoveKind::RegistryOnly.to_string(), "registry_only");
+    }
+
+    #[test]
+    fn remove_target_rejects_each_glob_and_variable_character_alone() {
+        // Each forbidden character must trip the guard on its own: a path
+        // containing only `?` (no `*`), only `[`, only `$`, only `%`.
+        for path in [
+            "/tmp/never?here",
+            "/tmp/never[here]",
+            "/tmp/$VAR",
+            "/tmp/%VAR%",
+        ] {
+            assert!(
+                validate_remove_target(Path::new(path), RemoveKind::WrapperFile).is_err(),
+                "{path} must be refused"
+            );
+        }
+    }
+
+    /// Platform: unix — the control assertion needs `/usr/local/bin/...` to
+    /// be an absolute, validatable target; a `/`-rooted path is
+    /// drive-relative (never `is_absolute`) on Windows, so both the unix-root
+    /// refusals and the control hold only on unix.
+    #[cfg(unix)]
+    #[test]
+    fn remove_target_rejects_every_broad_unix_root() {
+        for root in ["/", "/home", "/tmp", "/usr", "/etc"] {
+            assert!(
+                validate_remove_target(Path::new(root), RemoveKind::WrapperFile).is_err(),
+                "broad root {root} must be refused"
+            );
+        }
+        // A specific target outside the broad-root set stays allowed.
+        assert!(
+            validate_remove_target(Path::new("/opt/superai-thing"), RemoveKind::WrapperFile)
+                .is_ok()
+        );
+    }
+
+    /// Platform: unix — the `/data/...`, `//server/...` and
+    /// `/usr/local/bin/...` shapes require `/`-rooted paths to be absolute
+    /// (they are drive-relative on Windows, failing the control's `is_ok`),
+    /// so the whole fixture is unix-premised. The windows-shape STRING
+    /// semantics involved (`looks_windows_shaped`, folding, broad roots)
+    /// stay covered by the ungated cross-platform unit tests; the mutation
+    /// suite that this kill serves judges on ubuntu.
+    #[cfg(unix)]
+    #[test]
+    fn binary_remove_refuses_config_roots_in_every_shape() {
+        for bad in [
+            "/data/.claude",
+            "/data/.superai",
+            // Forward-slash UNC text is windows-shaped AND absolute on unix,
+            // so it reaches the folded branch of the config-root check.
+            "//server/.claude",
+            "//server/.superai",
+            "C:\\data\\.claude",
+            "C:\\data\\.SUPERAI",
+        ] {
+            assert!(
+                validate_remove_target(Path::new(bad), RemoveKind::Binary).is_err(),
+                "binary removal onto a config root must be refused: {bad}"
+            );
+        }
+        // Real binaries (no dot-prefixed config-root component) stay allowed.
+        assert!(
+            validate_remove_target(Path::new("/usr/local/bin/superai"), RemoveKind::Binary).is_ok()
+        );
+    }
+
+    #[test]
+    fn remove_target_refuses_the_real_home_directory() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            // No home in the environment: nothing to assert.
+            return;
+        };
+        assert!(
+            validate_remove_target(&home, RemoveKind::InstanceRoot).is_err(),
+            "the process home directory {} must never be a removal target",
+            home.display()
+        );
+    }
+
+    #[test]
+    fn paths_equal_folded_requires_real_windows_shape_on_both_sides() {
+        // UNC text folds case-insensitively (both sides windows-shaped).
+        assert!(paths_equal_platform_folded(
+            Path::new("\\\\Srv\\Share"),
+            Path::new("\\\\srv\\share")
+        ));
+        // `1:` is not windows-shaped (drive prefix needs an alphabetic first
+        // char), so comparison stays byte-exact and case-sensitive.
+        assert!(!paths_equal_platform_folded(
+            Path::new("1:Data"),
+            Path::new("1:data")
+        ));
+    }
+
+    /// The staged temp name embeds a current epoch-millis value and a compact
+    /// four-hex-char random suffix — the collision-avoidance contract.
+    #[test]
+    fn staged_temp_name_carries_recent_millis_and_compact_hex_suffix() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("cfg");
+        let id = OperationId::new("op-temp-name").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target,
+                content: b"payload".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        );
+        txn.prepare().unwrap();
+        let temp = txn
+            .staged_temps
+            .first()
+            .cloned()
+            .expect("prepare staged one temp");
+        // ".tmp.{file_name}.{suffix}.{millis}"
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        let mut segments = name.rsplit('.');
+        let millis: u128 = segments.next().unwrap_or_default().parse().unwrap_or(0);
+        let suffix = segments.next().unwrap_or_default().to_owned();
+        assert!(
+            millis >= 1_600_000_000_000,
+            "temp name must embed a post-2020 epoch millis value, got {name}"
+        );
+        assert_eq!(suffix.len(), 4, "suffix must be four chars: {name}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            "suffix must be lowercase hex: {name}"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Staged temps are created 0o600 for new targets, inherit the target's
+    /// mode for existing targets, and never land mode 0.
+    #[cfg(unix)]
+    #[test]
+    fn staged_temp_permissions_are_hardened_or_inherited() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp_root();
+
+        // New target: hardened 0o600.
+        let fresh = root.join("fresh.cfg");
+        let temp = stage_temp_file(&fresh, b"x", None).unwrap();
+        let mode = std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a fresh target's temp must be 0o600");
+
+        // Existing 0o644 target: the temp inherits the same mode.
+        let kept = root.join("kept.cfg");
+        std::fs::write(&kept, b"old").unwrap();
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let temp2 = stage_temp_file(&kept, b"new", None).unwrap();
+        let mode2 = std::fs::metadata(&temp2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o644, "an existing target's mode must be inherited");
+
+        // Existing 0o000 target: the metadata is still readable by the owner;
+        // mode 0 must be hardened back to 0o600.
+        let dark = root.join("dark.cfg");
+        std::fs::write(&dark, b"old").unwrap();
+        std::fs::set_permissions(&dark, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let temp3 = stage_temp_file(&dark, b"new", None).unwrap();
+        let mode3 = std::fs::metadata(&temp3).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode3, 0o600, "a zero mode must be hardened to 0o600");
+        std::fs::set_permissions(&dark, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// An unclassifiable error opening the parent (ELOOP) surfaces from the
+    /// commit against the PARENT path — the sync is not silently swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn commit_surfaces_parent_open_errors_against_the_parent_path() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("w.cfg");
+        std::fs::write(&target, b"v1").unwrap();
+        let inj = SabotageParentAtSync {
+            parent: root.clone(),
+            action: ParentSabotage::Loop,
+        };
+        let id = OperationId::new("op-sync-eloop").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target,
+                content: b"v2".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(Arc::new(inj));
+        txn.prepare().unwrap();
+        let err = txn
+            .commit()
+            .expect_err("the parent sync must surface the ELOOP");
+        match err {
+            ConfigError::Io { path, source } => {
+                assert_eq!(path, root, "the error must be attributed to the parent");
+                // ELOOP has no stable ErrorKind on this toolchain and its
+                // raw errno is platform-specific (40 on Linux, 62 on macOS);
+                // mirror the atomic.rs sync-parent precedent: require an OS
+                // error so a plain permission/not-found mixup cannot pass,
+                // and pin the exact errno on Linux where the mutation
+                // suite runs.
+                assert!(
+                    source.raw_os_error().is_some(),
+                    "the surfaced error is an OS error, got {source}"
+                );
+                #[cfg(target_os = "linux")]
+                assert_eq!(
+                    source.raw_os_error(),
+                    Some(40),
+                    "opening the looped parent must fail with ELOOP"
+                );
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        // The sabotaged parent is now a symlink; clean the link itself.
+        drop(std::fs::remove_file(&root));
+    }
+
+    /// An EACCES opening the parent (Windows-shaped denial) is tolerated:
+    /// the commit still succeeds and the content is readable back.
+    #[cfg(unix)]
+    #[test]
+    fn commit_tolerates_unreadable_parent_at_sync() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        if !perm_denies_dir_read_probe(&root) {
+            // DAC_OVERRIDE (e.g. root): the PermissionDenied open arm is
+            // unreachable for this process; nothing to assert here.
+            drop(std::fs::remove_dir_all(&root));
+            return;
+        }
+        let target = root.join("w.cfg");
+        std::fs::write(&target, b"v1").unwrap();
+        let inj = SabotageParentAtSync {
+            parent: root.clone(),
+            action: ParentSabotage::DenyRead,
+        };
+        let id = OperationId::new("op-sync-eacces").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target.clone(),
+                content: b"v2".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(Arc::new(inj));
+        txn.prepare().unwrap();
+        txn.commit()
+            .expect("an unreadable parent at sync time must be tolerated");
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A parent that vanishes at sync time is tolerated; the loss surfaces
+    /// at the read-back against the FILE path, never the parent.
+    #[cfg(unix)]
+    #[test]
+    fn commit_reports_vanished_parent_against_the_target_not_parent() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("w.cfg");
+        std::fs::write(&target, b"v1").unwrap();
+        let inj = SabotageParentAtSync {
+            parent: root,
+            action: ParentSabotage::Vanish,
+        };
+        let id = OperationId::new("op-sync-vanish").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target.clone(),
+                content: b"v2".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_injector(Arc::new(inj));
+        txn.prepare().unwrap();
+        let err = txn
+            .commit()
+            .expect_err("the vanished tree must fail the read-back");
+        match err {
+            ConfigError::Io { path, source } => {
+                assert_eq!(
+                    path, target,
+                    "the vanished-parent loss surfaces at the read-back against the file"
+                );
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    /// The commit creates missing target parent directories: a staged temp
+    /// committed into a not-yet-existing nested path lands successfully.
+    #[test]
+    fn commit_staged_file_creates_missing_target_parents() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let staged = root.join("a").join(".tmp.staged");
+        std::fs::write(&staged, b"payload").unwrap();
+        let target = root.join("b").join("gone").join("f.json");
+        commit_staged_file(&target, &staged, None, None)
+            .expect("the commit must create the missing parents");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+        assert!(
+            !staged.exists(),
+            "the staged temp is consumed by the rename"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A staged temp on another device (tmpfs) commits through the
+    /// copy fallback: EXDEV is not a dead end.
+    ///
+    /// Platform: Linux/macOS — the `/dev/shm` cross-device staging ground is
+    /// unix-only; the dev-id guard below skips environments without it.
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_file_falls_back_to_copy_across_devices() {
+        let shm = Path::new("/dev/shm");
+        let root = tmp_root();
+        {
+            use std::os::unix::fs::MetadataExt;
+            let different = match (shm.metadata(), root.metadata()) {
+                (Ok(a), Ok(b)) => a.dev() != b.dev(),
+                _ => false,
+            };
+            if !different {
+                // No cross-device staging ground available: skip.
+                drop(std::fs::remove_dir_all(&root));
+                return;
+            }
+        }
+        let staged = shm.join(format!("superai-exdev-{}", std::process::id()));
+        std::fs::write(&staged, b"cross-device payload").unwrap();
+        let target = root.join("landed.bin");
+        commit_staged_file(&target, &staged, None, None)
+            .expect("the cross-device fallback must land the content");
+        assert_eq!(std::fs::read(&target).unwrap(), b"cross-device payload");
+        assert!(
+            !staged.exists(),
+            "the staged temp is removed after the copy"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Every ASCII case variant of `config.json` except the all-lowercase
+    /// spelling itself (that is the probed name, not a sibling), in a fixed
+    /// order that stages a non-minimum variant FIRST and the lexicographic
+    /// minimum (every letter uppercased) SECOND, so even on a
+    /// creation-ordered readdir (tmpfs) the minimum starts interior.
+    fn case_variant_pool() -> Vec<String> {
+        let base = b"config.json";
+        let cased: Vec<usize> = (0..base.len())
+            .filter(|&i| base[i].is_ascii_alphabetic())
+            .collect();
+        let mut pool = Vec::new();
+        for bits in 1..(1usize << cased.len()) {
+            let mut name = base.to_vec();
+            for (k, &i) in cased.iter().enumerate() {
+                if bits & (1 << k) != 0 {
+                    name[i] = name[i].to_ascii_uppercase();
+                }
+            }
+            pool.push(String::from_utf8(name).expect("ascii stays valid utf-8"));
+        }
+        // `bits == all-ones` (the minimum) is generated last; move it behind
+        // the first non-minimum entry.
+        let last = pool.len() - 1;
+        pool.swap(1, last);
+        pool
+    }
+
+    /// The case-variant siblings of `config.json` currently staged in `dir`,
+    /// in the directory's own readdir order — the same order
+    /// `case_fold_collision_in_dir` iterates.
+    fn case_variants_in_readdir_order(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("the scratch directory must be readable")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.json" && name.eq_ignore_ascii_case("config.json"))
+            .collect()
+    }
+
+    /// Stage a scratch directory whose only entries are case-variant
+    /// siblings of `config.json`, adding variants until the directory's own
+    /// readdir order is DISCRIMINATING for the selection logic: the
+    /// lexicographic minimum sits strictly in the interior — neither the
+    /// first nor the last entry read back. Returns the directory and the
+    /// minimum variant's name.
+    ///
+    /// Why the interior requirement: the correct selection is
+    /// order-independent (always the minimum), but the `best`-update
+    /// mutants in `case_fold_collision_in_dir` are not — with the match
+    /// guard forced they return the first or the last readdir entry. A
+    /// two-variant fixture therefore only kills them when the filesystem's
+    /// iteration order happens to end (resp. start) with the minimum:
+    /// ext4/overlayfs readdir order is name-hash based and identical for
+    /// the same names in every directory on the volume, so staging the pair
+    /// in either creation order cannot fix it (the CI escape: the mutant's
+    /// last entry WAS the minimum). Observing the order here and requiring
+    /// the minimum to be interior makes the kill independent of whatever
+    /// order the host filesystem reports.
+    ///
+    /// Returns `None` on case-insensitive filesystems (default macOS APFS,
+    /// Windows NTFS), where all variants collapse to ONE directory entry
+    /// and the multi-variant premise is absent — the same `CASE-PROBE-A`
+    /// skip as `perm_denies_dir_read_probe`.
+    fn discriminating_case_variant_fixture(tag: &str) -> Option<(PathBuf, String)> {
+        let dir = boundary_scratch(tag);
+        std::fs::write(dir.join("case-probe-a"), b"{}").unwrap();
+        let case_insensitive = dir.join("CASE-PROBE-A").exists();
+        drop(std::fs::remove_file(dir.join("case-probe-a")));
+        if case_insensitive {
+            drop(std::fs::remove_dir_all(&dir));
+            return None;
+        }
+        let pool = case_variant_pool();
+        let min = pool[1].clone();
+        for (staged, name) in pool.iter().enumerate() {
+            std::fs::write(dir.join(name), b"{}").unwrap();
+            if staged < 2 {
+                continue;
+            }
+            let order = case_variants_in_readdir_order(&dir);
+            assert_eq!(
+                order.len(),
+                staged + 1,
+                "the staged variants must be the directory's only content"
+            );
+            if order.first() != Some(&min) && order.last() != Some(&min) {
+                return Some((dir, min));
+            }
+        }
+        // No mainstream filesystem sorts readdir output, so the loop finds
+        // an interior minimum long before the pool runs out (hash order: a
+        // handful of inserts; creation order: immediately). Fall through
+        // with the full pool regardless — the suite must never fail over an
+        // iteration order, only the kill strength would suffer.
+        Some((dir, min))
+    }
+
+    /// With several case-variant siblings the collision report names the
+    /// lexicographically first variant deterministically, whatever order the
+    /// filesystem reports the directory in.
+    #[test]
+    fn case_fold_collision_reports_the_first_variant() {
+        let Some((dir, min)) = discriminating_case_variant_fixture("case-min") else {
+            return; // case-insensitive filesystem: premise absent
+        };
+        let res = commit_file(
+            "case-min",
+            &dir.join("config.json"),
+            br#"{"a":1}"#,
+            DocumentKind::StrictJson,
+        );
+        let err = res.expect_err("the case-fold collision must be refused");
+        let message = format!("{err}");
+        let reported = dir.join(&min).display().to_string();
+        assert!(
+            message.contains(&reported),
+            "the report must name the first variant {reported}: {err}"
+        );
+        for name in case_variants_in_readdir_order(&dir) {
+            if name != min {
+                let other = dir.join(&name).display().to_string();
+                assert!(
+                    !message.contains(&other),
+                    "only the first variant may be named: {err}"
+                );
+            }
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Exact-output table for the `JsonC` comment stripper: string contents,
+    /// escapes, line and block comments, and lone slashes.
+    #[test]
+    fn strip_jsonc_comments_matches_the_expected_output_table() {
+        let cases: &[(&str, &str)] = &[
+            // Line comment to end of line.
+            (r#"{"a":1}// tail"#, r#"{"a":1}"#),
+            // Line comment stops at the newline.
+            ("A//c\nB", "A\nB"),
+            // Block comment removed entirely.
+            ("x/* hidden */y", "xy"),
+            // Unclosed block comment consumes the rest.
+            ("a/* never", "a"),
+            // `**/` closes the block.
+            ("a/* **/ b", "a b"),
+            // `//` inside a string is data.
+            (r#"{"u":"http://x"}"#, r#"{"u":"http://x"}"#),
+            // An escaped quote keeps the string open past a marker.
+            (r#"{"k":"a\"//b"}"#, r#"{"k":"a\"//b"}"#),
+            // An escaped backslash does not escape the closing quote.
+            ("{\"k\":\"a\\\\\"}// c", "{\"k\":\"a\\\\\"}"),
+            // A lone slash is ordinary data.
+            ("a/b", "a/b"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                &strip_jsonc_comments(input),
+                expected,
+                "stripping {input:?}"
+            );
+        }
+    }
+
+    /// `?` matches exactly one character and never a path separator.
+    #[test]
+    fn name_matches_question_mark_never_matches_a_separator() {
+        assert!(name_matches("*.md", "keep.md"));
+        assert!(!name_matches("*.md", "a/b.md"));
+        assert!(name_matches("?.txt", "a.txt"));
+        assert!(!name_matches("?.txt", "ab.txt"));
+        assert!(!name_matches("?", "/"));
+        assert!(!name_matches("?.txt", "/.txt"));
+        assert!(name_matches("exact.md", "exact.md"));
+    }
+
+    /// Exclude patterns prune whole directories, not just files.
+    #[test]
+    fn copy_tree_excludes_directories_by_name() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/sub/inner.md"), b"inner").unwrap();
+        std::fs::write(root.join("src/keep.md"), b"keep").unwrap();
+        let opts = CopyTreeOptions {
+            exclude: vec!["sub".to_owned()],
+            ..CopyTreeOptions::default()
+        };
+        let report = copy_tree(&root.join("src"), &root.join("dest"), &opts).unwrap();
+        assert!(
+            !root.join("dest/sub").exists(),
+            "an excluded directory must not be traversed"
+        );
+        assert!(
+            report.excluded.contains(&root.join("dest/sub")),
+            "the pruned directory must be reported: {:?}",
+            report.excluded
+        );
+        assert_eq!(std::fs::read(root.join("dest/keep.md")).unwrap(), b"keep");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The entry bound counts directories as well as files.
+    #[test]
+    fn copy_tree_entry_bound_counts_directories_too() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("src/l1/l2/l3")).unwrap();
+        std::fs::write(root.join("src/l1/l2/l3/leaf.md"), b"leaf").unwrap();
+        let opts = CopyTreeOptions {
+            max_entries: 3,
+            ..CopyTreeOptions::default()
+        };
+        let res = copy_tree(&root.join("src"), &root.join("dest"), &opts);
+        assert!(
+            res.is_err(),
+            "three directories plus one file must exceed max_entries 3"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The byte bound is strict: a file of exactly `max_bytes` still copies.
+    #[test]
+    fn copy_tree_byte_bound_is_strict() {
+        let root = tmp_root();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("exact.bin"), vec![0u8; 100]).unwrap();
+        let opts = CopyTreeOptions {
+            max_bytes: 100,
+            ..CopyTreeOptions::default()
+        };
+        let report = copy_tree(&src, &root.join("dest"), &opts)
+            .expect("a file of exactly max_bytes must copy");
+        assert_eq!(report.bytes, 100);
+        assert_eq!(
+            std::fs::read(root.join("dest/exact.bin")).unwrap().len(),
+            100
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The report accounts for every copied byte.
+    #[test]
+    fn copy_tree_reports_the_sum_of_copied_bytes() {
+        let root = tmp_root();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f1"), vec![0u8; 10]).unwrap();
+        std::fs::write(src.join("f2"), vec![0u8; 20]).unwrap();
+        let report = copy_tree(&src, &root.join("dest"), &CopyTreeOptions::default()).unwrap();
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.bytes, 30, "both files' sizes must be accounted");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Removing a directory that is already absent is a success (idempotent).
+    #[test]
+    fn remove_owned_empty_dir_treats_missing_as_success() {
+        let root = tmp_root();
+        let missing = root.join("never").join("there");
+        remove_owned_empty_dir(&missing)
+            .expect("a missing directory must be treated as already removed");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A stat error other than `NotFound` (EACCES on the parent) surfaces as
+    /// an error instead of being masked as success.
+    #[cfg(unix)]
+    #[test]
+    fn remove_owned_empty_dir_surfaces_stat_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp_root();
+        let parent = root.join("locked");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(parent.join("child")).is_ok() {
+            // DAC_OVERRIDE (e.g. root): the EACCES arm is unreachable here.
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(std::fs::remove_dir_all(&root));
+            return;
+        }
+        assert!(
+            remove_owned_empty_dir(&parent.join("child")).is_err(),
+            "an unreadable parent must surface its stat error"
+        );
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Plan validation rejects each glob character on its own.
+    #[test]
+    fn validate_plan_rejects_each_glob_character_alone() {
+        for path in ["/tmp/never?path", "/tmp/never[path]"] {
+            let id = OperationId::new("op-glob").unwrap();
+            let txn = Transaction::new(
+                id,
+                vec![FileAction::Write {
+                    path: PathBuf::from(path),
+                    content: b"x".to_vec(),
+                    kind: DocumentKind::TextFragment,
+                }],
+            );
+            assert!(
+                txn.validate_plan().is_err(),
+                "a plan path containing a glob character must be refused: {path}"
+            );
+        }
+    }
+
+    /// Declared follow roots may be spelled through symlinked directory
+    /// components: containment compares canonicalized paths on both sides.
+    #[cfg(unix)]
+    #[test]
+    fn follow_roots_resolve_through_symlinked_root_components() {
+        let root = tmp_root();
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // Declare the root BEFORE the allowed subtree exists, spelled
+        // through the alias: canonicalization must happen at check time.
+        let declared = alias.join("allowed");
+        let id = OperationId::new("op-alias-root").unwrap();
+        let mut txn = Transaction::new(id, Vec::new()).with_symlink_follow_roots(vec![declared]);
+        // Build the tree the plan will mutate through the link.
+        let allowed = real.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let referent = allowed.join("cfg.json");
+        std::fs::write(&referent, br#"{"v":1}"#).unwrap();
+        let link = root.join("link.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+        txn.steps = vec![FileAction::Write {
+            path: link.clone(),
+            content: br#"{"v":2}"#.to_vec(),
+            kind: DocumentKind::StrictJson,
+        }];
+        let outcome = txn.execute().unwrap();
+        assert!(
+            outcome.success,
+            "the aliased root must contain its referent: {:?}",
+            outcome.diagnostics_redacted
+        );
+        assert!(std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()));
+        assert_eq!(std::fs::read(&referent).unwrap(), br#"{"v":2}"#);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A write onto a plain single-link file records no hard-link warning.
+    #[test]
+    fn plain_writes_never_record_a_hard_link_warning() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("solo.json");
+        std::fs::write(&target, b"{\"a\":1}").unwrap();
+        let id = OperationId::new("op-no-hlink").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target,
+                content: b"{\"a\":2}".to_vec(),
+                kind: DocumentKind::StrictJson,
+            }],
+        );
+        let outcome = txn.execute().unwrap();
+        assert!(outcome.success);
+        assert!(
+            !outcome
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("hard link")),
+            "a single-link write must not warn: {:?}",
+            outcome.diagnostics_redacted
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A Write planned onto an existing directory is not a backup candidate:
+    /// prepare succeeds and the failure surfaces at the rename.
+    #[test]
+    fn write_onto_an_existing_directory_prepares_cleanly_and_fails_at_rename() {
+        let root = tmp_root();
+        let dir = root.join("adir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = OperationId::new("op-dir-target").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: dir.clone(),
+                content: b"payload".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        );
+        txn.prepare()
+            .expect("a directory target is skipped by the backup pass");
+        assert!(
+            txn.commit().is_err(),
+            "the rename onto a directory must fail"
+        );
+        assert!(dir.is_dir(), "the empty directory survives untouched");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A failure at the third file compensates the two files that already
+    /// committed: unrestorable ones are reported as residuals.
+    #[test]
+    fn third_file_failure_compensates_the_earlier_files() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a1 = root.join("a1.json");
+        let a2 = root.join("a2.json");
+        let a3 = root.join("a3.json");
+        std::fs::write(&a1, b"{\"a\":1}").unwrap();
+        std::fs::write(&a2, b"{\"b\":1}").unwrap();
+        std::fs::write(&a3, b"{\"c\":1}").unwrap();
+        let id = OperationId::new("op-third-file").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a1.clone(),
+                    content: b"{\"a\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: a2.clone(),
+                    content: b"{\"b\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+                FileAction::Write {
+                    path: a3.clone(),
+                    content: b"{\"c\":2}".to_vec(),
+                    kind: DocumentKind::StrictJson,
+                },
+            ],
+        )
+        .with_injector(FailAtPoint::new(Point::ThirdFile, 1));
+        txn.prepare().unwrap();
+        // Corrupt the FIRST file's backup: its restore must be refused and
+        // reported as a residual — proving the first two steps committed
+        // before the third-file boundary failed.
+        let a1_backup = txn
+            .backups
+            .iter()
+            .find(|e| e.original_path == a1)
+            .cloned()
+            .expect("prepare backed up the first target");
+        std::fs::write(&a1_backup.backup_path, b"corrupted").unwrap();
+
+        assert!(
+            txn.commit().is_err(),
+            "the injected third-file boundary must fail the commit"
+        );
+        let rollback = txn
+            .partial_rollback
+            .clone()
+            .expect("the compensation outcome must be retained");
+        assert!(
+            rollback.residuals.contains(&a1),
+            "the unrestorable first file must be a residual: {rollback:?}"
+        );
+        assert_eq!(std::fs::read(&a2).unwrap(), b"{\"b\":1}", "restored");
+        assert_eq!(std::fs::read(&a3).unwrap(), b"{\"c\":1}", "never committed");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// When directory creation fails, the error names the uncreatable
+    /// PARENT component (created first), not the full leaf path.
+    #[test]
+    fn create_dir_failure_names_the_uncreatable_parent() {
+        let root = tmp_root();
+        let blocker = root.join("file.txt");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let leaf = blocker.join("sub");
+        let id = OperationId::new("op-dir-parent").unwrap();
+        let mut txn = Transaction::new(id, vec![FileAction::CreateDir { path: leaf }]);
+        txn.prepare().unwrap();
+        let err = txn.commit().expect_err("creation under a file must fail");
+        match err {
+            ConfigError::Io { path, .. } => assert_eq!(
+                path, blocker,
+                "the parent-first creation must attribute the failure to the parent"
+            ),
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A Symlink step creates its missing parent directories.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_steps_create_missing_parent_directories() {
+        let root = tmp_root();
+        let target = root.join("t.txt");
+        std::fs::write(&target, b"t").unwrap();
+        let link = root.join("deep").join("nested").join("lk");
+        let id = OperationId::new("op-link-parents").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: target.clone(),
+                expected_current: None,
+            }],
+        );
+        let outcome = txn.execute().unwrap();
+        assert!(outcome.success, "{:?}", outcome.diagnostics_redacted);
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+            "the link must land with its parents"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// An existing BROKEN link (`exists()` false, lstat ok) is still replaced
+    /// under the default policy.
+    #[cfg(unix)]
+    #[test]
+    fn broken_links_are_replaced_under_the_default_policy() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let present = root.join("present.txt");
+        std::fs::write(&present, b"p").unwrap();
+        let link = root.join("lnk");
+        std::os::unix::fs::symlink(root.join("absent.txt"), &link).unwrap();
+        let id = OperationId::new("op-broken-link").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: present.clone(),
+                expected_current: None,
+            }],
+        );
+        let outcome = txn.execute().unwrap();
+        assert!(outcome.success, "{:?}", outcome.diagnostics_redacted);
+        assert_eq!(std::fs::read_link(&link).unwrap(), present);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// An UNCHANGED link is replaced under the default policy (only a
+    /// retarget since prepare is a conflict).
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_links_are_replaced_under_the_default_policy() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let old_target = root.join("old.txt");
+        let new_target = root.join("new.txt");
+        std::fs::write(&old_target, b"o").unwrap();
+        std::fs::write(&new_target, b"n").unwrap();
+        let link = root.join("lnk");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        let id = OperationId::new("op-unchanged-link").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Symlink {
+                link: link.clone(),
+                target: new_target.clone(),
+                expected_current: None,
+            }],
+        );
+        let outcome = txn.execute().unwrap();
+        assert!(
+            outcome.success,
+            "an unchanged link must be replaceable: {:?}",
+            outcome.diagnostics_redacted
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), new_target);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A `RemoveFile` step removes a broken symlink (the link itself).
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_steps_remove_broken_symlinks() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("lnk");
+        std::os::unix::fs::symlink(root.join("absent.txt"), &link).unwrap();
+        let id = OperationId::new("op-rm-broken").unwrap();
+        let mut txn = Transaction::new(id, vec![FileAction::RemoveFile { path: link.clone() }]);
+        let outcome = txn.execute().unwrap();
+        assert!(outcome.success, "{:?}", outcome.diagnostics_redacted);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the broken link itself must be gone"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A `RemoveFile` step on a missing target is a success (idempotent).
+    #[test]
+    fn remove_file_steps_treat_missing_targets_as_success() {
+        let root = tmp_root();
+        let missing = root.join("never.json");
+        let id = OperationId::new("op-rm-missing").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::RemoveFile {
+                path: missing.clone(),
+            }],
+        );
+        let outcome = txn.execute().unwrap();
+        assert!(
+            outcome.success,
+            "removing an absent file must be idempotent: {:?}",
+            outcome.diagnostics_redacted
+        );
+        assert!(!missing.exists());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Foreign content drift in the commit→verify window fails verification,
+    /// names the digest mismatch, and rolls the target back.
+    #[test]
+    fn verify_digest_drift_rolls_back_and_names_the_digest() {
+        let root = tmp_root();
+        let jroot = root.join(".superai").join("journal");
+        let target = root.join("d.cfg");
+        std::fs::write(&target, b"pre-op").unwrap();
+        let inj = TamperTargetAtJournalVerify {
+            target: target.clone(),
+            bytes: b"drifted".to_vec(),
+        };
+        let id = OperationId::new("op-drift").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: target.clone(),
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_journal(jroot)
+        .with_injector(Arc::new(inj));
+        let outcome = txn.execute().unwrap();
+        assert!(
+            !outcome.success,
+            "content drift must fail verification: {:?}",
+            outcome.diagnostics_redacted
+        );
+        assert!(
+            outcome
+                .verification
+                .iter()
+                .any(|v| v.message.contains("digest mismatch")),
+            "the drift must be named as a digest mismatch: {:?}",
+            outcome.verification
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"pre-op",
+            "the rollback must restore the pre-op bytes"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Rollback removes a created BROKEN symlink (lstat-visible though
+    /// `exists()` is false).
+    #[cfg(unix)]
+    #[test]
+    fn rollback_removes_created_broken_symlinks() {
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.cfg");
+        std::fs::write(&a, b"old").unwrap();
+        let link = root.join("lnk");
+        let r = root.join("r.cfg");
+        std::fs::write(&r, b"original").unwrap();
+        let id = OperationId::new("op-rb-broken").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![
+                FileAction::Write {
+                    path: a.clone(),
+                    content: b"new".to_vec(),
+                    kind: DocumentKind::TextFragment,
+                },
+                FileAction::Symlink {
+                    link: link.clone(),
+                    target: root.join("absent.txt"),
+                    expected_current: None,
+                },
+                FileAction::RemoveFile { path: r.clone() },
+            ],
+        );
+        txn.prepare().unwrap();
+        // Foreign edit of the removal target: the last step aborts after the
+        // first two committed, forcing the rollback path.
+        std::fs::write(&r, b"foreign edit").unwrap();
+        assert!(txn.commit().is_err());
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the created broken link must be removed by the rollback"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), b"old", "restored from backup");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// An aborted follow-and-preserve commit (caller token invalidated by a
+    /// link retarget) leaves no staged temp behind.
+    #[cfg(unix)]
+    #[test]
+    fn follow_token_abort_cleans_staged_temps() {
+        let root = tmp_root();
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let referent = allowed.join("real.json");
+        std::fs::write(&referent, br#"{"v":1}"#).unwrap();
+        let other = allowed.join("other.json");
+        std::fs::write(&other, br#"{"v":2}"#).unwrap();
+        let link = root.join("cfg.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+        let token = snapshot(&link);
+        // Foreign retarget between the caller's read and the commit.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+
+        let roots = vec![allowed.clone()];
+        let res = commit_file_expecting_with_roots(
+            "follow-abort",
+            &link,
+            br#"{"v":3}"#,
+            DocumentKind::StrictJson,
+            Some(&token),
+            &roots,
+        );
+        match res {
+            Err(ConfigError::ConcurrentModification { .. }) => {}
+            other_err => panic!("expected ConcurrentModification, got {other_err:?}"),
+        }
+        assert_eq!(std::fs::read(&other).unwrap(), br#"{"v":2}"#);
+        for entry in std::fs::read_dir(&allowed).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".tmp."),
+                "the aborted follow leaked staged temp {name}"
+            );
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// Forward-slash UNC text is windows-shaped on every host: the folded
+    /// comparison in `paths_equal_platform_folded` relies on the `//` prefix
+    /// alone (a host cannot see `\\`-only text from a windows caller).
+    #[test]
+    fn looks_windows_shaped_accepts_forward_slash_unc_text() {
+        assert!(looks_windows_shaped("//server/share"));
+        assert!(looks_windows_shaped("\\\\server\\share"));
+        assert!(looks_windows_shaped("C:\\Data"));
+        assert!(looks_windows_shaped("z:/cfg"));
+        assert!(!looks_windows_shaped("1:Data"));
+        assert!(!looks_windows_shaped("/unix/path"));
+        assert!(!looks_windows_shaped(""));
+    }
+
+    /// Two suffixes drawn within the same millisecond must differ: the
+    /// process-id + counter mix keeps same-millis temp names collision-free.
+    #[test]
+    fn random_suffixes_stay_distinct_within_the_same_millisecond() {
+        let a = generate_random_suffix(1_700_000_000_123);
+        let b = generate_random_suffix(1_700_000_000_123);
+        for suffix in [&a, &b] {
+            assert_eq!(suffix.len(), 4, "suffix must be four chars: {suffix}");
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+                "suffix must be lowercase hex: {suffix}"
+            );
+        }
+        assert_ne!(a, b, "the counter must keep same-millis suffixes distinct");
+    }
+
+    /// The case-fold collision report is deterministic: with several variant
+    /// siblings it names the lexicographically first one, independent of the
+    /// directory iteration order the filesystem happens to report (hash
+    /// order on ext4/overlayfs, creation order on tmpfs). The fixture
+    /// guarantees the minimum is interior to that order, so the selection is
+    /// observable rather than coincidental.
+    #[test]
+    fn case_fold_collision_picks_the_lexicographically_first_variant() {
+        let Some((dir, min)) = discriminating_case_variant_fixture("fold-order") else {
+            return; // case-insensitive filesystem: premise absent
+        };
+        let got = case_fold_collision_in_dir(&dir.join("config.json"))
+            .expect("a case-variant sibling must be detected");
+        assert_eq!(
+            got,
+            dir.join(&min),
+            "the lexicographically first variant must be reported"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }

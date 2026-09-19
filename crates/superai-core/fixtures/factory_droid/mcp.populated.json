@@ -1,5 +1,12 @@
 {
   "mcpServers": {
-    "playwright": {"command": "npx", "args": ["@playwright/mcp@0.0.27"]}
+    "preexisting-fetch": {
+      "type": "stdio",
+      "command": "echo",
+      "args": [
+        "droid-live"
+      ],
+      "disabled": false
+    }
   }
 }

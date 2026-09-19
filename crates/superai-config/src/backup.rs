@@ -1381,4 +1381,896 @@ mod tests {
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&entry.backup_path));
     }
+
+    // ---- Behaviour tests for the mutation-testing gate (area B) ----
+
+    /// Every `<name>.bak.*` file sitting next to `path` (used to observe
+    /// which pipeline boundaries leave artifacts behind).
+    fn backup_files_next_to(path: &Path) -> Vec<String> {
+        let parent = path.parent().unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = format!("{file_name}.bak.");
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix.as_str()) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Test injector that fails at exactly one backup boundary.
+    #[derive(Debug)]
+    struct FailAt(Point);
+
+    impl Injector for FailAt {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == self.0 {
+                Err(ConfigError::io(
+                    Path::new("injected"),
+                    std::io::Error::other("injected failure"),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Test injector that swaps the freshly copied backup file (the single
+    /// `<name>.bak.*` entry in `dir`) for a symlink to `/dev/null` at the
+    /// flush boundary. Only usable where `fsync` on `/dev/null` fails with
+    /// `EINVAL` (Linux); see the test below.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct SwapBackupForDevNull {
+        dir: PathBuf,
+        prefix: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Injector for SwapBackupForDevNull {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point != Point::BackupFlush {
+                return Ok(());
+            }
+            // Failures are dropped on purpose: any missed swap makes the
+            // test's outcome assertion fail loudly.
+            let backup_path = std::fs::read_dir(&self.dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(self.prefix.as_str()))
+                });
+            if let Some(backup_path) = backup_path {
+                drop(std::fs::remove_file(&backup_path));
+                drop(std::os::unix::fs::symlink("/dev/null", &backup_path));
+            }
+            Ok(())
+        }
+    }
+
+    /// The injector plumbing runs the real production path: with no injector
+    /// the backup lands and is verifiable.
+    #[test]
+    fn backup_with_injector_runs_the_real_pipeline_and_copies_the_file() {
+        let path = unique_scratch("injector-none");
+        std::fs::write(&path, b"payload for injector").unwrap();
+        let entry = backup_with_injector(&path, Some("op-1"), "reason", None)
+            .unwrap()
+            .expect("a clean run through the injector plumbing must back up");
+        assert_eq!(
+            std::fs::read(&entry.backup_path).unwrap(),
+            b"payload for injector"
+        );
+        assert_eq!(entry.operation_id.as_deref(), Some("op-1"));
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// Each backup boundary failure surfaces as an error and never touches
+    /// the original; only the boundaries after the copy leave the copied
+    /// backup file behind.
+    #[test]
+    fn backup_with_injector_failures_at_each_boundary() {
+        for point in [
+            Point::BackupOpen,
+            Point::BackupWrite,
+            Point::BackupFlush,
+            Point::BackupVerify,
+        ] {
+            let path = unique_scratch(&format!("injector-{point}"));
+            std::fs::write(&path, b"boundaries").unwrap();
+            let injector = FailAt(point);
+            let res = backup_with_injector(&path, None, "reason", Some(&injector));
+            assert!(res.is_err(), "the {point} failure must surface as an error");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"boundaries",
+                "a backup boundary failure must never touch the original"
+            );
+            let leftovers = backup_files_next_to(&path);
+            match point {
+                // These boundaries fire before `fs::copy` starts.
+                Point::BackupOpen | Point::BackupWrite => assert!(
+                    leftovers.is_empty(),
+                    "{point} fires before the copy; found {leftovers:?}"
+                ),
+                // These fire once the backup file has landed.
+                _ => assert_eq!(
+                    leftovers.len(),
+                    1,
+                    "{point} leaves exactly the copied backup behind: {leftovers:?}"
+                ),
+            }
+            let parent = path.parent().unwrap();
+            for leftover in leftovers {
+                drop(std::fs::remove_file(parent.join(&leftover)));
+            }
+            drop(std::fs::remove_file(&path));
+            drop(std::fs::remove_dir(parent));
+        }
+    }
+
+    /// The backup flush is more than a no-op: `fsync` on `/dev/null` fails
+    /// with `EINVAL` (raw errno 22) through both a read-write and a
+    /// read-only descriptor, while reading `/dev/null` back succeeds (as
+    /// empty). A stubbed flush therefore surfaces a digest
+    /// `BackupVerification` failure instead of the flush's io error.
+    ///
+    /// Platform: Linux — `fsync` on `/dev/null` reporting `EINVAL` is
+    /// Linux's behavior; macOS reports `ENODEV` (19) there, so the errno
+    /// premise is asserted only where it holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_surfaces_flush_sync_errors_before_digest_verification() {
+        if !Path::new("/dev/null").exists() {
+            // Not every environment provides /dev/null; nothing to assert.
+            return;
+        }
+        let path = unique_scratch("flush-einval");
+        std::fs::write(&path, b"flushable").unwrap();
+        let injector = SwapBackupForDevNull {
+            dir: path.parent().unwrap().to_path_buf(),
+            prefix: format!("{}.bak.", path.file_name().unwrap().to_string_lossy()),
+        };
+        let res = backup_with_injector(&path, None, "reason", Some(&injector));
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                // EINVAL from fsync(/dev/null); the kind is unstable
+                // `Uncategorized`, so assert the raw OS error.
+                source.raw_os_error(),
+                Some(22),
+                "the flush must surface the fsync EINVAL from /dev/null"
+            ),
+            other => panic!("expected the flush io error, got {other:?}"),
+        }
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_dir_all(path.parent().unwrap()));
+    }
+
+    /// `BackupId` accessors are the catalog's stable identifier surface.
+    #[test]
+    fn backup_id_accessors_preserve_the_string() {
+        let id = BackupId::new("1714123456789-a1b2");
+        assert_eq!(id.as_str(), "1714123456789-a1b2");
+        assert_eq!(id.to_string(), "1714123456789-a1b2");
+        assert_eq!(id.clone().into_string(), "1714123456789-a1b2");
+        assert_eq!(String::from(id), "1714123456789-a1b2");
+    }
+
+    /// The entry and the landed file name embed a current epoch-millis value
+    /// and a compact four-hex-char suffix — the collision-avoidance
+    /// contract.
+    #[test]
+    fn backup_entry_and_file_name_embed_recent_millis_and_compact_hex_suffix() {
+        let path = unique_scratch("naming");
+        std::fs::write(&path, b"naming").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        assert!(
+            entry.timestamp_millis >= 1_600_000_000_000,
+            "backup millis must be a post-2020 epoch value, got {}",
+            entry.timestamp_millis
+        );
+        assert_eq!(entry.suffix.len(), 4, "suffix must be four chars");
+        assert!(
+            entry
+                .suffix
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "suffix must be lowercase hex, got {}",
+            entry.suffix
+        );
+        assert_eq!(
+            entry.id.to_string(),
+            format!("{}-{}", entry.timestamp_millis, entry.suffix),
+            "the id is <millis>-<suffix>"
+        );
+        let expected_name = format!(
+            "{}.bak.{}.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            entry.timestamp_millis,
+            entry.suffix
+        );
+        assert_eq!(
+            entry.backup_path.file_name().unwrap(),
+            std::ffi::OsStr::new(expected_name.as_str()),
+            "the backup file name carries the same millis and suffix"
+        );
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// An unresolvable symlink path is an io error, not "nothing to back up".
+    #[cfg(unix)]
+    #[test]
+    fn backup_reports_io_error_for_symlink_loop() {
+        let dir = crate::test_util::temp_dir_unique("config-backup-loop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        match backup(&a) {
+            Err(ConfigError::Io { .. }) => {}
+            other => panic!("expected io error for an unresolvable symlink, got {other:?}"),
+        }
+        drop(std::fs::remove_file(&a));
+        drop(std::fs::remove_file(&b));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// A file that cannot even be lstat'ed (unsearchable parent) is an io
+    /// error, not "nothing to back up": only a truly missing file maps to
+    /// `Ok(None)`.
+    #[cfg(unix)]
+    #[test]
+    fn backup_reports_io_error_when_parent_directory_is_unsearchable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("config-backup-lstat-denied");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"settings").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if path.symlink_metadata().is_ok() {
+            // Root bypasses permission checks; the arm is unreachable here.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(std::fs::remove_file(&path));
+            drop(std::fs::remove_dir(&dir));
+            return;
+        }
+        let res = backup(&path);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "lstat through an unsearchable parent must surface EACCES"
+            ),
+            other => panic!("expected io error for an unsearchable parent, got {other:?}"),
+        }
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// Only regular files are backed up; a character device is rejected up
+    /// front with `InvalidInput` instead of being read and copied.
+    #[cfg(unix)]
+    #[test]
+    fn backup_rejects_non_regular_files() {
+        let dev_null = Path::new("/dev/null");
+        if !dev_null.exists() {
+            // Not every environment provides /dev/null; nothing to assert.
+            return;
+        }
+        match backup(dev_null) {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "character devices must be rejected as non-regular files"
+            ),
+            other => panic!("expected rejection of a non-regular file, got {other:?}"),
+        }
+    }
+
+    /// A parent directory that does not exist lists no backups.
+    #[test]
+    fn list_backups_returns_empty_for_missing_parent() {
+        let root = crate::test_util::temp_dir_unique("config-backup-list-missing");
+        let target = root.join("never-created").join("settings.json");
+        let list = list_backups(&target).unwrap();
+        assert!(list.is_empty(), "an absent parent directory lists nothing");
+        drop(std::fs::remove_dir(&root));
+    }
+
+    /// A parent directory that cannot be read is an io error, not an empty
+    /// catalog (an unreadable parent could hide existing backups).
+    #[cfg(unix)]
+    #[test]
+    fn list_backups_surfaces_unreadable_parent_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("config-backup-list-denied");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o333)).unwrap();
+        if std::fs::read_dir(&dir).is_ok() {
+            // The chmod does not deny this process (root bypasses permission
+            // checks); the arm is unreachable here.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(std::fs::remove_dir(&dir));
+            return;
+        }
+        let res = list_backups(&dir.join("settings.json"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match res {
+            Err(ConfigError::Io { path, .. }) => assert_eq!(
+                path, dir,
+                "the read_dir failure is reported against the parent"
+            ),
+            other => panic!("expected io error for an unreadable parent, got {other:?}"),
+        }
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// Directory entries that merely look like backups are not listed; the
+    /// real backup file is.
+    #[test]
+    fn list_backups_lists_only_regular_backup_files() {
+        let path = unique_scratch("list-nonfile");
+        std::fs::write(&path, b"real").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        let decoy = path.parent().unwrap().join(format!(
+            "{}.bak.0.dead",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir(&decoy).unwrap();
+        let list = list_backups(&path).unwrap();
+        assert_eq!(list.len(), 1, "only the real backup file is listed");
+        assert_eq!(list[0].id, entry.id);
+        drop(std::fs::remove_dir(&decoy));
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_dir(path.parent().unwrap()));
+    }
+
+    /// Verification requires BOTH the digest and the size to match; a match
+    /// on one alone must not verify.
+    #[test]
+    fn verify_backup_requires_both_digest_and_size_to_match() {
+        let path = unique_scratch("verify-parts");
+        std::fs::write(&path, b"verify me").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        assert!(verify_backup(&entry).unwrap(), "the fresh entry verifies");
+
+        let wrong_size = BackupEntry {
+            size: entry.size + 1,
+            ..entry.clone()
+        };
+        assert!(
+            !verify_backup(&wrong_size).unwrap(),
+            "a matching digest with a wrong size must not verify"
+        );
+
+        let wrong_digest = BackupEntry {
+            digest: compute_digest(b"other bytes"),
+            ..entry.clone()
+        };
+        assert!(
+            !verify_backup(&wrong_digest).unwrap(),
+            "a matching size with a wrong digest must not verify"
+        );
+
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// The relation check accepts only a backup that is a properly named
+    /// sibling of the very target it claims to belong to.
+    #[test]
+    fn verify_backup_relation_accepts_only_named_siblings_of_the_target() {
+        let dir = crate::test_util::temp_dir_unique("config-backup-relation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cfg.json");
+        std::fs::write(&target, b"relation").unwrap();
+        let entry = backup(&target).unwrap().expect("backup");
+
+        // The real relation: same original, sibling backup, matching bytes.
+        assert!(
+            verify_backup_relation(&entry, &target).unwrap(),
+            "a fresh backup relates to its target"
+        );
+
+        // A different target is refused outright.
+        let other = dir.join("other.json");
+        assert!(
+            !verify_backup_relation(&entry, &other).unwrap(),
+            "a backup of cfg.json does not relate to other.json"
+        );
+
+        // A backup that lives in a different directory is not a sibling.
+        let foreign_dir = crate::test_util::temp_dir_unique("config-backup-relation-foreign");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join(entry.backup_path.file_name().unwrap());
+        std::fs::copy(&entry.backup_path, &foreign).unwrap();
+        let foreign_entry = BackupEntry {
+            backup_path: foreign,
+            ..entry.clone()
+        };
+        assert!(
+            !verify_backup_relation(&foreign_entry, &target).unwrap(),
+            "a backup in another directory is not a sibling"
+        );
+        drop(std::fs::remove_dir_all(&foreign_dir));
+
+        // A sibling whose name does not start with the target name is
+        // refused even though it carries the marker and matching bytes.
+        let misnamed = dir.join("xcfg.json.bak.1.abcd");
+        std::fs::copy(&entry.backup_path, &misnamed).unwrap();
+        let misnamed_entry = BackupEntry {
+            backup_path: misnamed.clone(),
+            ..entry.clone()
+        };
+        assert!(
+            !verify_backup_relation(&misnamed_entry, &target).unwrap(),
+            "a backup name must start with the target's file name"
+        );
+
+        // A sibling prefixed like the target but missing the `.bak.` marker
+        // is refused.
+        let unmarked = dir.join("cfg.json.old");
+        std::fs::copy(&entry.backup_path, &unmarked).unwrap();
+        let unmarked_entry = BackupEntry {
+            backup_path: unmarked.clone(),
+            ..entry.clone()
+        };
+        assert!(
+            !verify_backup_relation(&unmarked_entry, &target).unwrap(),
+            "a backup name must carry the .bak. marker"
+        );
+
+        // A bare target name (no parent directory component) must not trip
+        // the sibling check: the name checks still apply and the properly
+        // named backup still relates.
+        let bare = BackupEntry {
+            original_path: PathBuf::from("cfg.json"),
+            backup_path: entry.backup_path.clone(),
+            ..entry.clone()
+        };
+        assert!(
+            verify_backup_relation(&bare, Path::new("cfg.json")).unwrap(),
+            "an empty parent component must not fail the sibling check"
+        );
+
+        drop(std::fs::remove_file(&misnamed));
+        drop(std::fs::remove_file(&unmarked));
+        drop(std::fs::remove_file(&target));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// The catalog resolves known ids and refuses unknown ones.
+    #[test]
+    fn find_backup_by_id_resolves_only_known_ids() {
+        let path = unique_scratch("find-by-id");
+        std::fs::write(&path, b"findable").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        let found = find_backup_by_id(&path, &entry.id)
+            .unwrap()
+            .expect("the fresh backup id must resolve");
+        assert_eq!(found.id, entry.id);
+        assert_eq!(found.digest, entry.digest);
+        assert_eq!(found.size, entry.size);
+        let missing = find_backup_by_id(&path, &BackupId::new("0-dead")).unwrap();
+        assert!(missing.is_none(), "an unknown id must not resolve");
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// Every secret-bearing keyword redacts, in both `:` and `=` styles, and
+    /// ordinary lines pass through untouched.
+    #[test]
+    fn redact_line_redacts_each_secret_keyword_in_both_separator_styles() {
+        assert_eq!(redact_line("apikey: sk-123"), "apikey: [REDACTED]");
+        assert_eq!(redact_line("password=x"), "password=[REDACTED]");
+        assert_eq!(redact_line("ordinary line"), "ordinary line");
+        assert_eq!(redact_line("token"), "[REDACTED]");
+
+        let keyword_lines = [
+            "apikey: sk-123",
+            "api_key=abc",
+            "the secret: value",
+            "token: t",
+            "password: p",
+            "authorization: Bearer x",
+            "bearer: y",
+        ];
+        for line in keyword_lines {
+            let redacted = redact_line(line);
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "{line:?} must be redacted, got {redacted:?}"
+            );
+            assert!(
+                !redacted.contains("sk-123") && !redacted.contains("abc"),
+                "the raw value must never survive: {redacted:?}"
+            );
+        }
+    }
+
+    /// The preview distinguishes "no changes" from line-level additions and
+    /// removals, and redacts secret values on the way through.
+    #[test]
+    fn redacted_diff_preview_marks_no_changes_and_line_changes() {
+        assert_eq!(redacted_diff_preview(b"same", b"same"), "no changes");
+        assert_eq!(
+            redacted_diff_preview(b"new line", b"old line"),
+            "- old line\n+ new line\n"
+        );
+        // An unchanged line inside a changed document produces no pair of
+        // its own: only the differing lines appear in the preview.
+        assert_eq!(
+            redacted_diff_preview(b"x\nsame\nz", b"a\nsame\nc"),
+            "- a\n+ x\n- c\n+ z\n"
+        );
+        assert_eq!(
+            redacted_diff_preview(b"password: new", b"password: old"),
+            "- password: [REDACTED]\n+ password: [REDACTED]\n"
+        );
+        let small = redacted_diff_preview(b"x\ny\nz", b"a\nb\nc");
+        assert_eq!(small, "- a\n+ x\n- b\n+ y\n- c\n+ z\n");
+        assert!(!small.contains("truncated"));
+    }
+
+    /// Binary content (non-UTF-8 on either side) produces the size/digest
+    /// summary instead of a line diff.
+    #[test]
+    fn redacted_diff_preview_summarizes_binary_content() {
+        let summary = redacted_diff_preview(b"plain text", b"\xff\xfe binary");
+        assert!(
+            summary.starts_with("binary diff: current 10 bytes"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            summary.contains("backup 9 bytes"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            summary.contains(compute_digest(b"plain text").as_str()),
+            "the summary embeds the current digest: {summary}"
+        );
+        assert!(
+            summary.contains(compute_digest(b"\xff\xfe binary").as_str()),
+            "the summary embeds the backup digest: {summary}"
+        );
+    }
+
+    /// The 4 KiB preview budget truncates only once the accumulated output
+    /// strictly exceeds it: the first pair below contributes exactly 4096
+    /// bytes, so the second pair must still be included.
+    #[test]
+    fn redacted_diff_preview_truncates_only_past_the_size_budget() {
+        let old_first = "B".repeat(2000);
+        let new_first = "C".repeat(2090);
+        let backup = format!("{old_first}\nsecond-old");
+        let current = format!("{new_first}\nsecond-new");
+        let out = redacted_diff_preview(current.as_bytes(), backup.as_bytes());
+        assert!(
+            out.contains("... truncated\n"),
+            "a >4 KiB diff must be truncated, got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("second-old") && out.contains("second-new"),
+            "the second pair still fits after the exact-4096 first pair"
+        );
+        assert!(
+            out.contains(old_first.as_str()),
+            "the first pair is included"
+        );
+    }
+
+    /// `validate_bytes_for_kind` is the restore-time semantic check: it must
+    /// reject invalid documents, and blank/comment lines in env files are
+    /// not errors.
+    #[test]
+    fn validate_bytes_rejects_invalid_documents_and_accepts_valid_ones() {
+        use crate::document::DocumentKind;
+        let p = Path::new("probe");
+        assert!(validate_bytes_for_kind(b"{ bad json", DocumentKind::StrictJson, p).is_err());
+        validate_bytes_for_kind(b"{}", DocumentKind::StrictJson, p).unwrap();
+        assert!(validate_bytes_for_kind(b"not toml ]", DocumentKind::Toml, p).is_err());
+        validate_bytes_for_kind(b"a = 1\n", DocumentKind::Toml, p).unwrap();
+        // env: blank lines and comments are skipped; a line without '='
+        // fails; `export ` prefixes are honored.
+        validate_bytes_for_kind(b"KEY=1\n\n# comment\nOTHER =2\n", DocumentKind::Env, p).unwrap();
+        assert!(validate_bytes_for_kind(b"KEY=1\nNO_EQUALS_HERE\n", DocumentKind::Env, p).is_err());
+        validate_bytes_for_kind(b"KEY=1\nexport EXPORTED=3\n", DocumentKind::Env, p).unwrap();
+        // jsonc strips comments before parsing.
+        validate_bytes_for_kind(b"{ \"a\": 1 } // tail\n", DocumentKind::JsonC, p).unwrap();
+        assert!(validate_bytes_for_kind(b"{ broken // x\n", DocumentKind::JsonC, p).is_err());
+        // yaml round-trips through the core yaml codec.
+        validate_bytes_for_kind(b"a: 1\n", DocumentKind::Yaml, p).unwrap();
+        assert!(validate_bytes_for_kind(b"a: [1,\n", DocumentKind::Yaml, p).is_err());
+    }
+
+    /// Kind inference covers every supported extension, the `.env` family,
+    /// and stays `None` for everything else.
+    #[test]
+    fn infer_kind_covers_every_supported_extension_and_env_names() {
+        use crate::document::DocumentKind;
+        assert_eq!(
+            infer_kind_for_path(Path::new("a/config.json")),
+            Some(DocumentKind::StrictJson)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new("b.JSON")),
+            Some(DocumentKind::StrictJson)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new("c.jsonc")),
+            Some(DocumentKind::JsonC)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new("d.toml")),
+            Some(DocumentKind::Toml)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new("e.yaml")),
+            Some(DocumentKind::Yaml)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new("f.yml")),
+            Some(DocumentKind::Yaml)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new(".env")),
+            Some(DocumentKind::Env)
+        );
+        assert_eq!(
+            infer_kind_for_path(Path::new(".env.production")),
+            Some(DocumentKind::Env)
+        );
+        assert_eq!(infer_kind_for_path(Path::new("notes.txt")), None);
+        assert_eq!(infer_kind_for_path(Path::new("noext")), None);
+        assert_eq!(infer_kind_for_path(Path::new(".envx")), None);
+    }
+
+    /// Line and block comments are removed outside strings; string contents
+    /// and escapes survive verbatim.
+    #[test]
+    fn strip_comments_removes_line_and_block_comments_outside_strings() {
+        assert_eq!(strip_comments_for_restore("a // tail\nb"), "a \nb");
+        assert_eq!(strip_comments_for_restore("a /* hidden */ b"), "a  b");
+        assert_eq!(strip_comments_for_restore("/* multi\nline */x"), "x");
+        assert_eq!(strip_comments_for_restore("keep // only"), "keep ");
+        assert_eq!(strip_comments_for_restore("plain"), "plain");
+        assert_eq!(strip_comments_for_restore(""), "");
+        assert_eq!(strip_comments_for_restore("s/**/e"), "se");
+        // A slash that is not a comment marker survives.
+        assert_eq!(strip_comments_for_restore("a/b"), "a/b");
+        assert_eq!(strip_comments_for_restore("a/"), "a/");
+    }
+
+    /// Comment markers inside strings are data; an escaped quote does not
+    /// close the string, so comments after the real closing quote are still
+    /// comments.
+    #[test]
+    fn strip_comments_preserves_string_contents_and_escapes() {
+        assert_eq!(strip_comments_for_restore(r#""a//b""#), r#""a//b""#);
+        assert_eq!(strip_comments_for_restore(r#""x"// c"#), r#""x""#);
+        assert_eq!(
+            strip_comments_for_restore(r#""a\""// c"#),
+            r#""a\"""#,
+            "an escaped quote keeps the string open past the comment"
+        );
+        assert_eq!(
+            strip_comments_for_restore(r#"q"// c""#),
+            r#"q"// c""#,
+            "a bare quote opens a string: the comment marker inside is data"
+        );
+        assert_eq!(
+            strip_comments_for_restore(r#""a\\" // c"#),
+            r#""a\\" "#,
+            "an escaped backslash does not hide the closing quote"
+        );
+    }
+
+    /// A corrupted backup (same size, different bytes) is refused by the
+    /// digest check and the target stays untouched.
+    #[test]
+    fn restore_refuses_a_corrupted_backup_and_keeps_the_target() {
+        let path = unique_scratch("restore-corrupt");
+        std::fs::write(&path, b"backed up").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        std::fs::write(&path, b"current").unwrap();
+        // Same length, different bytes: only the digest can catch it.
+        std::fs::write(&entry.backup_path, b"corrupted").unwrap();
+        let res = restore_entry(&entry);
+        assert!(res.is_err(), "a corrupted backup must be refused");
+        match res {
+            Err(ConfigError::BackupVerification { .. }) => {}
+            other => panic!("expected BackupVerification, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"current",
+            "the target must stay untouched by a refused restore"
+        );
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// The MUT-07 restore refuses a backup that does not belong to the
+    /// target instead of writing it over an unrelated file.
+    #[test]
+    fn restore_verified_refuses_a_backup_from_another_target() {
+        let dir = crate::test_util::temp_dir_unique("config-backup-wrong-target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.json");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let entry = backup(&source).unwrap().expect("backup");
+        let victim = dir.join("victim.json");
+        std::fs::write(&victim, b"victim bytes").unwrap();
+        let forged = BackupEntry {
+            original_path: victim.clone(),
+            ..entry.clone()
+        };
+        match restore_verified(&forged) {
+            Err(ConfigError::BackupVerification { .. }) => {}
+            other => panic!("expected BackupVerification for a relation mismatch, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim bytes",
+            "the unrelated target must stay untouched"
+        );
+        drop(std::fs::remove_file(&source));
+        drop(std::fs::remove_file(&victim));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// A target that cannot be read for any reason other than being absent
+    /// aborts the restore instead of silently diffing against empty bytes.
+    #[cfg(unix)]
+    #[test]
+    fn restore_verified_aborts_when_the_current_target_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_scratch("verified-unreadable");
+        std::fs::write(&path, b"backed up").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        std::fs::write(&path, b"current secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Root bypasses permission checks; the arm is unreachable here.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            drop(std::fs::remove_file(&path));
+            drop(std::fs::remove_file(&entry.backup_path));
+            return;
+        }
+        let res = restore_verified(&entry);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the unreadable current target must abort the restore"
+            ),
+            other => panic!("expected io error for an unreadable target, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"current secret",
+            "the target must stay untouched by the aborted restore"
+        );
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// Backing up a SYMLINK is the one input shape where the explicit
+    /// permission re-apply in `backup_inner` is observable: the entry's mode
+    /// comes from `symlink_metadata` (the LINK's own mode: 0o777 on Linux,
+    /// 0o755 on macOS) while `fs::copy` follows the link and lands the
+    /// REFERENT's 0o644 on the fresh backup.
+    /// The re-apply must override the referent mode with the recorded link
+    /// mode — a `set_permissions_u32 -> Ok(())` mutant leaves the backup at
+    /// the referent's 0o644.
+    #[cfg(unix)]
+    #[test]
+    fn backup_of_a_symlink_lands_the_link_mode_not_the_referent_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("config-backup-link-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let referent = dir.join("referent.json");
+        std::fs::write(&referent, b"symlinked content").unwrap();
+        std::fs::set_permissions(&referent, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        let entry = backup(&link)
+            .unwrap()
+            .expect("backup of a symlink to a regular file must succeed");
+
+        // The link's own mode is platform-given, not a constant: Linux
+        // creates symlinks 0o777, macOS reports 0o755. Derive it from a
+        // fresh lstat; the distinguishing premise only needs link != referent.
+        let link_mode = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .permissions()
+            .mode();
+        let referent_mode = std::fs::metadata(&referent).unwrap().permissions().mode();
+        if link_mode & 0o777 == referent_mode & 0o777 {
+            // A platform where the link carries the referent's mode: the
+            // premise separating "recorded link mode" from "copied referent
+            // mode" is absent; nothing to distinguish. (Not hit on Linux
+            // 0o777-vs-0o644 or macOS 0o755-vs-0o644.)
+            drop(std::fs::remove_file(&link));
+            drop(std::fs::remove_file(&entry.backup_path));
+            drop(std::fs::remove_file(&referent));
+            drop(std::fs::remove_dir(&dir));
+            return;
+        }
+        assert_eq!(
+            entry.permissions,
+            Some(link_mode),
+            "the entry records the link's own mode from symlink_metadata"
+        );
+        let backup_mode = std::fs::metadata(&entry.backup_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            backup_mode & 0o777,
+            link_mode & 0o777,
+            "the landed backup must carry the recorded link mode, not the referent's 0o644"
+        );
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_file(&entry.backup_path));
+        drop(std::fs::remove_file(&referent));
+        drop(std::fs::remove_dir(&dir));
+    }
+
+    /// A DIRECTORY that replaced the original path must surface the raw
+    /// `IsADirectory` read error, not be masked to "missing": the NotFound-only
+    /// guard keeps non-NotFound read errors visible (`verify_backup_relation`
+    /// is name-based and cannot catch this). The guard->true mutant would
+    /// treat EISDIR as absence, hand `WriteExpectation::Missing` to
+    /// `atomic_write_expecting`, and surface that helper's `InvalidInput`
+    /// pre-check instead — a different `ErrorKind`.
+    ///
+    /// Platform: unix — reading a directory reports `EISDIR`
+    /// (`ErrorKind::IsADirectory`) on Linux and macOS; Windows surfaces a
+    /// different error kind for a read through a directory path, so the
+    /// premise is asserted only where it holds.
+    #[cfg(unix)]
+    #[test]
+    fn restore_verified_surfaces_is_a_directory_when_the_original_became_a_directory() {
+        let path = unique_scratch("verified-isdir");
+        std::fs::write(&path, b"backed up").unwrap();
+        let entry = backup(&path).unwrap().expect("backup");
+        drop(std::fs::remove_file(&path));
+        std::fs::create_dir(&path).unwrap();
+
+        let res = restore_verified(&entry);
+        match res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::IsADirectory,
+                "EISDIR from the fresh read must surface, not be masked to missing"
+            ),
+            other => panic!("expected io error for a directory at the original, got {other:?}"),
+        }
+        assert!(
+            path.is_dir(),
+            "the aborted restore must leave the directory untouched"
+        );
+        drop(std::fs::remove_dir(&path));
+        drop(std::fs::remove_file(&entry.backup_path));
+    }
 }

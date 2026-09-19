@@ -1,7 +1,10 @@
 //! Kiro adapter — `KIRO_HOME`, `ReadOnly` until research gaps closed.
 //!
-//! Research source: `docs/harness-configs/kiro.md` (last verified 2026-08-25).
-//! Executable `kiro`, config root `~/.kiro` or `$KIRO_HOME`, surfaces
+//! Research source: `docs/harness-configs/kiro.md` (last verified 2026-08-25;
+//! executable name live-verified 2026-09-18).
+//! Executable `kiro-cli` (the only name the vendor installer ships —
+//! cli.kiro.dev/install, kiro-cli 2.22.0; `kiro` exists only where a wrapper
+//! or bridge aliases it), config root `~/.kiro` or `$KIRO_HOME`, surfaces
 //! `settings/cli.json` (JSON), `settings/mcp.json` (JSON),
 //! `settings/permissions.yaml` (YAML), `agents/` / `skills/` / `steering/` /
 //! `hooks/` dirs, isolation `relocated-root` via `KIRO_HOME`, product status
@@ -33,8 +36,16 @@ pub const HARNESS_ID_STR: &str = "kiro";
 /// Human display name.
 pub const DISPLAY_NAME: &str = "Kiro CLI/IDE";
 
-/// Primary executable name.
-pub const EXECUTABLE: &str = "kiro";
+/// Primary executable name — the only binary the vendor installer ships
+/// (`kiro-cli`; probe 2026-09-18: cli.kiro.dev/install materializes
+/// kiro-cli/kiro-cli-chat/kiro-cli-term and no `kiro`, evidence
+/// live/kiro/executable-r6.log).
+pub const EXECUTABLE: &str = "kiro-cli";
+
+/// Alternative executable name — `kiro` exists only where a wrapper or
+/// bridge aliases it (kept for alias-style installs, workbuddy
+/// cbc/codebuddy precedent).
+pub const EXECUTABLE_ALT: &str = "kiro";
 
 /// Environment variable that relocates the config root.
 pub const CONFIG_ENV_VAR: &str = "KIRO_HOME";
@@ -91,24 +102,26 @@ impl KiroAdapter {
         READONLY_REASON
     }
 
-    /// Try to locate `kiro` binary via PATH.
+    /// Try to locate `kiro-cli` (then the `kiro` alias) via `PATH`.
     #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
     #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
     fn find_binary_in_path(&self) -> Option<PathBuf> {
         let path_var = std::env::var("PATH").ok()?;
         let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
+        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
+            for dir in path_var.split(separator) {
+                if dir.is_empty() {
+                    continue;
+                }
+                let candidate = Path::new(dir).join(exec);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                if cfg!(windows) {
+                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
+                    if exe_candidate.is_file() {
+                        return Some(exe_candidate);
+                    }
                 }
             }
         }
@@ -288,6 +301,7 @@ impl Adapter for KiroAdapter {
         LAST_VERIFIED
     }
 
+    #[expect(clippy::single_match_else, reason = "detection branching explicit")]
     fn detection(&self) -> DetectionResult {
         let mut evidence = Vec::new();
         let mut version: Option<String> = None;
@@ -297,7 +311,9 @@ impl Adapter for KiroAdapter {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
-                    EXECUTABLE,
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(EXECUTABLE),
                     path.display()
                 ));
                 match Self::probe_version(&path) {
@@ -313,6 +329,9 @@ impl Adapter for KiroAdapter {
             }
             None => {
                 evidence.push(format!("binary `{EXECUTABLE}` not found in PATH"));
+                evidence.push(format!(
+                    "binary `{EXECUTABLE_ALT}` (alias) not found in PATH"
+                ));
             }
         }
 
@@ -493,8 +512,8 @@ impl Adapter for KiroAdapter {
         plan.env_vars
             .push((CONFIG_ENV_VAR.to_owned(), instance.config_root.to_string()));
         plan.description = format!(
-            " Wrapper sets {CONFIG_ENV_VAR}={} and execs `{}` (read-only; writes blocked: {READONLY_REASON})",
-            instance.config_root, EXECUTABLE
+            " Wrapper sets {CONFIG_ENV_VAR}={} and execs `{EXECUTABLE}` (or the `{EXECUTABLE_ALT}` alias) (read-only; writes blocked: {READONLY_REASON})",
+            instance.config_root
         );
         Ok(plan)
     }
@@ -557,7 +576,9 @@ impl Adapter for KiroAdapter {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, KiroAdapter, RESEARCH_DOC};
+    use super::{
+        DISPLAY_NAME, EXECUTABLE, EXECUTABLE_ALT, HARNESS_ID_STR, KiroAdapter, RESEARCH_DOC,
+    };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::ids::{HarnessId, InstanceId, InstanceName};
     use crate::instance::Instance;
@@ -628,6 +649,7 @@ mod tests {
     #[test]
     fn parse_version_output_cases() {
         let cases = vec![
+            ("kiro-cli 2.22.0", Some("2.22.0")),
             ("kiro 0.5.1", Some("0.5.1")),
             ("0.3.0", Some("0.3.0")),
             ("v1.0.0", Some("1.0.0")),
@@ -638,6 +660,16 @@ mod tests {
             let got = KiroAdapter::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
+    }
+
+    /// Live-probe regression pin (2026-09-18): the vendor installer ships
+    /// `kiro-cli` only; bare `kiro` is a wrapper/bridge alias.
+    #[test]
+    fn executable_pins_vendor_name_with_alias() {
+        assert_eq!(EXECUTABLE, "kiro-cli");
+        assert_eq!(EXECUTABLE_ALT, "kiro");
+        assert_ne!(EXECUTABLE, EXECUTABLE_ALT);
+        assert_eq!(adapter().executable_name(), "kiro-cli");
     }
 
     #[test]

@@ -1,9 +1,14 @@
 //! Cursor adapter — `CURSOR_CONFIG_DIR` plus IDE `--user-data-dir` isolation.
 //!
-//! Research source: `docs/harness-configs/cursor.md` (last verified 2026-08-25).
+//! Research source: `docs/harness-configs/cursor.md` (last verified 2026-08-25;
+//! MCP read paths live-verified 2026-09-18).
 //! Executables `cursor` (IDE) and `agent`/`cursor-agent` (CLI), CLI config
 //! `~/.cursor/cli-config.json` via `$CURSOR_CONFIG_DIR`, IDE user-data via
 //! `--user-data-dir` + `--extensions-dir`, isolation `ide-user-data`.
+//! NOTE (live probe, agent 2026.09.15-d2fe57e): `mcp.json` is NOT relocated
+//! by `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` — the agent reads it only from
+//! `$HOME/.cursor/mcp.json` and project `.cursor/mcp.json`; only
+//! `cli-config.json` follows `CURSOR_CONFIG_DIR`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,6 +59,11 @@ pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 
 /// Default CLI config fallback.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.cursor";
+
+/// Live-read user MCP fallback (agent 2026.09.15-d2fe57e ignores
+/// `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` for `mcp.json` — probe-verified
+/// 2026-09-18, evidence live/cursor/mcp-readpath-r6.log).
+pub const MCP_READ_PATH_FALLBACK: &str = "~/.cursor/mcp.json";
 
 /// Research document link.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/cursor.md";
@@ -230,6 +240,19 @@ impl CursorAdapter {
         Some(PathBuf::from(home).join(".cursor"))
     }
 
+    /// Live user-MCP read path `$HOME/.cursor/mcp.json` — the agent does not
+    /// relocate `mcp.json` via `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME`
+    /// (probe-verified 2026-09-18, evidence live/cursor/mcp-readpath-r6.log).
+    fn mcp_read_path() -> Option<PathBuf> {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        if home.trim().is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(home).join(".cursor").join("mcp.json"))
+    }
+
     /// IDE user-data root default.
     fn default_user_data_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
@@ -293,10 +316,6 @@ impl CursorAdapter {
                             cli_config.display()
                         ));
                     }
-                    let mcp = root.join("mcp.json");
-                    if mcp.exists() {
-                        evidence.push(format!("mcp.json found at {}", mcp.display()));
-                    }
                     let rules = Path::new(".cursor").join("rules");
                     if rules.exists() {
                         evidence.push(format!(".cursor/rules present at {}", rules.display()));
@@ -306,6 +325,13 @@ impl CursorAdapter {
                 }
             }
             None => evidence.push("could not resolve config root (no HOME)".to_owned()),
+        }
+        // `mcp.json` lives at the HOME-based live read path, NOT under the
+        // (env-relocated) config root that holds `cli-config.json`.
+        if let Some(mcp) = Self::mcp_read_path()
+            && mcp.exists()
+        {
+            evidence.push(format!("mcp.json found at {}", mcp.display()));
         }
         if let Some(user_data) = Self::default_user_data_root() {
             if user_data.exists() {
@@ -490,11 +516,15 @@ impl Adapter for CursorAdapter {
         project_cli.backup_required = true;
         surfaces.push(project_cli);
 
+        // Live-read layout (probe 2026-09-18): `agent mcp list` reads only
+        // `$HOME/.cursor/mcp.json` (+ project `.cursor/mcp.json`); a file at
+        // `$CURSOR_CONFIG_DIR/mcp.json` or `$XDG_CONFIG_HOME/cursor/mcp.json`
+        // is ignored — unlike `cli-config.json`, which does follow the env.
         let mcp_resolver = PathResolver::new(
-            Some("$CURSOR_CONFIG_DIR/mcp.json"),
-            Some("$CURSOR_CONFIG_DIR/mcp.json"),
-            Some("%CURSOR_CONFIG_DIR%\\mcp.json"),
-            "~/.cursor/mcp.json",
+            Some(MCP_READ_PATH_FALLBACK),
+            Some(MCP_READ_PATH_FALLBACK),
+            Some("%USERPROFILE%\\.cursor\\mcp.json"),
+            MCP_READ_PATH_FALLBACK,
         );
         let mut mcp = ConfigSurface::new(
             "mcp.json",
@@ -638,7 +668,7 @@ impl Adapter for CursorAdapter {
             "~/.cursor/cli-config.json".to_owned(),
             "~/.cursor/mcp.json".to_owned(),
             "$CURSOR_CONFIG_DIR/cli-config.json".to_owned(),
-            "$CURSOR_CONFIG_DIR/mcp.json".to_owned(),
+            "$HOME/.cursor/mcp.json (mcp.json ignores CURSOR_CONFIG_DIR)".to_owned(),
             ".cursor/cli.json".to_owned(),
             ".cursor/mcp.json".to_owned(),
             "~/.config/Cursor/User/settings.json".to_owned(),
@@ -674,7 +704,9 @@ impl Adapter for CursorAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (cursor.md 1.2: `~/.cursor/mcp.json` global + project `.cursor/mcp.json`)
+    /// EXT-08/09: MCP destination (cursor.md §1.2: `~/.cursor/mcp.json` global
+    /// and project `.cursor/mcp.json` — live-confirmed read paths; the agent
+    /// does NOT read `$CURSOR_CONFIG_DIR/mcp.json`, probe 2026-09-18).
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp.json",
@@ -696,8 +728,8 @@ impl Adapter for CursorAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONFIG_ENV_VAR, CursorAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS,
-        RESEARCH_DOC, USER_DATA_DIR_FLAG,
+        CONFIG_ENV_VAR, CursorAdapter, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
+        MCP_READ_PATH_FALLBACK, OWNED_SELECTORS, RESEARCH_DOC, USER_DATA_DIR_FLAG,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -783,6 +815,65 @@ mod tests {
         }
         let mcp = surfaces.iter().find(|s| s.id == "mcp.json").unwrap();
         assert!(mcp.owned_selectors.contains(&"mcpServers".to_owned()));
+    }
+
+    /// Live-probe regression pin (2026-09-18, agent 2026.09.15-d2fe57e): the
+    /// agent reads `mcp.json` only from `$HOME/.cursor/mcp.json` (+ project
+    /// `.cursor/mcp.json`) — never from `$CURSOR_CONFIG_DIR/mcp.json`.
+    #[test]
+    fn mcp_surface_pins_home_cursor_read_path() {
+        let a = adapter();
+        let surfaces = a.config_surfaces();
+        let mcp = surfaces
+            .iter()
+            .find(|s| s.id == "mcp.json")
+            .expect("mcp.json surface");
+        assert_eq!(
+            mcp.path_resolver.linux.as_deref(),
+            Some(MCP_READ_PATH_FALLBACK)
+        );
+        assert_eq!(
+            mcp.path_resolver.macos.as_deref(),
+            Some(MCP_READ_PATH_FALLBACK)
+        );
+        assert_eq!(
+            mcp.path_resolver.windows.as_deref(),
+            Some("%USERPROFILE%\\.cursor\\mcp.json")
+        );
+        let hints = [
+            mcp.path_resolver.linux.as_deref(),
+            mcp.path_resolver.macos.as_deref(),
+            mcp.path_resolver.windows.as_deref(),
+            Some(mcp.path_resolver.fallback.as_str()),
+        ];
+        for hint in hints.into_iter().flatten() {
+            assert!(
+                !hint.contains(CONFIG_ENV_VAR),
+                "live agent ignores {CONFIG_ENV_VAR} for mcp.json, hint: {hint}"
+            );
+        }
+        // The env-relocated config root remains correct for cli-config.json.
+        let cli = surfaces
+            .iter()
+            .find(|s| s.id == "cli-config.json")
+            .expect("cli-config.json surface");
+        assert_eq!(
+            cli.path_resolver.linux.as_deref(),
+            Some("$CURSOR_CONFIG_DIR/cli-config.json")
+        );
+    }
+
+    #[test]
+    fn scan_candidates_do_not_claim_env_relocated_mcp_json() {
+        let a = adapter();
+        let candidates = a.scan_candidates();
+        assert!(candidates.iter().any(|c| c.contains("mcp.json")));
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c == "$CURSOR_CONFIG_DIR/mcp.json"),
+            "scan must not hint the env-relocated mcp.json path the live agent ignores"
+        );
     }
 
     #[test]

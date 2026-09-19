@@ -1,0 +1,12 @@
+# foreign/unmodelled keys alongside the desktop-relevant ones — preserved on write
+notify = ["terminal-notifier"]
+
+[projects."/home/example/demo"]
+trust_level = "trusted"
+
+[desktop]
+custom_file_handlers = []
+
+[mcp_servers.keep-me]
+command = "/opt/foreign/foreign-mcp"
+args = ["--flag"]

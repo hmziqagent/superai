@@ -88,6 +88,18 @@ grok -p "prompt"                                  # one-shot
 ## 6. Other notable config sections in `config.toml`
 General settings (input mode, default selected permission, vim mode, screen mode, scroll snapping, scrolling), `[toolset]`, authentication, custom models (above), MCP servers, memory, subagents, goal mode/background workflows, skills, harness compatibility, plugins, hints, notifications (+ hooks, terminal support matrix), status line, keyboard shortcuts, telemetry, version pinning, enterprise deployment — plus separate `pager.toml` for appearance and project-scoped `.grok/config.toml`.
 
+## 6a. MCP servers — `config.toml` `[mcp_servers.<name>]` + `grok mcp` CLI ✅ writable
+
+**Live-verified 2026-09-18 against grok 1.0.34** (evidence: `.z-workflow/evidence/live/grok-build/mcp-probe.txt`; the binary also materializes its own user guide at `$GROK_HOME/docs/user-guide/07-mcp-servers.md`). Corrects the earlier corpus gap that recorded MCP as absent.
+
+- **Destination**: user-scope `config.toml` (i.e. `$GROK_HOME/config.toml` — GROK_HOME relocation honored by the MCP writer, probe-verified) under `[mcp_servers.<name>]` tables → dest key `mcp_servers`, name-map shape (same as codex-cli). Project-scope `.grok/config.toml` (cwd → git-root chain, deepest wins) also contributes `[mcp_servers]` but `grok mcp add` only writes it with `--scope project`.
+- **stdio form**: `command`, `args`, `env` (table), `enabled` (default `true` — omitted-key entries still load, probe-verified), `startup_timeout_sec`, `tool_timeout_sec`, `tool_timeouts`. **Remote form**: `url`, `headers` (table). `${VAR}` expansion on string fields at load time.
+- **CLI (own writer, probe-verified)**: `grok mcp list [--json]`, `grok mcp add <name> [-e K=V…] [--transport stdio|http|sse] [--scope user|project] -- cmd args…` (default user scope; exit 0, prints `File modified: $GROK_HOME/config.toml`), `grok mcp remove <name>` (exit 1 when absent), `grok mcp enable|disable`, `grok mcp doctor`. `enable/disable` persist to `disabled_mcp_servers` / `[mcp_servers.<name>].enabled` in user config.
+- **Pickup without restart**: config hot-reload + `/mcps` modal refresh (`r`) — no full restart required (basis for `RestartBehavior::Reload`).
+- **Read-side compat sources** (never written by superai): `.mcp.json` (project root), `~/.claude.json`, `~/.cursor/mcp.json` — merged priority config.toml > Claude > Cursor > `.mcp.json`.
+- Grok's own writer is not comment-preserving (probe: rewrite dropped a leading `#` comment but kept sibling tables like `[user_config]`); superai's TOML codec is format-preserving and restores comments — moot for correctness either way.
+- Interop nuance (probe): grok reads minimal superai-shaped tables (command/args only) and tolerates superai's `disabled = true` marker key without strict-schema rejection, but its native toggle key is `enabled` (default `true`) — so a superai-disabled entry still loads as enabled in grok until flipped via `enabled = false` / `grok mcp disable`.
+
 ## MULTI-INSTANCE WRAPPERS
 
 Two clean mechanisms:
@@ -107,4 +119,4 @@ exec grok "$@"
 (`models` is inside the env-overlay allowlist; for full custom-model blocks use `config.toml` per `GROK_HOME` instead.)
 
 ## Sources
-All four URLs above, fetched 2026-08-25.
+All four URLs above, fetched 2026-08-25. MCP section additionally from the binary-shipped user guide `crates/codegen/xai-grok-pager/docs/user-guide/07-mcp-servers.md` (same repo path), cross-checked against the live binary 2026-09-18 (grok 1.0.34; probe transcript in `.z-workflow/evidence/live/grok-build/mcp-probe.txt`).

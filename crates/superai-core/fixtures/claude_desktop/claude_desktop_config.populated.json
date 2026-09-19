@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/example/Desktop"
+      ]
+    },
+    "echo-server": {
+      "command": "/usr/local/bin/echo-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "ECHO_GREETING": "fixture"
+      }
+    }
+  }
+}

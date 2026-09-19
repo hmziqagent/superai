@@ -1,0 +1,16 @@
+{
+  "models": [
+    {
+      "id": "test-model-current",
+      "name": "Test Model (cbc >= 2.103.4, window via CODEBUDDY_AUTO_COMPACT_WINDOW)",
+      "vendor": "OpenAI",
+      "url": "https://api.example.com/v1/chat/completions",
+      "apiKey": "${CBC_TEST_API_KEY}",
+      "maxOutputTokens": 8192,
+      "supportsToolCall": true,
+      "supportsImages": false,
+      "supportsReasoning": true
+    }
+  ],
+  "availableModels": ["test-model-current"]
+}

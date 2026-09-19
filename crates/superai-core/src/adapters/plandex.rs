@@ -4,7 +4,8 @@
 //! Executable `plandex`, env-driven providers
 //! (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
 //!  `PLANDEX_API_HOST`/`PLANDEX_ENV` plus `PLANDEX_BASE_DIR`/`DATABASE_URL` for
-//!  self-host), custom models JSON via `plandex models custom`
+//!  self-host), custom models JSON `~/.plandex-home-v2/custom-models.json` via
+//!  `plandex models custom`
 //!  (`https://plandex.ai/schemas/models-input.schema.json`, `providers`/`models`/
 //!  `modelPacks`), per-plan roles (`planner`/`coder`/… with temperature/strongModel
 //!  fallbacks), provider precedence + `OpenRouter` failover, isolation `env_only`,
@@ -59,6 +60,19 @@ pub const SERVER_BASE_DIR_ENV_VAR: &str = "PLANDEX_BASE_DIR";
 
 /// Database URL (self-host).
 pub const DATABASE_URL_ENV_VAR: &str = "DATABASE_URL";
+
+/// Per-user home directory the v2 CLI keeps its state in. Live-verified
+/// against plandex cli/v2.2.1: the binary materializes `~/.plandex-home-v2/`
+/// (cache/, plandex.log) and its strings carry `.plandex-home-v2` joined with
+/// `projects-v2.json`/`settings-v2.json`/`custom-models.json` — there is NO
+/// relocation env (`PLANDEX_HOME`/`PLANDEX_MODELS_FILE` absent from the
+/// binary) and NO `.config/plandex` or `~/.plandex/models.json` path
+/// (area-5 evidence, `.z-workflow/evidence/live/plandex/`).
+pub const V2_HOME_DIR_HINT: &str = "~/.plandex-home-v2";
+
+/// Custom models JSON file inside the v2 home (created/edited by
+/// `plandex models custom`; schema `models-input.schema.json`).
+pub const CUSTOM_MODELS_FILE: &str = "custom-models.json";
 
 /// Research document link.
 pub const RESEARCH_DOC: &str = "docs/harness-configs/plandex.md";
@@ -233,26 +247,22 @@ impl PlandexAdapter {
         None
     }
 
-    /// Resolve the custom models JSON path: heuristic `~/.config/plandex/models.json` or `~/.plandex/models.json`.
+    /// Resolve the custom models JSON path: `~/.plandex-home-v2/custom-models.json`
+    /// (the real v2 home materialized by plandex cli/v2.2.1; the binary contains
+    /// no `.config/plandex` or `~/.plandex/models.json` path — those legacy
+    /// heuristics matched no live layout).
     fn custom_models_path() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
-            && !home.trim().is_empty()
-        {
-            let candidate = PathBuf::from(&home)
-                .join(".config")
-                .join("plandex")
-                .join("models.json");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            let alt = PathBuf::from(&home).join(".plandex").join("models.json");
-            if alt.exists() {
-                return Some(alt);
-            }
-            // Default to xdg path even if missing for evidence.
-            return Some(candidate);
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        if home.trim().is_empty() {
+            return None;
         }
-        None
+        Some(
+            PathBuf::from(home)
+                .join(".plandex-home-v2")
+                .join(CUSTOM_MODELS_FILE),
+        )
     }
 
     /// Build detection evidence about env, custom models, and server config.
@@ -476,10 +486,12 @@ impl Adapter for PlandexAdapter {
         surfaces.push(env_surface);
 
         let models_resolver = PathResolver::new(
-            Some("~/.config/plandex/models.json (custom models, via `plandex models custom`)"),
-            Some("~/.config/plandex/models.json (via `plandex models custom`)"),
-            Some("%USERPROFILE%\\.config\\plandex\\models.json"),
-            "~/.config/plandex/models.json (`plandex models custom`, providers/models/modelPacks)",
+            Some(
+                "~/.plandex-home-v2/custom-models.json (custom models, via `plandex models custom`)",
+            ),
+            Some("~/.plandex-home-v2/custom-models.json (via `plandex models custom`)"),
+            Some("%USERPROFILE%\\.plandex-home-v2\\custom-models.json"),
+            "~/.plandex-home-v2/custom-models.json (`plandex models custom`, providers/models/modelPacks)",
         );
         let mut models_surface = ConfigSurface::new(
             "custom-models.json",
@@ -498,24 +510,6 @@ impl Adapter for PlandexAdapter {
         models_surface.backup_required = true;
         models_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(models_surface);
-
-        let alt_models_resolver =
-            PathResolver::fallback_only("~/.plandex/models.json (alt custom path)");
-        let mut alt_models = ConfigSurface::new(
-            "custom-models.json (alt)",
-            alt_models_resolver,
-            DocumentKind::Json,
-            ConfigScope::User,
-            SurfaceOwnership::UserEditable,
-        );
-        alt_models.precedence = 11;
-        alt_models.owned_selectors = vec![
-            "providers".to_owned(),
-            "models".to_owned(),
-            "modelPacks".to_owned(),
-        ];
-        alt_models.backup_required = true;
-        surfaces.push(alt_models);
 
         let server_resolver = PathResolver::new(
             Some("$PLANDEX_BASE_DIR + $DATABASE_URL + $PORT + $GOENV (server, self-host)"),
@@ -624,20 +618,23 @@ impl Adapter for PlandexAdapter {
             .push((ENV_ENV_VAR.to_owned(), "production".to_owned()));
         // Provider keys are template/secrets driven; wrapper sets host + env marker.
         plan.description = format!(
-            " Wrapper sets {API_HOST_ENV_VAR}=http://localhost:{derived_port} {ENV_ENV_VAR}=production (provider keys via template, custom models JSON per-user-file, server PLANDEX_BASE_DIR/DATABASE_URL per-deploy, {CONSTRAINED_NOTE})"
+            " Wrapper sets {API_HOST_ENV_VAR}=http://localhost:{derived_port} {ENV_ENV_VAR}=production and HOME={} (provider keys via template, custom models JSON at <home>/.plandex-home-v2/custom-models.json, server PLANDEX_BASE_DIR/DATABASE_URL per-deploy, {CONSTRAINED_NOTE})",
+            instance.config_root
         );
-        // Also expose instance isolation hint via custom models path env if needed
-        plan.env_vars.push((
-            "PLANDEX_MODELS_FILE".to_owned(),
-            format!("{}/models.json", instance.config_root),
-        ));
+        // Isolation: plandex v2 has NO relocation env (live cli/v2.2.1 carries no
+        // PLANDEX_HOME/PLANDEX_MODELS_FILE); its home is HOME-relative
+        // (~/.plandex-home-v2), so per-instance isolation relocates HOME itself
+        // (aider precedent) — custom models land at
+        // <config_root>/.plandex-home-v2/custom-models.json.
+        plan.env_vars
+            .push(("HOME".to_owned(), instance.config_root.to_string()));
         Ok(plan)
     }
 
     fn scan_candidates(&self) -> Vec<String> {
         vec![
-            "~/.config/plandex/models.json".to_owned(),
-            "~/.plandex/models.json".to_owned(),
+            "~/.plandex-home-v2".to_owned(),
+            "~/.plandex-home-v2/custom-models.json".to_owned(),
             "$PLANDEX_API_HOST via PLANDEX_API_HOST".to_owned(),
             "$PLANDEX_BASE_DIR via PLANDEX_BASE_DIR (server)".to_owned(),
             "$DATABASE_URL via DATABASE_URL (server)".to_owned(),
@@ -801,7 +798,10 @@ mod tests {
     fn config_surfaces_include_env_and_custom_models() {
         let a = adapter();
         let surfaces = a.config_surfaces();
-        assert!(surfaces.len() >= 4);
+        // env + custom-models + server env + per-plan roles (the legacy
+        // `~/.plandex/models.json` alt surface was removed: the live v2
+        // binary contains no such path).
+        assert_eq!(surfaces.len(), 4);
         let env = surfaces
             .iter()
             .find(|s| s.id == "env (PLANDEX_* + provider keys)")
@@ -832,6 +832,63 @@ mod tests {
             .find(|s| s.id == "server env (self-host)")
             .expect("server env must exist");
         assert_eq!(server.scope, ConfigScope::SystemManaged);
+    }
+
+    /// Custom models live in the REAL v2 home `~/.plandex-home-v2/` (live
+    /// plandex cli/v2.2.1 materialized it; binary strings carry
+    /// `.plandex-home-v2` + `custom-models.json` and no `.config/plandex` /
+    /// `~/.plandex/models.json` path — area-5 evidence,
+    /// `.z-workflow/evidence/live/plandex/`).
+    #[test]
+    fn custom_models_surface_pins_v2_home_layout() {
+        let a = adapter();
+        let models = a
+            .config_surfaces()
+            .into_iter()
+            .find(|s| s.id == "custom-models.json")
+            .expect("custom-models.json must exist");
+        let resolver = &models.path_resolver;
+        assert_eq!(
+            resolver.linux.as_deref(),
+            Some(
+                "~/.plandex-home-v2/custom-models.json (custom models, via `plandex models custom`)"
+            )
+        );
+        assert_eq!(
+            resolver.macos.as_deref(),
+            Some("~/.plandex-home-v2/custom-models.json (via `plandex models custom`)")
+        );
+        assert_eq!(
+            resolver.windows.as_deref(),
+            Some("%USERPROFILE%\\.plandex-home-v2\\custom-models.json")
+        );
+        assert_eq!(
+            resolver.fallback,
+            "~/.plandex-home-v2/custom-models.json (`plandex models custom`, providers/models/modelPacks)"
+        );
+        // no surface may reference the legacy heuristic paths
+        for surface in a.config_surfaces() {
+            for hint in [
+                surface.path_resolver.linux.clone(),
+                surface.path_resolver.macos.clone(),
+                surface.path_resolver.windows.clone(),
+                Some(surface.path_resolver.fallback.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(
+                    !hint.contains(".config/plandex"),
+                    "surface `{}` still references legacy .config/plandex: {hint}",
+                    surface.id
+                );
+                assert!(
+                    !hint.contains("~/.plandex/models.json"),
+                    "surface `{}` still references legacy ~/.plandex/models.json: {hint}",
+                    surface.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -879,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_wrapper_sets_api_host_and_models_file() {
+    fn plan_wrapper_sets_api_host_and_home() {
         let a = adapter();
         let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".plandex-work"));
         let plan = a.plan_wrapper(&inst).unwrap();
@@ -888,10 +945,12 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == API_HOST_ENV_VAR && v.contains("localhost"))
         );
+        // Isolation relocates HOME (no relocation env exists in the v2
+        // binary), so custom models land at <root>/.plandex-home-v2/.
         assert!(
             plan.env_vars
                 .iter()
-                .any(|(k, v)| k == "PLANDEX_MODELS_FILE" && v.contains(".plandex-work"))
+                .any(|(k, v)| k == "HOME" && v.contains(".plandex-work"))
         );
         assert!(!plan.description.is_empty());
         assert!(plan.description.contains(API_HOST_ENV_VAR));
@@ -904,14 +963,14 @@ mod tests {
         let a = adapter();
         let inst = sample_instance_with_root(&root);
         let plan = a.plan_wrapper(&inst).unwrap();
-        let models_file = plan
+        let home = plan
             .env_vars
             .iter()
-            .find(|(k, _)| k == "PLANDEX_MODELS_FILE")
+            .find(|(k, _)| k == "HOME")
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(models_file, format!("{root}/models.json"));
-        assert!(models_file.contains(' '));
+        assert_eq!(home, root.as_str());
+        assert!(home.contains(' '));
     }
 
     #[test]
