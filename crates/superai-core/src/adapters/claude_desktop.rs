@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use superai_config::document::ValueType;
 
+use serde_json::Value;
+
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
     DetectionResult, DocumentKind, Os, PathResolver, Platform, ProductStatus, RestartBehavior,
@@ -82,6 +84,216 @@ pub const OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
 /// MCP container selector.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
+
+// ---------------------------------------------------------------------------
+// Third-party inference ("Claude Desktop on 3P") provider surface (run-5)
+// ---------------------------------------------------------------------------
+
+/// Linux local 3P config root (official config reference; the 3P instance
+/// writes here while the 1P instance uses `~/.config/Claude` — the two modes
+/// coexist by design).
+pub const THIRD_PARTY_LINUX_ROOT: &str = "~/.config/Claude-3p";
+
+/// macOS local 3P config root.
+pub const THIRD_PARTY_MACOS_ROOT: &str = "~/Library/Application Support/Claude-3p";
+
+/// Windows local 3P config root.
+pub const THIRD_PARTY_WINDOWS_ROOT: &str = "%LOCALAPPDATA%\\Claude-3p";
+
+/// Directory inside the 3P root holding the local inference configuration
+/// (official: "local: `~/.config/Claude-3p/configLibrary/`").
+pub const THIRD_PARTY_LIBRARY_DIR: &str = "configLibrary";
+
+/// Default library file name. HONESTY NOTE: the per-OS `configLibrary`
+/// DIRECTORY is officially documented, but the exact file name inside it is
+/// NOT published in the fetched docs (2026-09-19, claude.com
+/// /docs/third-party/claude-desktop/configuration) — the name is therefore
+/// a parameter of [`commit_third_party_inference`] with this default, to be
+/// pinned by live verification (run-5 area C).
+pub const THIRD_PARTY_LIBRARY_FILE: &str = "inference.json";
+
+/// The gateway-group + connection keys superai owns on the 3P surface
+/// (official key names, claude.com third-party configuration reference).
+pub const THIRD_PARTY_OWNED_SELECTORS: &[&str] = &[
+    "inferenceGatewayBaseUrl",
+    "inferenceGatewayApiKey",
+    "inferenceGatewayAuthScheme",
+    "inferenceProvider",
+    "inferenceModels",
+];
+
+/// Auth scheme the 3P gateway expects (official enum: `bearer` default |
+/// `x-api-key`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThirdPartyAuthScheme {
+    /// `Authorization: Bearer <key>` (the documented default).
+    Bearer,
+    /// `x-api-key: <key>`.
+    XApiKey,
+}
+
+impl ThirdPartyAuthScheme {
+    /// The wire value the app config expects.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::XApiKey => "x-api-key",
+        }
+    }
+}
+
+/// A third-party inference configuration for Claude Desktop (official
+/// "Deploy Claude Desktop on 3P with an LLM gateway" keys). The gateway must
+/// be Anthropic-Messages-compatible: the app appends `/v1/messages` to the
+/// base URL (Bifrost integration docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThirdPartyInference<'a> {
+    /// Full URL of the inference gateway endpoint
+    /// (`inferenceGatewayBaseUrl`).
+    pub gateway_base_url: &'a str,
+    /// API key for the gateway (`inferenceGatewayApiKey`). The 3P config
+    /// file is the app's own official credential sink — there is NO env
+    /// mechanism — so this value IS written to that file (hardened 0600,
+    /// backed up, foreign keys preserved), matching how
+    /// [`crate::provider::commit_api_key`] treats harness-declared config
+    /// sinks. It is never written to any manifest, record, or log.
+    pub api_key: &'a crate::error::RedactedString,
+    /// Auth scheme (`inferenceGatewayAuthScheme`).
+    pub auth_scheme: ThirdPartyAuthScheme,
+    /// `inferenceProvider` value; the gateway flow uses `gateway`.
+    pub provider: &'a str,
+    /// `inferenceModels` names, first = default model.
+    pub models: Vec<String>,
+}
+
+impl<'a> ThirdPartyInference<'a> {
+    /// A gateway-flavored configuration with the documented defaults.
+    #[must_use]
+    pub fn gateway(
+        base_url: &'a str,
+        api_key: &'a crate::error::RedactedString,
+        auth_scheme: ThirdPartyAuthScheme,
+    ) -> Self {
+        Self {
+            gateway_base_url: base_url,
+            api_key,
+            auth_scheme,
+            provider: "gateway",
+            models: Vec::new(),
+        }
+    }
+
+    /// Pin the model list (first entry is the default).
+    #[must_use]
+    pub fn with_models(mut self, models: Vec<String>) -> Self {
+        self.models = models;
+        self
+    }
+}
+
+/// The 3P inference surface DECLARATION: a standalone, explicitly-reached
+/// surface (NOT part of [`Adapter::config_surfaces`], which is resolved
+/// under `instance.config_root` and pinned by the adapter's five-piece
+/// tests): its root is a SEPARATE fixed path per OS (`Claude-3p`), reached
+/// through the profile mechanism with parameterized paths
+/// (see [`crate::profile`]).
+pub fn third_party_inference_surface() -> ConfigSurface {
+    let file = format!("{THIRD_PARTY_LIBRARY_DIR}/{THIRD_PARTY_LIBRARY_FILE}");
+    let resolver = PathResolver::new(
+        Some(&format!("{THIRD_PARTY_LINUX_ROOT}/{file}")),
+        Some(&format!("{THIRD_PARTY_MACOS_ROOT}/{file}")),
+        Some(&format!(
+            "{THIRD_PARTY_WINDOWS_ROOT}\\{THIRD_PARTY_LIBRARY_DIR}\\{THIRD_PARTY_LIBRARY_FILE}"
+        )),
+        &format!("{THIRD_PARTY_MACOS_ROOT}/{file}"),
+    );
+    let mut surface = ConfigSurface::new(
+        &file,
+        resolver,
+        DocumentKind::Json,
+        ConfigScope::User,
+        SurfaceOwnership::UserEditable,
+    );
+    surface.precedence = 10;
+    surface.owned_selectors = THIRD_PARTY_OWNED_SELECTORS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    surface.backup_required = true;
+    surface.restart_behavior = RestartBehavior::Restart;
+    surface
+}
+
+/// Write a third-party inference configuration into the 3P `configLibrary`
+/// under `config_root` (the Claude-3p-shaped root — a profile's managed tree
+/// in the profile flow, a fake root in tests; never resolved from the real
+/// home here).
+///
+/// Fresh read → backup → atomic write through the config crate's mutation
+/// boundary, preserving every foreign key (managed-settings neighbors like
+/// `inferenceStreamIdleTimeoutSec` or `egressProxyUrl` survive untouched);
+/// the file is hardened to 0600 because it carries the gateway key. Returns
+/// the written file path.
+pub fn commit_third_party_inference(
+    config_root: &Path,
+    library_file: &str,
+    config: &ThirdPartyInference<'_>,
+) -> Result<PathBuf, CoreError> {
+    let path = config_root.join(THIRD_PARTY_LIBRARY_DIR).join(library_file);
+    let key = config.api_key.expose_secret().to_owned();
+    superai_config::json::edit(&path, |map| {
+        map.insert(
+            "inferenceGatewayBaseUrl".to_owned(),
+            Value::String(config.gateway_base_url.to_owned()),
+        );
+        map.insert(
+            "inferenceGatewayApiKey".to_owned(),
+            Value::String(key.clone()),
+        );
+        map.insert(
+            "inferenceGatewayAuthScheme".to_owned(),
+            Value::String(config.auth_scheme.as_str().to_owned()),
+        );
+        map.insert(
+            "inferenceProvider".to_owned(),
+            Value::String(config.provider.to_owned()),
+        );
+        let models: Vec<Value> = config
+            .models
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        map.insert("inferenceModels".to_owned(), Value::Array(models));
+    })
+    .map_err(CoreError::Config)?;
+    harden_file_permissions(&path)?;
+    Ok(path)
+}
+
+/// Unix: tighten the 3P config to owner-only (0600) — it carries the gateway
+/// key. Windows has no mode bits; the atomic write already creates the file
+/// with user-only defaults. (Same treatment as the provider key sink in
+/// `provider.rs`.)
+#[cfg(unix)]
+fn harden_file_permissions(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let perm = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perm).map_err(|e| CoreError::InvalidPath {
+        kind: "permissions".to_owned(),
+        value: path.display().to_string(),
+        reason: format!("cannot set 0o600: {e}"),
+    })
+}
+
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "no-op off unix; callers keep the Result contract"
+)]
+fn harden_file_permissions(_path: &Path) -> Result<(), CoreError> {
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Adapter struct
@@ -892,5 +1104,194 @@ mod tests {
                 .any(|d| d.message.contains("root must be") && d.message.contains("object")),
             "non-object root must be rejected: {diags:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Run-5: third-party inference ("Claude Desktop on 3P") surface
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn third_party_surface_declares_official_keys_and_roots() {
+        let surface = super::third_party_inference_surface();
+        assert_eq!(surface.kind, DocumentKind::Json);
+        assert_eq!(surface.scope, ConfigScope::User);
+        assert_eq!(surface.ownership, SurfaceOwnership::UserEditable);
+        assert_eq!(surface.restart_behavior, RestartBehavior::Restart);
+        assert!(surface.backup_required);
+        // Official key names, verbatim.
+        for key in super::THIRD_PARTY_OWNED_SELECTORS {
+            assert!(
+                surface.owned_selectors.contains(&(*key).to_owned()),
+                "owned selector {key} missing"
+            );
+        }
+        // The three officially documented local roots (Claude-3p siblings of
+        // the 1P roots) and the configLibrary dir; never the 1P root.
+        let hints = [
+            surface.path_resolver.linux.as_deref(),
+            surface.path_resolver.macos.as_deref(),
+            surface.path_resolver.windows.as_deref(),
+        ];
+        for hint in hints.into_iter().flatten() {
+            assert!(hint.contains("Claude-3p"), "3P root missing: {hint}");
+            assert!(
+                hint.contains(super::THIRD_PARTY_LIBRARY_DIR),
+                "configLibrary missing: {hint}"
+            );
+            assert!(!hint.contains("Claude-3p-3p"), "{hint}");
+        }
+        // The declaration is NOT part of config_surfaces() (pinned 1P
+        // partition): it is reached explicitly with parameterized roots.
+        let a = adapter();
+        assert!(
+            !a.config_surfaces().iter().any(|s| s.id == surface.id),
+            "the 3P surface is a separate fixed root, not under config_root"
+        );
+    }
+
+    #[test]
+    fn third_party_write_preserves_foreign_keys_and_hardens() {
+        let root = crate::test_util::temp_dir_unique("claude-3p-write");
+        let library = root.join(super::THIRD_PARTY_LIBRARY_DIR);
+        std::fs::create_dir_all(&library).unwrap();
+        let file = library.join(super::THIRD_PARTY_LIBRARY_FILE);
+        std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "inferenceStreamIdleTimeoutSec": 600,
+                "coworkEgressAllowedHosts": ["example.com"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let key = crate::error::RedactedString::new("dummy-gateway-token");
+        let config = super::ThirdPartyInference::gateway(
+            "http://127.0.0.1:8787",
+            &key,
+            super::ThirdPartyAuthScheme::Bearer,
+        )
+        .with_models(vec!["gateway-default".to_owned()]);
+        let written =
+            super::commit_third_party_inference(&root, super::THIRD_PARTY_LIBRARY_FILE, &config)
+                .unwrap();
+        assert_eq!(written, file);
+
+        let value = superai_config::json::load(&file).unwrap();
+        assert_eq!(
+            value.get("inferenceGatewayBaseUrl"),
+            Some(&serde_json::json!("http://127.0.0.1:8787"))
+        );
+        assert_eq!(
+            value.get("inferenceGatewayApiKey"),
+            Some(&serde_json::json!("dummy-gateway-token"))
+        );
+        assert_eq!(
+            value.get("inferenceGatewayAuthScheme"),
+            Some(&serde_json::json!("bearer"))
+        );
+        assert_eq!(
+            value.get("inferenceProvider"),
+            Some(&serde_json::json!("gateway"))
+        );
+        assert_eq!(
+            value.get("inferenceModels"),
+            Some(&serde_json::json!([{"name": "gateway-default"}]))
+        );
+        // Foreign managed-settings neighbors survive.
+        assert_eq!(
+            value.get("inferenceStreamIdleTimeoutSec"),
+            Some(&serde_json::json!(600))
+        );
+        assert_eq!(
+            value.get("coworkEgressAllowedHosts"),
+            Some(&serde_json::json!(["example.com"]))
+        );
+        // Foreign-authored original was backed up; file hardened to 0600.
+        assert!(superai_config::backup::list_backups(&file).is_ok_and(|b| !b.is_empty()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "gateway key file must be 0600");
+        }
+
+        // The x-api-key scheme round-trips its official wire value.
+        let xapikey = super::ThirdPartyInference::gateway(
+            "http://127.0.0.1:8787",
+            &key,
+            super::ThirdPartyAuthScheme::XApiKey,
+        );
+        super::commit_third_party_inference(&root, super::THIRD_PARTY_LIBRARY_FILE, &xapikey)
+            .unwrap();
+        let value = superai_config::json::load(&file).unwrap();
+        assert_eq!(
+            value.get("inferenceGatewayAuthScheme"),
+            Some(&serde_json::json!("x-api-key"))
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The run-5 area-A reachability requirement: the 3P keys are written
+    /// THROUGH the profile mechanism (the config file's root is fixed-path,
+    /// so a symlink-swap profile puts it in place) — all on fake roots.
+    #[test]
+    fn third_party_keys_reach_the_fixed_path_via_a_profile_swap() {
+        use crate::profile;
+        let base = crate::test_util::temp_dir_unique("claude-3p-profile-base");
+        let record = profile::create_profile(
+            &base,
+            &profile::ProfileSpec::new(
+                HarnessId::new(HARNESS_ID_STR).unwrap(),
+                InstanceName::new("gatewayed").unwrap(),
+            ),
+        )
+        .unwrap();
+        // Seed the 3P inference config INTO the managed profile tree.
+        let key = crate::error::RedactedString::new("dummy-gateway-token");
+        let config = super::ThirdPartyInference::gateway(
+            "http://127.0.0.1:8787",
+            &key,
+            super::ThirdPartyAuthScheme::Bearer,
+        )
+        .with_models(vec!["gateway-default".to_owned()]);
+        super::commit_third_party_inference(
+            record.root.as_path(),
+            super::THIRD_PARTY_LIBRARY_FILE,
+            &config,
+        )
+        .unwrap();
+
+        // Swap the profile in at a FAKE Claude-3p fixed path (never the real
+        // home) and read the keys back through that path.
+        let fake_fixed = crate::test_util::temp_dir_unique("claude-3p-fake-root");
+        let fixed_path = fake_fixed.join(".config").join("Claude-3p");
+        profile::activate_profile(
+            &base,
+            &HarnessId::new(HARNESS_ID_STR).unwrap(),
+            "gatewayed",
+            &fixed_path,
+        )
+        .unwrap();
+        let through_path = fixed_path
+            .join(super::THIRD_PARTY_LIBRARY_DIR)
+            .join(super::THIRD_PARTY_LIBRARY_FILE);
+        let value = superai_config::json::load(&through_path).unwrap();
+        assert_eq!(
+            value.get("inferenceGatewayBaseUrl"),
+            Some(&serde_json::json!("http://127.0.0.1:8787"))
+        );
+        assert_eq!(
+            value.get("inferenceGatewayApiKey"),
+            Some(&serde_json::json!("dummy-gateway-token"))
+        );
+
+        // Deactivate removes the swap; the fixed path is gone again (there
+        // was no pre-existing content to restore).
+        profile::deactivate_profile(&base, &HarnessId::new(HARNESS_ID_STR).unwrap(), &fixed_path)
+            .unwrap();
+        assert!(!fixed_path.exists(), "swap removed");
+        drop(std::fs::remove_dir_all(&base));
+        drop(std::fs::remove_dir_all(&fake_fixed));
     }
 }

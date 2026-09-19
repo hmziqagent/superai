@@ -88,8 +88,13 @@ pub mod activation;
 pub mod daemon;
 
 /// Multi-instance alias core: per-alias relocated roots, seeded MCP/plugin
-/// sets, and launch composition (run-4 area a).
+/// sets, third-party provider overrides, HOME-virtualized desktop
+/// instances, and launch composition (run-4 area a, run-5 area A).
 pub mod alias;
+
+/// Symlink-swap profiles over parameterized fixed config paths: the
+/// desktop alternative for unrelocatable harnesses (run-5 area A).
+pub mod profile;
 
 #[cfg(test)]
 mod test_util;
