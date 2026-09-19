@@ -240,8 +240,6 @@ mod tests {
         assert_eq!(seen.len(), threads);
     }
 
-    // ---- QAL-01: retain-on-failure policy ----
-
     #[test]
     fn keep_mode_parses_env_values() {
         assert_eq!(keep_mode_from_env_value(None), KeepMode::No);

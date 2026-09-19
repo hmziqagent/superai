@@ -1,31 +1,20 @@
-//! Env files — `KEY=value`, `export KEY=value`, quoting, comments, duplicates.
+//! Env files: `KEY=value`, `export KEY=value`, quoting, comments, duplicates.
 //!
-//! Crate research (DOC-07):
-//! - `dotenvy` 0.15.7 exists on crates.io, MIT OR Apache-2.0, maintained fork of
-//!   `dotenv`, verifies with `cargo search dotenvy` and `cargo info dotenvy`.
-//!   It parses `KEY=value` and `export KEY=value`, supports single/double/unquoted
-//!   values, handles comments and blank lines, but **does not preserve** comments,
-//!   blank lines, export prefix, quoting style, spacing, or duplicate entries on
-//!   write — it is a loader, not a lossless editor.
-//! - `dotenv` 0.15.0 and `const-dotenvy` also exist but have the same limitation.
-//! - For superai's requirement to preserve comments, blank lines, export prefix,
-//!   quoting, spacing, and duplicate-key policy, a custom line-preserving parser
-//!   is required (similar to `toml_edit` for TOML). No existing crate offers
-//!   lossless round-tripping with `export` and duplicate preservation at the
-//!   level required, so this module implements its own parser.
+//! No existing crate round-trips env files losslessly (dotenvy and friends
+//! are loaders: they drop comments, blank lines, export prefixes, quoting
+//! style, and duplicates on write), so this module implements its own
+//! line-preserving parser (DOC-07).
 //!
-//! Preservation contract (DOC-07):
+//! Preservation contract:
 //! - Comments (`# ...`), blank lines, `export` prefix, quoting style
-//!   (`'`, `"`, or unquoted), spacing around `=`, and newline style (LF vs CRLF)
-//!   are preserved where untouched.
-//! - Duplicate keys are preserved; the effective value is the last occurrence.
-//!   Edits update the **last** occurrence and never silently deduplicate.
-//! - Duplicate policy is adapter-declared: this module implements
-//!   "edit effective last value" and preserves earlier duplicates. Rejecting
-//!   ambiguity or using a dedicated generated file is left to the adapter.
-//! - CRLF inputs are preserved on edit (detected from raw bytes).
-//! - Single/double quotes and escapes are handled (`\"`, `\\`, `\n`, `\r`, `\t` in
-//!   double quotes; `\'`, `\\` in single quotes; `\#` in unquoted).
+//!   (`'`, `"`, or unquoted), spacing around `=`, and newline style (LF vs
+//!   CRLF) are preserved where untouched.
+//! - Duplicate keys are preserved; the effective value is the last
+//!   occurrence. Edits update the **last** occurrence and never silently
+//!   deduplicate. Stricter duplicate policy is the adapter's call.
+//! - Single/double quotes and escapes are handled (`\"`, `\\`, `\n`, `\r`,
+//!   `\t` in double quotes; `\'`, `\\` in single quotes; `\#` in unquoted).
+//!   Values are kept literal: no `$VAR` expansion is performed or honored.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -304,8 +293,7 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
     let key: String;
     if left_trimmed.starts_with("export") {
         let after_export = left_trimmed.get(6..).unwrap_or_default();
-        // "export" must be followed by whitespace or be the whole left part? But left is before '=', so after_export should be whitespace + key or empty? Actually export prefix is "export " then key.
-        // left_trimmed is like "export FOO" or "export   FOO" or "FOO"
+        // Only "export<whitespace>KEY" carries the prefix; "exportFOO" is a key.
         if after_export.is_empty() {
             return Err(format!("invalid env line (export without key): {raw}"));
         }
@@ -316,7 +304,6 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
                 return Err(format!("invalid env line (export without key): {raw}"));
             }
         } else {
-            // "exportFOO" is not export prefix, treat as key
             key = left_trimmed.to_owned();
         }
     } else {
@@ -326,7 +313,6 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
     if key.is_empty() {
         return Err(format!("invalid env line (empty key): {raw}"));
     }
-    // Validate key chars: allow alphanumeric, underscore, dot? Be permissive but reject spaces/#
     if key.contains(' ')
         || key.contains('\t')
         || key.contains('#')
@@ -335,10 +321,7 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
     {
         return Err(format!("invalid env key `{key}`"));
     }
-    // Key must not be empty and should start with alphabetic or underscore? Be permissive.
 
-    // Parse right for value and trailing comment
-    // Find value_start: first non-whitespace in right
     let right_ws_len = right
         .char_indices()
         .find(|(_, c)| !c.is_whitespace())
@@ -346,38 +329,8 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
 
     // value_start byte offset in raw = eq_idx + 1 + right_ws_len
     let value_start = eq_idx + 1 + right_ws_len;
-    if value_start > raw.len() {
-        // No value, empty
-        let meta = EntryMeta {
-            key,
-            value: String::new(),
-            quoting: Quoting::Unquoted,
-            export,
-            value_start,
-            value_end: value_start,
-        };
-        return Ok(ParsedLine {
-            raw: raw.to_owned(),
-            kind: LineKind::Entry(meta),
-        });
-    }
 
     let value_part = raw.get(value_start..).unwrap_or_default();
-    if value_part.is_empty() {
-        let meta = EntryMeta {
-            key,
-            value: String::new(),
-            quoting: Quoting::Unquoted,
-            export,
-            value_start,
-            value_end: value_start,
-        };
-        return Ok(ParsedLine {
-            raw: raw.to_owned(),
-            kind: LineKind::Entry(meta),
-        });
-    }
-
     let first_char = value_part.chars().next().unwrap_or('\0');
     let (decoded, quoting, value_end) = if first_char == '"' {
         // Double quoted
@@ -435,8 +388,7 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
             return Err(format!("unterminated single quote in line: {raw}"));
         }
     } else {
-        // Unquoted: value runs until '#' that is not escaped, or end (but # inside value if escaped as \#)
-        // Scan value_part char_indices to find unescaped '#'
+        // Unquoted: value runs until an unescaped '#'.
         let mut end_offset = value_part.len();
         let mut escaped = false;
         for (i, c) in value_part.char_indices() {
@@ -454,9 +406,8 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
             }
         }
         let raw_value = value_part.get(0..end_offset).unwrap_or_default();
-        // Trim trailing whitespace from raw_value for decoded value (unquoted values are trimmed)
+        // Unquoted values are trailing-whitespace trimmed.
         let trimmed_end = raw_value.trim_end();
-        // Need to handle escaped chars in unquoted: decode \# -> #, \\ -> \, etc? For simplicity handle \# and \\ and \= \"
         let mut decoded = String::with_capacity(trimmed_end.len());
         let mut chars = trimmed_end.chars().peekable();
         while let Some(c) = chars.next() {
@@ -482,8 +433,6 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
                 decoded.push(c);
             }
         }
-        // Value end is start + trimmed_end.len() (byte length of trimmed part) but need byte index for original raw_value's trimmed portion.
-        // Compute byte length of trimmed raw_value: find where trimmed_end ends in raw_value
         let trimmed_byte_len = trimmed_end.len();
         let ve = value_start + trimmed_byte_len;
         (decoded, Quoting::Unquoted, ve)
@@ -507,79 +456,29 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
 /// Parse full text into lines and effective map.
 ///
 /// Returns the lines in order and a map of effective (last) values.
-#[expect(
-    clippy::excessive_nesting,
-    reason = "line splitting with comment handling"
-)]
 fn parse_env_text(
     text: &str,
 ) -> std::result::Result<(Vec<ParsedLine>, BTreeMap<String, String>), String> {
     let text = strip_bom(text);
-    // Split on \n, but handle \r\n by trimming \r from each line's end in raw
-    // We keep raw without \r or \n, but detect newline style separately.
     let mut lines = Vec::new();
     let mut map = BTreeMap::new();
 
-    // Use split_inclusive to keep track, but simpler split on '\n'
-    // Preserve CRLF handling: raw lines may end with '\r' if input was CRLF and we split on '\n'
-    let mut start = 0usize;
-    let bytes = text.as_bytes();
-    while start <= text.len() {
-        let Some(next_nl) = text.get(start..).and_then(|s| s.find('\n')) else {
-            // Last segment
-            let segment = text.get(start..).unwrap_or_default();
-            // Remove trailing \r if present (part of CRLF, but last line may not have newline)
-            let raw_line = if segment.ends_with('\r') {
-                segment.get(0..segment.len() - 1).unwrap_or_default()
-            } else {
-                segment
-            };
-            // Only push if not the artificial empty after final newline? We need to handle trailing newline.
-            // If text ends with newline, the last segment after split will be empty; we should not treat as extra blank line unless there was content.
-            // Example: "a=1\n" split gives ["a=1", ""]; we want one line, not two.
-            // So if start == text.len() (empty remainder after final newline), skip.
-            if !(segment.is_empty() && start == text.len()) {
-                // But if original text ended with newline, we already accounted for line before; the empty after should be ignored.
-                // However if text is empty, we want zero lines.
-                if !(raw_line.is_empty() && segment.is_empty() && text.ends_with('\n')) {
-                    let parsed = parse_line(raw_line)?;
-                    if let LineKind::Entry(ref meta) = parsed.kind {
-                        map.insert(meta.key.clone(), meta.value.clone());
-                    }
-                    lines.push(parsed);
-                }
+    if !text.is_empty() {
+        // A trailing newline ends the last line rather than starting an
+        // empty one; interior blank lines stay.
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        for segment in body.split('\n') {
+            let raw_line = segment.strip_suffix('\r').unwrap_or(segment);
+            let parsed = parse_line(raw_line)?;
+            if let LineKind::Entry(ref meta) = parsed.kind {
+                map.insert(meta.key.clone(), meta.value.clone());
             }
-            break;
-        };
-        let nl_idx = start + next_nl;
-        let segment = text.get(start..nl_idx).unwrap_or_default();
-        let raw_line = if segment.ends_with('\r') {
-            segment.get(0..segment.len() - 1).unwrap_or_default()
-        } else {
-            segment
-        };
-        let _ = bytes; // keep for lint
-        let parsed = parse_line(raw_line)?;
-        if let LineKind::Entry(ref meta) = parsed.kind {
-            map.insert(meta.key.clone(), meta.value.clone());
-        }
-        lines.push(parsed);
-        start = nl_idx + 1;
-        // If text ends with newline, loop will handle final empty correctly via above logic
-        if start == text.len() && text.ends_with('\n') {
-            break;
-        }
-        if start > text.len() {
-            break;
+            lines.push(parsed);
         }
     }
 
     Ok((lines, map))
 }
-
-// ---------------------------------------------------------------------------
-// Public API — env files (DOC-07)
-// ---------------------------------------------------------------------------
 
 /// Read an env file fresh from disk. A missing file reads as an empty map.
 ///
@@ -609,15 +508,9 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
 
 /// Back up, then write `vars` to `path`, creating parent directories as needed.
 ///
-/// Plan-02 fold: the write goes through the crate's one mutation boundary
-/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
-/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
-/// replacement, read-back verify.
-///
-/// The file is written as normalized `KEY=value` lines with quoting only when
-/// required (double quotes). No `export` prefix, comments, or blank lines are
-/// emitted — they are preserved only via [`edit`] on existing files. The output
-/// uses LF newlines and a trailing newline.
+/// Written as normalized `KEY=value` lines, quoted only when required, with
+/// LF newlines and a trailing newline. `export` prefixes, comments, and
+/// blank lines survive only through [`edit`] on existing files.
 pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
     let mut text = String::new();
     for (k, v) in vars {
@@ -639,20 +532,10 @@ pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
 
 /// Read fresh, apply `edit`, write back only if the effective map changed.
 ///
-/// Preserves comments, blank lines, `export` prefix, quoting style, spacing,
-/// and duplicate entries where untouched. For changed keys, the **last**
-/// occurrence is updated in place (preserving its prefix/spacing/trailing
-/// comment). New keys are appended. Removed keys have **all** occurrences
-/// deleted. No silent deduplication occurs — earlier duplicates remain unless
-/// explicitly removed. CRLF vs LF is preserved from the original file.
-///
-/// Nothing is cached between calls. For a no-op (effective map unchanged) no
-/// write and no backup are performed, so the file's byte identity is preserved.
-#[expect(
-    clippy::too_many_lines,
-    reason = "edit reconciles duplicates and preserves formatting"
-)]
-#[expect(clippy::excessive_nesting, reason = "reconciling edits needs nesting")]
+/// Changed keys update their last occurrence in place; new keys are appended;
+/// removed keys lose every occurrence. Comments, blank lines, `export`
+/// prefixes, quoting, spacing, duplicates, and CRLF/LF are preserved where
+/// untouched. A no-op edit performs no write and no backup.
 pub fn edit<F>(path: &Path, edit_fn: F) -> Result<()>
 where
     F: FnOnce(&mut BTreeMap<String, String>),
@@ -699,12 +582,11 @@ where
 
     // Reconcile lines with new map
     // 1. Handle removed keys: delete all occurrences
-    let mut removed_keys: Vec<String> = Vec::new();
-    for k in original_map.keys() {
-        if !map.contains_key(k) {
-            removed_keys.push(k.clone());
-        }
-    }
+    let removed_keys: Vec<String> = original_map
+        .keys()
+        .filter(|k| !map.contains_key(*k))
+        .cloned()
+        .collect();
     if !removed_keys.is_empty() {
         lines.retain(|line| match &line.kind {
             LineKind::Entry(meta) => !removed_keys.contains(&meta.key),
@@ -716,105 +598,54 @@ where
     for (key, new_value) in &map {
         let Some(old_value) = original_map.get(key) else {
             // New key: append
-            let formatted = format_value_normalized(new_value);
-            let raw = format!("{key}={formatted}");
-            lines.push(ParsedLine {
-                raw,
-                kind: LineKind::Entry(EntryMeta {
-                    key: key.clone(),
-                    value: new_value.clone(),
-                    quoting: if requires_quotes(new_value) {
-                        Quoting::Double
-                    } else {
-                        Quoting::Unquoted
-                    },
-                    export: false,
-                    value_start: key.len() + 1,
-                    value_end: key.len() + 1 + formatted.len(),
-                }),
-            });
+            lines.push(new_entry_line(key, new_value));
             continue;
         };
         if old_value == new_value {
             continue;
         }
-        // Changed: update last occurrence
-        let mut last_idx: Option<usize> = None;
-        for (idx, line) in lines.iter().enumerate().rev() {
-            if let LineKind::Entry(meta) = &line.kind
-                && meta.key == *key
-            {
-                last_idx = Some(idx);
-                break;
-            }
-        }
-        if let Some(idx) = last_idx {
-            let old_line = lines.get(idx).cloned().unwrap_or_else(|| ParsedLine {
-                raw: String::new(),
-                kind: LineKind::Blank,
-            });
-            if let LineKind::Entry(meta) = old_line.kind {
-                let new_formatted = format_value_for_entry(new_value, meta.quoting);
-                let prefix = old_line.raw.get(0..meta.value_start).unwrap_or_default();
-                let suffix = old_line.raw.get(meta.value_end..).unwrap_or_default();
-                let new_raw = format!("{prefix}{new_formatted}{suffix}");
-                let new_start = prefix.len();
-                let new_end = new_start + new_formatted.len();
-                let new_meta = EntryMeta {
-                    key: key.clone(),
-                    value: new_value.clone(),
-                    quoting: meta.quoting,
-                    export: meta.export,
-                    value_start: new_start,
-                    value_end: new_end,
-                };
-                if let Some(slot) = lines.get_mut(idx) {
-                    *slot = ParsedLine {
-                        raw: new_raw,
-                        kind: LineKind::Entry(new_meta),
-                    };
-                }
-            }
-        } else {
-            // Should not happen (key existed before but no line), append
-            let formatted = format_value_normalized(new_value);
-            let raw = format!("{key}={formatted}");
-            lines.push(ParsedLine {
-                raw,
-                kind: LineKind::Entry(EntryMeta {
-                    key: key.clone(),
-                    value: new_value.clone(),
-                    quoting: if requires_quotes(new_value) {
-                        Quoting::Double
-                    } else {
-                        Quoting::Unquoted
-                    },
-                    export: false,
-                    value_start: key.len() + 1,
-                    value_end: key.len() + 1 + formatted.len(),
-                }),
-            });
+        // Changed: update the last occurrence in place, keeping its
+        // export prefix, spacing, quoting style, and trailing comment.
+        let Some(idx) = lines
+            .iter()
+            .rposition(|line| matches!(&line.kind, LineKind::Entry(m) if m.key == *key))
+        else {
+            continue;
+        };
+        let Some(line) = lines.get(idx) else {
+            continue;
+        };
+        let LineKind::Entry(meta) = &line.kind else {
+            continue;
+        };
+        let new_formatted = format_value_for_entry(new_value, meta.quoting);
+        let prefix = line.raw.get(0..meta.value_start).unwrap_or_default();
+        let suffix = line.raw.get(meta.value_end..).unwrap_or_default();
+        let new_raw = format!("{prefix}{new_formatted}{suffix}");
+        let new_start = prefix.len();
+        let new_meta = EntryMeta {
+            key: key.clone(),
+            value: new_value.clone(),
+            quoting: meta.quoting,
+            export: meta.export,
+            value_start: new_start,
+            value_end: new_start + new_formatted.len(),
+        };
+        if let Some(slot) = lines.get_mut(idx) {
+            *slot = ParsedLine {
+                raw: new_raw,
+                kind: LineKind::Entry(new_meta),
+            };
         }
     }
 
-    // Serialize lines back
+    // Serialize lines back; every line keeps a terminator.
     let mut out = String::new();
-    for (i, line) in lines.iter().enumerate() {
+    for line in &lines {
         out.push_str(&line.raw);
-        if i + 1 < lines.len() {
-            out.push_str(newline);
-        } else {
-            // Ensure trailing newline (like other codecs)
-            out.push_str(newline);
-        }
+        out.push_str(newline);
     }
 
-    // If original file ended without newline, we still add one (normalized trailing newline)
-    // This matches `store` behaviour and is acceptable.
-
-    // Plan-02 fold: the mutation goes through the one boundary — backup of
-    // the existing contents, staged parse-validation, §4.2 conflict recheck,
-    // atomic replacement, read-back verify.
     crate::transaction::commit_file(
         "env-edit",
         path,
@@ -822,6 +653,27 @@ where
         crate::document::DocumentKind::Env,
     )?;
     Ok(())
+}
+
+/// A normalized `KEY=value` line for a key the file did not carry before.
+fn new_entry_line(key: &str, value: &str) -> ParsedLine {
+    let formatted = format_value_normalized(value);
+    let raw = format!("{key}={formatted}");
+    ParsedLine {
+        raw,
+        kind: LineKind::Entry(EntryMeta {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            quoting: if requires_quotes(value) {
+                Quoting::Double
+            } else {
+                Quoting::Unquoted
+            },
+            export: false,
+            value_start: key.len() + 1,
+            value_end: key.len() + 1 + formatted.len(),
+        }),
+    }
 }
 
 #[cfg(test)]

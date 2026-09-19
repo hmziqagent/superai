@@ -9,7 +9,7 @@ use crate::error::{ConfigError, Result};
 /// `toml_edit` keeps comments, key order, whitespace, and table layout, so
 /// writing back only touches what superai actually changed (DOC-04). Dotted
 /// keys, quoted keys, arrays of tables, and inline tables are preserved where
-/// untouched. Each call reads fresh — disk is the truth.
+/// untouched. Each call reads fresh: disk is the truth.
 pub fn load(path: &Path) -> Result<DocumentMut> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -26,14 +26,10 @@ pub fn load(path: &Path) -> Result<DocumentMut> {
 
 /// Back up, then write `doc` to `path`, creating parent directories as needed.
 ///
-/// Plan-02 fold: the write goes through the crate's one mutation boundary
-/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
-/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
-/// replacement, read-back verify.
-///
-/// The file is serialized via `toml_edit::DocumentMut::to_string`, which
-/// preserves comments and formatting for unchanged regions. No typed struct is
-/// ever serialized over the source document (DOC-04).
+/// The write goes through the crate's one mutation boundary
+/// ([`crate::transaction::commit_file`]). `toml_edit` serialization
+/// preserves comments and formatting for unchanged regions; no typed struct
+/// is ever serialized over the source document (DOC-04).
 pub fn store(path: &Path, doc: &DocumentMut) -> Result<()> {
     let text = doc.to_string();
     crate::transaction::commit_file(
@@ -47,12 +43,8 @@ pub fn store(path: &Path, doc: &DocumentMut) -> Result<()> {
 
 /// Read fresh, apply `edit`, write back only if the document changed.
 ///
-/// Nothing is cached between calls. For a no-op (the document serializes to the
-/// same string as before the edit when feasible), the original bytes are kept
-/// byte-identical by skipping the write when the serialized form matches. Note
-/// that `toml_edit` already preserves untouched decor, so no-op byte identity
-/// holds for many inputs; CRLF inputs are normalized to LF on write (documented
-/// limitation).
+/// No-op edits keep the original bytes, including CRLF and a missing final
+/// newline; changing writes normalize CRLF to LF (documented limitation).
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut DocumentMut),
@@ -62,26 +54,17 @@ where
     edit(&mut doc);
     let after = doc.to_string();
     if before == after {
-        // No semantic change that affects serialization — preserve original bytes
-        // (including CRLF / missing final newline) by not writing.
-        // We still check if the on-disk bytes match the serialized form: if the
-        // file was CRLF or missing newline, its original bytes differ from
-        // `before` (which is LF-normalized). In that narrow case we keep the
-        // file as-is rather than normalizing without need.
         return Ok(());
     }
     store(path, &doc)
 }
 
-/// DOC-10: disclosure when a changing write must reformat surrounding
-/// layout.
+/// DOC-10: disclosure when a changing write must reformat surrounding layout.
 ///
-/// `toml_edit` preserves comments and decor for untouched regions, but the
-/// documented narrower guarantee normalizes CRLF to LF on a changing write.
-/// Returns the warning when `text` (the pre-edit content) carries CRLF or
-/// cannot round-trip through the codec's serializer unchanged; `None` when
-/// the layout already matches the codec's output form (or `text` does not
-/// parse — syntax diagnostics cover that case).
+/// `toml_edit` preserves untouched decor, but changing writes normalize CRLF
+/// to LF. Returns the warning when `text` carries CRLF or cannot round-trip
+/// through the serializer unchanged; `None` when the layout already matches
+/// (unparsable `text` is left to syntax diagnostics).
 pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
     if text.trim().is_empty() {
         return None;

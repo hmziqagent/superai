@@ -1,44 +1,19 @@
-//! Parser fuzz scaffolding — QAL-04.
+//! Parser fuzz scaffolding (QAL-04).
 //!
-//! Deterministic, quick-loop fuzz for all config codecs without requiring
-//! `cargo-fuzz` or `libFuzzer`. Each test loops 100 iterations over
-//! truncated / huge / nested / deep / random inputs, seeded from harness
-//! fixtures, and asserts:
+//! Deterministic quick-loop fuzz for every config codec, no `cargo-fuzz` or
+//! `libFuzzer` required. Each test loops 100 iterations over truncated,
+//! huge, nested, deep, and random inputs seeded from harness fixtures, and
+//! asserts:
 //!
 //! - no panic, hang, or unbounded allocation
 //! - no path escape outside the per-test temp dir
 //! - re-parse succeeds when input is accepted
 //! - rejected input causes **no** filesystem mutation
 //!
-//! Seed corpus is collected from `crates/superai-core/fixtures/**` at runtime
-//! (via `CARGO_MANIFEST_DIR`) with a hardcoded fallback, so the test is
-//! self-contained but benefits from real harness corpora when present.
-//!
-//! # Optional `cargo-fuzz` integration
-//!
-//! These loops do **not** require `cargo-fuzz`. For deeper coverage-guided
-//! fuzzing install it and add a `fuzz/fuzz_targets` crate (not committed):
-//!
-//! ```bash
-//! cargo install cargo-fuzz
-//! cargo fuzz init   # creates fuzz/ directory
-//! # example target fuzz/fuzz_targets/fuzz_json.rs:
-//! #![no_main]
-//! use libfuzzer_sys::fuzz_target;
-//! fuzz_target!(|data: &[u8]| {
-//!     let _ = superai_config::raw_editor::validate(data, superai_config::document::DocumentKind::StrictJson);
-//!     if let Ok(s) = std::str::from_utf8(data) {
-//!         let _ = s.parse::<toml_edit::DocumentMut>();
-//!     }
-//! });
-//! cargo fuzz run fuzz_json -- -max_total_time=60
-//! cargo fuzz run fuzz_yaml -- -max_total_time=60
-//! cargo fuzz run fuzz_toml -- -max_total_time=60
-//! cargo fuzz run fuzz_env  -- -max_total_time=60
-//! ```
-//!
-//! The quick loops here are CI-friendly; `cargo-fuzz` can be run locally for
-//! extended budget before a release (QAL-04 exit gate).
+//! The seed corpus comes from `crates/superai-core/fixtures/**` at runtime
+//! (via `CARGO_MANIFEST_DIR`) with a hardcoded fallback. Coverage-guided
+//! fuzzing can be layered on locally with `cargo-fuzz` before a release
+//! (QAL-04 exit gate); these loops are the CI-friendly baseline.
 
 #![expect(
     clippy::all,
@@ -51,10 +26,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-
-// ---------------------------------------------------------------------------
-// Deterministic PRNG — SplitMix64 (no external dep)
-// ---------------------------------------------------------------------------
 
 struct Prng {
     state: u64,
@@ -109,10 +80,6 @@ impl Prng {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Corpus seeding from harness fixtures + hardcoded edge cases
-// ---------------------------------------------------------------------------
-
 const MAX_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB hard cap (QAL-04: no unbounded allocation)
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 const HUGE_JSON_KEYS: usize = 1500;
@@ -139,7 +106,7 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         }
     }
 
-    // Hardcoded minimal corpus — always present even if fixtures missing
+    // Hardcoded minimal corpus, always present even if fixtures are missing
     corpus.extend(hardcoded_corpus());
 
     // Cap corpus size to avoid huge input in fallback (ensure deterministic)
@@ -214,10 +181,6 @@ fn hardcoded_corpus() -> Vec<Vec<u8>> {
         "key: value: dup\nkey: 2\n".as_bytes().to_vec(),
     ]
 }
-
-// ---------------------------------------------------------------------------
-// Fuzz input generators — truncated / huge / nested / deep / random
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 fn gen_truncated(prng: &mut Prng, base: &[u8]) -> Vec<u8> {
@@ -420,10 +383,6 @@ fn gen_random_text_with_bom_and_control(prng: &mut Prng) -> Vec<u8> {
     b
 }
 
-// ---------------------------------------------------------------------------
-// Assertion helpers — bounded allocation, path escape, FS mutation, re-parse
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 fn assert_bounded_allocation(input: &[u8], output: &[u8], label: &str) {
     // Output must not be unbounded relative to input (10x or 10MiB cap)
@@ -519,30 +478,13 @@ fn compute_digest(bytes: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-// ---------------------------------------------------------------------------
-// Tests — each loops 100 iterations, deterministic, quick
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[expect(redundant_imports, reason = "PathBuf used in fuzz tests")]
-    use std::path::PathBuf;
 
     use crate::document::{DocumentKind, Selector};
     use crate::test_util::temp_dir_unique;
     use serde_json::Value;
-
-    #[expect(dead_code, reason = "helper for potential fuzz extension")]
-    fn scratch_path(prefix: &str, iter: usize, ext: &str) -> PathBuf {
-        let dir = temp_dir_unique(prefix);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join(format!("fuzz-{iter}{ext}"))
-    }
-
-    // ---------------------------------------------------------------
-    // 1. JSON load fuzz — truncated / huge / nested / deep / random
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_json_load_no_panic_100() {
@@ -633,10 +575,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // 2. JSONC load fuzz
-    // ---------------------------------------------------------------
-
     #[test]
     fn fuzz_jsonc_load_no_panic_100() {
         let corpus = seed_corpus();
@@ -703,10 +641,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // 3. TOML load fuzz
-    // ---------------------------------------------------------------
-
     #[test]
     fn fuzz_toml_load_no_panic_100() {
         let corpus = seed_corpus();
@@ -765,10 +699,6 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-
-    // ---------------------------------------------------------------
-    // 4. YAML load fuzz
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_yaml_load_no_panic_100() {
@@ -840,10 +770,6 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-
-    // ---------------------------------------------------------------
-    // 5. Env load fuzz
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_env_load_no_panic_100() {
@@ -929,15 +855,9 @@ mod tests {
                     assert_eq!(before_bytes, after_bytes);
                 }
             }
-            // Verify before snapshot not mutated beyond original file
-            let _ = before; // used
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-
-    // ---------------------------------------------------------------
-    // 6. Selector parse fuzz — typed selectors, no ad-hoc panic
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_selector_parse_no_panic_100() {
@@ -1039,16 +959,12 @@ mod tests {
                     drop(std::fs::remove_dir_all(&dir));
                 }
             } else {
-                // Rejected — no FS mutation expected (parse is pure, so vacuously true)
+                // Rejected: no FS mutation (the parse is pure).
                 // Just ensure input was bounded
                 assert!(text.len() <= MAX_INPUT_BYTES);
             }
         }
     }
-
-    // ---------------------------------------------------------------
-    // 7. Edit application fuzz — JSON/TOML/YAML/env via raw_editor + edit
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_edit_application_no_panic_100() {
@@ -1178,17 +1094,11 @@ mod tests {
                         reparse_ok,
                         "re-parse failed after successful edit at iter {iter} ext={ext}"
                     );
-                    // Verify digest changed or file stayed same for no-op? Accept either but must be valid
-                    let after_digest = compute_digest(&after_bytes);
-                    // If before was malformed, edit shouldn't have succeeded? But our edit API returns Err for malformed, so Ok means it was valid
-                    // Ensure no path escape: file still inside dir
                     assert_no_path_escape(&dir, &path, &format!("edit-ok {iter}"));
-                    // Ensure no file outside dir created
+                    // A new backup (.bak.) may appear; nothing else may.
                     let after_snapshot = snapshot_dir(&dir);
-                    // On success, there may be a new backup file (.bak.) — allow that but no other escape
                     for (p, _) in &after_snapshot {
                         assert_no_path_escape(&dir, p, "edit-ok-after");
-                        // Also ensure backup not unbounded
                         if p.to_string_lossy().contains(".bak.") {
                             let bak_bytes = std::fs::read(p).unwrap_or_default();
                             assert_bounded_allocation(&before_bytes, &bak_bytes, "backup-bounded");
@@ -1209,7 +1119,6 @@ mod tests {
                             "successful edit must leave backup at iter {iter}"
                         );
                     }
-                    let _ = after_digest;
                 }
                 Err(_) => {
                     // Rejected: ensure no FS mutation (file untouched, no new backup beyond before)
@@ -1239,10 +1148,6 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-
-    // ---------------------------------------------------------------
-    // 8. Document envelope + operation fuzz
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_document_envelope_and_operation_100() {
@@ -1292,7 +1197,7 @@ mod tests {
                 assert!(op_res.is_ok(), "operation creation panicked at {iter}");
                 let op = op_res.expect("ok");
                 assert_eq!(op.selector(), &sel);
-                // Operation should not cause path escape when applied — selector is typed, not FS path
+                // Operations cannot path-escape when applied: the selector is typed, not an FS path.
                 let repr = sel.to_typed_string();
                 assert!(repr.len() <= MAX_OUTPUT_BYTES);
                 assert_bounded_allocation(selector_text.as_bytes(), repr.as_bytes(), "op-selector");
@@ -1312,10 +1217,6 @@ mod tests {
             }
         }
     }
-
-    // ---------------------------------------------------------------
-    // 9. Registry migration fuzz (simulated via JSON) — no panic, no FS mutation
-    // ---------------------------------------------------------------
 
     #[test]
     fn fuzz_registry_migration_no_panic_100() {
@@ -1388,7 +1289,7 @@ mod tests {
             let before_snapshot = snapshot_dir(&dir);
             let before_bytes = std::fs::read(&path).unwrap_or_default();
 
-            // Load via json::load_value — the layer registry uses — must not panic
+            // Load via json::load_value, the layer registry's parse layer.
             let load_res = std::panic::catch_unwind(|| crate::json::load_value(&path));
             assert!(
                 load_res.is_ok(),
@@ -1412,7 +1313,7 @@ mod tests {
                                     .or_else(|| inst.get("config_dir").and_then(|v| v.as_str()))
                                 {
                                     let p = Path::new(root);
-                                    // Registry migration must reject path escapes — we check lexical escape detection
+                                    // Registry migration must reject path escapes; check lexical detection.
                                     let has_parent = p
                                         .components()
                                         .any(|c| matches!(c, std::path::Component::ParentDir));
@@ -1499,10 +1400,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // 10. Combined codec fuzz — truncated/huge/nested/deep across all kinds
-    // ---------------------------------------------------------------
-
     #[test]
     fn fuzz_all_codecs_combined_truncated_huge_nested_deep_100() {
         let corpus = seed_corpus();
@@ -1516,7 +1413,7 @@ mod tests {
             let input: Vec<u8> = match variant {
                 0 => gen_truncated(&mut prng, &base), // truncated
                 1 => {
-                    // huge — pick one huge generator by codec rotation
+                    // huge: rotate through the per-codec huge generators
                     match iter % 4 {
                         0 => gen_huge_json(&mut prng),
                         1 => gen_huge_toml(&mut prng),
@@ -1602,7 +1499,7 @@ mod tests {
                     "snapshot after should not shrink"
                 );
             } else {
-                // Rejected (e.g., dir) — ensure no mutation beyond allowed
+                // Rejected (e.g., dir): no mutation beyond the allowed set
                 let after = snapshot_dir(&dir);
                 // If write failed due to being a directory etc., ensure no new file outside dir
                 for (p, _) in &after {
@@ -1653,7 +1550,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("mkdir");
             let traversal_name = format!("../escape-{iter}.json");
             let candidate = dir.join(&traversal_name);
-            // candidate contains `..`; assert_no_path_escape should detect it (by panic) — we verify via catch
+            // The candidate contains `..`; the escape check must panic, caught here.
             let escape_check = std::panic::catch_unwind(|| {
                 assert_no_path_escape(&dir, &candidate, "selector-sentinel-traversal")
             });
@@ -1753,10 +1650,6 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-
-    // -----------------------------------------------------------------------
-    // QAL-04: NEW engine surface — executor operations (DOC-02) fuzz
-    // -----------------------------------------------------------------------
 
     #[test]
     fn fuzz_executor_operations_no_panic_and_no_mutation_on_reject_100() {
@@ -1892,7 +1785,7 @@ mod tests {
                     }
                 }
                 Err(err) => {
-                    // Rejected: no filesystem mutation of any kind — the DOC-02
+                    // Rejected: no filesystem mutation of any kind; the DOC-02
                     // policies are enforced before any write.
                     let after = snapshot_dir(&dir);
                     assert_dir_unchanged(&before, &after, &format!("executor-rejected {iter}"));
@@ -1906,10 +1799,6 @@ mod tests {
             drop(std::fs::remove_dir_all(&dir));
         }
     }
-
-    // -----------------------------------------------------------------------
-    // QAL-04: NEW engine surface — managed span codec (DOC-08) fuzz
-    // -----------------------------------------------------------------------
 
     /// Generate a random text with a mix of plain lines, sentinel-ish lines,
     /// CRLF line endings, and smuggled sentinels.

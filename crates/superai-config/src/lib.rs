@@ -1,4 +1,4 @@
-//! Layer 1 — harness config files.
+//! Layer 1: harness config files.
 //!
 //! Every operation reads the file fresh, backs it up, and writes back preserving
 //! keys superai does not model. Nothing is cached: the harness, an editor, or a
@@ -27,7 +27,7 @@ pub mod json;
 pub mod jsonc;
 /// Recoverable quarantine for directory removal.
 pub mod quarantine;
-/// Raw editor backend — read/validate/diff/commit.
+/// Raw editor backend: read/validate/diff/commit.
 pub mod raw_editor;
 /// Filesystem snapshot and conflict token.
 pub mod snapshot;

@@ -67,10 +67,6 @@ mod tests {
         crate::test_util::temp_dir_unique(&format!("config-abuse-{prefix}"))
     }
 
-    // -----------------------------------------------------------------------
-    // Sentinel backup perms
-    // -----------------------------------------------------------------------
-
     #[test]
     fn sentinel_allowed_only_in_harness_config_and_backup_with_600() {
         let dir = temp_root("sentinel-perms");
@@ -86,8 +82,7 @@ mod tests {
             "harness config must contain sentinel here"
         );
 
-        // Backup should inherit restrictive perms on unix and also contain sentinel (allowed)
-        // Actually set perms to 0o600 explicitly then backup
+        // A 0o600 config file must back up to a 0o600 copy on unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -143,10 +138,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -----------------------------------------------------------------------
-    // Symlink swap race -> ConcurrentModification
-    // -----------------------------------------------------------------------
-
     #[test]
     fn symlink_swap_race_aborts_concurrent_modification() {
         #[cfg(unix)]
@@ -182,7 +173,7 @@ mod tests {
             // the dir declared as a follow root the write would follow the
             // link (MUT-02) and the caller's token detects the swap; with NO
             // roots declared the boundary refuses to follow the symlink at
-            // all — both paths abort, neither overwrites through the swapped
+            // all; both paths abort, neither overwrites through the swapped
             // link.
             let res = crate::transaction::commit_file_expecting_with_roots(
                 "abuse-symlink-race",
@@ -261,10 +252,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Broad deletion: validate_quarantine_target
-    // -----------------------------------------------------------------------
-
     #[test]
     fn broad_deletion_targets_are_rejected() {
         // Direct broad roots
@@ -286,7 +273,7 @@ mod tests {
                 home.display()
             );
         }
-        // Windows style: `C:\Windows` is a broad windows root on every host —
+        // Windows style: `C:\Windows` is a broad windows root on every host;
         // on Windows via the drive-root/system-dir rule, on unix via the
         // absolute-path requirement (it parses as relative there).
         for win_root in [
@@ -337,16 +324,11 @@ mod tests {
             assert!(err.is_err(), "quarantine base should be rejected");
         }
 
-        // Ensure none panic and no sentinel leak even when path contains sentinel
+        // A path that itself contains the sentinel is rejected without panic;
+        // the error echoes the caller's path, which is unavoidable.
         let sentinel_path = Path::new("/tmp/sk-superai-test-sentinel-12345-fake");
-        let err = validate_quarantine_target(sentinel_path);
-        // It will be rejected for not existing or other reason, but error must not contain sentinel? Actually path display will contain sentinel, but that's the path itself, not a leak of secret value? For path containing sentinel as name, it's okay to show path? However per QAL-10, errors should not contain sentinel plain from secret value. Path containing sentinel is not secret value but path name; we ensure error display contains path but we check that error's debug doesn't leak sentinel beyond path? We allow path to appear? The spec says errors should not contain sentinel plain. If the attacker crafts a path containing sentinel, the error will contain that path string which includes sentinel. That's unavoidable as we report the path. But we should ensure we don't leak sentinel value separate from path. For this test, we just ensure no panic.
-        drop(err);
+        drop(validate_quarantine_target(sentinel_path));
     }
-
-    // -----------------------------------------------------------------------
-    // Shell metachars in paths/names
-    // -----------------------------------------------------------------------
 
     #[test]
     fn shell_metachars_in_paths_are_rejected() {
@@ -379,8 +361,8 @@ mod tests {
             };
             let txn = Transaction::new(op_id, vec![action]);
             let res = txn.validate_plan();
-            // Some shell chars like `;` `&` `|` are not currently rejected by validate_path_safety (which only checks *,?,[, $,%). So we check that at least `$` is rejected.
-            // For this test, we assert that transaction with `$(rm` is rejected because it contains `$`
+            // Path safety rejects globs and `$`; other metachars are inert
+            // because the duct layer never spawns a shell.
             if name.contains('$') {
                 assert!(
                     res.is_err(),
@@ -390,9 +372,6 @@ mod tests {
                 let msg = format!("{:?}", res.unwrap_err());
                 assert!(!msg.contains(SENTINEL));
             } else {
-                // For other metachars not yet rejected, we at least ensure no panic and that run_command would not shell-interpret
-                // The duct layer does not use shell, so it's safe even if path is accepted.
-                // We just ensure no panic occurred.
                 drop(res);
             }
         }
@@ -408,18 +387,13 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -----------------------------------------------------------------------
-    // Huge 5MB deep config
-    // -----------------------------------------------------------------------
-
     #[test]
     fn huge_5mb_deep_config_is_bounded_and_rejected_safely() {
         let dir = temp_root("huge-deep");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("huge.json");
 
-        // Generate 5MB deep JSON: nested objects 300 deep plus large payload
-        // Use bounded generation: depth 300, but total size ~5MB
+        // 300-deep nested objects plus a separate 5MB payload.
         let mut json = String::new();
         let depth = 300;
         for _ in 0..depth {
@@ -429,20 +403,18 @@ mod tests {
         for _ in 0..depth {
             json.push('}');
         }
-        // Ensure it's at least 1KB deep, but we need 5MB total: pad with large keys
-        // Append huge payload inside innermost? For now create separate huge file of 5MB
         let huge_payload = "x".repeat(5 * 1024 * 1024);
         let mut huge_json = String::from("{\"data\":\"");
         huge_json.push_str(&huge_payload);
         huge_json.push_str("\"}");
 
-        // Test deep: should not panic, and validation should handle bounded
         let deep_bytes = json.into_bytes();
         assert!(deep_bytes.len() < 10 * 1024 * 1024, "deep bytes bounded");
-        // Try to validate via raw_editor validate (which parses)
-        let diags = crate::raw_editor::validate(&deep_bytes, DocumentKind::StrictJson);
-        // Deep nesting may be valid or invalid, but must not panic and must be bounded
-        drop(diags);
+        // Must not panic whether the depth parses or not.
+        drop(crate::raw_editor::validate(
+            &deep_bytes,
+            DocumentKind::StrictJson,
+        ));
 
         // Huge 5MB should be handled: validate should not panic, and atomic_write should handle size
         let huge_bytes = huge_json.into_bytes();
@@ -466,12 +438,9 @@ mod tests {
             "plan valid for huge path, content not yet checked"
         );
 
-        // Prepare will validate staged content and should handle huge without unbounded allocation beyond limit
-        // It may succeed (huge JSON with single key is valid) but we check it doesn't panic.
-        // We set no limit for harness config, but we assert it doesn't contain sentinel leak
-        let prepare_res = txn.prepare();
-        // Whether it succeeds or fails, it must not panic and must not leak sentinel
-        match prepare_res {
+        // Huge-but-valid content may stage successfully; either way no
+        // panic and no sentinel leak.
+        match txn.prepare() {
             Ok(()) => {
                 // Clean up staged temps
                 for t in txn.staged_temps {
@@ -527,10 +496,6 @@ mod tests {
         drop(diags_t);
     }
 
-    // -----------------------------------------------------------------------
-    // No panic on malformed huge inputs and no sentinel leak via scan
-    // -----------------------------------------------------------------------
-
     #[test]
     fn malformed_huge_inputs_do_not_panic_and_do_not_leak_sentinel() {
         let dir = temp_root("malformed-huge");
@@ -542,9 +507,8 @@ mod tests {
         std::fs::write(&path, &sentinel_content).unwrap();
         let snap = snapshot(&path);
 
-        // Try to commit malformed huge content — through the boundary as an
-        // opaque payload (the write layer must carry arbitrary bytes safely;
-        // parse-validating kinds would fail-closed at staging instead).
+        // Commit malformed huge content through the boundary as an opaque
+        // payload; parse-validating kinds fail closed at staging instead.
         let bad_content = vec![b'{'; 2 * 1024 * 1024]; // 2MB of '{'
         let res = crate::transaction::commit_file_expecting(
             "abuse-huge",
@@ -601,20 +565,16 @@ mod tests {
         // QAL-09/11: Windows reserved, long paths, case-insensitive collisions, CRLF, no panic or leak
         let dir = temp_root("windows-long-crlf");
         std::fs::create_dir_all(&dir).unwrap();
-        // Windows reserved names must be rejected by transaction path validation (via validate_quarantine or general path checks)
+        // Windows reserved device names are rejected at plan validation on
+        // every host; the error must not leak the sentinel.
         for reserved in ["CON", "PRN", "AUX", "NUL", "COM1", "LPT1"] {
             let path = dir.join(format!("{reserved}.json"));
-            // Attempt to use as quarantine target – should be rejected or at least not treated as safe broad deletion
-            // We test that atomic write with snapshot still works for regular reserved-looking file inside temp (allowed on unix) but does not leak sentinel
             let res = crate::transaction::commit_file(
                 "abuse-reserved-name",
                 &path,
                 br#"{"a":1}"#,
                 DocumentKind::StrictJson,
             );
-            // Reserved device names are rejected at plan validation on every
-            // host (QAL-09 guard); must not panic and the error must not leak
-            // the sentinel.
             if let Err(e) = res {
                 let msg = format!("{e:?}");
                 assert!(!msg.contains(SENTINEL));
@@ -624,7 +584,7 @@ mod tests {
                 drop(std::fs::remove_file(&path));
             }
         }
-        // Long path (> 255 chars) must be handled without panic; either succeeds or returns error bounded
+        // A 300-char path must not panic; either outcome stays bounded.
         let long_name = "a".repeat(300);
         let long_path = dir.join(format!("{long_name}.json"));
         let long_res = std::panic::catch_unwind(|| {
@@ -670,7 +630,7 @@ mod tests {
         }
         assert!(!format!("{snap_lower:?}").contains(SENTINEL));
         // CRLF handling: env/json with CRLF must not panic and must round-trip.
-        // FS truth: CRLF is ordinary whitespace for JSON — load and edit both
+        // FS truth: CRLF is ordinary whitespace for JSON; load and edit both
         // succeed on every platform, and the edit lands the new key while the
         // on-disk file stays parseable.
         let crlf_path = dir.join("crlf.json");

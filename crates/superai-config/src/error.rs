@@ -86,8 +86,8 @@ pub enum ConfigError {
 
     /// A changing write was refused because the codec cannot preserve the
     /// file's lexical content (comments, anchors, tags, scalar style,
-    /// trailing commas). The format stays read-only for such writes until a
-    /// lexically preserving codec exists (plans/01 DOC-05/DOC-06).
+    /// trailing commas). The format stays read-only for such writes
+    /// (plans/01 DOC-05/DOC-06).
     #[error(
         "lossy write unsupported for {path}: {format} is read-only until a lexically preserving codec exists"
     )]
@@ -158,8 +158,8 @@ pub enum ConfigError {
     },
 
     /// Managed-span sentinels are missing, duplicated, unbalanced, or
-    /// nested (DOC-08). The fragment is treated as invalid and stays
-    /// unwritten — fail closed rather than guess which span is owned.
+    /// nested (DOC-08). The fragment stays unwritten: fail closed rather
+    /// than guess which span is owned.
     #[error("invalid managed spans in {path}: {reason}")]
     InvalidSpans {
         /// Path of the fragment.
@@ -169,8 +169,7 @@ pub enum ConfigError {
     },
 
     /// A text-fragment write was refused because bytes outside managed
-    /// spans would change (DOC-08): whole-file rewrites stay opaque and
-    /// read-only; only managed-span edits are accepted.
+    /// spans would change (DOC-08): whole-file rewrites stay read-only.
     #[error("unmanaged text fragment write refused for {path}: {reason}")]
     UnmanagedSpanWrite {
         /// Path of the fragment.
@@ -180,9 +179,8 @@ pub enum ConfigError {
     },
 
     /// Two planned paths resolve to the same inode on one device (MUT-02):
-    /// a hard link alias. Committing both would silently mutate the same
-    /// bytes twice and atomic replacement of one path breaks link sharing,
-    /// so the plan is rejected.
+    /// a hard link alias. Committing both would mutate the same bytes twice
+    /// and break link sharing, so the plan is rejected.
     #[error("hard link conflict at {path}: also targets {alias} ({reason})")]
     HardlinkConflict {
         /// Path that collided.
@@ -194,8 +192,7 @@ pub enum ConfigError {
     },
 
     /// An existing symlink does not point at the owned/expected target
-    /// (MUT-02/MUT-06 `replace symlink only if it matches expected owned
-    /// target`). Nothing was replaced.
+    /// (MUT-02/MUT-06). Nothing was replaced.
     #[error("symlink target mismatch at {path}: expected {expected}, found {actual}")]
     SymlinkTargetMismatch {
         /// Link path that was refused replacement.
@@ -218,10 +215,9 @@ pub enum ConfigError {
     },
 
     /// A mutation target is (or resolves through) a symlink whose referent
-    /// lies OUTSIDE the adapter-allowed root set (MUT-02 default link
-    /// policy: follow an existing symlink only after resolving the target
-    /// within adapter-allowed roots). Nothing was mutated and the link
-    /// itself was never replaced — following it would silently mutate a
+    /// lies OUTSIDE the adapter-allowed root set (MUT-02: follow an existing
+    /// symlink only after resolving the target within adapter-allowed
+    /// roots). Nothing was mutated; following it would silently mutate a
     /// file the caller never declared authority over.
     #[error(
         "symlink follow refused at {path}: resolves to {resolved}, outside allowed roots {roots}"

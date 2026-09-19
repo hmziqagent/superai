@@ -1,4 +1,5 @@
-//! Property tests for QAL-03 — manual loops with deterministic RNG, no external dep.
+//! Property tests for QAL-03: manual loops with a deterministic RNG, no
+//! external dependency.
 //!
 //! Covers: no-op byte identity, unrelated survive, restore exact,
 //! preview deterministic, collision-safe normalization.
@@ -19,10 +20,6 @@ mod tests {
     use crate::quarantine::validate_quarantine_target;
     use crate::snapshot::{is_modified, snapshot};
     use crate::test_util::temp_dir_unique;
-
-    // -----------------------------------------------------------------------
-    // Deterministic PRNG — SplitMix64, no external crate.
-    // -----------------------------------------------------------------------
 
     struct Prng {
         state: u64,
@@ -82,10 +79,9 @@ mod tests {
     const VALUE_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 
     fn random_key(rng: &mut Prng) -> String {
-        // Keys length 1..12, must not be empty and reasonable.
+        // Keys are 1..10 chars; a leading digit gets an alpha prefix so the
+        // key stays valid for env and TOML.
         let mut k = rng.gen_string(1, 10, KEY_CHARSET);
-        // Ensure not starting with digit-only? It's allowed, but keep valid for JSON/TOML.
-        // Ensure first char is alpha for env/TOML safety.
         if let Some(first) = k.chars().next() {
             if first.is_ascii_digit() {
                 let prefix = if rng.gen_bool() { "k" } else { "a" };
@@ -164,9 +160,6 @@ mod tests {
         dir.join(name)
     }
 
-    // -----------------------------------------------------------------------
-    // 1. No-op byte identity — JSON
-    // -----------------------------------------------------------------------
     #[test]
     fn property_no_op_byte_identity_json() {
         for iter in 0..100 {
@@ -205,9 +198,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 2. No-op byte identity — TOML
-    // -----------------------------------------------------------------------
     #[test]
     fn property_no_op_byte_identity_toml() {
         for iter in 0..80 {
@@ -237,9 +227,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 3. No-op byte identity — YAML
-    // -----------------------------------------------------------------------
     #[test]
     fn property_no_op_byte_identity_yaml() {
         for iter in 0..80 {
@@ -267,9 +254,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 4. Unrelated survive — JSON
-    // -----------------------------------------------------------------------
     #[test]
     fn property_unrelated_survive_json() {
         for iter in 0..100 {
@@ -347,9 +331,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 5. Unrelated survive — env file
-    // -----------------------------------------------------------------------
     #[test]
     fn property_unrelated_survive_env() {
         for iter in 0..100 {
@@ -398,9 +379,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 6. Restore exact — backup/restore returns exact pre-write bytes
-    // -----------------------------------------------------------------------
     #[test]
     fn property_restore_exact_backup() {
         for iter in 0..50 {
@@ -458,9 +436,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 7. Preview deterministic — raw_editor diff
-    // -----------------------------------------------------------------------
     #[test]
     fn property_preview_deterministic_raw_diff() {
         use crate::document::DocumentKind;
@@ -507,9 +482,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 8. Collision-safe normalization — backup suffix / backup id unique
-    // -----------------------------------------------------------------------
     #[test]
     fn property_collision_safe_backup_suffix() {
         // Generate many backups for same file quickly and ensure suffixes unique enough
@@ -518,7 +490,6 @@ mod tests {
         std::fs::write(&path, b"initial").unwrap();
 
         let mut ids = HashSet::new();
-        let mut suffixes = HashSet::new();
 
         for iter in 0..100 {
             // Mutate file each time so backup captures new state.
@@ -530,17 +501,11 @@ mod tests {
                 ids.insert(id_str.clone()),
                 "backup id collision at iter {iter}: {id_str}"
             );
-            assert!(
-                suffixes.insert(entry.suffix.clone()) || true,
-                "suffix collision not necessarily failure but check uniqueness trend"
-            );
             // Verify backup file exists and digest matches.
             assert!(entry.backup_path.exists(), "backup file missing at {iter}");
             assert!(verify_backup(&entry).unwrap(), "verify failed at {iter}");
         }
 
-        // Also verify atomic_write suffix generation is collision resistant via parallel creation?
-        // Simulate 50 writes with same millis bucket by using list.
         let listed = list_backups(&path).unwrap();
         let mut seen_paths = HashSet::new();
         for e in listed {
@@ -560,9 +525,6 @@ mod tests {
         drop(std::fs::remove_dir_all(path.parent().unwrap()));
     }
 
-    // -----------------------------------------------------------------------
-    // 9. Commit result matches preview or aborts on conflict (raw_editor commit)
-    // -----------------------------------------------------------------------
     #[test]
     fn property_commit_matches_preview_or_aborts_raw_editor() {
         for iter in 0..50 {
@@ -648,12 +610,9 @@ mod tests {
             std::fs::write(&path, &original).unwrap();
             let snap = snapshot(&path);
             assert!(snap.exists);
-            // Correct path: backup exists before write
             let entry = backup(&path).unwrap().expect("backup");
             assert!(verify_backup(&entry).unwrap());
             assert_eq!(std::fs::read(&entry.backup_path).unwrap(), original);
-            // Simulate mutant that skips backup: directly overwrites without backup — we must detect that no backup file beyond this entry exists prior
-            // Ensure backup count is exactly 1 (no prior backup leaked)
             let backups = list_backups(&path).unwrap();
             assert!(backups.len() >= 1, "at least one backup at {iter}");
             for b in &backups {
@@ -661,11 +620,11 @@ mod tests {
                 assert!(!dbg.contains("sk-superai-test-sentinel"));
                 assert!(b.backup_path.exists());
             }
-            // Now commit through the mutation boundary, which internally
-            // verifies the snapshot token — a mutant skipping is_modified
-            // would let a stale write through.
+            // Commit through the mutation boundary, which verifies the
+            // snapshot token; a mutant skipping is_modified would let a
+            // stale write through.
             let new_content = format!(r#"{{"a":{}}}"#, iter + 1000).into_bytes();
-            let ok = crate::transaction::commit_file_expecting(
+            crate::transaction::commit_file_expecting(
                 "prop-backup-mutant",
                 &path,
                 &new_content,
@@ -678,8 +637,8 @@ mod tests {
                 new_content,
                 "write should succeed with correct snapshot at {iter}"
             );
-            let _ = ok;
-            // Mutant: if we flip is_modified to always false, external edit would be overwritten silently — ensure is_modified detects change
+            // A mutant flipping is_modified to always false would silently
+            // overwrite external edits.
             std::fs::write(&path, &original).unwrap();
             let snap2 = snapshot(&path);
             std::fs::write(&path, br#"{"a":9999}"#).unwrap(); // external edit
@@ -731,21 +690,12 @@ mod tests {
 
     #[test]
     fn mutant_template_selector_traversal_is_rejected() {
-        // Mutant-killer: if traversal check is removed, this must fail.
+        // Traversal-shaped selectors must parse or reject without panicking;
+        // quarantine rejects traversal outright.
         let traversals = ["../", "a/../b", "..\\", "key:../escape", "table:../"];
         for t in traversals {
-            // Simulate template path check via document selector validation path – we use raw_editor validate on selector-like input
-            // Ensure that commit with traversal-named path would be rejected or at least not escape
-            let dir = temp_dir_unique("mutant-traversal");
-            let file = dir.join(format!("{t}.json").replace(['/', '\\', ':'], "_"));
-            let _ = &file;
-            // File name sanitized for test filesystem; but selector parsing must reject traversal logically
-            let sel_res = Selector::parse(t);
-            // For raw traversal like "../", parsing may succeed as key but applying it as path must be rejected later – we check file creation doesn't escape
-            drop(sel_res);
-            drop(std::fs::remove_dir_all(&dir));
+            drop(Selector::parse(t));
         }
-        // Concrete: quarantine must reject traversal
         assert!(validate_quarantine_target(std::path::Path::new("/tmp/../etc")).is_err());
         assert!(validate_quarantine_target(std::path::Path::new("relative")).is_err());
     }
