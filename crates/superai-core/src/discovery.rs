@@ -14,7 +14,7 @@ use crate::state::Ownership;
 
 /// Confidence for a fingerprint.
 ///
-/// Evidence is what matters — a directory name alone is `Low` at best.
+/// Evidence is what matters; a directory name alone is `Low` at best.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Confidence {
     /// Multiple consistent signals (canonical file + schema key + path pattern).
@@ -61,11 +61,11 @@ pub struct ForeignCheck {
     pub evidence: Vec<String>,
     /// Whether the evidence is AMBIGUOUS (DRF-04): a foreign manager is
     /// plausibly present but no direct link proves ownership. Ambiguity
-    /// blocks adopt/remove — it never silently resolves to unmanaged.
+    /// blocks adopt/remove; it never silently resolves to unmanaged.
     pub ambiguous: bool,
 }
 
-/// Drift category for a finding (DRF drift-category list — never collapse
+/// Drift category for a finding (DRF drift-category list; never collapse
 /// everything into "unmanaged").
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DriftCategory {
@@ -200,7 +200,7 @@ pub enum WrapperFindingKind {
         /// Why it is foreign.
         reason: String,
     },
-    /// A package-manager shim (mise/asdf style) — never an instance wrapper.
+    /// A package-manager shim (mise/asdf style), never an instance wrapper.
     PackageShim {
         /// Manager the shim belongs to.
         manager: String,
@@ -252,9 +252,7 @@ pub struct DriftReport {
     pub permission_diagnostics: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
 // helpers: tilde/env expansion and path match
-// ---------------------------------------------------------------------------
 
 fn expand_tilde(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
@@ -354,9 +352,7 @@ fn known_prefixes() -> &'static [&'static str] {
     ]
 }
 
-// ---------------------------------------------------------------------------
 // fingerprinting
-// ---------------------------------------------------------------------------
 
 /// Fingerprint a candidate config root using multiple signals.
 ///
@@ -554,7 +550,7 @@ pub fn fingerprint_candidate(path: &Path) -> Fingerprint {
         }
     }
 
-    // Matching binary/app install (DRF-02 signal): PATH lookup ONLY — the
+    // Matching binary/app install (DRF-02 signal): PATH lookup ONLY; the
     // binary is never executed during fingerprinting. Corroborating
     // evidence; a directory name alone still cannot establish the harness.
     if let Some(harness) = harness_found.and_then(|s| HarnessId::new(s).ok()) {
@@ -591,14 +587,12 @@ fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     Ok(text)
 }
 
-// ---------------------------------------------------------------------------
 // foreign-manager detection
-// ---------------------------------------------------------------------------
 
 /// Orchestrator workspace markers (DRF-04) per
 /// docs/harness-configs/orchestrators.md: each GUI orchestrator keeps its
 /// managed workspaces under a well-known root. A candidate living under one
-/// of those roots is orchestrator-managed — superai never adopts or removes
+/// of those roots is orchestrator-managed; superai never adopts or removes
 /// another manager's workspace.
 const ORCHESTRATOR_WORKSPACE_MARKERS: &[(&str, &str)] = &[
     // Vibe Kanban: worktrees live under `.vibe-kanban-workspaces/`
@@ -775,7 +769,7 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
                     path.display()
                 ));
                 // DRF-04: a foreign manager is plausibly present but nothing
-                // links THIS candidate to it — ambiguous evidence, never a
+                // links THIS candidate to it, ambiguous evidence, never a
                 // silent unmanaged classification.
                 ambiguous = true;
             }
@@ -802,9 +796,7 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PATH adjacency + package-manager shim detection (DRF-02/04)
-// ---------------------------------------------------------------------------
 
 /// Find `name` as an executable file on a `PATH`-shaped string (lookup
 /// only; nothing is executed). Pure over its inputs so tests can pass a
@@ -868,7 +860,7 @@ fn binary_on_path_from_env(name: &str) -> Option<PathBuf> {
 /// Detect whether `path` is a package-manager shim rather than an instance
 /// wrapper (DRF-04). mise shims are tiny generated shell scripts that exec
 /// `mise x --` / `mise run`; asdf shims look the same shape. A shim is
-/// NEVER a superai wrapper and NEVER a config root — ownership stays with
+/// NEVER a superai wrapper and NEVER a config root; ownership stays with
 /// the package manager.
 pub fn detect_shim_manager(path: &Path) -> Option<&'static str> {
     let data = std::fs::read(path).ok()?;
@@ -889,35 +881,35 @@ pub fn detect_shim_manager(path: &Path) -> Option<&'static str> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // ownership classification
-// ---------------------------------------------------------------------------
 
 /// Classify ownership of a candidate path given the current registry and home.
 ///
-/// Rules:
-/// - If the candidate matches a recorded instance's `config_root`, return that instance's ownership.
-/// - If foreign checks prove foreign-managed, return `ForeignManaged`.
-/// - If the directory exists on disk with no record and no foreign owner, return `Unmanaged`.
-/// - If the path is recorded but missing on disk, return `Detached`.
-/// - Ambiguous evidence never causes a merge based on name alone.
+/// Recorded roots take their record's ownership; proven foreign-managed
+/// paths are `ForeignManaged`; otherwise existence on disk decides between
+/// `Unmanaged` and `Detached`. Ambiguous evidence never merges on name
+/// alone.
 pub fn classify_ownership(path: &Path, registry: &Registry, home: Option<&Path>) -> Ownership {
-    let normalized = normalize_path(path);
+    classify_ownership_with_foreign(path, registry, &is_foreign_managed(path, home))
+}
 
-    // Check registry first (exact normalized config_root match)
+/// [`classify_ownership`] with an already-computed foreign check, so a
+/// drift-report pass runs the (stat-heavy) foreign check once per
+/// candidate instead of twice.
+fn classify_ownership_with_foreign(
+    path: &Path,
+    registry: &Registry,
+    foreign: &ForeignCheck,
+) -> Ownership {
+    let normalized = normalize_path(path);
     for inst in registry.instances() {
         if normalize_path(inst.config_root.as_path()) == normalized {
             return inst.ownership;
         }
     }
-
-    // Not in registry: check foreign
-    let foreign = is_foreign_managed(path, home);
     if foreign.is_foreign {
         return Ownership::ForeignManaged;
     }
-
-    // Existence on disk determines unmanaged vs detached
     if path.exists() {
         Ownership::Unmanaged
     } else {
@@ -942,9 +934,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-// ---------------------------------------------------------------------------
 // candidate root discovery (bounded)
-// ---------------------------------------------------------------------------
 
 const MAX_HOME_ENTRIES: usize = 1024;
 const MAX_XDG_ENTRIES: usize = 256;
@@ -1014,7 +1004,7 @@ impl ScanOptions {
 /// Default user-owned bin directories wrappers are installed into
 /// (DRF-03 "configured wrapper directories"): `~/.local/bin` (XDG) and
 /// superai's own `~/.superai/bin`. Only these get the bounded one-level
-/// wrapper scan — never a PATH crawl.
+/// wrapper scan, never a PATH crawl.
 pub fn default_wrapper_dirs(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".local").join("bin"),
@@ -1151,12 +1141,6 @@ pub fn scan_with_diagnostics(home: &Path, options: &ScanOptions) -> ScanReport {
             let p = expand_tilde(&val, home);
             if p.is_dir() {
                 push_candidate(p);
-            } else {
-                // Also consider absolute value from env even if not tilde-related
-                let pb = PathBuf::from(&val);
-                if pb.is_absolute() && pb.is_dir() {
-                    push_candidate(pb);
-                }
             }
         }
     }
@@ -1284,21 +1268,15 @@ fn dedup_by_identity_unix(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for path in candidates {
         let normalized_key = normalize_path(&path).to_string_lossy().into_owned();
-        // Lexical dedup first
-        if !seen_lexical.insert(normalized_key.clone()) {
+        if !seen_lexical.insert(normalized_key) {
             continue;
         }
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let id = (meta.dev(), meta.ino());
-            if !seen_ids.insert(id) {
-                // Duplicate inode; keep first display path, skip this one
-                // Need to remove the lexical we just inserted? No, we want to keep lexical set
-                // but this inode dup means we should remove the duplicate path from out
-                // Since we haven't pushed yet, just skip.
-                // But we already inserted lexical; keep it to prevent re-adding same normalized path via symlink.
-                // The inode dup should be skipped.
-                continue;
-            }
+        // A duplicate inode (hardlink or symlink) keeps only the first
+        // display path; its lexical key stays so the alias cannot re-enter.
+        if let Ok(meta) = std::fs::metadata(&path)
+            && !seen_ids.insert((meta.dev(), meta.ino()))
+        {
+            continue;
         }
         out.push(path);
     }
@@ -1453,9 +1431,7 @@ pub fn scan_wrapper_dirs(dirs: &[PathBuf], registry: &Registry) -> Vec<WrapperFi
     findings
 }
 
-// ---------------------------------------------------------------------------
 // registry reconciliation (DRF-05)
-// ---------------------------------------------------------------------------
 
 /// Marker file name superai writes into config roots it creates; carries
 /// the stable `InstanceId` so reconciliation matches identity FIRST, before
@@ -1489,7 +1465,7 @@ pub enum MatchBasis {
 pub struct Reconciliation {
     /// Registry record id.
     pub instance: crate::ids::InstanceId,
-    /// Registry record name (display only — never a match key).
+    /// Registry record name (display only, never a match key).
     pub name: crate::ids::InstanceName,
     /// Matched candidate root, when one matched.
     pub candidate: Option<PathBuf>,
@@ -1508,12 +1484,15 @@ pub fn reconcile(
     candidates: &[PathBuf],
     wrapper_findings: &[WrapperFinding],
 ) -> Vec<Reconciliation> {
+    // Markers are read once per candidate (N reads, not N x records).
+    let markers: Vec<Option<crate::ids::InstanceId>> =
+        candidates.iter().map(|c| read_instance_marker(c)).collect();
     let mut out: Vec<Reconciliation> = Vec::new();
     for inst in registry.instances() {
         // 1) marker first: any candidate whose marker names this record
         let mut matched: Option<(PathBuf, MatchBasis)> = None;
-        for cand in candidates {
-            if read_instance_marker(cand).is_some_and(|id| id == inst.id) {
+        for (cand, marker) in candidates.iter().zip(&markers) {
+            if marker.as_ref().is_some_and(|id| id == &inst.id) {
                 matched = Some((cand.clone(), MatchBasis::InstanceMarker));
                 break;
             }
@@ -1556,9 +1535,7 @@ pub fn reconcile(
     out
 }
 
-// ---------------------------------------------------------------------------
 // drift report (DRF-08)
-// ---------------------------------------------------------------------------
 
 /// Classify one candidate into a drift category + risk + next operations
 /// (DRF-08). Pure over its inputs.
@@ -1598,7 +1575,7 @@ fn classify_finding(
         );
     }
     if is_recorded {
-        // Per-record checks: config root exists? wrapper healthy?
+        // Per-record checks: config root and wrapper health.
         let inst = registry
             .instances()
             .iter()
@@ -1906,7 +1883,7 @@ pub fn drift_report_with_options(
     for cand in &candidates {
         let fingerprint = fingerprint_candidate(cand);
         let foreign = is_foreign_managed(cand, Some(home));
-        let ownership = classify_ownership(cand, registry, Some(home));
+        let ownership = classify_ownership_with_foreign(cand, registry, &foreign);
         let is_recorded = registry
             .instances()
             .iter()
@@ -1995,7 +1972,7 @@ pub fn drift_report_with_options(
     let groups = build_groups(registry, &findings, &wrapper_findings, &reconciliations);
 
     DriftReport {
-        scanned_at: now_iso8601(),
+        scanned_at: crate::registry::now_iso8601(),
         home: home.to_path_buf(),
         candidates,
         findings,
@@ -2005,53 +1982,7 @@ pub fn drift_report_with_options(
     }
 }
 
-fn now_iso8601() -> String {
-    // Cheap RFC3339 without external crate; reuses registry helper logic
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    unix_secs_to_rfc3339(secs)
-}
-
-fn unix_secs_to_rfc3339(secs: u64) -> String {
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "secs/86400 fits in i64 for timestamps within reasonable range"
-    )]
-    let days = (secs / 86400) as i64;
-    let secs_of_day = secs % 86400;
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "year fits in i32 for registry timestamps"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "days derived from u64 secs, always non-negative"
-)]
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i32, m as u32, d as u32)
-}
-
-// ---------------------------------------------------------------------------
 // adoption helper (record-first, config-preserving)
-// ---------------------------------------------------------------------------
 
 /// Minimum fingerprint confidence adoption requires.
 ///
@@ -2070,14 +2001,28 @@ fn meets_adoption_floor(confidence: Confidence) -> bool {
 
 /// Validate that a candidate can be adopted.
 ///
-/// Checks: harness fingerprint at or above
+/// Checks: the candidate is a real directory or file (a symlink is refused;
+/// it points outside the scan root's trust and the home crawl already
+/// skips links), harness fingerprint at or above
 /// [`ADOPTION_CONFIDENCE_FLOOR`] (a canonical config file must prove the
-/// harness — a directory name alone never does), a readable canonical config
-/// file (so the preview→commit conflict token is enforceable rather than
-/// vacuously empty), foreign ownership, and a fresh readable candidate.
-/// Returns the fingerprint on success.
-/// Never copies, migrates, normalizes, or reformats the harness config.
+/// harness; a directory name alone never does), a readable canonical config
+/// file, no foreign ownership, and a fresh readable candidate. Returns the
+/// fingerprint on success. Never copies, migrates, normalizes, or
+/// reformats the harness config.
 pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
+    let meta = std::fs::symlink_metadata(candidate).map_err(|e| CoreError::Validation {
+        field: "candidate".to_owned(),
+        reason: format!("cannot stat {}: {e}", candidate.display()),
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(CoreError::Validation {
+            field: "candidate".to_owned(),
+            reason: format!(
+                "candidate {} is a symlink; adoption requires a real path under the scan root",
+                candidate.display()
+            ),
+        });
+    }
     let fingerprint = fingerprint_candidate(candidate);
     if !meets_adoption_floor(fingerprint.confidence) {
         return Err(CoreError::InsufficientEvidence {
@@ -2110,7 +2055,7 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
             owner: foreign.owner.unwrap_or_else(|| "foreign".to_owned()),
         });
     }
-    // DRF-04: ambiguous evidence blocks adopt — it never silently resolves
+    // DRF-04: ambiguous evidence blocks adopt; it never silently resolves
     // to unmanaged.
     if foreign.ambiguous {
         return Err(CoreError::AmbiguousOwnership {
@@ -2118,24 +2063,13 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
             evidence: foreign.evidence,
         });
     }
-    if !candidate.exists() {
-        return Err(CoreError::Validation {
-            field: "candidate".to_owned(),
-            reason: format!("candidate {} does not exist", candidate.display()),
-        });
-    }
-    // Ensure we can read at least the directory (fresh read)
-    let _meta = std::fs::symlink_metadata(candidate).map_err(|e| CoreError::Validation {
-        field: "candidate".to_owned(),
-        reason: format!("cannot stat {}: {e}", candidate.display()),
-    })?;
     Ok(fingerprint)
 }
 
 /// Canonical config file names adoption uses as its conflict token.
 ///
 /// These are the readable harness files [`fingerprint_candidate`] proves
-/// identity from — never a secret store — so a digest over exactly this set
+/// identity from, never a secret store, so a digest over exactly this set
 /// is the minimal token that says "the proof still stands".
 const ADOPTION_TOKEN_FILES: &[&str] = &[
     "settings.json",
@@ -2166,9 +2100,7 @@ pub fn canonical_config_digests(candidate: &Path) -> Vec<(String, String)> {
     tokens
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -2203,7 +2135,6 @@ mod tests {
         }
     }
 
-    /// Platform: Linux, macOS, Windows — `scan_candidate_roots` via XDG `~/.config` and home dotfiles; Linux/macOS use `/home/...`, Windows uses `C:\Users\...` via `AbsolutePath::expand_home`. Finds `.claude-*`, `.codex`, `.aider` on all.
     #[test]
     fn scan_finds_claude_variants_in_temp_home() {
         let home = tmp_home("scan_claude_variants");
@@ -2323,7 +2254,7 @@ mod tests {
     /// DRF-04: orchestrator-managed workspace roots (Vibe Kanban /
     /// Conductor / Sculptor per docs/harness-configs/orchestrators.md) are
     /// classified foreign-owned with the orchestrator named, and adoption is
-    /// refused — superai never takes over another manager's workspace.
+    /// refused, superai never takes over another manager's workspace.
     #[test]
     fn orchestrator_workspaces_are_foreign_managed_and_block_adoption() {
         let home = tmp_home("orchestrator_foreign");
@@ -2396,7 +2327,7 @@ mod tests {
         assert!(!clean.ambiguous, "{clean:?}");
     }
 
-    /// Platform: Linux/macOS — dedup by `(dev, ino)` via `MetadataExt` for symlinked roots; Windows — lexical dedup (no `MetadataExt`), hardlinks/junctions not resolved. Test asserts one entry on each via `#[cfg(unix)]`/`#[cfg(not(unix))]`.
+    /// Unix dedups by `(dev, ino)`; Windows falls back to lexical dedup.
     #[test]
     fn symlinked_roots_deduplicate_by_identity() {
         let home = tmp_home("dedup_symlink");
@@ -2427,7 +2358,6 @@ mod tests {
         }
     }
 
-    /// Platform: all — bounded scan `scan_candidate_roots_limited` prevents huge tree traversal on Linux, macOS, and Windows by capping entries before deduplication.
     #[test]
     fn scan_bounds_prevent_huge_tree() {
         let home = tmp_home("scan_bounds");
@@ -2454,7 +2384,6 @@ mod tests {
         );
     }
 
-    /// Platform: all — fingerprint uses multiple signals (exists, size, mtime) independent of OS; Windows mtime granularity differs but still deterministic.
     #[test]
     fn fingerprint_uses_multiple_signals() {
         let home = tmp_home("fingerprint_multi");
@@ -2486,7 +2415,6 @@ mod tests {
         }
     }
 
-    /// Platform: all — ownership classification via registry and foreign marker (`claude-multi`) is FS-agnostic; Windows path case-insensitivity handled via lexical compare, not OS case folding.
     #[test]
     fn classify_ownership_respects_registry_and_foreign() {
         let home = tmp_home("classify_owner");
@@ -2571,7 +2499,6 @@ mod tests {
         assert_eq!(content, r#"{"model":"sonnet"}"#);
     }
 
-    /// Platform: all — wiring is pure pattern-string assembly, no FS access.
     /// Every catalog harness must resolve to its concrete adapter and every
     /// adapter-specific candidate must be part of the discovery pattern set
     /// (HAD-09/10/11): a future catalog row without a concrete adapter fails
@@ -2597,11 +2524,8 @@ mod tests {
         }
     }
 
-    /// Platform: all — `~/.config/warp-terminal/cli/settings.toml` under a temp
-    /// home; tilde expansion via `expand_tilde` is uniform.
-    /// A previously generic-only harness now gets adapter-specific candidates:
     /// warp's CLI settings file is reachable only through
-    /// `WarpAdapter::scan_candidates` — the generic `~/.<id>` fallback never
+    /// `WarpAdapter::scan_candidates`; the generic `~/.<id>` fallback never
     /// listed it, no known home prefix matches, and the XDG crawl ignores
     /// `warp-terminal`.
     #[test]
@@ -2647,7 +2571,7 @@ mod tests {
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join("settings.json"), r#"{"model":"x"}"#).unwrap();
         // A glob candidate the adapter corpus really declares (swe-agent
-        // and trae-agent): `trajectories/*` — previously dropped by
+        // and trae-agent): `trajectories/*`, previously dropped by
         // `contains('*') { continue }`.
         let workspace = home.join("trajectories").join("run-1");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2670,7 +2594,7 @@ mod tests {
         );
     }
 
-    /// DRF-02: version marker and binary adjacency are fingerprint signals —
+    /// DRF-02: version marker and binary adjacency are fingerprint signals,
     /// the marker promotes a canonical-file match to High, the PATH lookup
     /// adds evidence without executing anything, and a name pattern alone
     /// still never rises above Low.
@@ -2742,7 +2666,7 @@ mod tests {
     }
 
     /// DRF-03/04: the wrapper-directory scan classifies superai wrappers,
-    /// records, orphans, package-manager shims, and foreign launchers — and
+    /// records, orphans, package-manager shims, and foreign launchers, and
     /// never executes anything.
     #[test]
     fn wrapper_dir_scan_classifies_shims_wrappers_and_orphans() {
@@ -2867,8 +2791,33 @@ mod tests {
         );
     }
 
-    /// DRF-05: reconciliation matches the `InstanceId` marker FIRST — a moved
-    /// root still matches its record before any path comparison — and never
+    /// Adoption refuses a symlinked root: the home crawl already skips
+    /// links (they are neither dirs nor files), and a link can point anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn adoption_refuses_symlinked_root() {
+        let home = tmp_home("adopt_symlink");
+        let real = home.join(".claude-real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let link = home.join(".claude-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        can_adopt(&real, Some(&home)).unwrap();
+        match can_adopt(&link, Some(&home)) {
+            Err(CoreError::Validation { reason, .. }) => {
+                assert!(reason.contains("symlink"), "{reason}");
+            }
+            other => panic!("expected symlink refusal, got {other:?}"),
+        }
+        assert!(
+            real.join("settings.json").is_file(),
+            "refused adoption must not touch the target"
+        );
+    }
+
+    /// DRF-05: reconciliation matches the `InstanceId` marker FIRST, a moved
+    /// root still matches its record before any path comparison, and never
     /// merges on the display name.
     #[test]
     fn reconcile_matches_marker_first() {

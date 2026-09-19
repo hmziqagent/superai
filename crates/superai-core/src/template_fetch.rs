@@ -9,15 +9,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::error::{CoreError, Result as CoreResult};
+use crate::error::CoreError;
 use crate::template::{
     Catalog, MAX_TEMPLATE_BYTES, Template, TemplateRepoConfig, compute_digest,
     validate_template_path,
 };
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Maximum number of redirects to follow.
 pub const MAX_REDIRECTS: u8 = 3;
@@ -30,10 +26,6 @@ pub const USER_AGENT: &str = concat!("superai/", env!("CARGO_PKG_VERSION"));
 
 /// Maximum response size (1 MiB).
 pub const MAX_BYTES: usize = MAX_TEMPLATE_BYTES;
-
-// ---------------------------------------------------------------------------
-// Error taxonomy (maps to CoreError::NetworkTemplate etc.)
-// ---------------------------------------------------------------------------
 
 /// Errors from fetching templates or catalogs.
 #[derive(Debug, thiserror::Error)]
@@ -161,14 +153,8 @@ impl From<TemplateFetchError> for CoreError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// URL helpers
-// ---------------------------------------------------------------------------
-
-/// Validate that a URL is HTTPS (or `file://` for tests) and not containing
-/// traversal or control characters.
-///
-/// Returns `Ok(())` if the URL is acceptable for fetching.
+/// Validate that a URL is HTTPS (or `file://` for tests) and free of
+/// traversal, control characters, and private-network hosts.
 pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchError> {
     if url.trim().is_empty() {
         return Err(TemplateFetchError::InvalidUrl {
@@ -221,7 +207,7 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
             reason: format!("url must be https://, got `{url}`"),
         });
     }
-    // Reject private / loopback hosts (QAL-11: redirect to private)
+    // QAL-11: the URL host itself must not be private or loopback.
     if let Some(host) = extract_host(url)
         && is_private_host(&host)
     {
@@ -230,7 +216,6 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
             reason: format!("url host `{host}` is private or loopback, rejected: `{url}`"),
         });
     }
-    // Reject obvious traversal in URL path.
     if url.contains("/../") || url.contains("/./") || url.ends_with("/..") {
         return Err(TemplateFetchError::InvalidUrl {
             template: context.to_owned(),
@@ -246,63 +231,76 @@ fn has_parent_component(path: &Path) -> bool {
         .any(|comp| matches!(comp, std::path::Component::ParentDir))
 }
 
+/// Host of an https URL, lowercased. Strips userinfo (`user@`) and unwraps
+/// bracketed IPv6 literals (`[::1]:8443` -> `::1`), both of which otherwise
+/// hide the real host from the private-range check.
 fn extract_host(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
     let end = rest.find('/').unwrap_or(rest.len());
     let host_port = rest.get(0..end)?;
-    let host = host_port.split(':').next().unwrap_or(host_port);
+    let host_port = host_port.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
     Some(host.to_ascii_lowercase())
 }
 
+/// True for hosts a fetch must never reach: loopback, link-local, and
+/// RFC1918 space, including `inet_aton` shorthands (`127.1`, `2130706433`)
+/// and IPv6 literals (`fc00::/7`, `::1`, v4-mapped loopback).
 fn is_private_host(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
-    if h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0" {
+    if h == "localhost" || h.is_empty() {
         return true;
     }
-    if h.starts_with("10.") {
-        return true;
+    if h.contains(':') {
+        // IPv6 literal: loopback, unspecified, v4-mapped loopback, and
+        // unique-local fc00::/7 (first hextet starts fc/fd).
+        let first_group = h.split(':').next().unwrap_or_default();
+        return h == "::1"
+            || h == "::"
+            || h.contains("127.0.0.1")
+            || first_group.starts_with("fc")
+            || first_group.starts_with("fd");
     }
-    if h.starts_with("192.168.") {
-        return true;
-    }
-    if h.starts_with("169.254.") {
-        return true;
-    }
-    if h.starts_with("172.") {
-        let parts: Vec<&str> = h.split('.').collect();
-        if let Some(second_str) = parts.get(1)
-            && let Ok(second) = second_str.parse::<u8>()
-            && (16..=31).contains(&second)
-        {
+    // Digits and dots only is an IP literal in some inet_aton spelling,
+    // never a real domain; judge it by its leading octet (or u32 form).
+    if h.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        let lead = if h.contains('.') {
+            h.split('.')
+                .find(|s| !s.is_empty())
+                .unwrap_or_default()
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+        } else {
+            h.parse::<u32>().map_or(u32::MAX, |v| v >> 24)
+        };
+        if matches!(lead, 0 | 10 | 127) {
             return true;
         }
     }
-    // IPv6 private / loopback
-    if h.starts_with("fc") || h.starts_with("fd") || h == "::1" {
+    if h.starts_with("10.") || h.starts_with("192.168.") || h.starts_with("169.254.") {
         return true;
+    }
+    if h.starts_with("172.") {
+        let second = h.split('.').nth(1).unwrap_or_default();
+        return second.parse::<u8>().is_ok_and(|v| (16..=31).contains(&v));
     }
     false
 }
 
-// ---------------------------------------------------------------------------
 // Core fetch: bytes with limits
-// ---------------------------------------------------------------------------
 
-/// Fetch raw bytes from `url` with HTTPS-only, redirect, size, and timeout guards.
-///
-/// - If `url` starts with `file://`, reads from the local filesystem (for tests).
-/// - Otherwise performs a blocking HTTPS GET via `ureq` with:
-///   - `MAX_REDIRECTS` redirects,
-///   - `MAX_BYTES` size limit,
-///   - `FETCH_TIMEOUT_SECS` timeout,
-///   - `USER_AGENT` header.
-///
-/// Returns the bytes on success or a [`TemplateFetchError`].
+/// Fetch raw bytes from `url`: `file://` reads the local filesystem (tests
+/// only); anything else is a blocking HTTPS GET with `MAX_REDIRECTS`
+/// redirects, `MAX_BYTES` size cap, `FETCH_TIMEOUT_SECS` timeout, and
+/// `USER_AGENT` header.
 pub fn fetch_bytes(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchError> {
     validate_fetch_url(url, context)?;
 
     if let Some(path_str) = url.strip_prefix("file://") {
-        // Local file mock path for tests. Do not follow symlinks blindly beyond read.
         let path = Path::new(path_str);
         let bytes = std::fs::read(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -326,83 +324,123 @@ pub fn fetch_bytes(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchErr
         return Ok(bytes);
     }
 
-    // HTTPS fetch via ureq.
     fetch_bytes_ureq(url, context)
 }
 
+/// Resolve a redirect `Location` against the current URL. Absolute https and
+/// same-origin absolute-path locations are accepted; relative paths are
+/// refused (fail-closed; no URL library in this workspace).
+fn resolve_redirect(
+    base: &str,
+    location: &str,
+    context: &str,
+) -> Result<String, TemplateFetchError> {
+    let invalid = |reason: String| TemplateFetchError::InvalidUrl {
+        template: context.to_owned(),
+        reason,
+    };
+    if location.starts_with("https://") {
+        return Ok(location.to_owned());
+    }
+    if !location.starts_with('/') {
+        return Err(invalid(format!(
+            "redirect location must be absolute, got `{location}`"
+        )));
+    }
+    let rest = base
+        .strip_prefix("https://")
+        .ok_or_else(|| invalid(format!("redirect base is not https: `{base}`")))?;
+    let origin = rest.split('/').next().unwrap_or_default();
+    Ok(format!("https://{origin}{location}"))
+}
+
 fn fetch_bytes_ureq(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchError> {
-    // Build an agent with timeout and redirect limit.
-    // ureq 3 API: Agent::config_builder() -> ConfigBuilder.
-    // Fall back to simple agent if builder not available; we attempt the modern API first.
-    let timeout = Duration::from_secs(FETCH_TIMEOUT_SECS);
+    let agent = build_agent(Duration::from_secs(FETCH_TIMEOUT_SECS));
+    let mut current = url.to_owned();
+    // Redirects are followed manually so EVERY hop re-passes URL validation;
+    // ureq itself never re-checks a Location target (QAL-11).
+    for _ in 0..=MAX_REDIRECTS {
+        let mut response = agent
+            .get(&current)
+            .header("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| map_ureq_error(e, context, &current))?;
 
-    // Try to create an agent with custom config. If the builder API differs, we fall back to default.
-    let agent = build_agent(timeout);
+        let status = response.status().as_u16();
+        if (300..400).contains(&i32::from(status)) {
+            let location = response
+                .headers()
+                .get("Location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| TemplateFetchError::Network {
+                    template: context.to_owned(),
+                    reason: format!("redirect {status} without a valid Location header"),
+                })?;
+            current = resolve_redirect(&current, location, context)?;
+            validate_fetch_url(&current, context)?;
+            continue;
+        }
+        if status == 404 {
+            return Err(TemplateFetchError::NotFound {
+                template: context.to_owned(),
+                reason: format!("404 not found for `{current}`"),
+            });
+        }
+        if status == 429 {
+            return Err(TemplateFetchError::RateLimited {
+                template: context.to_owned(),
+                reason: format!("429 rate limited for `{current}`"),
+            });
+        }
+        if !(200..300).contains(&i32::from(status)) {
+            return Err(TemplateFetchError::Network {
+                template: context.to_owned(),
+                reason: format!("http {status} for `{current}`"),
+            });
+        }
 
-    let mut request = agent.get(url);
-    request = request.header("User-Agent", USER_AGENT);
+        if let Some(len_str) = response.headers().get("Content-Length")
+            && let Ok(s) = len_str.to_str()
+            && let Ok(len) = s.parse::<usize>()
+            && len > MAX_BYTES
+        {
+            return Err(TemplateFetchError::SizeLimit {
+                template: context.to_owned(),
+                reason: format!("content-length {len} exceeds limit {MAX_BYTES}"),
+            });
+        }
 
-    let mut response = request
-        .call()
-        .map_err(|e| map_ureq_error(e, context, url))?;
-
-    // Status checks.
-    let status = response.status().as_u16();
-    if status == 404 {
-        return Err(TemplateFetchError::NotFound {
-            template: context.to_owned(),
-            reason: format!("404 not found for `{url}`"),
-        });
+        let mut body = response.body_mut().as_reader();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut limited = (&mut body).take((MAX_BYTES + 1) as u64);
+        limited
+            .read_to_end(&mut buf)
+            .map_err(|e| TemplateFetchError::Network {
+                template: context.to_owned(),
+                reason: format!("read failed for `{current}`: {e}"),
+            })?;
+        if buf.len() > MAX_BYTES {
+            return Err(TemplateFetchError::SizeLimit {
+                template: context.to_owned(),
+                reason: format!("response size exceeds limit {MAX_BYTES}"),
+            });
+        }
+        return Ok(buf);
     }
-    if status == 429 {
-        return Err(TemplateFetchError::RateLimited {
-            template: context.to_owned(),
-            reason: format!("429 rate limited for `{url}`"),
-        });
-    }
-    if !(200..300).contains(&i32::from(status)) {
-        return Err(TemplateFetchError::Network {
-            template: context.to_owned(),
-            reason: format!("http {status} for `{url}`"),
-        });
-    }
-
-    // Size limit via Content-Length header if present.
-    if let Some(len_str) = response.headers().get("Content-Length")
-        && let Ok(s) = len_str.to_str()
-        && let Ok(len) = s.parse::<usize>()
-        && len > MAX_BYTES
-    {
-        return Err(TemplateFetchError::SizeLimit {
-            template: context.to_owned(),
-            reason: format!("content-length {len} exceeds limit {MAX_BYTES}"),
-        });
-    }
-
-    // Read body with size limit.
-    let mut body = response.body_mut().as_reader();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut limited = (&mut body).take((MAX_BYTES + 1) as u64);
-    limited
-        .read_to_end(&mut buf)
-        .map_err(|e| TemplateFetchError::Network {
-            template: context.to_owned(),
-            reason: format!("read failed for `{url}`: {e}"),
-        })?;
-    if buf.len() > MAX_BYTES {
-        return Err(TemplateFetchError::SizeLimit {
-            template: context.to_owned(),
-            reason: format!("response size exceeds limit {MAX_BYTES}"),
-        });
-    }
-    Ok(buf)
+    Err(TemplateFetchError::RedirectLimit {
+        template: context.to_owned(),
+        reason: format!("more than {MAX_REDIRECTS} redirects for `{url}`"),
+    })
 }
 
 fn build_agent(timeout: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
-        .max_redirects(u32::from(MAX_REDIRECTS))
-        .max_redirects_will_error(true)
+        .https_only(true)
+        // The redirect loop in fetch_bytes_ureq follows manually so each hop
+        // is re-validated; ureq must not silently follow anything itself.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
         .user_agent(USER_AGENT)
         .build();
     ureq::Agent::new_with_config(config)
@@ -438,12 +476,7 @@ fn map_ureq_error(err: ureq::Error, context: &str, url: &str) -> TemplateFetchEr
         },
         other => {
             let msg = format!("{other}");
-            if msg.contains("redirect") || msg.contains("Redirect") {
-                TemplateFetchError::RedirectLimit {
-                    template: context.to_owned(),
-                    reason: msg,
-                }
-            } else if msg.contains("timed out") || msg.contains("timeout") {
+            if msg.contains("timed out") || msg.contains("timeout") {
                 TemplateFetchError::Network {
                     template: context.to_owned(),
                     reason: format!("timeout for `{url}`: {msg}"),
@@ -458,16 +491,10 @@ fn map_ureq_error(err: ureq::Error, context: &str, url: &str) -> TemplateFetchEr
     }
 }
 
-// ---------------------------------------------------------------------------
 // High-level fetchers
-// ---------------------------------------------------------------------------
 
-/// Fetch and validate the catalog for `config`.
-///
-/// Performs HTTPS-only fetch, validates JSON schema, checks size, and
-/// verifies the catalog's own digest if the server provides one via
-/// `X-Content-Sha256` header (optional). The returned catalog is already
-/// validated.
+/// Fetch and validate the catalog for `config` (HTTPS-only, size-capped;
+/// the returned catalog is already validated).
 pub fn fetch_catalog(config: &TemplateRepoConfig) -> Result<Catalog, TemplateFetchError> {
     let url = config
         .catalog_url()
@@ -484,10 +511,7 @@ pub fn fetch_catalog(config: &TemplateRepoConfig) -> Result<Catalog, TemplateFet
     Ok(catalog)
 }
 
-/// Fetch a catalog from a local file path (for tests).
-///
-/// Reads `path` from disk, validates size, parses and validates the catalog.
-/// No network is involved.
+/// Fetch a catalog from a local file path (tests; no network involved).
 pub fn fetch_catalog_from_path(path: &Path) -> Result<Catalog, TemplateFetchError> {
     let bytes = std::fs::read(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -551,7 +575,6 @@ pub fn fetch_template_bytes(
             reason: format!("{e}"),
         })?;
     let bytes = fetch_bytes(&url, template_id)?;
-    // Digest verification from catalog.
     let actual = compute_digest(&bytes);
     if actual != file_ref.digest.to_ascii_lowercase() {
         return Err(TemplateFetchError::DigestMismatch {
@@ -567,11 +590,8 @@ pub fn fetch_template_bytes(
     Ok(bytes)
 }
 
-/// Fetch a template struct directly, after verifying catalog digest.
-///
-/// Convenience wrapper around [`fetch_template_bytes`] that parses and
-/// validates the template and checks `validate_against_adapter` is not
-/// called here (callers must validate against an adapter explicitly).
+/// Fetch a template struct directly, after verifying the catalog digest.
+/// Callers must still call `validate_against_adapter` explicitly.
 pub fn fetch_template(
     config: &TemplateRepoConfig,
     catalog: &Catalog,
@@ -587,8 +607,8 @@ pub fn fetch_template(
     Ok(tmpl)
 }
 
-/// Verify that a template file's bytes match the expected digest from catalog
-/// without performing network I/O. Useful for offline verification.
+/// Verify that template bytes match `expected_digest` and parse as a valid
+/// template, without network I/O.
 pub fn verify_template_bytes(
     bytes: &[u8],
     expected_digest: &str,
@@ -602,7 +622,6 @@ pub fn verify_template_bytes(
             actual,
         });
     }
-    // Also ensure bytes are valid template JSON.
     Template::from_json_bytes(bytes).map_err(|e| TemplateFetchError::SchemaInvalid {
         template: context.to_owned(),
         reason: format!("{e}"),
@@ -610,21 +629,15 @@ pub fn verify_template_bytes(
     Ok(())
 }
 
-/// Ensure a relative template path never escapes the repository root when
-/// joined to a base directory. Rejects traversal.
-///
-/// This is the filesystem-side guard that mirrors [`validate_template_path`]
-/// but also checks the joined path does not escape `base`.
-///
-/// The function does not touch the filesystem; it only validates the path
-/// string. Callers must still use validated joins when writing files.
+/// Ensure a relative template path never escapes `base` when joined.
+/// Lexical only: the filesystem is never touched; writers must use the
+/// returned path as-is.
 pub fn ensure_path_safe(base: &Path, relative: &str) -> Result<PathBuf, TemplateFetchError> {
     validate_template_path(relative).map_err(|e| TemplateFetchError::InvalidUrl {
         template: relative.to_owned(),
         reason: format!("{e}"),
     })?;
     let joined = base.join(relative);
-    // Lexically check for parent components in joined path.
     for comp in joined.components() {
         if matches!(comp, std::path::Component::ParentDir) {
             return Err(TemplateFetchError::InvalidUrl {
@@ -633,8 +646,6 @@ pub fn ensure_path_safe(base: &Path, relative: &str) -> Result<PathBuf, Template
             });
         }
     }
-    // Ensure the joined path is still under base (prefix check).
-    // For lexical check, ensure base is prefix of joined.
     let base_str = base.to_string_lossy();
     let joined_str = joined.to_string_lossy();
     if !joined_str.starts_with(base_str.as_ref()) {
@@ -650,19 +661,7 @@ pub fn ensure_path_safe(base: &Path, relative: &str) -> Result<PathBuf, Template
     Ok(joined)
 }
 
-// ---------------------------------------------------------------------------
-// CoreError convenience
-// ---------------------------------------------------------------------------
-
-/// Fetch catalog and map errors to [`CoreError`] for callers that use the
-/// core taxonomy.
-pub fn fetch_catalog_core(config: &TemplateRepoConfig) -> CoreResult<Catalog> {
-    fetch_catalog(config).map_err(Into::into)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[expect(redundant_imports, reason = "test imports overlap")]
@@ -729,6 +728,55 @@ mod tests {
             TemplateFetchError::InvalidUrl { .. } => {}
             other => panic!("expected InvalidUrl, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn private_host_rejection_covers_bypass_spellings() {
+        for url in [
+            "https://127.0.0.2/catalog.json",
+            "https://[::1]/catalog.json",
+            "https://[fd00::1]/catalog.json",
+            "https://user@127.0.0.1/catalog.json",
+            "https://user:pw@10.0.0.5/catalog.json",
+            "https://2130706433/catalog.json",
+            "https://127.1/catalog.json",
+            "https://0.0.0.1/catalog.json",
+        ] {
+            let err = validate_fetch_url(url, "catalog").unwrap_err();
+            assert!(err.to_string().contains("private"), "{url}: {err}");
+        }
+        // Ordinary domains, including fc/fd initials, stay fetchable.
+        validate_fetch_url("https://fdtools.example.com/catalog.json", "catalog").unwrap();
+        validate_fetch_url("https://example.com/catalog.json", "catalog").unwrap();
+    }
+
+    #[test]
+    fn redirect_targets_resolve_and_revalidate() {
+        assert_eq!(
+            resolve_redirect("https://example.com/a/b.json", "/c/d.json", "catalog").unwrap(),
+            "https://example.com/c/d.json"
+        );
+        assert_eq!(
+            resolve_redirect(
+                "https://example.com/a",
+                "https://other.example/x",
+                "catalog"
+            )
+            .unwrap(),
+            "https://other.example/x"
+        );
+        // Relative-path locations are refused rather than guessed.
+        resolve_redirect("https://example.com/a/b.json", "../c.json", "catalog").unwrap_err();
+        // A redirect to a private host fails the per-hop revalidation.
+        let redirected =
+            resolve_redirect("https://example.com/a", "https://127.0.0.2/x", "catalog").unwrap();
+        validate_fetch_url(&redirected, "catalog").unwrap_err();
+        let redirected_file =
+            resolve_redirect("https://example.com/a", "file:///etc/passwd", "catalog").unwrap_err();
+        assert!(
+            matches!(redirected_file, TemplateFetchError::InvalidUrl { .. }),
+            "non-https redirect must be refused: {redirected_file:?}"
+        );
     }
 
     #[test]
