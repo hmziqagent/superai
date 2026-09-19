@@ -1,4 +1,4 @@
-//! Provider definitions — data-driven, no hardcoded provider list.
+//! Provider definitions: data-driven, no hardcoded provider list.
 //!
 //! A provider is versioned data, not a Rust branch. Adding a provider is a
 //! data-only change: add a JSON/YAML file and no Rust source edit is required.
@@ -19,10 +19,6 @@ use crate::capability::{Capability, Support};
 use crate::error::{CoreError, RedactedString, Result};
 use crate::ids::ProviderId;
 use crate::instance::Instance;
-
-// ---------------------------------------------------------------------------
-// Enums
-// ---------------------------------------------------------------------------
 
 /// How the harness authenticates to the provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -88,7 +84,7 @@ pub enum ModelStatus {
     Preview,
     /// Deprecated but still available.
     Deprecated,
-    /// Retired — must not be used as default.
+    /// Retired; must not be used as default.
     Retired,
 }
 
@@ -119,10 +115,6 @@ pub enum ProviderStatus {
     Retired,
 }
 
-// ---------------------------------------------------------------------------
-// Modalities and model limits (PRV-02)
-// ---------------------------------------------------------------------------
-
 /// Input/output modality of a model (PRV-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,7 +143,7 @@ impl std::fmt::Display for Modality {
 
 /// Token limits of a model (PRV-02: context/input/output limits).
 ///
-/// All fields are optional — providers document different subsets. Validation
+/// All fields are optional; providers document different subsets. Validation
 /// requires every present limit to be positive and consistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelLimits {
@@ -165,10 +157,6 @@ pub struct ModelLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
 }
-
-// ---------------------------------------------------------------------------
-// Model and defaults
-// ---------------------------------------------------------------------------
 
 /// One model entry in the provider catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,17 +196,13 @@ fn default_true() -> bool {
     true
 }
 
-/// Defaults for a provider — which model to use when the harness needs one.
+/// Defaults for a provider: which model to use when the harness needs one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProviderDefaults {
     /// Default model identifier.
     #[serde(default)]
     pub default_model: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Endpoint variants, auth inputs, probes, capabilities (PRV-01/PRV-06)
-// ---------------------------------------------------------------------------
 
 /// Base-endpoint variant keyed by region or plan (PRV-01).
 ///
@@ -240,7 +224,7 @@ pub struct EndpointVariant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AuthInputs {
     /// Environment variable names the harness may read the key from, in
-    /// preference order (names only — never values).
+    /// preference order (names only, never values).
     #[serde(default)]
     pub env_var_names: Vec<String>,
     /// Config field name the harness uses for the key, when applicable.
@@ -324,10 +308,6 @@ pub struct ProviderCapabilityDecl {
     pub limitations: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// ProviderDefinition
-// ---------------------------------------------------------------------------
-
 /// Current provider definition schema version (PRV-01: versioned data).
 pub const PROVIDER_SCHEMA_VERSION: u32 = 1;
 
@@ -339,7 +319,7 @@ fn default_provider_schema_version() -> u32 {
 ///
 /// No secret values are stored here. Adding a provider means adding a file,
 /// not editing Rust. Fields not modelled survive via serde's ignore on write
-/// but are not invented — unknown keys are ignored on read.
+/// Unknown keys are ignored on read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderDefinition {
     /// Stable provider identifier.
@@ -435,22 +415,12 @@ impl ProviderDefinition {
         reason = "validation covers the full PRV-01/02 field set"
     )]
     #[expect(clippy::excessive_nesting, reason = "field-set validation branches")]
-    /// Validate the definition before use.
-    ///
-    /// Checks (PRV-01/02):
-    /// - `schema_version` equals [`PROVIDER_SCHEMA_VERSION`]
-    /// - `base_url` and every endpoint variant non-empty and syntactically
-    ///   valid (no network), no duplicate normalized endpoint
-    /// - unique endpoint variant names
-    /// - unique model IDs and aliases
-    /// - `default_model` exists and is active unless the provider is legacy
-    /// - positive, consistent model limits; consistent modality/capability
-    ///   combinations
-    /// - header/param names carry no control characters and no secrets
-    /// - auth env var names are valid identifiers
-    /// - probe definitions: unique ids, valid method/path/bounds/predicates,
-    ///   auth reference only with an auth style
-    /// - `verified_at`, when present, is `YYYY-MM-DD`
+    /// Validate the definition before use (PRV-01/02): schema version, URL
+    /// syntax and uniqueness for the base and every endpoint variant, unique
+    /// model ids/aliases, an existing non-legacy `default_model`, consistent
+    /// limits and modalities, control-char-free and secret-free header/param
+    /// names, identifier-shaped auth env vars, well-formed probes, and a
+    /// `YYYY-MM-DD` `verified_at`. No network is touched.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != PROVIDER_SCHEMA_VERSION {
             return Err(CoreError::Validation {
@@ -935,7 +905,7 @@ impl ProviderDefinition {
                 return Err(CoreError::Validation {
                     field: "model_list.input_modalities".to_owned(),
                     reason: format!(
-                        "provider `{}` model `{}` declares tool support but no text input modality — tools ride on text turns",
+                        "provider `{}` model `{}` declares tool support but no text input modality; tools ride on text turns",
                         self.id, model.id
                     ),
                 });
@@ -1069,10 +1039,6 @@ pub(crate) fn contains_secret_shaped_value(text: &str) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// URL validation
-// ---------------------------------------------------------------------------
-
 fn is_valid_base_url(url: &str) -> (bool, String) {
     if url.trim().is_empty() {
         return (false, "must not be empty".to_owned());
@@ -1105,16 +1071,8 @@ fn is_valid_base_url(url: &str) -> (bool, String) {
     if !is_local && !host.contains('.') {
         return (false, "host must contain '.' or be localhost".to_owned());
     }
-    // Block file:// already handled by scheme check; explicitly reject others.
-    if url.starts_with("file://") {
-        return (false, "file scheme not allowed".to_owned());
-    }
     (true, "ok".to_owned())
 }
-
-// ---------------------------------------------------------------------------
-// Bundled providers — data-driven JSON under assets/providers.json
-// ---------------------------------------------------------------------------
 
 /// Raw JSON for bundled providers (`GLM`, `MiniMax`, `Anthropic`) as checked in
 /// `crates/superai-core/assets/providers.json`.
@@ -1145,25 +1103,16 @@ pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
 
 /// Load bundled providers plus any additional definitions from `extra_path`.
 ///
-/// `extra_path` may be a file or directory. Bundled providers and extra
-/// providers are merged; duplicates across the two sets are rejected. This
-/// proves that adding a dummy provider via a file requires no code change.
+/// `extra_path` may be a file or directory. Both sides are validated by
+/// their loaders; duplicates across the two sets are rejected.
 pub fn load_bundled_plus_extra(extra_path: &Path) -> Result<Vec<ProviderDefinition>> {
     let mut bundled = load_bundled_providers()?;
-    let extra = load_provider_defs(extra_path)?;
-    bundled.extend(extra);
+    bundled.extend(load_provider_defs(extra_path)?);
     validate_no_duplicates(&bundled)?;
-    for p in &bundled {
-        p.validate()?;
-    }
     Ok(bundled)
 }
 
-// ---------------------------------------------------------------------------
-// Health probe — delegated to crate::health (bounded, redacted, classified)
-// ---------------------------------------------------------------------------
-
-/// Result of a health probe — validates URL format, timeout, and classification.
+/// Result of a health probe: validates URL format, timeout, and classification.
 ///
 /// `base_url` is redacted if it contained query secrets (e.g. `api_key=...`).
 /// `reason` never contains raw secrets.
@@ -1224,10 +1173,6 @@ pub fn health_probe_with_config(
     }
 }
 
-// ---------------------------------------------------------------------------
-// API-key placement — ephemeral, sink-restricted, redacted
-// ---------------------------------------------------------------------------
-
 /// Kind of sink where an ephemeral API key may be written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1269,7 +1214,7 @@ pub struct ApiKeySink {
 
 /// Preview of where an ephemeral API key would be written.
 ///
-/// Contains no secret — only the destination and auth style, with a
+/// Contains no secret, only the destination and auth style, with a
 /// `[REDACTED]` placeholder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyPreview {
@@ -1377,7 +1322,7 @@ pub fn external_auth_requirement(adapter: &dyn Adapter) -> Option<CoreError> {
 /// surfaces.
 pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
     let surfaces = adapter.config_surfaces();
-    // First, prefer any UserEditable JSON/Jsonc/Toml/Yaml/Toml surface with an api-key-like owned selector.
+    // Prefer a writable document surface with an api-key-shaped owned selector.
     for surface in &surfaces {
         if surface.ownership == SurfaceOwnership::ExternalSecretStore {
             continue;
@@ -1391,7 +1336,6 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
         ) {
             continue;
         }
-        // Only consider surfaces that are writable (UserEditable or SuperaiCreated)
         let is_writable = matches!(
             surface.ownership,
             SurfaceOwnership::UserEditable | SurfaceOwnership::SuperaiCreated
@@ -1399,16 +1343,12 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
         if !is_writable {
             continue;
         }
-        // Check owned selectors for api-key-like patterns.
         for sel in &surface.owned_selectors {
             let lower = sel.to_ascii_lowercase();
             if lower.contains("api_key")
                 || lower.contains("apikey")
                 || lower.contains("api-key")
                 || lower.contains("auth_token")
-                || lower.contains("anthropic_api_key")
-                || lower.contains("anthropic_auth_token")
-                || lower.contains("apikeyhelper")
             {
                 return Ok(ApiKeySink {
                     kind: ApiKeySinkKind::ConfigField,
@@ -1537,10 +1477,9 @@ pub fn commit_api_key(
             });
         }
     }
-    // Harden permissions (unix 0o600). Do not log raw key.
+    // The preview carries the redacted placeholder only; `raw` never leaves
+    // this function except into the sink write.
     harden_permissions(&dest_path)?;
-    // Drop raw: the RedactedString will be dropped by caller; we ensure no copy remains in preview.
-    // Explicitly zeroing is not needed here as we never cloned raw into a long-lived structure.
     Ok(preview)
 }
 
@@ -1572,7 +1511,8 @@ fn write_config_field(
     secret: &str,
     adapter: &dyn Adapter,
 ) -> Result<()> {
-    // Read existing json if present, else start empty object. Preserve unmodelled keys.
+    // Read the existing document if present, else start an empty object;
+    // unmodelled keys ride through untouched.
     let existing: Option<Value> = if dest.exists() {
         let bytes = std::fs::read(dest).map_err(|e| CoreError::InvalidPath {
             kind: "read".to_owned(),
@@ -1582,7 +1522,6 @@ fn write_config_field(
         if bytes.is_empty() {
             None
         } else {
-            // Try parse as json; if fails, treat as error with validation kind.
             let v: Value = serde_json::from_slice(&bytes).map_err(|e| CoreError::Parse {
                 path: dest.to_path_buf(),
                 kind: "json".to_owned(),
@@ -1594,51 +1533,47 @@ fn write_config_field(
         None
     };
     let mut root = existing.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    // Backup before write if file existed.
-    if dest.exists() {
-        let _ = superai_config::backup::backup(dest).map_err(CoreError::Config)?;
-    }
-    // Apply selector: supports "model", "env.FOO", "env.ANTHROPIC_API_KEY" etc.
-    // Selector may be prefixed with "key:" or "env." already; strip "key:" if present.
+    let not_an_object = || CoreError::Validation {
+        field: "selector".to_owned(),
+        reason: format!("selector `{selector}` does not address an object"),
+    };
+    // Selectors may carry a "key:" or "env." prefix; strip both when present.
     let sel = selector
         .strip_prefix("key:")
         .unwrap_or(selector)
         .strip_prefix("env.")
         .unwrap_or(selector);
-    // Heuristic: if selector still contains "env." handle nested env object.
-    let (target_obj, leaf_key) = if selector.contains("env.") || selector.starts_with("env.") {
-        // Ensure "env" object exists.
-        let env_key = "env";
+    let (target_obj, leaf_key) = if selector.contains("env.") {
         if !root.is_object() {
             root = Value::Object(serde_json::Map::new());
         }
-        let map = root.as_object_mut().expect("just set to object");
+        let Some(map) = root.as_object_mut() else {
+            return Err(not_an_object());
+        };
         let env_entry = map
-            .entry(env_key.to_owned())
+            .entry("env".to_owned())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if !env_entry.is_object() {
             *env_entry = Value::Object(serde_json::Map::new());
         }
-        // Extract leaf after last '.'
-        let leaf = sel.split('.').next_back().unwrap_or(sel);
-        // For selectors like "env.ANTHROPIC_API_KEY", sel already stripped, leaf is correct.
-        // If original was "env.ANTHROPIC_API_KEY", sel = "ANTHROPIC_API_KEY", ok.
-        (env_entry, leaf.to_owned())
+        (
+            env_entry,
+            sel.split('.').next_back().unwrap_or(sel).to_owned(),
+        )
     } else if selector.contains('.') {
-        // Generic dot nesting: create nested objects.
         let parts: Vec<&str> = selector.split('.').collect();
         let leaf = parts.last().copied().unwrap_or(selector).to_owned();
-        // Walk/create path except leaf.
         let mut cur = &mut root;
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
             if !cur.is_object() {
                 *cur = Value::Object(serde_json::Map::new());
             }
-            let map = cur.as_object_mut().expect("object");
-            let entry = map
+            let Some(map) = cur.as_object_mut() else {
+                return Err(not_an_object());
+            };
+            cur = map
                 .entry((*part).to_owned())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            cur = entry;
         }
         (cur, leaf)
     } else {
@@ -1647,17 +1582,13 @@ fn write_config_field(
     if let Some(obj) = target_obj.as_object_mut() {
         obj.insert(leaf_key, Value::String(secret.to_owned()));
     } else {
-        return Err(CoreError::Validation {
-            field: "selector".to_owned(),
-            reason: format!("selector `{selector}` target is not an object"),
-        });
+        return Err(not_an_object());
     }
     let new_bytes = serde_json::to_vec_pretty(&root).map_err(|e| CoreError::InvalidPath {
         kind: "serialize".to_owned(),
         value: dest.display().to_string(),
         reason: format!("cannot serialize json: {e}"),
     })?;
-    // Write via atomic transaction (which also backs up, but we already did). Use raw_editor commit_for_adapter to enforce surface policy.
     crate::raw_editor::commit_for_adapter(dest, &new_bytes, None, adapter)?;
     Ok(())
 }
@@ -1669,10 +1600,7 @@ fn write_env_file(dest: &Path, var: &str, secret: &str) -> Result<()> {
             reason: format!("invalid env var name `{var}`"),
         });
     }
-    if dest.exists() {
-        let _ = superai_config::backup::backup(dest).map_err(CoreError::Config)?;
-    }
-    let mut content = if dest.exists() {
+    let content = if dest.exists() {
         std::fs::read_to_string(dest).map_err(|e| CoreError::InvalidPath {
             kind: "read".to_owned(),
             value: dest.display().to_string(),
@@ -1699,14 +1627,9 @@ fn write_env_file(dest: &Path, var: &str, secret: &str) -> Result<()> {
         }
     }
     if !found {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-            lines = content.lines().map(ToOwned::to_owned).collect();
-        }
         lines.push(format!("{var}={secret}"));
     }
     let new_content = lines.join("\n") + "\n";
-    // Ensure parent exists.
     if let Some(parent) = dest.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1716,10 +1639,8 @@ fn write_env_file(dest: &Path, var: &str, secret: &str) -> Result<()> {
             reason: format!("cannot create parent: {e}"),
         })?;
     }
-    // Plan-02 fold: provider env writes go through the config crate's ONE
-    // mutation boundary (snapshot → backup → §4.2 recheck → atomic replace →
-    // verify); the boundary's env staged-validation skips comment/blank lines
-    // so preserved lexical material is never refused.
+    // The mutation boundary stages env content with comment/blank lines
+    // skipped, so preserved lexical material is never refused.
     superai_config::transaction::commit_file(
         "provider-env",
         dest,
@@ -1729,10 +1650,6 @@ fn write_env_file(dest: &Path, var: &str, secret: &str) -> Result<()> {
     .map_err(CoreError::Config)?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Loading
-// ---------------------------------------------------------------------------
 
 /// Load provider definitions from a file or directory.
 ///
@@ -1871,10 +1788,6 @@ fn validate_no_duplicates(providers: &[ProviderDefinition]) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     #![expect(clippy::assertions_on_result_states, reason = "explicit Ok/Err checks")]
@@ -1999,7 +1912,7 @@ mod tests {
         let first = load_provider_defs(&dir).unwrap();
         assert_eq!(first.len(), 2);
 
-        // Add a synthetic third provider — no Rust edit.
+        // Add a synthetic third provider; no Rust edit.
         let new_json = single_provider_json("synthetic-new-99", "https://new.example.com");
         std::fs::write(dir.join("synthetic-new-99.json"), new_json).unwrap();
         let second = load_provider_defs(&dir).unwrap();
@@ -2183,7 +2096,7 @@ status: active
 
     #[test]
     fn no_hardcoded_provider_list() {
-        // Loading from empty dir yields empty vec — no built-in providers injected.
+        // Loading from an empty dir yields an empty vec; no built-ins inject.
         let dir = tmp_dir("empty");
         let out = load_provider_defs(&dir).unwrap();
         assert!(
@@ -2229,10 +2142,6 @@ status: active
         load_provider_defs(&path).unwrap_err();
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // -----------------------------------------------------------------------
-    // Bundled providers data-driven tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn bundled_providers_load_examples() {
@@ -2302,10 +2211,6 @@ status: active
         );
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // -----------------------------------------------------------------------
-    // Health probe enhanced — bounded, redacted, classified via fake harness
-    // -----------------------------------------------------------------------
 
     #[test]
     fn health_bounded_timeout_and_private_policy() {
@@ -2416,10 +2321,6 @@ status: active
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // API-key placement — ephemeral, sink-restricted, redacted
-    // -----------------------------------------------------------------------
-
     #[test]
     fn api_key_placement_only_to_declared_sink_and_redacted() {
         let dir = tmp_dir("api-key-sink");
@@ -2511,8 +2412,53 @@ status: active
         assert!(!format!("{key:?}").contains(sentinel));
         assert_eq!(format!("{key}"), "[REDACTED]");
 
-        // Check that writing literal to wrapper is not allowed as sink
-        // (resolve would not return wrapper literal; committing via that kind should error)
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// An overwritten sink keeps exactly one backup per commit (the mutation
+    /// boundary's pre-commit backup); duplicate copies would multiply
+    /// secret-bearing files on disk.
+    #[test]
+    fn key_commit_takes_exactly_one_backup_per_overwrite() {
+        let dir = tmp_dir("api-key-one-backup");
+        let inst = sample_instance(&dir, "one-backup");
+        // Hermetic version gate (see the test above for the rationale).
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_claude = write_fake_claude(&bin_dir);
+        let adapter =
+            crate::adapters::claude_code::ClaudeCodeAdapter::with_configured_binary(fake_claude)
+                .unwrap();
+        let provider = def("one-backup-prov", "https://api.example.com");
+
+        commit_api_key(
+            &RedactedString::new("first-fake-key-0123456789abcdef"),
+            &provider,
+            &adapter,
+            &inst,
+        )
+        .unwrap();
+        let dest = inst.config_root.as_path().join("settings.json");
+        assert!(
+            superai_config::backup::list_backups(&dest).is_ok_and(|backups| backups.is_empty()),
+            "creating the sink takes no backup"
+        );
+
+        commit_api_key(
+            &RedactedString::new("second-fake-key-0123456789abcdef"),
+            &provider,
+            &adapter,
+            &inst,
+        )
+        .unwrap();
+        let backups = superai_config::backup::list_backups(&dest).unwrap();
+        assert_eq!(backups.len(), 1, "one backup per overwrite: {backups:?}");
+        let backed_up = std::fs::read(&backups[0].backup_path).unwrap();
+        assert!(
+            String::from_utf8_lossy(&backed_up).contains("first-fake-key-0123456789abcdef"),
+            "backup holds the prior key value"
+        );
+
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -2569,10 +2515,9 @@ status: active
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "comprehensive health polish covers data-driven, bounded, redacted, classify, redirect in one test"
+        reason = "health polish covers data-driven, bounded, redacted, classify, redirect in one test"
     )]
-    fn health_polish_comprehensive_data_driven_bounded_redacted_classified_and_redirect_stripping()
-    {
+    fn health_polish_covers_data_driven_bounded_redacted_classified_and_redirect_stripping() {
         // Data-driven: synthetic provider loaded from file, no Rust edit.
         let dir = tmp_dir("health-polish");
         let json = single_provider_json("synthetic-health-polish", "https://api.example.com");
@@ -2692,10 +2637,6 @@ status: active
 
         drop(std::fs::remove_dir_all(&dir));
     }
-
-    // -----------------------------------------------------------------------
-    // PRV-01/02 field completeness + validation
-    // -----------------------------------------------------------------------
 
     #[test]
     fn schema_version_mismatch_rejected() {

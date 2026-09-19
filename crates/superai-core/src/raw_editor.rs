@@ -1,4 +1,4 @@
-//! Core raw editor — harness-aware wrapper over `superai_config::raw_editor`.
+//! Core raw editor: harness-aware wrapper over `superai_config::raw_editor`.
 //!
 //! Provides interface-neutral read/validate/diff/commit that enforces
 //! harness version and surface ownership policies before delegating to the
@@ -12,16 +12,14 @@ use superai_config::raw_editor::{CommitReport, DiffResult, RawDocument};
 use crate::adapter::{Adapter, DocumentKind as AdapterKind, SurfaceOwnership};
 use crate::error::{CoreError, Result};
 
-/// Re-export sensitive wrapper and document types for core consumers.
-pub use superai_config::raw_editor::{find_redaction_spans, validate};
+use superai_config::raw_editor::validate;
 
 /// Interface-agnostic raw editor service for core.
 ///
-/// Wraps the config-layer `RawEditor` and enforces harness version and
+/// Wraps the config-layer `RawEditor`, enforcing harness version and
 /// surface-ownership policies before delegating. Disk is the truth on every
-/// `open`; `validate` never touches disk; `diff` returns redacted lexical
-/// diff plus semantic ops; `commit` validates, checks conflict, backs up,
-/// atomically replaces, and verifies. No GPUI types.
+/// `open`; `validate` never touches disk; `commit` validates, checks
+/// conflict, backs up, atomically replaces, and verifies.
 #[derive(Debug, Clone, Default)]
 pub struct RawEditor {
     inner: superai_config::raw_editor::RawEditor,
@@ -200,10 +198,6 @@ pub fn validate_for_adapter(
 /// Checks `adapter.version_resolution().compatible` and the target surface's
 /// kind/ownership before delegating to the config backend. Wrong version and
 /// read-only internal/keychain surfaces are blocked without touching disk.
-#[expect(
-    clippy::excessive_nesting,
-    reason = "surface policy needs nested matching"
-)]
 pub fn commit_for_adapter(
     path: &Path,
     new_content: &[u8],
@@ -225,80 +219,57 @@ pub fn commit_for_adapter(
         });
     }
 
-    // Surface ownership gate (RAW-06)
-    // Find the most specific surface whose id or fallback appears in the path.
-    let path_str = path.to_string_lossy();
-    let path_lower = path_str.to_ascii_lowercase();
-    for surface in adapter.config_surfaces() {
-        let id_lower = surface.id.to_ascii_lowercase();
-        let fallback_lower = surface.path_resolver.fallback.to_ascii_lowercase();
-        let matches = path_lower.contains(id_lower.as_str())
-            || (!fallback_lower.is_empty() && path_lower.contains(fallback_lower.as_str()))
-            || path_lower.ends_with(id_lower.as_str());
-        if matches {
-            match surface.kind {
-                AdapterKind::Executable => {
-                    return Err(CoreError::ResearchBlocked {
-                        harness: adapter.id().to_string(),
-                        surface: surface.id,
-                        reason: "executable config is read-only via raw editor".to_owned(),
-                    });
-                }
-                AdapterKind::Sqlite | AdapterKind::Keychain | AdapterKind::Opaque => {
-                    return Err(CoreError::UnsupportedOperation {
-                        harness: adapter.id().to_string(),
-                        operation: "raw_commit".to_owned(),
-                        reason: format!("surface `{}` is read-only ({})", surface.id, surface.kind),
-                    });
-                }
-                _ => {
-                    if surface.ownership == SurfaceOwnership::ExternalSecretStore
-                        || surface.ownership == SurfaceOwnership::HarnessManaged
-                    {
-                        // Harness-managed or external secret stores are not writable via raw editor
-                        // unless the adapter explicitly marks them user-editable.
-                        // For now, block external secret store surfaces.
-                        if surface.ownership == SurfaceOwnership::ExternalSecretStore {
-                            return Err(CoreError::UnsupportedOperation {
-                                harness: adapter.id().to_string(),
-                                operation: "raw_commit".to_owned(),
-                                reason: format!(
-                                    "surface `{}` is externally managed ({})",
-                                    surface.id, surface.ownership
-                                ),
-                            });
-                        }
-                    }
-                }
+    // Surface ownership gate (RAW-06): the first declared surface whose id
+    // or fallback hint appears in the path decides the policy.
+    let path_lower = path.to_string_lossy().to_ascii_lowercase();
+    if let Some(surface) = surface_for_path(adapter, path) {
+        match surface.kind {
+            AdapterKind::Executable => {
+                return Err(CoreError::ResearchBlocked {
+                    harness: adapter.id().to_string(),
+                    surface: surface.id,
+                    reason: "executable config is read-only via raw editor".to_owned(),
+                });
             }
-            // Found matching writable surface, stop searching.
-            break;
+            AdapterKind::Sqlite | AdapterKind::Keychain | AdapterKind::Opaque => {
+                return Err(CoreError::UnsupportedOperation {
+                    harness: adapter.id().to_string(),
+                    operation: "raw_commit".to_owned(),
+                    reason: format!("surface `{}` is read-only ({})", surface.id, surface.kind),
+                });
+            }
+            _ if surface.ownership == SurfaceOwnership::ExternalSecretStore => {
+                return Err(CoreError::UnsupportedOperation {
+                    harness: adapter.id().to_string(),
+                    operation: "raw_commit".to_owned(),
+                    reason: format!(
+                        "surface `{}` is externally managed ({})",
+                        surface.id, surface.ownership
+                    ),
+                });
+            }
+            _ => {}
         }
     }
 
-    // Also block config-level Opaque detection (e.g. unknown binary)
+    // Config-level Opaque kind with no declared surface id in the path:
+    // treat db/keychain-shaped unknowns as internal stores (RAW-06).
     let config_kind = ConfigKind::from_path(path);
     if config_kind == ConfigKind::Opaque {
-        // If adapter has no matching surface, still block opaque via config kind
-        // to satisfy RAW-06 for internal SQLite/keychain stores.
         let known_surface = adapter
             .config_surfaces()
             .iter()
             .any(|s| path_lower.contains(s.id.to_ascii_lowercase().as_str()));
-        if !known_surface {
-            // Unknown file with opaque kind: allow only if adapter says it's not internal.
-            // For safety, treat generic opaque as read-only when no surface matches
-            // and path looks like a db/keychain.
-            if path_lower.contains(".db")
+        if !known_surface
+            && (path_lower.contains(".db")
                 || path_lower.contains(".sqlite")
-                || path_lower.contains("keychain")
-            {
-                return Err(CoreError::UnsupportedOperation {
-                    harness: adapter.id().to_string(),
-                    operation: "raw_commit".to_owned(),
-                    reason: "opaque/internal store is read-only".to_owned(),
-                });
-            }
+                || path_lower.contains("keychain"))
+        {
+            return Err(CoreError::UnsupportedOperation {
+                harness: adapter.id().to_string(),
+                operation: "raw_commit".to_owned(),
+                reason: "opaque/internal store is read-only".to_owned(),
+            });
         }
     }
 
@@ -354,10 +325,6 @@ fn surface_gates_for_adapter(
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// RAW-01 — open with surface identity and path policy
-// ---------------------------------------------------------------------------
 
 /// Response of an adapter-aware open (RAW-01).
 #[derive(Debug, Clone)]
@@ -514,10 +481,6 @@ pub fn open_explicit(path: &Path) -> Result<RawDocument> {
     read(normalized.as_path())
 }
 
-// ---------------------------------------------------------------------------
-// RAW-02 — validate a draft (schema at validate time)
-// ---------------------------------------------------------------------------
-
 /// Result of draft validation (RAW-02): syntax + size + adapter schema
 /// diagnostics and the version gate, without touching disk.
 #[derive(Debug, Clone)]
@@ -537,7 +500,7 @@ impl RawEditor {
     /// Validate a draft against the adapter's surface schema and version
     /// gate (RAW-02): size + encoding + syntax + adapter semantic schema +
     /// deprecated/owned-key identification + root/type constraints, plus the
-    /// harness version gate — all at VALIDATE time, never touching disk.
+    /// harness version gate, all at VALIDATE time, never touching disk.
     pub fn validate_draft(
         &self,
         adapter: &dyn Adapter,
@@ -578,10 +541,6 @@ pub fn validate_draft(adapter: &dyn Adapter, path: &Path, draft: &[u8]) -> Draft
     }
 }
 
-// ---------------------------------------------------------------------------
-// RAW-03 — diff with scope/precedence, restart, and template ownership
-// ---------------------------------------------------------------------------
-
 /// Adapter-aware diff (RAW-03): the base diff plus scope/precedence warning,
 /// restart/reload requirement, and template-owned divergence markers.
 #[derive(Debug, Clone)]
@@ -597,7 +556,7 @@ pub struct AdapterDiffResult {
     /// Scope/precedence warning: other surfaces may override this file.
     pub scope_warning: Option<String>,
     /// Template-owned fields the draft diverges on (reported, never
-    /// forbidden — disk is authoritative and users may intentionally
+    /// forbidden; disk is authoritative and users may intentionally
     /// diverge).
     pub template_owned_changes: Vec<superai_config::raw_editor::SemanticOp>,
 }
@@ -688,10 +647,6 @@ pub fn diff_for_adapter(
         template_owned_changes,
     }
 }
-
-// ---------------------------------------------------------------------------
-// RAW-05 — adapter-permission-gated creation with rollback
-// ---------------------------------------------------------------------------
 
 /// Preview of creating a missing config file (RAW-05).
 #[derive(Debug, Clone)]
@@ -819,10 +774,6 @@ pub fn create_file_for_adapter(
     superai_config::raw_editor::create_file(path, initial).map_err(CoreError::Config)
 }
 
-// ---------------------------------------------------------------------------
-// RAW-07 — reopen with a new schema (manual rebase)
-// ---------------------------------------------------------------------------
-
 /// Rebase report after a schema-version change invalidated a draft (RAW-07).
 #[derive(Debug, Clone)]
 pub struct RebaseReport {
@@ -835,7 +786,7 @@ pub struct RebaseReport {
     /// Whether the current resolution is write-compatible at all.
     pub new_version_compatible: bool,
     /// Keys/spans affected between the draft and the current on-disk
-    /// document — the manual rebase work list. Nothing is auto-applied.
+    /// document: the manual rebase work list. Nothing is auto-applied.
     pub affected: Vec<superai_config::raw_editor::SemanticOp>,
     /// Lexical unified diff (draft -> current disk) for the human rebase.
     pub lexical: String,
@@ -878,7 +829,7 @@ pub fn reopen_rebase(
     } else {
         format!(
             "harness changed {} -> {} while the draft was open; {} affected key(s)/span(s) \
-             listed for MANUAL rebase — superai never auto-applies a draft under a new schema",
+             listed for MANUAL rebase; superai never auto-applies a draft under a new schema",
             draft_version,
             version.detected_version.as_deref().unwrap_or("unknown"),
             affected.len()
@@ -1132,10 +1083,6 @@ mod tests {
         drop(std::fs::remove_file(&yaml_path));
     }
 
-    // -------------------------------------------------------------------
-    // HAD-03 schema gate + HAD-05 era gate at the commit boundary
-    // -------------------------------------------------------------------
-
     use crate::adapter::{RootShape, SurfaceSchema};
 
     /// Adapter with a compatible version, writable TOML + JSON surfaces, a
@@ -1350,9 +1297,6 @@ mod tests {
         assert_eq!(surface.id, "config.toml");
         assert!(surface_for_path(&adapter, &root.join("other.txt")).is_none());
     }
-    // -------------------------------------------------------------------
-    // RAW-01/02/03/05/07 — adapter-aware open/validate/diff/create/reopen
-    // -------------------------------------------------------------------
 
     /// Writable adapter with two scoped surfaces (project .mcp.json at lower
     /// precedence requiring reload; user settings.json at higher precedence).

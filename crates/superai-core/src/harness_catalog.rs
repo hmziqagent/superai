@@ -1,4 +1,4 @@
-//! Registered harness catalog — the 51 planned product surfaces.
+//! Registered harness catalog: the 51 planned product surfaces.
 //!
 //! Every row from `docs/plans/03-harness-adapters.md` provisional ledger is
 //! present with its entry gate, source link, and reason. This satisfies the
@@ -62,10 +62,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::state::{AdapterSupport, Isolation};
 
-// ---------------------------------------------------------------------------
-// Catalog entry
-// ---------------------------------------------------------------------------
-
 /// One provisional ledger row, registered in code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
@@ -96,10 +92,6 @@ impl CatalogEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Static catalog
-// ---------------------------------------------------------------------------
-
 /// All 51 provisional ledger rows.
 ///
 /// Order follows the table in `docs/plans/03-harness-adapters.md` with the
@@ -111,7 +103,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Aider",
         source: "docs/harness-configs/aider.md",
         support: AdapterSupport::Full,
-        reason: "YAML/env/JSON, explicit config — full candidate",
+        reason: "YAML/env/JSON, explicit config: full candidate",
         isolation: Isolation::ExplicitConfig,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/aider.md",
@@ -122,7 +114,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Amazon Q Developer CLI",
         source: "docs/harness-configs/amazon-q-cli.md",
         support: AdapterSupport::MigrationOnly,
-        reason: "sunsetting 2026-05-15, EOS 2027-04-30 — migration only",
+        reason: "sunsetting 2026-05-15, EOS 2027-04-30: migration only",
         isolation: Isolation::ProjectScope,
         product_status: ProductStatus::Sunset,
         research_doc: "docs/harness-configs/amazon-q-cli.md",
@@ -210,7 +202,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Codex CLI",
         source: "docs/harness-configs/codex-cli.md",
         support: AdapterSupport::Full,
-        reason: "TOML, relocated-root/profile — full candidate",
+        reason: "TOML, relocated-root/profile: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/codex-cli.md",
@@ -232,7 +224,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "GitHub Copilot CLI",
         source: "docs/harness-configs/copilot-cli.md",
         support: AdapterSupport::Full,
-        reason: "JSONC/MCP, relocated-root — full candidate",
+        reason: "JSONC/MCP, relocated-root: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/copilot-cli.md",
@@ -254,7 +246,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Crush",
         source: "docs/harness-configs/crush.md",
         support: AdapterSupport::ResearchBlocked,
-        reason: "executable crushrc, deprecated JSON — research blocked for writes",
+        reason: "executable crushrc, deprecated JSON: research blocked for writes",
         isolation: Isolation::ProjectScope,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/crush.md",
@@ -265,7 +257,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Cursor IDE and Agent CLI",
         source: "docs/harness-configs/cursor.md",
         support: AdapterSupport::Constrained,
-        reason: "CLI root plus IDE user-data — constrained",
+        reason: "CLI root plus IDE user-data: constrained",
         isolation: Isolation::IdeUserData,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/cursor.md",
@@ -298,7 +290,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Forge",
         source: "docs/harness-configs/forge.md",
         support: AdapterSupport::Full,
-        reason: "relocated config — full candidate",
+        reason: "relocated config: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/forge.md",
@@ -320,7 +312,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Goose",
         source: "docs/harness-configs/goose.md",
         support: AdapterSupport::Full,
-        reason: "YAML config/recipes, relocated-root — full candidate after unverified keys close",
+        reason: "YAML config/recipes, relocated-root: full candidate after unverified keys close",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/goose.md",
@@ -331,7 +323,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "gptme",
         source: "docs/harness-configs/gptme.md",
         support: AdapterSupport::Constrained,
-        reason: "workspace plus explicit state — constrained",
+        reason: "workspace plus explicit state: constrained",
         isolation: Isolation::ProjectScope,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/gptme.md",
@@ -342,7 +334,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Grok Build",
         source: "docs/harness-configs/grok-build.md",
         support: AdapterSupport::Full,
-        reason: "TOML + JSON overlay, relocated-root — full candidate",
+        reason: "TOML + JSON overlay, relocated-root: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/grok-build.md",
@@ -353,7 +345,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Hermes Agent",
         source: "docs/harness-configs/hermes-agent.md",
         support: AdapterSupport::Full,
-        reason: "YAML/env, relocated-root/profile — full candidate",
+        reason: "YAML/env, relocated-root/profile: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/hermes-agent.md",
@@ -364,7 +356,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "iFlow CLI",
         source: "docs/harness-configs/iflow-cli.md",
         support: AdapterSupport::MigrationOnly,
-        reason: "shutdown 2026-04-17 — migration only",
+        reason: "shutdown 2026-04-17: migration only",
         isolation: Isolation::EnvOnly,
         product_status: ProductStatus::Sunset,
         research_doc: "docs/harness-configs/iflow-cli.md",
@@ -375,7 +367,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Junie CLI",
         source: "docs/harness-configs/junie-cli.md",
         support: AdapterSupport::Full,
-        reason: "relocated-root, EAP gated — full candidate",
+        reason: "relocated-root, EAP gated: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Eap,
         research_doc: "docs/harness-configs/junie-cli.md",
@@ -386,7 +378,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Kilo Code extension and CLI",
         source: "docs/harness-configs/kilo-code.md",
         support: AdapterSupport::Constrained,
-        reason: "layered JSONC, inline/HOME plus IDE — constrained until root verified",
+        reason: "layered JSONC, inline/HOME plus IDE: constrained until root verified",
         isolation: Isolation::IdeUserData,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/kilo-code.md",
@@ -397,7 +389,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Kimi Code CLI",
         source: "docs/harness-configs/kimi-cli.md",
         support: AdapterSupport::Full,
-        reason: "TOML plus MCP JSON, relocated-root — full candidate",
+        reason: "TOML plus MCP JSON, relocated-root: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/kimi-cli.md",
@@ -408,7 +400,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Legacy Kimi CLI",
         source: "docs/harness-configs/kimi-cli.md",
         support: AdapterSupport::MigrationOnly,
-        reason: "legacy root, wound down — migration only",
+        reason: "legacy root, wound down: migration only",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Retired,
         research_doc: "docs/harness-configs/kimi-cli.md",
@@ -430,7 +422,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Kode CLI",
         source: "docs/harness-configs/kode.md",
         support: AdapterSupport::Full,
-        reason: "JSON/MCP/agents, relocated-root — full candidate",
+        reason: "JSON/MCP/agents, relocated-root: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/kode.md",
@@ -452,7 +444,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "MiMo Code",
         source: "docs/harness-configs/mimo-code.md",
         support: AdapterSupport::Full,
-        reason: "JSON/JSONC, relocated-root — full candidate",
+        reason: "JSON/JSONC, relocated-root: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/mimo-code.md",
@@ -463,7 +455,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Mistral Vibe",
         source: "docs/harness-configs/mistral-vibe.md",
         support: AdapterSupport::Full,
-        reason: "TOML, relocated-root — full candidate",
+        reason: "TOML, relocated-root: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/mistral-vibe.md",
@@ -474,7 +466,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Nanocoder",
         source: "docs/harness-configs/nanocoder.md",
         support: AdapterSupport::Full,
-        reason: "JSON provider/MCP, relocated/explicit — full candidate",
+        reason: "JSON provider/MCP, relocated/explicit: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/nanocoder.md",
@@ -496,7 +488,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "OpenCode",
         source: "docs/harness-configs/opencode.md",
         support: AdapterSupport::Full,
-        reason: "layered JSONC, relocated/inline — full candidate",
+        reason: "layered JSONC, relocated/inline: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/opencode.md",
@@ -507,7 +499,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "OpenHands",
         source: "docs/harness-configs/openhands.md",
         support: AdapterSupport::Constrained,
-        reason: "V1 JSON/env plus V0 TOML, Docker — version split required",
+        reason: "V1 JSON/env plus V0 TOML, Docker: version split required",
         isolation: Isolation::OsBound,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/openhands.md",
@@ -540,7 +532,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Qwen Code",
         source: "docs/harness-configs/qwen-code.md",
         support: AdapterSupport::Full,
-        reason: "layered JSON/env/MCP, relocated settings — full candidate",
+        reason: "layered JSON/env/MCP, relocated settings: full candidate",
         isolation: Isolation::RelocatedRoot,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/qwen-code.md",
@@ -551,7 +543,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Roo Code",
         source: "docs/harness-configs/roo-code.md",
         support: AdapterSupport::MigrationOnly,
-        reason: "VS Code storage, archived 2026-05 — migration only",
+        reason: "VS Code storage, archived 2026-05: migration only",
         isolation: Isolation::IdeUserData,
         product_status: ProductStatus::Archived,
         research_doc: "docs/harness-configs/roo-code.md",
@@ -562,7 +554,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "SWE-agent",
         source: "docs/harness-configs/swe-agent.md",
         support: AdapterSupport::Full,
-        reason: "composed YAML, explicit config/batch — full candidate",
+        reason: "composed YAML, explicit config/batch: full candidate",
         isolation: Isolation::ExplicitConfig,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/swe-agent.md",
@@ -573,7 +565,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Trae Agent",
         source: "docs/harness-configs/trae-agent.md",
         support: AdapterSupport::Full,
-        reason: "YAML + deprecated JSON, explicit config/env — full candidate",
+        reason: "YAML + deprecated JSON, explicit config/env: full candidate",
         isolation: Isolation::ExplicitConfig,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/trae-agent.md",
@@ -595,7 +587,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Windsurf/Devin Desktop",
         source: "docs/harness-configs/windsurf.md",
         support: AdapterSupport::Constrained,
-        reason: "MCP JSON + rules/skills, IDE user-data — constrained",
+        reason: "MCP JSON + rules/skills, IDE user-data: constrained",
         isolation: Isolation::IdeUserData,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/windsurf.md",
@@ -617,7 +609,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "ZCode",
         source: "docs/harness-configs/zcode.md",
         support: AdapterSupport::SingleInstance,
-        reason: "versioned-path JSON, fixed path — single instance",
+        reason: "versioned-path JSON, fixed path: single instance",
         isolation: Isolation::FixedPathSingle,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/zcode.md",
@@ -628,7 +620,7 @@ pub const ENTRIES: &[CatalogEntry] = &[
         display_name: "Zed AI/ACP",
         source: "docs/harness-configs/zed-acp.md",
         support: AdapterSupport::Constrained,
-        reason: "JSON settings, ACP wrappers, wrapper registrations — version gates",
+        reason: "JSON settings, ACP wrappers, wrapper registrations: version gates",
         isolation: Isolation::IdeUserData,
         product_status: ProductStatus::Active,
         research_doc: "docs/harness-configs/zed-acp.md",
@@ -669,10 +661,6 @@ pub const ENTRIES: &[CatalogEntry] = &[
     },
 ];
 
-// ---------------------------------------------------------------------------
-// Public accessors
-// ---------------------------------------------------------------------------
-
 /// Return the full catalog slice.
 pub fn all_entries() -> &'static [CatalogEntry] {
     ENTRIES
@@ -697,7 +685,7 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
 ///
 /// Returns `None` when `id` has no concrete adapter implementation; callers
 /// fall back to a [`GenericAdapter`] built from the catalog row. This is the
-/// single registry of concrete adapter constructors — consumers resolve
+/// single registry of concrete adapter constructors; consumers resolve
 /// harness ids through here instead of duplicating per-adapter wiring.
 #[expect(
     clippy::too_many_lines,
@@ -1050,32 +1038,30 @@ pub fn all_skill_supported_ids() -> Vec<&'static str> {
 /// For every catalog entry, the catalog helper `skill_modes_for` must agree
 /// with the live adapter's `supported_skill_modes`. This catches ledger drift.
 pub fn verify_skill_support_consistency() -> Result<(), CoreError> {
+    // Build the adapter set once; constructing it per entry is 51x the cost.
+    let adapters = all_adapters();
     for entry in ENTRIES {
         let catalog_modes = skill_modes_for(entry.id);
-        let adapters = all_adapters();
-        let adapter = adapters
+        let Some(adapter) = adapters
             .iter()
-            .find(|adapter| adapter.id().as_str() == entry.id);
-        if let Some(adapter) = adapter {
-            let live_modes = adapter.supported_skill_modes();
-            // Compare as sets (order independent)
-            let mut cat_set = std::collections::BTreeSet::new();
-            let mut live_set = std::collections::BTreeSet::new();
-            for mode in catalog_modes {
-                cat_set.insert(mode.to_string());
-            }
-            for mode in live_modes {
-                live_set.insert(mode.to_string());
-            }
-            if cat_set != live_set {
-                return Err(CoreError::Validation {
-                    field: "skill_support".to_owned(),
-                    reason: format!(
-                        "catalog vs adapter skill mode mismatch for `{}`: catalog {:?} vs adapter {:?}",
-                        entry.id, cat_set, live_set
-                    ),
-                });
-            }
+            .find(|adapter| adapter.id().as_str() == entry.id)
+        else {
+            continue;
+        };
+        let live_modes = adapter.supported_skill_modes();
+        // Compare as sets (order independent).
+        let cat_set: std::collections::BTreeSet<String> =
+            catalog_modes.iter().map(ToString::to_string).collect();
+        let live_set: std::collections::BTreeSet<String> =
+            live_modes.iter().map(ToString::to_string).collect();
+        if cat_set != live_set {
+            return Err(CoreError::Validation {
+                field: "skill_support".to_owned(),
+                reason: format!(
+                    "catalog vs adapter skill mode mismatch for `{}`: catalog {:?} vs adapter {:?}",
+                    entry.id, cat_set, live_set
+                ),
+            });
         }
     }
     Ok(())

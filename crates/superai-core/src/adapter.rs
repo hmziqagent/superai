@@ -20,16 +20,8 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
 
-// ---------------------------------------------------------------------------
-// Adapter revision
-// ---------------------------------------------------------------------------
-
 /// Revision of the adapter implementation, equal to the crate version.
 pub const ADAPTER_REVISION: &str = env!("CARGO_PKG_VERSION");
-
-// ---------------------------------------------------------------------------
-// Product status
-// ---------------------------------------------------------------------------
 
 /// Lifecycle status of the upstream product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,10 +60,6 @@ impl fmt::Display for ProductStatus {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Platform
-// ---------------------------------------------------------------------------
 
 /// Operating system for adapter support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -141,10 +129,6 @@ impl fmt::Display for Platform {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Detection
-// ---------------------------------------------------------------------------
-
 /// Confidence of a detection probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,10 +194,6 @@ impl DetectionResult {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Config surface types
-// ---------------------------------------------------------------------------
 
 /// Kind of on-disk document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -428,10 +408,6 @@ impl ConfigSurface {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Surface schemas — root shape + owned-key semantics (HAD-03)
-// ---------------------------------------------------------------------------
 
 /// Required shape of a surface's document root (HAD-03 "root shape").
 ///
@@ -709,10 +685,6 @@ pub fn validate_instance_surfaces(adapter: &dyn Adapter, root: &Path) -> Result<
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Version resolution
-// ---------------------------------------------------------------------------
-
 /// How the adapter maps a detected harness version to a schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionResolution {
@@ -752,10 +724,6 @@ impl VersionResolution {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wrapper plan
-// ---------------------------------------------------------------------------
-
 /// How the launched process's standard streams behave (WRP-01).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -781,8 +749,8 @@ impl fmt::Display for StdioPolicy {
 }
 
 /// An auth prerequisite the harness needs before the wrapper can run
-/// (WRP-01). Always a reference — the env var NAME the harness reads or a
-/// login step the user performs in the harness itself — never a secret.
+/// (WRP-01). Always a reference, the env var NAME the harness reads or a
+/// login step the user performs in the harness itself, never a secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthPrerequisite {
     /// What must exist: an env var name or an in-harness login step.
@@ -822,7 +790,7 @@ impl AuthPrerequisite {
 
 /// Plan for invoking an isolated instance via a wrapper.
 ///
-/// WRP-01: the full invocation specification — executable reference, argv
+/// WRP-01: the full invocation specification (executable reference, argv
 /// policy, environment set/unset operations, working-directory policy,
 /// config/state paths, stdio/daemon behavior, auth prerequisites, and the
 /// isolation guarantees plus shared-state warnings the harness honestly
@@ -863,7 +831,7 @@ pub struct WrapperPlan {
     #[serde(default)]
     pub isolation_guarantees: Vec<String>,
     /// State that stays SHARED across profiles despite the split (e.g. an
-    /// OS keychain, a subscription, cloud state) — the honest constrained
+    /// OS keychain, a subscription, cloud state), the honest constrained
     /// channel.
     #[serde(default)]
     pub shared_state_warnings: Vec<String>,
@@ -888,10 +856,6 @@ impl WrapperPlan {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Skill destination modes
-// ---------------------------------------------------------------------------
-
 /// How a skill reaches an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -914,10 +878,6 @@ impl fmt::Display for SkillMode {
         f.write_str(s)
     }
 }
-
-// ---------------------------------------------------------------------------
-// MCP transport and adapter declarations (EXT-06..08)
-// ---------------------------------------------------------------------------
 
 /// Transport for an MCP server (EXT-08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1265,10 +1225,6 @@ impl PluginAdapterDecl {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Capability declarations (plan 09 CAP-03 source 1)
-// ---------------------------------------------------------------------------
-
 /// Harness-native capability declaration (CAP-03 source 1): what the
 /// harness's own transport can carry, independent of any provider.
 ///
@@ -1316,10 +1272,6 @@ impl AdapterCapabilityDecl {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Adapter trait
-// ---------------------------------------------------------------------------
-
 /// Harness adapter: read-only probes plus plans for mutation.
 ///
 /// Every implementor is object-safe, `Send + Sync`, and has no async methods.
@@ -1366,7 +1318,7 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// copy when mirroring (INS-03 `Linked` / INS-04 step 4 shared assets).
     ///
     /// A declared path must be shared, re-derivable state the harness reads
-    /// through the relocated root — e.g. a skills directory the harness
+    /// through the relocated root, e.g. a skills directory the harness
     /// resolves through `$CONFIG_DIR/skills` and that superai already
     /// manages by symlinking (EXT-03 `LinkAll`). The mirror plan classifies
     /// matching entries [`crate::lifecycle::MirrorKind::Linked`] and the
@@ -1401,7 +1353,7 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Adapters that have modeled a surface's semantics return its schema
     /// keyed by the surface id; the raw editor consults it at validate time
     /// and before adapter-aware commits. `None` (the default) means the
-    /// surface has no adapter-declared schema yet — syntax validation still
+    /// surface has no adapter-declared schema yet; syntax validation still
     /// applies, semantic validation does not.
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
         let _ = surface_id;
@@ -1430,7 +1382,7 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Adapters that have modeled their harness's capability transport
     /// return one declaration per catalog capability; resolution feeds these
     /// as the transport constraint. `None`/empty (the default) means the
-    /// adapter has not declared capability transport — resolution treats the
+    /// adapter has not declared capability transport; resolution treats the
     /// pair as Unknown rather than guessing.
     fn capability_declarations(&self) -> Vec<AdapterCapabilityDecl> {
         Vec::new()
@@ -1475,10 +1427,6 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Generic adapter backed by catalog data
-// ---------------------------------------------------------------------------
-
 /// Generic adapter constructed from catalog ledger data.
 ///
 /// This is the runtime representation of a provisional ledger row. Real
@@ -1500,9 +1448,6 @@ pub struct GenericAdapter {
 
 impl GenericAdapter {
     /// Create a generic adapter from catalog row fields.
-    ///
-    /// All string parameters are `&str` to satisfy the `&str` over `String`
-    /// guideline; they are cloned into owned storage.
     #[expect(
         clippy::too_many_arguments,
         reason = "catalog row maps to adapter fields"
@@ -1886,10 +1831,6 @@ mod tests {
         assert!(found, "wrapper env must reference instance root");
     }
 
-    // -------------------------------------------------------------------
-    // Surface schema vocabulary (HAD-03)
-    // -------------------------------------------------------------------
-
     use super::{
         DeprecatedKeyDecl, OwnedKeyRule, RootShape, SurfaceSchema, ValueType, VersionResolution,
     };
@@ -2127,10 +2068,6 @@ mod tests {
         assert!(schema.owned_key_rules.is_empty());
         assert!(schema.deprecated_keys.is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // MCP/plugin declaration vocabulary (EXT-06..09)
-    // -------------------------------------------------------------------
 
     #[test]
     fn mcp_decl_defaults_to_writable_name_map() {

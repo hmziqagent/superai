@@ -12,7 +12,7 @@
 //! endpoint gets a typed Unsupported outcome and no mutation.
 //!
 //! superai never proxies model traffic: rendering writes configuration only.
-//! Auth is rendered as a sink/variable NAME, never a secret value — key
+//! Auth is rendered as a sink/variable NAME, never a secret value; key
 //! placement stays in [`crate::provider::commit_api_key`].
 
 use std::path::PathBuf;
@@ -31,10 +31,6 @@ use crate::ids::ProviderId;
 use crate::instance::Instance;
 use crate::provider::{ApiKeySink, Protocol, ProviderDefinition, resolve_api_key_sink};
 use crate::template::Template;
-
-// ---------------------------------------------------------------------------
-// PRV-03 — render outcome types
-// ---------------------------------------------------------------------------
 
 /// A successful render: typed engine operations against one surface, plus
 /// the auth reference the harness expects (name only, never a secret).
@@ -108,7 +104,7 @@ fn is_writable(surface: &ConfigSurface) -> bool {
 
 /// Pick the rendering strategy a surface's owned selectors express.
 ///
-/// Pure selector inspection — the same provider data renders differently
+/// Pure selector inspection: the same provider data renders differently
 /// per harness because the harnesses declare different owned selectors.
 fn strategy_for(surface: &ConfigSurface) -> Option<RenderStrategy> {
     if !is_writable(surface) || surface.owned_selectors.is_empty() {
@@ -203,7 +199,7 @@ fn auth_env_var(provider: &ProviderDefinition, warnings: &mut Vec<String>) -> St
 /// Pure: nothing is written. `instance` only names the destination for the
 /// caller; mutations are content-level engine operations the caller applies
 /// (see [`commit_provider_change`]) or previews. Rendering never emits a
-/// secret — auth appears as a sink/variable name only.
+/// secret; auth appears as a sink/variable name only.
 #[expect(clippy::too_many_lines, reason = "strategy table is deliberate")]
 pub fn render_provider_into_adapter(
     provider: &ProviderDefinition,
@@ -440,10 +436,6 @@ pub fn render_provider_into_adapter(
     })
 }
 
-// ---------------------------------------------------------------------------
-// PRV-05 — effective provider inspection
-// ---------------------------------------------------------------------------
-
 /// Where a detected credential lives (type only, never the secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum CredentialSourceKind {
@@ -473,7 +465,7 @@ pub struct ModelRole {
     pub role: String,
     /// Selector the role was read from.
     pub selector: String,
-    /// Value read (model id / provider id — not secret-shaped).
+    /// Value read (model id / provider id, never secret-shaped).
     pub value: String,
     /// Surface the value was read from.
     pub surface: String,
@@ -668,9 +660,9 @@ pub fn inspect_effective_provider(
         let Some(value) = load_surface_value(&path, surface.kind)? else {
             continue;
         };
-        let Value::Object(map) = value else {
+        if !matches!(value, Value::Object(_)) {
             continue;
-        };
+        }
         let mut surface_has_provider_value = false;
         let match_endpoint = |endpoint: &str| -> Option<DetectedProvider> {
             let normalized = normalize_endpoint_for_match(endpoint);
@@ -689,7 +681,7 @@ pub fn inspect_effective_provider(
         for sel in &surface.owned_selectors {
             let lower = sel.to_ascii_lowercase();
             let segments: Vec<&str> = sel.split('.').collect();
-            let mut current: Option<&Value> = Some(&Value::Object(map.clone()));
+            let mut current: Option<&Value> = Some(&value);
             for segment in &segments {
                 current = current.and_then(|v| v.as_object().and_then(|o| o.get(*segment)));
             }
@@ -766,7 +758,7 @@ pub fn inspect_effective_provider(
         // Provider-shaped keys the adapter does NOT own (relevant to
         // mutation decisions; read-only observation). Unowned tables count
         // when they or their children look provider-shaped.
-        if let Value::Object(root) = &Value::Object(map.clone()) {
+        if let Value::Object(root) = &value {
             let providerish = |name: &str| -> bool {
                 let lower = name.to_ascii_lowercase();
                 lower.contains("model")
@@ -833,10 +825,6 @@ pub fn inspect_effective_provider(
     })
 }
 
-// ---------------------------------------------------------------------------
-// PRV-08 — provider lifecycle
-// ---------------------------------------------------------------------------
-
 /// One lifecycle change to apply to an instance's provider configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderChange<'a> {
@@ -878,7 +866,7 @@ pub struct ProviderChangePreview {
     /// File that would change.
     pub path: PathBuf,
     /// Redacted edit descriptions (`selector: old -> new`); secrets never
-    /// appear — auth fields are presence-only.
+    /// appear; auth fields are presence-only.
     pub edits: Vec<String>,
     /// Warnings (dangling references, unsupported notes).
     pub warnings: Vec<String>,
@@ -1064,7 +1052,7 @@ fn plan_change(
                 RenderStrategy::ProviderMap => format!("provider.{provider_id}"),
                 RenderStrategy::ProviderOptions => {
                     // Single-provider shape: removal means clearing the
-                    // provider/options pair — only valid when they point at
+                    // provider/options pair, only valid when they point at
                     // the removed provider.
                     let current_provider = read_selector("provider");
                     let matches_removed = current_provider
@@ -1349,8 +1337,8 @@ fn apply_ops_to_toml(doc: &mut toml_edit::DocumentMut, ops: &[EngineOperation]) 
 /// Commit a lifecycle change (PRV-08): fresh read, engine-enforced owned-key
 /// edits, backup + atomic write through a Transaction.
 ///
-/// Foreign entries — other providers, unmodelled keys, comments and layout
-/// on TOML surfaces — are preserved. JSONC surfaces with comments are
+/// Foreign entries (other providers, unmodelled keys, comments and layout
+/// on TOML surfaces) are preserved. JSONC surfaces with comments are
 /// refused with the typed lossy-write error instead of silently stripping
 /// them (codec honesty). Dangling default references block removal.
 #[expect(clippy::excessive_nesting, reason = "per-kind serialization branches")]
@@ -1490,10 +1478,6 @@ pub fn commit_provider_change(
         warnings,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
