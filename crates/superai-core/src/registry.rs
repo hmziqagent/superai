@@ -689,6 +689,7 @@ impl Registry {
         // Perform rename.
         let inst = &mut self.instances[idx];
         let old_name_owned = inst.name.to_string();
+        let old_command = inst.wrapper.as_ref().map(|w| w.command_name.clone());
         inst.name = new_name.clone();
         // Update wrapper command_name if it matches old name (case-folded).
         if let Some(wrapper) = &mut inst.wrapper
@@ -700,9 +701,12 @@ impl Registry {
 
         // Validate whole registry after rename.
         if let Err(e) = self.validate() {
-            // Roll back
+            // Roll back the name and any wrapper command the rename touched.
             let inst = &mut self.instances[idx];
             inst.name = InstanceName::new(&old_name_owned).unwrap_or(new_name);
+            if let (Some(wrapper), Some(command)) = (&mut inst.wrapper, old_command) {
+                wrapper.command_name = command;
+            }
             return Err(e);
         }
 

@@ -277,13 +277,7 @@ pub fn run_command(
         cmd = cmd.full_env(Vec::<(String, String)>::new());
     }
     for key in &opts.env_remove {
-        // duct has no env_remove; emulate by setting to empty and rely on child
-        // ignoring it is not perfect, but toride-runner's apply_env_policy
-        // handles removal via std::env scrubbing. For superai, we pass
-        // env_remove via `env` with explicit removal after spawn is not yet
-        // implemented; we document the limitation and avoid clear_env removal
-        // divergence by not using env_remove in catalog commands (none need it).
-        let _ = key;
+        cmd = cmd.env_remove(key);
     }
     for (k, v) in &opts.env {
         cmd = cmd.env(k, v);
@@ -619,5 +613,28 @@ mod tests {
         };
         let err = run_command("sleep", &["2".to_owned()], &opts).unwrap_err();
         assert!(format!("{err}").contains("timed out"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_env_remove_drops_variable_from_child() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned())],
+            env_remove: vec!["HOME".to_owned()],
+            ..Default::default()
+        };
+        // printenv prints one value line per found variable; HOME must not
+        // print, so the child saw exactly the kept variable.
+        let out = run_command(
+            "printenv",
+            &["HOME".to_owned(), "SUPERAI_TEST_KEEP".to_owned()],
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            out.stdout, "yes\n",
+            "HOME must be removed from the child environment"
+        );
     }
 }
