@@ -1,23 +1,15 @@
 //! Quarantine for recoverable deletion (MUT-08).
 //!
-//! Material directory removal first moves the exact validated target into a
-//! superai quarantine area on the same filesystem where possible. The default
-//! quarantine path is `~/.superai/quarantine/<operation_id>/` and the move
-//! reports recoverability and retention.
-//!
-//! Operations that own a relocated superai root (alias bases outside the
-//! user's home) pass that root explicitly through the `*_under` functions, so
-//! their recovery state lands at `<root>/.superai/quarantine/<operation_id>/`
-//! — under the root the operation targets, never in the real home
-//! (run-4 round-3 finding 2).
+//! A validated target is moved into a quarantine area (default
+//! `~/.superai/quarantine/<operation_id>/`) and the move reports
+//! recoverability. Operations owning a relocated superai root use the
+//! `*_under` functions so recovery state lands under that root, never in
+//! the real home.
 
 use std::path::{Path, PathBuf};
 
+use crate::atomic::compute_digest;
 use crate::error::{ConfigError, Result};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn home_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
@@ -35,24 +27,15 @@ fn home_dir() -> Option<PathBuf> {
     None
 }
 
-fn compute_digest(bytes: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-/// Whether `path` looks like a broad root that must never be quarantined.
+/// Whether `path` is a broad root that must never be quarantined: unix
+/// broad roots plus Windows-shaped ones (drive, UNC, first-level system
+/// directories), which are inert on unix hosts.
 fn is_broad_root(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let raw = s.as_ref();
     matches!(raw, "/" | "/home" | "/tmp" | "/usr" | "/etc" | "/var")
         || raw == "/home/"
         || raw == "/tmp/"
-        // Windows-shaped broad roots (drive roots, UNC roots, first-level
-        // system directories), case-folded with both separators — inert on
-        // unix, where no absolute path is windows-shaped.
         || crate::transaction::windows_shaped_broad_root(path)
 }
 
@@ -73,15 +56,8 @@ fn has_glob(path: &Path) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
 
-// ---------------------------------------------------------------------------
-// Quarantine paths
-// ---------------------------------------------------------------------------
-
-/// Returns the base quarantine directory: `~/.superai/quarantine`.
-///
-/// Operations with their own relocated root must use
-/// [`quarantine_base_under`] instead, so recovery state stays under the root
-/// the operation targets.
+/// Base quarantine directory: `~/.superai/quarantine`. Operations with
+/// their own relocated root must use [`quarantine_base_under`].
 pub fn quarantine_base() -> Result<PathBuf> {
     let home = home_dir().ok_or_else(|| {
         ConfigError::io(
@@ -95,11 +71,8 @@ pub fn quarantine_base() -> Result<PathBuf> {
     Ok(home.join(".superai").join("quarantine"))
 }
 
-/// Returns the base quarantine directory under an explicit superai-owned
-/// root: `<root>/.superai/quarantine`.
-///
-/// The root must be absolute; relative roots are refused before any
-/// filesystem work.
+/// Base quarantine directory under an explicit superai-owned root
+/// (`<root>/.superai/quarantine`); the root must be absolute.
 pub fn quarantine_base_under(root: &Path) -> Result<PathBuf> {
     if !root.is_absolute() {
         return Err(ConfigError::io(
@@ -113,8 +86,8 @@ pub fn quarantine_base_under(root: &Path) -> Result<PathBuf> {
     Ok(root.join(".superai").join("quarantine"))
 }
 
-/// Compute the operation quarantine directory inside an already-resolved
-/// base, validating the operation id shape.
+/// Operation quarantine directory inside `base`; the id must be a single
+/// path component.
 fn quarantine_dir_in_base(base: &Path, operation_id: &str) -> Result<PathBuf> {
     if operation_id.is_empty() {
         return Err(ConfigError::io(
@@ -149,10 +122,6 @@ pub fn quarantine_dir_under(root: &Path, operation_id: &str) -> Result<PathBuf> 
     quarantine_dir_in_base(&quarantine_base_under(root)?, operation_id)
 }
 
-// ---------------------------------------------------------------------------
-// Entry
-// ---------------------------------------------------------------------------
-
 /// A quarantined artifact, recoverable from the quarantine directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineEntry {
@@ -177,7 +146,7 @@ impl QuarantineEntry {
     pub fn recoverability_report(&self) -> String {
         if self.recoverable {
             format!(
-                "recoverable at {} (operation {}) — same_filesystem={}",
+                "recoverable at {} (operation {}, same_filesystem={})",
                 self.quarantine_path.display(),
                 self.operation_id,
                 self.same_filesystem
@@ -192,14 +161,9 @@ impl QuarantineEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
-/// Validate that `path` is a safe quarantine source.
-///
-/// Rejects broad roots, unresolved variables, globs, home directories,
-/// workspace roots, and foreign-managed path surrogates.
+/// Validate that `path` is a safe quarantine source: absolute, with no
+/// traversal, globs, unresolved variables, broad roots, home, or quarantine
+/// base among its targets.
 pub fn validate_quarantine_target(path: &Path) -> Result<()> {
     let display = path.to_string_lossy();
     let s = display.as_ref();
@@ -297,26 +261,15 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Core move
-// ---------------------------------------------------------------------------
-
-/// Move `path` into the quarantine directory for `operation_id`.
-///
-/// Validates the target, ensures the quarantine directory exists with
-/// owner-only permissions where supported, moves the file/directory via
-/// rename where same-filesystem, otherwise copy-then-delete, verifies digest,
-/// and reports recoverability.
+/// Move `path` into the quarantine directory for `operation_id`: validate,
+/// create the owner-only quarantine dir, rename (or copy-then-delete
+/// across filesystems), verify the digest, report recoverability.
 pub fn move_to_quarantine(path: &Path, operation_id: &str) -> Result<QuarantineEntry> {
     move_to_quarantine_in_base(&quarantine_base()?, path, operation_id)
 }
 
-/// Move `path` into the quarantine directory for `operation_id` under the
-/// explicit superai-owned `root` (see [`quarantine_base_under`]).
-///
-/// Same semantics as [`move_to_quarantine`], with the quarantine tree rooted
-/// at `<root>/.superai/quarantine` so relocated operations keep recovery
-/// state out of the user's home.
+/// [`move_to_quarantine`] rooted at `<root>/.superai/quarantine` so
+/// relocated operations keep recovery state out of the user's home.
 pub fn move_to_quarantine_under(
     root: &Path,
     path: &Path,
@@ -371,11 +324,8 @@ fn move_to_quarantine_with_dest_in_base(
 ) -> Result<QuarantineEntry> {
     validate_quarantine_target(path)?;
 
-    // A target that is the base itself or one of its ancestors would
-    // swallow the quarantine tree: create_dir_all would build the
-    // destination inside the victim and the move would then fail (rename
-    // EINVAL on moving a directory into itself), leaving partial state.
-    // Refuse before any filesystem work.
+    // A target containing the base would swallow the quarantine tree and
+    // fail mid-move (rename EINVAL); refuse before any filesystem work.
     if base.starts_with(path) {
         return Err(ConfigError::io(
             path,
@@ -397,23 +347,20 @@ fn move_to_quarantine_with_dest_in_base(
         ));
     }
 
-    // Ensure quarantine dir exists with safe permissions
     std::fs::create_dir_all(&qdir).map_err(|e| ConfigError::io(&qdir, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perm = std::fs::Permissions::from_mode(0o700);
         drop(std::fs::set_permissions(&qdir, perm.clone()));
-        if let Some(parent) = qdir.parent() {
-            // Ensure the `.superai` state dir exists with 0o700 as well
-            let superai = parent;
-            if superai.exists() {
-                drop(std::fs::set_permissions(superai, perm));
-            }
+        if let Some(parent) = qdir.parent()
+            && parent.exists()
+        {
+            drop(std::fs::set_permissions(parent, perm));
         }
     }
 
-    // If dest already exists, make it unique
+    // Suffix .1, .2, ... until the destination name is free.
     let mut final_dest = dest.to_path_buf();
     let mut counter = 0u32;
     while final_dest.exists() {
@@ -433,7 +380,7 @@ fn move_to_quarantine_with_dest_in_base(
         }
     }
 
-    // Capture digest/size before move if file
+    // Digest and size are captured before the move.
     let (digest, size) = if path.is_file() {
         match std::fs::read(path) {
             Ok(bytes) => (Some(compute_digest(&bytes)), Some(bytes.len() as u64)),
@@ -450,7 +397,6 @@ fn move_to_quarantine_with_dest_in_base(
             if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) =>
         {
             same_filesystem = false;
-            // Cross-device: copy then delete original
             let meta = std::fs::symlink_metadata(path).map_err(|e2| ConfigError::io(path, e2))?;
             if meta.is_dir() {
                 copy_dir_recursively(path, &final_dest)?;
@@ -477,18 +423,17 @@ fn move_to_quarantine_with_dest_in_base(
         Err(e) => return Err(ConfigError::io(path, e)),
     }
 
-    // Verify quarantine copy if it was a file
     let recoverable = if let Some(expected) = digest.as_deref() {
         match std::fs::read(&final_dest) {
             Ok(bytes) => compute_digest(&bytes) == expected,
             Err(_) => false,
         }
     } else {
-        // For directories/symlinks, recoverability is existence
-        final_dest.exists()
+        // Directories and symlinks: recoverability is presence, including
+        // a dangling link, which exists() cannot see.
+        final_dest.exists() || std::fs::symlink_metadata(&final_dest).is_ok()
     };
 
-    // Sync parent
     if let Some(parent) = final_dest.parent()
         && let Ok(f) = std::fs::File::open(parent)
     {
@@ -514,7 +459,10 @@ fn copy_dir_recursively(from: &Path, to: &Path) -> Result<()> {
         let src = ent.path();
         let file_name = ent.file_name();
         let dest = to.join(file_name);
-        let meta = ent.metadata().map_err(|e| ConfigError::io(&src, e))?;
+        // lstat, never the followed metadata: a link entry must reach the
+        // symlink branch, or a link-to-directory would recurse into itself
+        // forever and a dangling link would abort the whole copy.
+        let meta = std::fs::symlink_metadata(&src).map_err(|e| ConfigError::io(&src, e))?;
         if meta.is_dir() {
             copy_dir_recursively(&src, &dest)?;
         } else if meta.file_type().is_symlink() {
@@ -537,7 +485,8 @@ fn copy_dir_recursively(from: &Path, to: &Path) -> Result<()> {
 
 /// Restore a quarantined entry back to its original location.
 pub fn restore_from_quarantine(entry: &QuarantineEntry) -> Result<()> {
-    if !entry.quarantine_path.exists() {
+    // lstat: a dangling quarantined symlink is still a restorable entry.
+    if std::fs::symlink_metadata(&entry.quarantine_path).is_err() {
         return Err(ConfigError::io(
             &entry.quarantine_path,
             std::io::Error::new(std::io::ErrorKind::NotFound, "quarantine entry missing"),
@@ -564,7 +513,24 @@ pub fn restore_from_quarantine(entry: &QuarantineEntry) -> Result<()> {
         {
             let meta = std::fs::symlink_metadata(&entry.quarantine_path)
                 .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
-            if meta.is_dir() {
+            if meta.file_type().is_symlink() {
+                // Recreate the link itself; copying would follow it and
+                // land the referent's bytes (or fail on a dangling link).
+                #[cfg(unix)]
+                {
+                    let target = std::fs::read_link(&entry.quarantine_path)
+                        .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
+                    std::os::unix::fs::symlink(&target, &entry.original_path)
+                        .map_err(|er| ConfigError::io(&entry.original_path, er))?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::copy(&entry.quarantine_path, &entry.original_path)
+                        .map_err(|er| ConfigError::io(&entry.original_path, er))?;
+                }
+                std::fs::remove_file(&entry.quarantine_path)
+                    .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
+            } else if meta.is_dir() {
                 copy_dir_recursively(&entry.quarantine_path, &entry.original_path)?;
                 std::fs::remove_dir_all(&entry.quarantine_path)
                     .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
@@ -592,7 +558,8 @@ pub fn list_quarantine(operation_id: &str) -> Result<Vec<QuarantineEntry>> {
     for ent in dir {
         let ent = ent.map_err(|e| ConfigError::io(&qdir, e))?;
         let path = ent.path();
-        let meta = ent.metadata().map_err(|e| ConfigError::io(&path, e))?;
+        // lstat: a dangling quarantined link must list, not error.
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| ConfigError::io(&path, e))?;
         let digest = if meta.is_file() {
             std::fs::read(&path).ok().map(|b| compute_digest(&b))
         } else {
@@ -607,7 +574,7 @@ pub fn list_quarantine(operation_id: &str) -> Result<Vec<QuarantineEntry>> {
             original_path: PathBuf::from("<unknown>"),
             quarantine_path: path,
             operation_id: operation_id.to_owned(),
-            recoverable: digest.is_some() || meta.is_dir(),
+            recoverable: digest.is_some() || meta.is_dir() || meta.is_symlink(),
             digest,
             size,
             same_filesystem: true,
@@ -617,9 +584,7 @@ pub fn list_quarantine(operation_id: &str) -> Result<Vec<QuarantineEntry>> {
     Ok(entries)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// tests
 
 #[cfg(test)]
 mod tests {
@@ -642,9 +607,8 @@ mod tests {
         assert!(dir.ends_with(&op));
     }
 
-    /// Relocated operations resolve their quarantine tree under their own
-    /// superai-owned root: `<root>/.superai/quarantine`, with the same
-    /// operation-id shape rules as the home-based family.
+    /// Relocated operations resolve `<root>/.superai/quarantine`, with the
+    /// same id shape rules as the home-based family.
     #[test]
     fn quarantine_base_under_nests_the_state_root() {
         let dir = crate::test_util::temp_dir_unique("quarantine-under-base");
@@ -668,10 +632,8 @@ mod tests {
         );
     }
 
-    /// Quarantining the base itself (or an ancestor of it) must be refused
-    /// before any filesystem work: the move would otherwise create the
-    /// quarantine tree inside the victim and then fail (rename EINVAL),
-    /// leaving partial state behind.
+    /// Quarantining the base or an ancestor is refused before any
+    /// filesystem work.
     #[test]
     fn quarantine_refuses_targets_containing_the_quarantine_base() {
         let dir = crate::test_util::temp_dir_unique("quarantine-self");
@@ -699,9 +661,8 @@ mod tests {
         assert!(base.exists(), "the victim is untouched");
     }
 
-    /// The headline regression (run-4 round-3 finding 2): quarantining for a
-    /// relocated operation must never touch the user's real-home quarantine
-    /// tree, and recovery must round-trip from the relocated base.
+    /// A relocated operation never touches the real-home quarantine tree,
+    /// and recovery round-trips from the relocated base.
     #[test]
     fn move_to_quarantine_under_keeps_recovery_state_out_of_the_user_home() {
         let dir = crate::test_util::temp_dir_unique("quarantine-under-move");
@@ -770,17 +731,14 @@ mod tests {
         assert!(entry.digest.is_some());
         assert!(entry.recoverability_report().contains("recoverable"));
 
-        // List
         let list = list_quarantine(&op).unwrap();
         assert!(!list.is_empty());
 
-        // Restore
         restore_from_quarantine(&entry).unwrap();
         assert!(src.exists());
         assert_eq!(std::fs::read(&src).unwrap(), b"quarantine content");
         assert!(!entry.quarantine_path.exists());
 
-        // Cleanup
         drop(std::fs::remove_file(&src));
         let qdir = quarantine_dir(&op).unwrap();
         drop(std::fs::remove_dir_all(&qdir));
@@ -836,12 +794,10 @@ mod tests {
         drop(std::fs::remove_dir_all(&qdir));
     }
 
-    // -----------------------------------------------------------------
-    // Mutation-hardening behaviour tests (area D).
-    // -----------------------------------------------------------------
+    // mutation-hardening behaviour tests
 
-    /// Whether chmod still denies the owner: root (`DAC_OVERRIDE`) bypasses
-    /// permission checks, so permission-driven scenarios must self-skip.
+    /// Whether chmod still denies the owner; root bypasses and callers
+    /// self-skip.
     #[cfg(unix)]
     fn permissions_are_enforced() -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -863,8 +819,8 @@ mod tests {
         std::fs::metadata(path).ok().map(|m| m.dev())
     }
 
-    /// A scratch directory on a filesystem other than the quarantine base's,
-    /// when one is available (/dev/shm tmpfs vs the home filesystem).
+    /// A scratch dir on another filesystem when one is available
+    /// (/dev/shm tmpfs vs the home filesystem).
     #[cfg(unix)]
     fn cross_device_scratch() -> Option<PathBuf> {
         let shm = PathBuf::from("/dev/shm");
@@ -909,11 +865,8 @@ mod tests {
         validate_quarantine_target(Path::new("/tmp/")).unwrap_err();
     }
 
-    /// Platform: unix — the fixture must CREATE existing paths whose names
-    /// contain `*` and `?`, which Win32 filename rules reserve (creation
-    /// fails before any assertion runs). Unix filenames may contain glob
-    /// characters, so the "existing path containing globs" premise is
-    /// stageable only there.
+    /// Unix only: the fixture creates real files named `*`/`?`, which Win32
+    /// filename rules reserve.
     #[cfg(unix)]
     #[test]
     fn validate_quarantine_rejects_existing_paths_containing_globs() {
@@ -1259,5 +1212,73 @@ mod tests {
             res.map(|v| v.len())
         );
         drop(std::fs::remove_dir_all(&qdir));
+    }
+
+    /// A tree with a symlink cycle and a dangling link copies to completion:
+    /// links are recreated as links (lstat), so the cycle cannot recurse
+    /// forever and the dangling link cannot abort the copy.
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursively_preserves_symlinks_and_survives_link_cycles() {
+        let root = crate::test_util::temp_dir_unique("quarantine-copydir");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("file.txt"), b"plain").unwrap();
+        std::fs::write(src.join("nested").join("leaf.txt"), b"leaf").unwrap();
+        std::os::unix::fs::symlink(".", src.join("self-loop")).unwrap();
+        std::os::unix::fs::symlink("/definitely/not/present", src.join("dangling")).unwrap();
+
+        let dst = root.join("dst");
+        copy_dir_recursively(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("file.txt")).unwrap(), b"plain");
+        assert_eq!(
+            std::fs::read(dst.join("nested").join("leaf.txt")).unwrap(),
+            b"leaf"
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.join("self-loop"))
+                .is_ok_and(|m| m.file_type().is_symlink()),
+            "a link-to-directory must be recreated as a link, never followed"
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.join("dangling"))
+                .is_ok_and(|m| m.file_type().is_symlink()),
+            "a dangling link must be recreated as a link, not fail the copy"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// A quarantined dangling symlink lists and reports recoverable: the
+    /// entry is present in quarantine even though its referent is gone.
+    #[cfg(unix)]
+    #[test]
+    fn list_quarantine_handles_a_dangling_symlink_entry() {
+        let op = unique_op("dangling");
+        let dir = crate::test_util::temp_dir_unique("quarantine-dangling");
+        let link = dir.join("victim-link");
+        std::os::unix::fs::symlink("/definitely/not/present", &link).unwrap();
+
+        let entry = move_to_quarantine(&link, &op).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&entry.quarantine_path).is_ok(),
+            "the link itself landed in quarantine"
+        );
+        let listed = list_quarantine(&op)
+            .unwrap_or_else(|e| panic!("a dangling quarantined link must list: {e}"));
+        let found = listed
+            .iter()
+            .find(|e| e.quarantine_path == entry.quarantine_path)
+            .expect("the dangling link appears in the listing");
+        assert!(found.recoverable, "a present symlink entry is recoverable");
+
+        restore_from_quarantine(&entry).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+            "restore recreates the dangling link itself"
+        );
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_dir_all(&dir));
+        drop(std::fs::remove_dir_all(quarantine_dir(&op).unwrap()));
     }
 }

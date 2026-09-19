@@ -1,23 +1,17 @@
 //! Operation journal and crash recovery (MUT-09).
 //!
-//! The transaction layer writes a small journal file before its mutations and
-//! at every phase transition, and removes it only after verified completion.
-//! A journal left behind at startup marks an abandoned operation; recovery
-//! inspects the actual filesystem state and restores each resource from its
-//! recorded backup — it NEVER replays writes from stale staged content.
-//!
-//! Journals live under `<home>/.superai/journal/<operation-id>.journal.json`
-//! and contain no config contents and no secrets: only paths, backup ids,
-//! phase, and redacted diagnostics.
+//! A journal is written before mutations and at every phase transition, and
+//! removed only after verified completion. Startup recovery inspects the real
+//! filesystem state and restores each resource from its recorded backup; it
+//! never replays stale staged content. Journals hold paths, backup ids,
+//! phase, and redacted diagnostics only: no contents, no secrets.
 
 use std::path::{Path, PathBuf};
 
 use crate::backup::{BackupId, find_backup_by_id, restore_verified, verify_backup};
 use crate::error::{ConfigError, Result};
 
-/// Directory holding pending operation journals for `home`.
-///
-/// Sibling of the registry records (`<home>/.superai`).
+/// Pending-operation journals for `home`, under `<home>/.superai/journal`.
 pub fn journal_dir(home: &Path) -> PathBuf {
     home.join(".superai").join("journal")
 }
@@ -37,13 +31,13 @@ pub enum JournalPhase {
     PrepareBackup,
     /// Temps staged and validated; no commits yet.
     StageTemp,
-    /// Committing (or committed) — `completed` lists steps that landed.
+    /// Committing or committed; `completed` lists steps that landed.
     Commit,
     /// Commit finished; verification pending.
     Verify,
     /// Rolling back after a failure.
     Rollback,
-    /// Fully completed and verified (journal is about to be removed).
+    /// Fully completed and verified; the journal is about to be removed.
     Done,
 }
 
@@ -71,7 +65,7 @@ pub struct JournalBackup {
     pub backup_id: String,
 }
 
-/// Minimal journal record written to disk; no secrets and no contents.
+/// Minimal journal record written to disk; no secrets, no contents.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CrashJournal {
     /// Operation id.
@@ -107,10 +101,8 @@ impl CrashJournal {
         }
     }
 
-    /// Serialize and atomically write the journal to `path`.
-    ///
-    /// Uses the crate's production atomic write (temp + rename + read-back),
-    /// so an interrupted journal write can never leave a half-written file.
+    /// Serialize and atomically write the journal to `path`, so an
+    /// interrupted write can never leave a half-written file.
     pub fn write_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -185,15 +177,10 @@ impl RecoveryReport {
     }
 }
 
-/// Perform startup recovery for `home` (MUT-09).
-///
-/// Scans `<home>/.superai/journal/*.journal.json` and recovers each abandoned
-/// operation by inspecting the actual filesystem: stale staged temps are
-/// removed, resources whose current bytes differ from their recorded backup
-/// are restored (with a fresh backup of the current bytes first, so a
-/// post-crash edit is never lost), committed creations are removed, and the
-/// journal file itself is removed only once nothing residual remains.
-/// Nothing is ever written from stale planned content.
+/// Startup recovery for `home` (MUT-09): remove stale temps, restore
+/// resources that differ from their recorded backup (backing up current
+/// bytes first), remove committed creations, drop the journal only when
+/// nothing residual remains. Stale planned content is never written.
 pub fn recover_pending(home: &Path) -> Result<RecoveryReport> {
     let dir = journal_dir(home);
     let entries = match std::fs::read_dir(&dir) {
@@ -271,9 +258,8 @@ pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
     })
 }
 
-/// Remove stale staged temps: the ones the journal recorded, plus unrecorded
-/// `.tmp.` siblings next to each resource (a crash between staging and the
-/// journal update can leave those behind). Returns (removed, residuals).
+/// Remove stale staged temps: the recorded ones plus unrecorded `.tmp.`
+/// siblings next to each resource. Returns (removed, residuals).
 fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -308,9 +294,7 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
 }
 
 /// Restore each resource whose current bytes differ from its recorded
-/// pre-transaction backup (deterministic rollback; `restore_verified` backs
-/// up the current bytes first, so a post-crash edit stays recoverable).
-/// Returns (restored, residuals).
+/// pre-transaction backup. Returns (restored, residuals).
 fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut restored = Vec::new();
     let mut residuals = Vec::new();
@@ -345,10 +329,8 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
     Ok((restored, residuals))
 }
 
-/// Remove committed creations: resources without a recorded backup that the
-/// journal shows as committed. A resource the journal shows as never
-/// committed was not mutated by this operation and is left untouched.
-/// Returns (removed, residuals).
+/// Remove committed creations (resources without a backup that the journal
+/// shows as committed); uncommitted paths are left untouched.
 fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -369,9 +351,7 @@ fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<Path
     (removed, residuals)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// tests
 
 #[cfg(test)]
 mod tests {
@@ -582,8 +562,7 @@ mod tests {
         assert!(report.all_recovered());
         // Deterministic rollback restored the pre-op bytes...
         assert_eq!(std::fs::read(&resource).unwrap(), b"original");
-        // ...and the post-crash edit is recoverable: restore_verified took a
-        // backup of the current bytes before replacing them.
+        // The post-crash edit is recoverable: restore_verified backed it up.
         let backups = crate::backup::list_backups(&resource).unwrap();
         assert!(
             backups.iter().any(|b| b.digest != entry.digest),
@@ -625,9 +604,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&home));
     }
 
-    // -----------------------------------------------------------------
-    // Mutation-hardening behaviour tests (area D).
-    // -----------------------------------------------------------------
+    // mutation-hardening behaviour tests
 
     #[test]
     fn journal_phase_display_matches_the_recorded_names() {
@@ -690,8 +667,7 @@ mod tests {
         let home = home_dir();
         let superai = home.join(".superai");
         std::fs::create_dir_all(&superai).unwrap();
-        // The journal dir path occupied by a regular file: read_dir fails
-        // with ENOTDIR, which is not NotFound and must surface.
+        // read_dir fails with ENOTDIR, which is not NotFound: must surface.
         std::fs::write(superai.join("journal"), b"not a directory").unwrap();
         assert!(
             recover_pending(&home).is_err(),
@@ -740,8 +716,7 @@ mod tests {
     #[test]
     fn recovery_removes_staged_broken_symlink_temps() {
         let home = home_dir();
-        // Deliberately NOT named `.tmp.*`: only the staged_temps loop owns it,
-        // so the lstat fallback in the exists() check is exercised directly.
+        // Not named `.tmp.*`: the lstat fallback in exists() is what sees it.
         let broken = home.join("staged-broken-link");
         std::os::unix::fs::symlink("/definitely/not/present", &broken).unwrap();
         let jroot = journal_dir(&home);

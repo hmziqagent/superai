@@ -1,42 +1,24 @@
-//! Format-neutral source document envelope and typed selectors.
+//! Format-neutral source document envelope and typed selectors
+//! (DOC-01, DOC-02, DOC-09).
 //!
-//! Implements DOC-01 (envelope) and DOC-02 (typed selectors / edit ops).
-//! The envelope is deliberately codec-agnostic: it stores raw bytes,
-//! detected encoding/BOM/newline style, a content digest, an inferred
-//! [`DocumentKind`], and parse diagnostics with line/column spans.
-//!
-//! Rules enforced here:
-//! - UTF-8 is the default encoding; adapters must opt into any other.
-//! - Invalid encoding is reported as a [`Diagnostic`], not lossy replacement.
-//! - Missing file and empty file are distinct (missing is an I/O error,
-//!   empty is a present document with zero bytes).
-//! - Root-shape expectations are an adapter/schema concern, not enforced here.
-//!
-//! Selectors and operations are typed (no ad-hoc dotted strings) so
-//! codecs and adapters can reason about stability and redaction.
-//!
-//! DOC-09 vocabulary also lives here: diagnostic severities (including
-//! deprecation), deprecated owned keys, the adapter-supplied semantic
-//! validator hook, and the path/value type-check primitive.
+//! The envelope is codec-agnostic: raw bytes, detected
+//! encoding/BOM/newline style, a digest, an inferred [`DocumentKind`],
+//! and diagnostics with spans. UTF-8 is the only default encoding, and
+//! invalid bytes become a [`Diagnostic`], never a lossy replacement.
+//! Missing and empty files stay distinct (I/O error vs zero bytes), and
+//! root shapes are an adapter concern. Selectors and operations are
+//! typed so ownership and redaction stay checkable.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde_json::Value;
 
+use crate::atomic::compute_digest;
 use crate::error::{ConfigError, Result};
 
-// ---------------------------------------------------------------------------
-// Encoding + newline
-// ---------------------------------------------------------------------------
-
-/// Text encoding detected for a source document.
-///
-/// Only UTF-8 is assumed by default. Other encodings require an explicit
-/// adapter opt-in; this envelope records diagnostics instead of silently
-/// replacing invalid bytes.
+/// Text encoding detected for a source document. UTF-8 only; adapters
+/// must opt into anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Encoding {
     /// UTF-8 (with or without BOM).
@@ -54,14 +36,8 @@ pub enum NewlineStyle {
     Crlf,
 }
 
-// ---------------------------------------------------------------------------
-// DocumentKind
-// ---------------------------------------------------------------------------
-
-/// Kind of document inferred from its path and/or explicit caller intent.
-///
-/// Adapters may override the inference; this envelope only carries the kind
-/// for codec dispatch. `Opaque` means no structured editing should be attempted.
+/// Kind of document inferred from the path or set by the caller. `Opaque`
+/// means no structured editing is attempted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DocumentKind {
     /// Strict JSON (no comments, no trailing commas).
@@ -76,22 +52,15 @@ pub enum DocumentKind {
     Env,
     /// Line-oriented or templated fragment with managed spans.
     TextFragment,
-    /// Unknown or executable config — treated as opaque/read-only.
+    /// Unknown or executable config, treated as opaque/read-only.
     #[default]
     Opaque,
 }
 
 impl DocumentKind {
-    /// Infer a kind from a file path's extension and file name.
-    ///
-    /// This is a heuristic for UI and codec dispatch; adapters decide the
-    /// authoritative kind and the root-shape policy.
+    /// Infer a kind from the file name and extension. A heuristic for
+    /// codec dispatch; adapters stay authoritative.
     pub fn from_path(path: &Path) -> Self {
-        Self::infer_from_path(path)
-    }
-
-    /// Alias for [`Self::from_path`] to match the task's "envelope detection" naming.
-    pub fn detect(path: &Path) -> Self {
         Self::infer_from_path(path)
     }
 
@@ -154,15 +123,9 @@ impl FromStr for DocumentKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostics
-// ---------------------------------------------------------------------------
-
-/// Severity of a [`Diagnostic`] (DOC-09).
-///
-/// Syntax problems are [`DiagnosticSeverity::Error`]; adapter-supplied
-/// semantic validators may downgrade to warnings, hints, or deprecations so
-/// deprecated owned keys surface without blocking reads.
+/// Severity of a [`Diagnostic`] (DOC-09). Syntax problems are `Error`;
+/// semantic validators may downgrade so deprecations surface without
+/// blocking reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DiagnosticSeverity {
     /// Blocking problem (the default for syntax diagnostics).
@@ -220,10 +183,8 @@ impl Diagnostic {
         }
     }
 
-    /// Create a deprecation diagnostic for a deprecated owned key (DOC-09).
-    ///
-    /// `replacement` is the recommended substitute (e.g. a replacement
-    /// selector pointer), when one exists.
+    /// Deprecation diagnostic for an owned key (DOC-09), naming the
+    /// replacement when one exists.
     pub fn deprecation(
         line: usize,
         col: usize,
@@ -257,20 +218,6 @@ impl std::fmt::Display for Diagnostic {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers: digest, newline, bom, encoding
-// ---------------------------------------------------------------------------
-
-/// Compute a hex digest of `bytes` using the standard library hasher.
-///
-/// The spec allows a simple hash of bytes via `std` (not a cryptographic
-/// requirement). The output is a zero-padded 16-hex-digit string.
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 /// Detect newline style: presence of `\r\n` means `Crlf`, otherwise `Lf`.
 fn detect_newline(bytes: &[u8]) -> NewlineStyle {
     let has_crlf = bytes
@@ -283,10 +230,8 @@ fn detect_newline(bytes: &[u8]) -> NewlineStyle {
     }
 }
 
-/// Detect BOM and UTF-8 validity, returning encoding, bom flag, and diagnostics.
-///
-/// UTF-8 is always reported; invalid sequences produce diagnostics instead of
-/// replacement characters.
+/// Detect BOM and UTF-8 validity. Invalid sequences become diagnostics,
+/// never replacement characters.
 fn detect_encoding_and_diagnostics(bytes: &[u8]) -> (Encoding, bool, Vec<Diagnostic>) {
     let bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
     let without_bom = if bom {
@@ -328,15 +273,9 @@ fn offset_to_line_col(bytes: &[u8], offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-// ---------------------------------------------------------------------------
-// SourceDocument envelope
-// ---------------------------------------------------------------------------
-
-/// Format-neutral source document envelope.
-///
-/// Carries raw bytes, detected metadata, an inferred kind, and diagnostics.
-/// Missing files are not represented: [`SourceDocument::load`] returns an
-/// I/O error for missing paths, keeping missing vs empty distinct.
+/// Format-neutral source document envelope. Missing files are not
+/// represented: [`SourceDocument::load`] errors, keeping missing vs empty
+/// distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDocument {
     /// Original path the document was loaded from.
@@ -358,31 +297,14 @@ pub struct SourceDocument {
 }
 
 impl SourceDocument {
-    /// Create an envelope from already-read bytes and a path.
-    ///
-    /// Detection is pure: no I/O. The digest, encoding, BOM, newline style,
-    /// kind, and diagnostics are derived from `bytes` and `path`.
+    /// Create an envelope from already-read bytes; detection is pure, no
+    /// I/O.
     pub fn from_bytes(path: &Path, bytes: Vec<u8>) -> Self {
-        let kind = DocumentKind::from_path(path);
-        let newline_style = detect_newline(&bytes);
-        let (encoding, bom, diagnostics) = detect_encoding_and_diagnostics(&bytes);
-        let digest = compute_digest(&bytes);
-        Self {
-            path: path.to_path_buf(),
-            bytes,
-            encoding,
-            bom,
-            newline_style,
-            digest,
-            kind,
-            diagnostics,
-        }
+        Self::from_bytes_with_kind(path, bytes, DocumentKind::from_path(path))
     }
 
-    /// Create an envelope from bytes with an explicit kind.
-    ///
-    /// Useful when the caller knows the kind more precisely than the
-    /// extension heuristic.
+    /// Create an envelope with an explicit kind, for callers that know it
+    /// better than the extension heuristic.
     pub fn from_bytes_with_kind(path: &Path, bytes: Vec<u8>, kind: DocumentKind) -> Self {
         let newline_style = detect_newline(&bytes);
         let (encoding, bom, diagnostics) = detect_encoding_and_diagnostics(&bytes);
@@ -399,13 +321,9 @@ impl SourceDocument {
         }
     }
 
-    /// Load a document fresh from disk.
-    ///
-    /// - Missing file → `Err(ConfigError::Io { kind: NotFound, .. })` (distinct from empty).
-    /// - Empty file → `Ok` with zero `bytes` and no diagnostics.
-    /// - Invalid UTF-8 → `Ok` with diagnostics; bytes are preserved, no replacement.
-    ///
-    /// Disk is the truth: no caching.
+    /// Load fresh from disk: missing is an `Io`/`NotFound` error, empty is a
+    /// zero-byte document, invalid UTF-8 keeps the bytes with a
+    /// diagnostic. No caching.
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
         Ok(Self::from_bytes(path, bytes))
@@ -421,10 +339,8 @@ impl SourceDocument {
         !self.diagnostics.is_empty()
     }
 
-    /// Attempt to view the bytes as UTF-8, stripping a leading BOM if present.
-    ///
-    /// Returns `None` when the bytes are not valid UTF-8 (diagnostics will
-    /// explain why). This never performs lossy replacement.
+    /// View the bytes as UTF-8, BOM stripped. `None` when invalid; never a
+    /// lossy replacement.
     pub fn text(&self) -> Option<&str> {
         let slice: &[u8] = if self.bom {
             self.bytes.get(3..).unwrap_or(&[])
@@ -445,20 +361,13 @@ impl SourceDocument {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Selector
-// ---------------------------------------------------------------------------
-
-/// Typed selector for a document edit, avoiding ad-hoc dotted strings.
-///
-/// Adapters declare which selector variants are stable for a given surface;
-/// e.g. array `Index` is only allowed when the schema proves the index is
-/// stable.
+/// Typed selector for a document edit. Adapters declare which variants
+/// are stable for a surface; `Index` needs proof the position is stable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Selector {
     /// Object/map key.
     Key(String),
-    /// Array index — only when adapter proves the position is stable.
+    /// Array index, only with proof the position is stable.
     Index(usize),
     /// Identity-selected array item (e.g. model id or server name).
     Identity {
@@ -474,16 +383,9 @@ pub enum Selector {
 }
 
 impl Selector {
-    /// Parse a selector from a string form.
-    ///
-    /// Supported forms (prefixes are case-insensitive):
-    /// - `key:<name>` or `key:<dotted.path>` → [`Selector::Key`]
-    /// - `index:<n>` → [`Selector::Index`]
-    /// - `identity:<key>=<value>` → [`Selector::Identity`]
-    /// - `table:<a.b.c>` or `toml:<a.b.c>` → [`Selector::TomlTable`]
-    /// - `span:<name>` or `managed:<name>` → [`Selector::ManagedSpan`]
-    ///
-    /// Bare strings without a recognised prefix fall back to `Key`.
+    /// Parse `key:<path>`, `index:<n>`, `identity:<k>=<v>`,
+    /// `table:<a.b.c>` (`toml:`), or `span:<name>` (`managed:`);
+    /// prefixes are case-insensitive and bare strings fall back to `Key`.
     pub fn parse(input: &str) -> std::result::Result<Self, String> {
         Self::from_str(input)
     }
@@ -586,10 +488,6 @@ impl std::fmt::Display for Selector {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Edit operations
-// ---------------------------------------------------------------------------
-
 /// How to handle duplicate keys or values during an edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DuplicateHandling {
@@ -618,12 +516,9 @@ pub enum RedactionPolicy {
     Full,
 }
 
-/// Typed edit operation variants (DOC-02).
-///
-/// Each variant carries the minimal addressing/value payload; per-operation
-/// policies like `owned_keys` or `duplicate_handling` are stored in the
-/// wrapping [`Operation`] so callers declare ownership, conflict expectations,
-/// and redaction explicitly.
+/// Typed edit operation variants (DOC-02). Each carries only its addressing
+/// and value; ownership, conflict, duplicate, and redaction policies live in
+/// the wrapping [`Operation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditOperation {
     /// Set a value at a selector.
@@ -667,8 +562,8 @@ pub enum EditOperation {
         selector: Selector,
         /// Item to append.
         value: Value,
-        /// Field inside `value` that carries the item's identity (e.g.
-        /// `"name"` or `"id"`); duplicate handling compares this field.
+        /// Field inside `value` carrying the item's identity; duplicate
+        /// handling compares it.
         identity_key: String,
     },
     /// Ensure a directory or list entry exists (e.g. skills, plugins).
@@ -680,30 +575,20 @@ pub enum EditOperation {
     },
 }
 
-/// A fully specified operation with addressing, payload, and policies.
-///
-/// Each operation declares:
-/// - `owned_keys` – which keys the adapter claims ownership of
-/// - `expected_old` – expected previous value or absence (conflict detection)
-/// - `duplicate_handling` – how to treat duplicates
-/// - `create_parent` – whether missing parents should be created
-/// - `redaction_policy` – what to redact in diffs/diagnostics
+/// A fully specified operation with addressing, payload, and policies
+/// (ownership, expected old value, duplicates, parent creation,
+/// redaction).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
     /// The typed edit to perform.
     pub kind: EditOperation,
-    /// Keys owned by the adapter at the target (for merge/ownership checks).
-    ///
-    /// The executor rejects any operation whose addressed key falls outside
-    /// this set (DOC-02). An empty set owns nothing, so every selector is
-    /// rejected — ownership must be declared, never assumed.
+    /// Keys owned by the adapter at the target. An empty set owns nothing
+    /// and rejects every selector (DOC-02): ownership is declared, never
+    /// assumed.
     pub owned_keys: Vec<String>,
-    /// Expected previous state (DOC-02 conflict detection):
-    /// - `None` — no expectation declared (any current state accepted)
-    /// - `Some(None)` — the entry must be absent
-    /// - `Some(Some(v))` — the entry must exist and equal `v`
-    ///
-    /// A mismatch is a typed conflict error and nothing is written.
+    /// Expected previous state (DOC-02): `None` accepts anything,
+    /// `Some(None)` requires absence, `Some(Some(v))` requires equality.
+    /// A mismatch is a typed conflict and nothing is written.
     pub expected_old: Option<Option<Value>>,
     /// Duplicate-key policy.
     pub duplicate_handling: DuplicateHandling,
@@ -777,17 +662,9 @@ impl Operation {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DOC-09 — semantic validation vocabulary
-// ---------------------------------------------------------------------------
-
-/// Adapter-supplied semantic validator over a parsed document (DOC-09).
-///
-/// Receives the semantic value tree and the document kind; returns
-/// diagnostics (empty = semantically valid). Pure: no I/O, no mutation.
-/// This is the engine-side hook the adapter trait consumes to validate a
-/// document's root shape and semantics at validate-time, not only at
-/// commit-time version gates.
+/// Adapter-supplied semantic validator over a parsed document (DOC-09):
+/// pure, returns diagnostics (empty = valid). The adapter-trait hook for
+/// validate-time shape checks.
 pub type SemanticValidator =
     std::sync::Arc<dyn Fn(&Value, DocumentKind) -> Vec<Diagnostic> + Send + Sync>;
 
@@ -810,11 +687,8 @@ impl DeprecatedKey {
     }
 }
 
-/// Adapter-supplied semantic schema consumed at validate-time (DOC-09).
-///
-/// Bundles the semantic validator hook with the adapter's deprecated owned
-/// keys so one object can be handed to
-/// [`crate::raw_editor::validate_with_schema`].
+/// Adapter-supplied semantic schema (DOC-09): the validator hook plus
+/// deprecated owned keys, handed to [`crate::raw_editor::validate_with_schema`].
 #[derive(Default, Clone)]
 pub struct SemanticSchema {
     /// Validator over the parsed semantic value, if the adapter supplies one.
@@ -892,11 +766,8 @@ impl ValueType {
 }
 
 /// Check that the dotted `path` exists in `value` and holds `expected`
-/// (DOC-09 path/value type-check primitive).
-///
-/// Path segments are separated by `.` and walk objects only. The error
-/// message names the failing segment, never any value content, so it is
-/// safe to surface in diagnostics.
+/// (DOC-09). Walks objects only; the error names the failing segment,
+/// never a value, so it is safe to surface.
 pub fn check_path_type(
     value: &Value,
     path: &str,
@@ -934,12 +805,9 @@ pub fn check_path_type(
     }
 }
 
-/// Produce deprecation diagnostics for deprecated owned keys present in
-/// `value` (DOC-09).
-///
-/// Keys are resolved as dotted paths; only keys actually present produce
-/// diagnostics. Positions are approximate (`1:1`) because the semantic
-/// value tree carries no spans — the message names the key and replacement.
+/// Deprecation diagnostics for deprecated owned keys present in `value`
+/// (DOC-09). Positions are approximate (1:1) because the value tree
+/// carries no spans.
 pub fn deprecation_diagnostics(value: &Value, deprecated: &[DeprecatedKey]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for entry in deprecated {
@@ -970,9 +838,165 @@ pub(crate) fn resolve_dotted<'a>(value: &'a Value, path: &str) -> Option<&'a Val
     Some(current)
 }
 
-// ---------------------------------------------------------------------------
-// Tests — envelope detection + selector parsing
-// ---------------------------------------------------------------------------
+/// Parse-check `bytes` as `kind` (transaction staging and restore
+/// verification). Text and opaque always pass; env lines must be blank,
+/// comments, or `KEY=VALUE` (empty keys rejected).
+pub(crate) fn validate_bytes_for_kind(
+    content: &[u8],
+    kind: DocumentKind,
+    path: &Path,
+) -> Result<()> {
+    match kind {
+        DocumentKind::StrictJson => {
+            std::str::from_utf8(content).map_err(|_err| {
+                ConfigError::io(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in json"),
+                )
+            })?;
+            serde_json::from_slice::<Value>(content).map_err(|source| ConfigError::Json {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(())
+        }
+        DocumentKind::JsonC => {
+            let text = std::str::from_utf8(content).map_err(|_err| {
+                ConfigError::io(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in jsonc"),
+                )
+            })?;
+            let stripped = strip_jsonc_comments(text);
+            serde_json::from_str::<Value>(&stripped).map_err(|source| ConfigError::Json {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(())
+        }
+        DocumentKind::Toml => {
+            let text = std::str::from_utf8(content).map_err(|_err| {
+                ConfigError::io(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in toml"),
+                )
+            })?;
+            let _ = text
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|source| ConfigError::Toml {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            Ok(())
+        }
+        DocumentKind::Yaml => {
+            let text = std::str::from_utf8(content).map_err(|_err| {
+                ConfigError::io(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 in yaml"),
+                )
+            })?;
+            yaml_serde::from_str::<Value>(text).map_err(|source| ConfigError::Yaml {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(())
+        }
+        DocumentKind::Env => {
+            // Validate env: each non-blank, non-comment line must contain '='
+            let text = std::str::from_utf8(content).map_err(|_err| ConfigError::Env {
+                path: path.to_path_buf(),
+                message: "invalid utf8 in env file".to_owned(),
+            })?;
+            for (idx, line) in text.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let without_export = if let Some(rest) = trimmed.strip_prefix("export ") {
+                    rest.trim()
+                } else {
+                    trimmed
+                };
+                if !without_export.contains('=') {
+                    return Err(ConfigError::Env {
+                        path: path.to_path_buf(),
+                        message: format!("line {} missing '='", idx + 1),
+                    });
+                }
+                if without_export.starts_with('=') {
+                    return Err(ConfigError::Env {
+                        path: path.to_path_buf(),
+                        message: format!("line {} has empty key", idx + 1),
+                    });
+                }
+            }
+            Ok(())
+        }
+        DocumentKind::TextFragment | DocumentKind::Opaque => Ok(()),
+    }
+}
+
+/// Strip `//` line and `/* */` block comments outside string literals;
+/// string contents and escapes survive verbatim.
+#[expect(
+    clippy::excessive_nesting,
+    reason = "comment stripping state machine requires nesting"
+)]
+pub(crate) fn strip_jsonc_comments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            output.push(ch);
+        } else if ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    while let Some(&peek) = chars.peek() {
+                        if peek == '\n' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            Some('*') => {
+                                if chars.peek().copied() == Some('/') {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                }
+                _ => output.push(ch),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+// tests
 
 #[cfg(test)]
 mod tests {
@@ -983,7 +1007,7 @@ mod tests {
         SourceDocument::from_bytes(Path::new(path), bytes.to_vec())
     }
 
-    // ---- DocumentKind detection ----
+    // DocumentKind detection
 
     #[test]
     fn kind_from_path_json() {
@@ -1062,12 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn kind_detect_alias_matches_from_path() {
-        let p = Path::new("a.json");
-        assert_eq!(DocumentKind::detect(p), DocumentKind::from_path(p));
-    }
-
-    #[test]
     fn kind_display_and_from_str_round_trip() {
         for kind in [
             DocumentKind::StrictJson,
@@ -1084,7 +1102,7 @@ mod tests {
         }
     }
 
-    // ---- Envelope basics ----
+    // Envelope basics
 
     #[test]
     fn envelope_empty_file_has_lf_and_no_diagnostics() {
@@ -1183,7 +1201,7 @@ mod tests {
         assert_eq!(d.kind, DocumentKind::Env);
     }
 
-    // ---- Selector parsing ----
+    // Selector parsing
 
     #[test]
     fn selector_parse_key() {
@@ -1266,7 +1284,7 @@ mod tests {
         Selector::parse("   ").unwrap_err();
     }
 
-    // ---- Operations carry required policies ----
+    // Operations carry required policies
 
     #[test]
     fn operation_carries_owned_keys_and_policies() {
@@ -1344,7 +1362,7 @@ mod tests {
         });
     }
 
-    // ---- DOC-09 vocabulary ----
+    // DOC-09 vocabulary
 
     #[test]
     fn diagnostic_severity_defaults_to_error_and_has_constructors() {

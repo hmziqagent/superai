@@ -1,17 +1,7 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+use crate::atomic::compute_digest;
 
 #[cfg(unix)]
 #[expect(clippy::unnecessary_wraps, reason = "Option needed for non-unix None")]
@@ -38,8 +28,8 @@ fn get_owner_ids(_meta: &std::fs::Metadata) -> Option<(u32, u32)> {
     None
 }
 
-/// Inode change time where the platform exposes it (unix ctime). Recorded as
-/// a hint (MUT-01), never the sole identity for conflict decisions.
+/// Inode change time where the platform exposes it; hint only, never the
+/// sole conflict identity.
 #[cfg(unix)]
 #[expect(clippy::unnecessary_wraps, reason = "Option needed for non-unix None")]
 fn get_ctime(meta: &std::fs::Metadata) -> Option<SystemTime> {
@@ -53,14 +43,9 @@ fn get_ctime(_meta: &std::fs::Metadata) -> Option<SystemTime> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot
-// ---------------------------------------------------------------------------
-
 /// Fresh snapshot of a filesystem resource, used as a conflict token.
 ///
-/// Captures existence, symlink status, digest, size, permissions, and mtime
-/// hint. No secrets are stored; digest is a hash of file bytes.
+/// Carries no contents, only digests and metadata. No secrets are stored.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "snapshot needs multiple bool flags"
@@ -81,11 +66,9 @@ pub struct Snapshot {
     pub gid: Option<u32>,
     /// Inode change time hint where available (MUT-01; hint only).
     pub ctime: Option<SystemTime>,
-    /// Target of the symlink when the path is a symlink (MUT-01/MUT-02:
-    /// target changes between plan and commit are conflicts).
+    /// Symlink target when the path is a symlink (a retarget is a conflict).
     pub symlink_target: Option<PathBuf>,
-    /// Document kind inferred from the path (MUT-01). This is the envelope's
-    /// heuristic; adapters stay authoritative for the real kind.
+    /// Kind inferred from the path; adapters stay authoritative.
     pub kind: Option<crate::document::DocumentKind>,
     /// Whether the path exists.
     pub exists: bool,
@@ -106,11 +89,8 @@ impl Snapshot {
     }
 }
 
-/// Take a fresh snapshot of `path`.
-///
-/// Reads the file fresh (disk is truth) and computes digest if it is a file.
-/// Does not follow a symlink loop; such cases are captured as existing but
-/// with `digest: None` and `is_symlink: true` where detectable.
+/// Take a fresh snapshot of `path`: disk read, no caching. A symlink loop
+/// still reports the link itself with `digest: None`.
 pub fn snapshot(path: &Path) -> Snapshot {
     let kind = Some(crate::document::DocumentKind::from_path(path));
     let symlink_meta = std::fs::symlink_metadata(path);
@@ -194,14 +174,9 @@ pub fn snapshot(path: &Path) -> Snapshot {
     }
 }
 
-/// Returns `true` if `current` differs from `previous` in a way that indicates
-/// the file was modified externally.
-///
-/// Compares `exists`, `digest`, `size`, and the symlink target (MUT-02: a
-/// retargeted link between plan and commit is a conflict even when the
-/// referent bytes are unchanged). Mtime, permissions, owner ids, and ctime are
-/// hints only and not used for the equality decision, matching MUT-01 which
-/// says metadata is a hint, not sole identity.
+/// Whether `current` differs from `previous` by an external modification:
+/// exists, digest, size, or symlink target (a retarget conflicts even with
+/// identical bytes). Metadata hints never decide.
 pub fn is_modified(previous: &Snapshot, current: &Snapshot) -> bool {
     if previous.exists != current.exists {
         return true;
@@ -221,14 +196,9 @@ pub fn is_modified(previous: &Snapshot, current: &Snapshot) -> bool {
     false
 }
 
-/// Placeholder for symlink loop detection.
-///
-/// Returns `true` if a symlink loop is detected at `path`. This is a best-
-/// effort check: it follows the symlink chain up to a small depth and reports
-/// a loop if the chain revisits a path or if the OS reports a loop error.
-///
-/// On platforms where the OS error is unavailable, falls back to chain
-/// tracking.
+/// Whether `path` is or resolves through a symlink loop: the OS error when
+/// available, otherwise a chain walk capped at 20 hops (a chain past the cap
+/// is reported as a loop).
 pub fn is_symlink_loop(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(_) => {}
@@ -283,9 +253,7 @@ pub fn is_symlink_loop(path: &Path) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// tests
 
 #[cfg(test)]
 mod tests {
@@ -467,8 +435,7 @@ mod tests {
             std::fs::write(&target_b, b"same-bytes").unwrap();
             std::os::unix::fs::symlink(&target_a, &link).unwrap();
             let before = snapshot(&link);
-            // Retarget to a different path with IDENTICAL referent bytes: the
-            // digest alone cannot see this, the recorded target can.
+            // Identical referent bytes: only the recorded target can see it.
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&target_b, &link).unwrap();
             let after = snapshot(&link);
@@ -480,10 +447,7 @@ mod tests {
         }
     }
 
-    // ---- Behaviour tests for the mutation-testing gate ----
-
-    /// `is_missing` is the existence accessor of the conflict token: absent
-    /// paths report missing, existing ones do not.
+    /// `is_missing` reports existence: absent paths are missing.
     #[test]
     fn is_missing_reports_existence() {
         let path = unique_scratch("missing-flag");
@@ -499,8 +463,8 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// Same-size content changes must be detected: the digest, not the size,
-    /// is what separates them, and identical bytes must compare unmodified.
+    /// Same-size content changes are detected by the digest; identical
+    /// bytes compare unmodified.
     #[test]
     fn snapshot_detects_same_size_content_changes() {
         let path = unique_scratch("same-size");
@@ -526,8 +490,7 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The snapshot records the target's unix permission bits (masked to the
-    /// rwx bits), so permission-restoring restores have a source of truth.
+    /// The snapshot records the target's permission bits for restores.
     #[cfg(unix)]
     #[test]
     fn snapshot_records_target_permission_bits() {
@@ -545,14 +508,12 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The ctime hint is a plausible recent instant: after 2020 and before
-    /// tomorrow, not a fabricated constant like the epoch.
+    /// The ctime hint is a plausible recent instant, not a constant.
     #[cfg(unix)]
     #[test]
     fn snapshot_ctime_is_a_plausible_recent_instant() {
-        /// 2020-01-01T00:00:00Z in seconds since the unix epoch.
+        /// 2020-01-01T00:00:00Z, and one day, in seconds.
         const SECS_AT_2020: u64 = 1_577_836_800;
-        /// One day of seconds.
         const DAY_SECS: u64 = 24 * 60 * 60;
         let path = unique_scratch("ctime-window");
         std::fs::write(&path, b"ctime").unwrap();
@@ -579,29 +540,21 @@ mod tests {
         assert!(!is_symlink_loop(&path), "a missing path is not a loop");
     }
 
-    /// A resolvable symlink chain deeper than the walk cutoff is reported as
-    /// a loop. Linux resolves chains up to 40 links deep and macOS up to 32,
-    /// so a 25-link chain to a real file is NOT an OS-level loop (`metadata`
-    /// succeeds and the errno fast-path cannot answer) — only the capped
-    /// chain walk sees it, and falling out of the walk without resolving
-    /// reports true.
+    /// A resolvable chain deeper than the 20-hop walk cutoff (but under the
+    /// kernel limits of Linux 40 and macOS 32) is reported as a loop by the
+    /// capped walk; the errno fast-path cannot see it.
     #[cfg(unix)]
     #[test]
     fn deep_symlink_chain_beyond_walk_cutoff_is_reported_as_a_loop() {
-        /// Chain length: over the walk's 20-iteration cutoff, under the
-        /// kernel resolution limits of both Linux (40) and macOS (32).
+        /// Over the walk cutoff (20), under the kernel limits (40/32).
         const DEPTH: usize = 25;
         let root = crate::test_util::temp_dir_unique("config-snapshot-deep");
         std::fs::create_dir_all(&root).unwrap();
         let real = root.join("real.txt");
         std::fs::write(&real, b"deep").unwrap();
-        // Chain link-0 -> link-1 -> ... -> link-24 -> real.txt (25 hops).
-        // Targets are RELATIVE so each hop costs exactly one symlink
-        // traversal at the OS level: an absolute target under the macOS
-        // temp root re-traverses the `/var -> /private/var` symlink on
-        // every hop (~2 budget per hop), which pushes a 25-link chain past
-        // macOS's MAXSYMLINKS (32) even though it fits the 32-link budget
-        // with room to spare when each hop costs one.
+        // Relative targets so each hop costs one OS-level traversal: absolute
+        // targets under the macOS temp root re-traverse /var per hop and
+        // would cross MAXSYMLINKS before the 25 hops are done.
         let mut next_target = std::ffi::OsString::from("real.txt");
         for i in (0..DEPTH).rev() {
             let link_name = format!("link-{i}");
