@@ -1,5 +1,5 @@
-//! Layer 3 — interface. A placeholder CLI until the GPUI interface exists;
-//! nothing below this crate knows an interface exists at all.
+//! Layer 3: interface. Placeholder CLI until the GPUI interface exists;
+//! nothing below this crate knows an interface exists.
 
 use std::process::ExitCode;
 
@@ -16,9 +16,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> superai_core::Result<()> {
-    // Startup crash recovery (MUT-09): finish or roll back any operation
-    // abandoned mid-transaction before anything else runs. Recovery inspects
-    // the actual filesystem state and never replays stale writes.
+    // Crash recovery (MUT-09): finish or roll back whatever was abandoned
+    // mid-transaction, judged from actual filesystem state, never a blind replay.
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)

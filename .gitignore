@@ -1,3 +1,4 @@
 .DS_Store
 target/
 .z-workflow/
+.z-proflow/
