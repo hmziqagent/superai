@@ -228,9 +228,19 @@ fn backup_inner(
         ));
     }
 
-    // The exists() probe only steers the rare collision elsewhere; the
-    // digest verification below still catches a copy that landed wrong.
-    let (target, millis, suffix) = generate_backup_path(path)?;
+    // Steer away from an existing backup name while one is free; the probe is
+    // advisory only, so after 5 collisions the copy overwrites that candidate.
+    let mut attempts = 0;
+    let (target, millis, suffix) = loop {
+        let (candidate, m, s) = generate_backup_path(path)?;
+        if !candidate.exists() {
+            break (candidate, m, s);
+        }
+        attempts += 1;
+        if attempts >= 5 {
+            break (candidate, m, s);
+        }
+    };
 
     let original_bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let digest = compute_digest(&original_bytes);

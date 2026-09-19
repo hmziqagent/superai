@@ -15,7 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::atomic::{compute_digest, generate_random_suffix, sync_parent, timestamp_millis_now};
+use crate::atomic::{
+    apply_mode, compute_digest, generate_random_suffix, resolve_final_mode, sync_parent,
+    timestamp_millis_now,
+};
 use crate::backup::{BackupEntry, backup_with_injector, verify_backup};
 use crate::document::{DocumentKind, validate_bytes_for_kind};
 use crate::error::{ConfigError, Result};
@@ -444,31 +447,6 @@ fn generate_temp_path(target: &Path) -> Result<PathBuf> {
     Ok(parent.join(tmp_name))
 }
 
-#[cfg(unix)]
-fn set_safe_permissions(path: &Path, original_path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if original_path.exists() {
-        match std::fs::metadata(original_path) {
-            Ok(m) => m.permissions().mode() & 0o777,
-            Err(_) => 0o600,
-        }
-    } else {
-        0o600
-    };
-    let safe_mode = if mode == 0 { 0o600 } else { mode };
-    let perm = std::fs::Permissions::from_mode(safe_mode);
-    std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
-}
-
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "windows has no POSIX chmod; keeps the unix call sites uniform"
-)]
-fn set_safe_permissions(_path: &Path, _original_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 /// Unix (device, inode) identity, following symlinks first so paths
 /// converging through links count as one target; used to catch hard-link
 /// aliases (MUT-02).
@@ -547,8 +525,10 @@ pub fn stage_temp_file(
         ));
     };
     // Safe permissions land while the file is still empty, so staged bytes are
-    // never group/world readable regardless of the process umask.
-    if let Err(e) = set_safe_permissions(&final_temp, target) {
+    // never group/world readable regardless of the process umask. The chmod
+    // goes through the held fd: it lands on the inode we created even if the
+    // temp name is swapped.
+    if let Err(e) = apply_mode(&f, &final_temp, resolve_final_mode(target, None)) {
         drop(std::fs::remove_file(&final_temp));
         return Err(e);
     }
@@ -2358,9 +2338,7 @@ impl Transaction {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// tests
 
 #[cfg(test)]
 #[expect(
@@ -2892,10 +2870,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // ------------------------------------------------------------------
-    // MUT-05: §4.2 conflict window: foreign edits between prepare and
-    // commit abort with ConcurrentModification and are never overwritten.
-    // ------------------------------------------------------------------
+    // MUT-05: §4.2 conflict window: foreign edits between prepare and commit abort with ConcurrentModification and are never overwritten.
 
     #[test]
     fn foreign_edit_between_prepare_and_commit_aborts_write() {
@@ -3110,9 +3085,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // ------------------------------------------------------------------
     // MUT-02: hard links and symlink target changes
-    // ------------------------------------------------------------------
 
     #[cfg(unix)]
     #[test]
@@ -3291,9 +3264,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // ------------------------------------------------------------------
     // MUT-02 default link policy: follow-and-preserve within roots
-    // ------------------------------------------------------------------
 
     #[cfg(unix)]
     #[test]
@@ -3482,9 +3453,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // ------------------------------------------------------------------
     // MUT-06: copy_tree + remove_owned_empty_dir
-    // ------------------------------------------------------------------
 
     #[test]
     fn copy_tree_respects_include_exclude_filters() {
@@ -3640,9 +3609,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // ------------------------------------------------------------------
     // MUT-09 + QAL-06: journal + injector on REAL paths
-    // ------------------------------------------------------------------
 
     #[test]
     fn journal_written_for_multi_file_commit_and_removed_after_success() {
@@ -3904,9 +3871,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root2));
     }
 
-    // -----------------------------------------------------------------------
     // Plan-02 fold: the single-file mutation boundary
-    // -----------------------------------------------------------------------
 
     fn boundary_scratch(tag: &str) -> PathBuf {
         let dir = crate::test_util::temp_dir_unique(&format!("tx-boundary-{tag}"));
@@ -4072,9 +4037,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -----------------------------------------------------------------------
     // Plan-02 fold: structural source guarantees
-    // -----------------------------------------------------------------------
 
     fn crate_src(name: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
@@ -4166,10 +4129,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Plan-13 / QAL-09 platform-adversarial cases (executed by the windows
-    // and macos CI runners; compiled out elsewhere)
-    // -----------------------------------------------------------------------
+    // Plan-13 / QAL-09 platform-adversarial cases (executed by the windows and macos CI runners; compiled out elsewhere)
 
     /// A target held open the way a running harness holds its config must
     /// surface a typed error, never corruption or a leaked temp.
@@ -4350,9 +4310,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // ------------------------------------------------------------------
     // Behaviour tests for the mutation-testing gate (area C)
-    // ------------------------------------------------------------------
 
     /// Whether chmod 0o333 actually denies opening this directory for
     /// reading for this process. Root bypasses permission checks; callers

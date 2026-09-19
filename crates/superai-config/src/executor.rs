@@ -1,15 +1,10 @@
-//! Operation executor (DOC-02).
-//!
-//! Applies a typed [`Operation`] through the codec layer after enforcing
-//! every declared policy (owned keys with prefix paths, `expected_old`,
-//! duplicate handling, parent creation, redaction); a violation means a
-//! typed error and no write.
-//!
-//! [`apply_to_value`] is the core over a semantic value tree; [`apply`]
-//! is the file level, writing back through the same codec only when the
-//! semantic value changed. JSONC/YAML keep their `LossyWrite` refusals,
-//! TOML edits go through `toml_edit` to preserve comments, and text
-//! fragments accept managed-span operations only (DOC-08).
+//! Operation executor (DOC-02): applies a typed [`Operation`] through the
+//! codec layer after enforcing every declared policy (owned keys,
+//! `expected_old`, duplicates, parent creation, redaction); a violation is
+//! a typed error and nothing is written. [`apply_to_value`] is the core
+//! over a semantic tree; [`apply`] is the file level, writing back only on
+//! a semantic change. JSONC/YAML keep `LossyWrite` refusals, TOML goes
+//! through `toml_edit` to preserve comments, text fragments are span-only.
 
 use std::collections::BTreeMap;
 use std::path::Path;

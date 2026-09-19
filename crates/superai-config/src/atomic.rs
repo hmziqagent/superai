@@ -54,7 +54,7 @@ fn generate_temp_path(target: &Path) -> Result<PathBuf> {
 /// restore) wins; otherwise derived from the current target, or owner-only
 /// `0o600` when the target is absent.
 #[cfg(unix)]
-fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
+pub(crate) fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     if let Some(mode) = mode {
         return mode;
@@ -71,31 +71,37 @@ fn resolve_final_mode(target: &Path, mode: Option<u32>) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn resolve_final_mode(_target: &Path, mode: Option<u32>) -> u32 {
+pub(crate) fn resolve_final_mode(_target: &Path, mode: Option<u32>) -> u32 {
     mode.unwrap_or(0o600)
 }
 
-/// Apply `mode` to `path`, masked to the permission bits, never zero access.
+/// Apply `mode` to the file behind `file`, masked to the permission bits and
+/// never zero access. `label` names the file in errors. Operating on the open
+/// fd means a name swap between creation and rename cannot redirect the
+/// chmod onto another file.
 #[cfg(unix)]
-fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn apply_mode(file: &std::fs::File, label: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let masked = mode & 0o777;
     let safe_mode = if masked == 0 { 0o600 } else { masked };
     let perm = std::fs::Permissions::from_mode(safe_mode);
-    std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
+    file.set_permissions(perm)
+        .map_err(|e| ConfigError::io(label, e))
 }
 
-/// Only the owner-write bit maps to the Windows readonly attribute; the
-/// replacement must never be readonly or a later rename-over fails.
+/// Windows has only the readonly attribute, mapped from the owner-write bit;
+/// the replacement must never be readonly or a later rename-over fails.
 #[cfg(windows)]
-fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn apply_mode(file: &std::fs::File, label: &Path, mode: u32) -> Result<()> {
     let masked = mode & 0o777;
     let safe_mode = if masked == 0 { 0o600 } else { masked };
-    let mut perm = std::fs::metadata(path)
+    let mut perm = file
+        .metadata()
         .map(|m| m.permissions())
-        .map_err(|e| ConfigError::io(path, e))?;
+        .map_err(|e| ConfigError::io(label, e))?;
     perm.set_readonly(safe_mode & 0o200 == 0);
-    std::fs::set_permissions(path, perm).map_err(|e| ConfigError::io(path, e))
+    file.set_permissions(perm)
+        .map_err(|e| ConfigError::io(label, e))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -103,8 +109,8 @@ fn apply_mode(path: &Path, mode: u32) -> Result<()> {
     clippy::unnecessary_wraps,
     reason = "no POSIX chmod and no windows readonly bit; keeps call sites uniform"
 )]
-fn apply_mode(path: &Path, _mode: u32) -> Result<()> {
-    let _ = path;
+pub(crate) fn apply_mode(file: &std::fs::File, _label: &Path, _mode: u32) -> Result<()> {
+    let _ = file;
     Ok(())
 }
 
@@ -278,9 +284,9 @@ pub(crate) fn atomic_write_expecting(
     };
 
     // Owner-only while empty, so payload bytes are never group/world readable
-    // regardless of the process umask; the chmod lands on the inode the open
-    // handle already owns even if the name is tampered with meanwhile.
-    if let Err(e) = apply_mode(&temp_path, 0o600) {
+    // regardless of the process umask. The chmod goes through the held fd, so
+    // it lands on the inode we created even if the temp name is swapped.
+    if let Err(e) = apply_mode(&file, &temp_path, 0o600) {
         drop(std::fs::remove_file(&temp_path));
         return Err(e);
     }
@@ -295,14 +301,15 @@ pub(crate) fn atomic_write_expecting(
         file.sync_all()
             .map_err(|e| ConfigError::io(&temp_path, e))?;
     }
-    drop(file);
 
     // Final mode after the bytes are durable but before the rename, so the
-    // replacement never appears with the interim owner-only mode.
-    if let Err(e) = apply_mode(&temp_path, resolve_final_mode(path, mode)) {
+    // replacement never appears with the interim owner-only mode. Still via
+    // the fd: a swapped name cannot redirect it onto a foreign file.
+    if let Err(e) = apply_mode(&file, &temp_path, resolve_final_mode(path, mode)) {
         drop(std::fs::remove_file(&temp_path));
         return Err(e);
     }
+    drop(file);
 
     // §4.2 / MUT-01: recheck immediately before the rename. A target that
     // changed anywhere inside the preparation window aborts untouched.
