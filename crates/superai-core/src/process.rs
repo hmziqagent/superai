@@ -495,7 +495,7 @@ mod tests {
     fn extract_version_semver_bound_is_bytes_not_chars() {
         // A multi-byte semver-shaped token must be bounded to 64 BYTES, not
         // 64 chars (found by the QAL-04 detection fuzz family).
-        let token = "1.2.3-β".repeat(30); // 6 bytes per rep, 180 bytes, 90 chars
+        let token = "1.2.3-β".repeat(30); // 8 bytes per rep, 240 bytes, 210 chars
         let text = format!("tool {token}");
         let v = extract_version(&text)
             .unwrap_or_else(|| panic!("semver-shaped token must be extracted: {text:?}"));
@@ -590,9 +590,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_command_env_remove_beats_env_on_same_key() {
-        // Pins duct's reverse-order composition: the env_remove wrap runs
-        // after the env wrap, so an explicit removal wins. If the deferred
-        // composition reorder ever lands, this flips and must be re-decided.
+        // Duct runs the env_remove wrap after the env wrap, so removal wins;
+        // the deferred composition reorder flips this and must be re-decided.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             env: vec![
