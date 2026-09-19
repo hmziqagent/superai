@@ -558,26 +558,32 @@ fn verify_profile_marker(root: &Path, harness: &HarnessId, name: &str) -> Result
 // Activation / deactivation
 // ---------------------------------------------------------------------------
 
-/// Activate profile `name` at `fixed_path`: point the path at the managed
-/// root via an atomic symlink swap.
-///
-/// Pre-existing REAL content at the path is moved to a recoverable backup
-/// under the profile base first (digest recorded for the byte-identical
-/// restore); a pre-existing FOREIGN symlink (target outside the base) is
-/// refused; a pre-existing MANAGED symlink is swapped in place. Activation
-/// while another fixed path still holds a profile of the same harness is
-/// refused (deactivate first); switching profiles at the SAME path is the
 /// Validate and prepare the fixed path for the swap: refuse a foreign
 /// symlink, back pre-existing REAL content up (recoverable, under the base —
 /// never a blind delete; files additionally record a digest so the
 /// deactivate restore is provably byte-identical, directories are moved
 /// untouched which is byte-identical by construction), and pass a managed
 /// symlink through (the rename replaces it atomically).
+///
+/// BACKUP-SLOT SEMANTICS — the backup chain must survive switches: the
+/// recorded `backup_path`/`preexisting_digest` pair is ONE canonical slot
+/// per fixed path, written only by the first activation that displaces real
+/// content (i.e. while no swap is recorded). When `prior` names an
+/// already-active swap at this path (a same-path profile switch), the path
+/// holds our managed symlink or the hole a deleted one left behind, so
+/// there is no new pre-existing content: the canonical slot is carried
+/// forward unchanged and only the active pointer moves, guaranteeing a
+/// later deactivate restores the ORIGINAL pre-activation content rather
+/// than the intermediate profile. REAL content at the path while a swap is
+/// recorded means the symlink we own was displaced — quarantining that
+/// content would orphan the original (or overwriting the slot would strand
+/// it), so the switch is refused instead.
 fn prepare_fixed_path_for_swap(
     base: &Path,
     base_dir: &Path,
     harness: &HarnessId,
     fixed_path: &Path,
+    prior: Option<&ActiveSwap>,
 ) -> Result<(Option<PathBuf>, Option<String>)> {
     match classify_fixed_path(fixed_path)? {
         FixedPathState::Symlink(target) => {
@@ -590,9 +596,20 @@ fn prepare_fixed_path_for_swap(
                     ),
                 });
             }
-            Ok((None, None))
+            Ok(carried_backup_slot(prior))
         }
         FixedPathState::RealContent => {
+            if let Some(swap) = prior {
+                return Err(CoreError::ForeignOwnership {
+                    path: fixed_path.to_path_buf(),
+                    owner: format!(
+                        "fixed path holds real content while profile `{}` is active here; \
+                         the managed symlink was displaced — deactivate or investigate \
+                         first instead of orphaning the recorded backup",
+                        swap.profile
+                    ),
+                });
+            }
             let mut digest = None;
             if fixed_path.is_file()
                 && let Ok(bytes) = std::fs::read(fixed_path)
@@ -604,12 +621,33 @@ fn prepare_fixed_path_for_swap(
                 .map_err(CoreError::Config)?;
             Ok((Some(entry.quarantine_path), digest))
         }
-        FixedPathState::Absent => Ok((None, None)),
+        FixedPathState::Absent => Ok(carried_backup_slot(prior)),
     }
 }
 
-/// supported flow. Concurrent activations serialize through the WRP-06
-/// activation lock.
+/// The canonical backup slot carried unchanged across a same-path switch:
+/// whatever the first activation recorded stays the content a later
+/// deactivate restores (None stays None when nothing was ever displaced).
+fn carried_backup_slot(prior: Option<&ActiveSwap>) -> (Option<PathBuf>, Option<String>) {
+    (
+        prior.and_then(|swap| swap.backup_path.as_deref().map(PathBuf::from)),
+        prior.and_then(|swap| swap.preexisting_digest.clone()),
+    )
+}
+
+/// Activate profile `name` at `fixed_path`: point the path at the managed
+/// root via an atomic symlink swap.
+///
+/// Pre-existing REAL content at the path is moved to a recoverable backup
+/// under the profile base first (digest recorded for the byte-identical
+/// restore); a pre-existing FOREIGN symlink (target outside the base) is
+/// refused; a pre-existing MANAGED symlink is swapped in place. Activation
+/// while another fixed path still holds a profile of the same harness is
+/// refused (deactivate first); switching profiles at the SAME path is the
+/// supported flow and preserves the canonical backup slot (see
+/// [`prepare_fixed_path_for_swap`]) so a later deactivate restores the
+/// ORIGINAL pre-activation content, not the intermediate profile. Concurrent
+/// activations serialize through the WRP-06 activation lock.
 pub fn activate_profile(
     base_dir: &Path,
     harness: &HarnessId,
@@ -641,7 +679,11 @@ pub fn activate_profile(
         .join(harness.as_str());
     let _lock = ActivationLock::acquire(&lock_dir, harness.as_str())?;
 
-    if let Some(active) = load_active_swap(base_dir, harness)?
+    // Loaded once under the lock: when a swap is recorded the check above
+    // guarantees it is at THIS fixed path, so `prior` (when present) is the
+    // same-path switch whose canonical backup slot must survive.
+    let prior = load_active_swap(base_dir, harness)?;
+    if let Some(active) = &prior
         && active.fixed_path != fixed_path.display().to_string()
     {
         return Err(CoreError::Validation {
@@ -653,8 +695,13 @@ pub fn activate_profile(
         });
     }
 
-    let (backup_path, preexisting_digest) =
-        prepare_fixed_path_for_swap(base.as_path(), base_dir, harness, fixed_path)?;
+    let (backup_path, preexisting_digest) = prepare_fixed_path_for_swap(
+        base.as_path(),
+        base_dir,
+        harness,
+        fixed_path,
+        prior.as_ref(),
+    )?;
 
     // Atomic swap: create the symlink under a temporary sibling name, then
     // rename(2) it onto the fixed path. rename replaces an existing symlink
@@ -982,6 +1029,171 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("two")
+        );
+    }
+
+    /// The live t3 sequence (run-5, evidence t3-profile-swap.typescript):
+    /// real content at the fixed path, activate A, same-path switch to B,
+    /// deactivate — the ORIGINAL content must come back byte-identical and
+    /// nothing may stay stranded in quarantine. Regression for the dropped
+    /// backup linkage (the switch overwrote the slot with None).
+    #[test]
+    fn switch_then_deactivate_restores_the_original_content() {
+        let b = base("switch-restore");
+        let work = create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("work")),
+        )
+        .unwrap();
+        let personal = create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("personal")),
+        )
+        .unwrap();
+        std::fs::write(
+            work.root.join("claude_desktop_config.json").unwrap(),
+            br#"{"work": true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            personal.root.join("claude_desktop_config.json").unwrap(),
+            br#"{"personal": true}"#,
+        )
+        .unwrap();
+        let fixed = fixed_root().join(".config").join("Claude");
+        let original: &[u8] = br#"{"mcpServers": {"real-user": true}}"#;
+        std::fs::create_dir_all(&fixed).unwrap();
+        std::fs::write(fixed.join("claude_desktop_config.json"), original).unwrap();
+
+        let first = activate_profile(&b, &harness("claude-desktop"), "work", &fixed).unwrap();
+        assert!(first.backup_path.is_some(), "original backed up");
+        let original_backup = first.backup_path.unwrap();
+
+        // Same-path switch: the canonical backup slot must survive.
+        let switch = activate_profile(&b, &harness("claude-desktop"), "personal", &fixed).unwrap();
+        assert_eq!(
+            switch.backup_path.as_deref(),
+            Some(original_backup.as_path()),
+            "switch carries the ORIGINAL backup, not None"
+        );
+        assert_eq!(
+            std::fs::read(fixed.join("claude_desktop_config.json")).unwrap(),
+            br#"{"personal": true}"#.to_vec()
+        );
+
+        let deactivation = deactivate_profile(&b, &harness("claude-desktop"), &fixed).unwrap();
+        assert!(deactivation.restored, "original restored, not dropped");
+        assert!(!fixed.is_symlink(), "symlink must be gone");
+        assert_eq!(
+            std::fs::read(fixed.join("claude_desktop_config.json")).unwrap(),
+            original.to_vec(),
+            "ORIGINAL content back byte-identical"
+        );
+        assert_eq!(
+            active_profile(&b, &harness("claude-desktop")).unwrap(),
+            None
+        );
+
+        // Quarantine leaves nothing stranded: the recorded backup entry was
+        // moved back, so no profile-swap op dir still holds content.
+        let qbase = b.join(".superai").join("quarantine");
+        let strays: Vec<PathBuf> = std::fs::read_dir(&qbase)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("profile-swap-"))
+                    && std::fs::read_dir(p).is_ok_and(|mut entries| entries.next().is_some())
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "quarantine strays after restore: {strays:?}"
+        );
+    }
+
+    /// The FILE-at-fixed-path variant: the recorded digest rides across a
+    /// same-path switch too, so the deactivate restore is still provably
+    /// byte-identical.
+    #[test]
+    fn switch_carries_the_file_backup_digest_until_deactivate() {
+        let b = base("switch-digest");
+        create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("one")),
+        )
+        .unwrap();
+        create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("two")),
+        )
+        .unwrap();
+        let fixed = fixed_root().join(".config").join("Claude");
+        std::fs::create_dir_all(fixed.parent().unwrap()).unwrap();
+        let original = b"original single-file config\n";
+        std::fs::write(&fixed, original).unwrap();
+
+        let first = activate_profile(&b, &harness("claude-desktop"), "one", &fixed).unwrap();
+        let expected_digest = first.preexisting_digest.unwrap();
+        let switch = activate_profile(&b, &harness("claude-desktop"), "two", &fixed).unwrap();
+        assert_eq!(
+            switch.preexisting_digest.as_deref(),
+            Some(expected_digest.as_str()),
+            "digest slot survives the switch"
+        );
+
+        let deactivation = deactivate_profile(&b, &harness("claude-desktop"), &fixed).unwrap();
+        assert!(deactivation.restored);
+        assert_eq!(std::fs::read(&fixed).unwrap(), original.to_vec());
+    }
+
+    /// Real content showing up at the fixed path WHILE a swap is recorded
+    /// means the managed symlink was displaced; a switch must refuse rather
+    /// than quarantine that content into (or strand it beside) the original
+    /// backup slot.
+    #[test]
+    fn switch_refuses_real_content_displacing_the_managed_symlink() {
+        let b = base("switch-displaced");
+        create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("one")),
+        )
+        .unwrap();
+        create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("two")),
+        )
+        .unwrap();
+        let fixed = fixed_root().join(".config").join("Claude");
+        std::fs::create_dir_all(&fixed).unwrap();
+        std::fs::write(fixed.join("claude_desktop_config.json"), b"original").unwrap();
+        let first = activate_profile(&b, &harness("claude-desktop"), "one", &fixed).unwrap();
+
+        // Someone replaces our symlink with real content mid-swap.
+        std::fs::remove_file(&fixed).unwrap();
+        std::fs::create_dir_all(&fixed).unwrap();
+        std::fs::write(fixed.join("alien.txt"), b"alien").unwrap();
+
+        match activate_profile(&b, &harness("claude-desktop"), "two", &fixed).unwrap_err() {
+            CoreError::ForeignOwnership { owner, .. } => {
+                assert!(owner.contains("displaced"), "{owner}");
+            }
+            other => panic!("expected ForeignOwnership, got {other:?}"),
+        }
+        // The displaced content is untouched, the original backup and the
+        // active pointer are exactly as the first activation left them.
+        assert_eq!(
+            std::fs::read(fixed.join("alien.txt")).unwrap(),
+            b"alien".to_vec()
+        );
+        assert!(first.backup_path.unwrap().exists(), "original backup kept");
+        assert_eq!(
+            active_profile(&b, &harness("claude-desktop"))
+                .unwrap()
+                .as_deref(),
+            Some("one")
         );
     }
 
