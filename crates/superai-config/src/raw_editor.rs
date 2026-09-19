@@ -1,25 +1,18 @@
-//! Raw editor backend — read/validate/diff/commit (RAW-01..07).
+//! Raw editor backend: read/validate/diff/commit (RAW-01..07).
 //!
-//! Interface-neutral services for future editors to open the exact harness
-//! files, display parse diagnostics, preview semantic/lexical changes, and
-//! commit safely. No editor widget or interface type is implemented.
-//!
-//! Guarantees:
-//! - Every `read` is fresh from disk (no cache).
-//! - `validate` is syntax-only and never touches disk.
-//! - `diff` produces semantic ops (format-agnostic) and lexical unified diff.
-//! - `commit` revalidates, checks conflict token, backs up, atomically
-//!   replaces, verifies, and never writes invalid content.
-//! - Sensitive content is wrapped in [`SensitiveContent`] whose `Debug` is
-//!   redacted.
+//! Interface-neutral services for future editors to open harness files,
+//! display parse diagnostics, preview semantic and lexical changes, and
+//! commit safely. Every `read` is fresh from disk, `validate` never touches
+//! disk, `diff` returns redacted previews, and `commit` validates, checks the
+//! conflict token, backs up, atomically replaces, and verifies. Sensitive
+//! content travels in [`SensitiveContent`] whose `Debug` is redacted.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 use toml_edit::DocumentMut;
 
 use crate::backup::{BackupEntry, backup_with_reason};
@@ -27,15 +20,10 @@ use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle};
 use crate::error::{ConfigError, Result};
 use crate::snapshot::{Snapshot, is_modified, snapshot};
 
-// ---------------------------------------------------------------------------
-// Sensitive wrapper
-// ---------------------------------------------------------------------------
-
 /// Sensitive bytes whose `Debug`/`Display` are redacted.
 ///
 /// The raw secret is only available via [`Self::expose`] or
-/// [`Self::expose_str`]. This satisfies RAW-01's "sensitive source text
-/// wrapper must avoid Debug/log/telemetry serialization".
+/// [`Self::expose_str`] (RAW-01: no Debug/log/telemetry serialization).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SensitiveContent(Vec<u8>);
 
@@ -88,10 +76,6 @@ impl std::fmt::Display for SensitiveContent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers: digest, newline, encoding
-// ---------------------------------------------------------------------------
-
 fn compute_digest(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -128,24 +112,16 @@ fn offset_to_line_col(bytes: &[u8], offset: usize) -> (usize, usize) {
     let mut line = 1usize;
     let mut col = 1usize;
     let limit = usize::min(offset, bytes.len());
-    let mut idx = 0usize;
-    while idx < limit {
-        if let Some(b) = bytes.get(idx).copied() {
-            if b == b'\n' {
-                line = line.saturating_add(1);
-                col = 1;
-            } else {
-                col = col.saturating_add(1);
-            }
+    for &b in bytes.get(..limit).unwrap_or(&[]) {
+        if b == b'\n' {
+            line = line.saturating_add(1);
+            col = 1;
+        } else {
+            col = col.saturating_add(1);
         }
-        idx = idx.saturating_add(1);
     }
     (line, col)
 }
-
-// ---------------------------------------------------------------------------
-// RawDocument
-// ---------------------------------------------------------------------------
 
 /// Fresh document as seen by the raw editor.
 ///
@@ -185,17 +161,10 @@ impl RawDocument {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Service struct — interface-agnostic editor backend
-// ---------------------------------------------------------------------------
-
-/// Interface-agnostic raw editor service.
+/// Interface-agnostic raw editor service: open, validate, diff, commit.
 ///
-/// Exposes `open(path) -> SourceDocument`, `validate`, `diff`, and `commit`
-/// without any GPUI or interface types. Disk is the truth on every `open`;
-/// `validate` never touches disk; `diff` returns redacted lexical diff plus
-/// semantic ops; `commit` validates, checks conflict, backs up, atomically
-/// replaces, and verifies. No caching, no `unwrap`, no panics.
+/// No caching and no interface types; `commit` validates, checks the
+/// conflict token, backs up, atomically replaces, and verifies.
 #[derive(Debug, Clone, Default)]
 pub struct RawEditor;
 
@@ -268,24 +237,14 @@ impl RawEditor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
-/// Maximum document size accepted by validation (RAW-02 size check).
-///
-/// Mirrors the process-layer capture bound: drafts larger than this are a
-/// diagnostic before any parse is attempted, so pathological inputs cannot
-/// drive unbounded parser work.
+/// Maximum document size accepted by validation (RAW-02). Larger drafts are
+/// a diagnostic before any parse, bounding parser work on hostile input.
 pub const MAX_VALIDATION_BYTES: usize = 1_048_576;
 
 /// Validate `content` for `kind` without touching disk.
 ///
-/// Returns syntax diagnostics only; adapter schema is optional and not
-/// applied here. Empty diagnostics means the content is syntactically valid.
-/// An empty buffer is NOT automatically an empty document (RAW-05): the
-/// format decides — TOML/YAML/env accept an empty document, while JSON kinds
-/// require the explicit empty object `{}`.
+/// Syntax diagnostics only. Empty buffer is not automatically an empty
+/// document (RAW-05): TOML/YAML/env accept one, JSON kinds require `{}`.
 pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -302,9 +261,7 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
         return diagnostics;
     }
 
-    // Encoding check: invalid UTF-8 is always a diagnostic.
-    // Opaque and TextFragment still require valid UTF-8 for display; binary
-    // content is reported but not treated as lossy replacement.
+    // Invalid UTF-8 is always a diagnostic, even for opaque fragments.
     let without_bom = bytes_without_bom(content);
     if let Err(err) = std::str::from_utf8(without_bom) {
         let valid_up_to = err.valid_up_to();
@@ -322,7 +279,7 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     let text = std::str::from_utf8(without_bom).unwrap_or_default();
     if text.trim().is_empty() {
         // RAW-05: the format decides whether an empty buffer is a valid
-        // document. TOML/YAML/env have empty documents; JSON kinds do not —
+        // document. TOML/YAML/env have empty documents; JSON kinds do not:
         // their empty document is the explicit `{}` object.
         if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
             diagnostics.push(Diagnostic::new(
@@ -361,14 +318,9 @@ fn validate_text_fragment(text: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// Validate `content` for `kind` with an adapter-supplied semantic schema
-/// (DOC-09): syntax diagnostics plus semantic-validator diagnostics plus
-/// deprecation diagnostics for deprecated owned keys, all at validate-time
-/// rather than only at commit-time version gates. Never touches disk.
-///
-/// The document is parsed per `kind` into its semantic value tree first;
-/// when it does not parse, only syntax diagnostics are returned (semantic
-/// validation of unparsable content is meaningless).
+/// Validate with an adapter-supplied semantic schema (DOC-09): syntax,
+/// semantic-validator, and deprecation diagnostics at validate time. Never
+/// touches disk. Unparsable content gets syntax diagnostics only.
 pub fn validate_with_schema(
     content: &[u8],
     kind: DocumentKind,
@@ -398,18 +350,16 @@ fn parse_semantic_value(content: &[u8], kind: DocumentKind) -> Option<Value> {
         return Some(Value::Object(Map::new()));
     }
     match kind {
-        DocumentKind::StrictJson => parse_strict_json_value(text).ok(),
+        DocumentKind::StrictJson => crate::json::parse_strict_raw(text).ok(),
         DocumentKind::JsonC => {
-            let stripped = strip_jsonc(text);
+            let stripped = crate::jsonc::strip_jsonc(text);
             if stripped.trim().is_empty() {
                 Some(Value::Object(Map::new()))
             } else {
-                parse_strict_json_value(&stripped).ok()
+                crate::json::parse_strict_raw(&stripped).ok()
             }
         }
-        DocumentKind::Yaml => yaml_serde::from_str::<StrictYamlValue>(text)
-            .ok()
-            .map(|v| v.0),
+        DocumentKind::Yaml => crate::yaml::parse_strict_raw(text).ok(),
         DocumentKind::Toml => text
             .parse::<DocumentMut>()
             .ok()
@@ -427,7 +377,7 @@ fn parse_semantic_value(content: &[u8], kind: DocumentKind) -> Option<Value> {
 
 fn validate_json(text: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    if let Err(err) = parse_strict_json_value(text) {
+    if let Err(err) = crate::json::parse_strict_raw(text) {
         let (line, col) = (err.line(), err.column());
         diags.push(Diagnostic::new(line, col, err.to_string()));
     }
@@ -435,7 +385,7 @@ fn validate_json(text: &str) -> Vec<Diagnostic> {
 }
 
 fn validate_jsonc(text: &str) -> Vec<Diagnostic> {
-    let stripped = strip_jsonc(text);
+    let stripped = crate::jsonc::strip_jsonc(text);
     // If original empty after stripping, it's valid.
     if stripped.trim().is_empty() {
         return Vec::new();
@@ -446,34 +396,24 @@ fn validate_jsonc(text: &str) -> Vec<Diagnostic> {
 fn validate_toml(text: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     if let Err(err) = text.parse::<DocumentMut>() {
-        // TomlError span handling: use first line/col if span available, else 1:1
-        let msg = err.to_string();
-        // Try to extract line from message like "expected ..." often includes line info.
-        // Fallback to 1:1.
-        diags.push(Diagnostic::new(1, 1, msg));
+        diags.push(Diagnostic::new(1, 1, err.to_string()));
     }
     diags
 }
 
 fn validate_yaml(text: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    if let Err(err) = yaml_serde::from_str::<StrictYamlValue>(text) {
-        let msg = err.to_string();
-        // yaml_serde error may contain location; try to parse line from message or use 1:1
-        diags.push(Diagnostic::new(1, 1, msg));
+    if let Err(err) = crate::yaml::parse_strict_raw(text) {
+        diags.push(Diagnostic::new(1, 1, err.to_string()));
     }
     diags
 }
 
 fn validate_env(text: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    // Reuse env parsing logic: split lines, check syntax for entries.
-    // RAW-06: duplicate keys are tracked so effective-definition (last-wins)
-    // diagnostics can be surfaced. Duplicates stay non-blocking — env edits
-    // preserve them on disk by design.
+    // RAW-06: duplicate keys surface as last-wins warnings; they stay
+    // non-blocking because env edits preserve duplicates on disk.
     let lines: Vec<&str> = text.lines().collect();
-    // (key, first line) in first-seen order; later lines recorded for the
-    // effective-definition message.
     let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -501,7 +441,6 @@ fn validate_env(text: &str) -> Vec<Diagnostic> {
             ));
             continue;
         }
-        // Key validation: before '=' must be valid identifier
         let Some(eq_pos) = without_export.find('=') else {
             continue;
         };
@@ -524,9 +463,7 @@ fn validate_env(text: &str) -> Vec<Diagnostic> {
                 .push(idx.saturating_add(1));
         }
     }
-    // RAW-06 duplicate diagnostics: one per duplicated key, placed at the
-    // effective (last) definition, naming every earlier definition. These are
-    // Warning severity so commits keep preserving duplicates on disk.
+    // One duplicate diagnostic per key, at the effective (last) definition.
     for (key, line_nums) in &seen {
         if line_nums.len() > 1 {
             let effective = line_nums.last().copied().unwrap_or(1);
@@ -564,371 +501,6 @@ fn is_valid_env_key(key: &str) -> bool {
     }
     true
 }
-
-// ---------------------------------------------------------------------------
-// Strict JSON helpers (duplicate key detection)
-// ---------------------------------------------------------------------------
-
-struct StrictJsonValue(Value);
-
-impl<'de> Deserialize<'de> for StrictJsonValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        struct StrictVisitor;
-
-        impl<'de> Visitor<'de> for StrictVisitor {
-            type Value = StrictJsonValue;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("any valid JSON value")
-            }
-
-            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::Bool(v)))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::Number(Number::from(v))))
-            }
-
-            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::Number(Number::from(v))))
-            }
-
-            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Number::from_f64(v).map_or_else(
-                    || Err(de::Error::custom("invalid f64")),
-                    |n| Ok(StrictJsonValue(Value::Number(n))),
-                )
-            }
-
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::String(v.to_owned())))
-            }
-
-            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::String(v)))
-            }
-
-            fn visit_borrowed_str<E>(self, v: &'de str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::String(v.to_owned())))
-            }
-
-            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::Null))
-            }
-
-            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictJsonValue(Value::Null))
-            }
-
-            #[expect(clippy::excessive_nesting, reason = "visitor boilerplate")]
-            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut vec = Vec::new();
-                while let Some(elem) = seq.next_element::<StrictJsonValue>()? {
-                    vec.push(elem.0);
-                }
-                Ok(StrictJsonValue(Value::Array(vec)))
-            }
-
-            #[expect(clippy::excessive_nesting, reason = "visitor boilerplate")]
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut m = Map::new();
-                while let Some((key, value)) = map.next_entry::<String, StrictJsonValue>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
-                    }
-                    m.insert(key, value.0);
-                }
-                Ok(StrictJsonValue(Value::Object(m)))
-            }
-        }
-
-        deserializer.deserialize_any(StrictVisitor)
-    }
-}
-
-fn parse_strict_json_value(text: &str) -> std::result::Result<Value, serde_json::Error> {
-    let mut de = serde_json::Deserializer::from_str(text);
-    let v = StrictJsonValue::deserialize(&mut de)?;
-    de.end()?;
-    Ok(v.0)
-}
-
-// ---------------------------------------------------------------------------
-// Strict YAML helper
-// ---------------------------------------------------------------------------
-
-struct StrictYamlValue(Value);
-
-impl<'de> Deserialize<'de> for StrictYamlValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        struct StrictVisitor;
-
-        impl<'de> Visitor<'de> for StrictVisitor {
-            type Value = StrictYamlValue;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("any valid YAML value")
-            }
-
-            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::Bool(v)))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::Number(Number::from(v))))
-            }
-
-            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::Number(Number::from(v))))
-            }
-
-            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Number::from_f64(v).map_or_else(
-                    || Err(de::Error::custom("invalid f64")),
-                    |n| Ok(StrictYamlValue(Value::Number(n))),
-                )
-            }
-
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::String(v.to_owned())))
-            }
-
-            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::String(v)))
-            }
-
-            fn visit_borrowed_str<E>(self, v: &'de str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::String(v.to_owned())))
-            }
-
-            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::Null))
-            }
-
-            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictYamlValue(Value::Null))
-            }
-
-            #[expect(clippy::excessive_nesting, reason = "visitor boilerplate")]
-            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut vec = Vec::new();
-                while let Some(elem) = seq.next_element::<StrictYamlValue>()? {
-                    vec.push(elem.0);
-                }
-                Ok(StrictYamlValue(Value::Array(vec)))
-            }
-
-            #[expect(clippy::excessive_nesting, reason = "visitor boilerplate")]
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut m = Map::new();
-                while let Some((key, value)) = map.next_entry::<String, StrictYamlValue>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
-                    }
-                    m.insert(key, value.0);
-                }
-                Ok(StrictYamlValue(Value::Object(m)))
-            }
-        }
-
-        deserializer.deserialize_any(StrictVisitor)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// JSONC stripping
-// ---------------------------------------------------------------------------
-
-#[expect(clippy::excessive_nesting, reason = "comment scan")]
-fn strip_comments(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else if ch == '"' {
-            in_string = true;
-            output.push(ch);
-        } else if ch == '/' {
-            match chars.peek().copied() {
-                Some('/') => {
-                    chars.next();
-                    while let Some(&peek) = chars.peek() {
-                        if peek == '\n' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                }
-                Some('*') => {
-                    chars.next();
-                    loop {
-                        match chars.next() {
-                            Some('*') => {
-                                if chars.peek().copied() == Some('/') {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
-                    }
-                }
-                _ => output.push(ch),
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-
-    output
-}
-
-#[expect(clippy::excessive_nesting, reason = "string-aware scan")]
-fn strip_trailing_commas(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut idx = 0usize;
-
-    while idx < chars.len() {
-        let Some(ch) = chars.get(idx).copied() else {
-            break;
-        };
-        if in_string {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            idx = idx.saturating_add(1);
-        } else if ch == '"' {
-            in_string = true;
-            output.push(ch);
-            idx = idx.saturating_add(1);
-        } else if ch == ',' {
-            let mut look = idx.saturating_add(1);
-            loop {
-                match chars.get(look).copied() {
-                    Some(c) if c == ' ' || c == '\t' || c == '\n' || c == '\r' => {
-                        look = look.saturating_add(1);
-                    }
-                    _ => break,
-                }
-            }
-            if let Some(next) = chars.get(look).copied()
-                && (next == '}' || next == ']')
-            {
-                idx = idx.saturating_add(1);
-                continue;
-            }
-            output.push(ch);
-            idx = idx.saturating_add(1);
-        } else {
-            output.push(ch);
-            idx = idx.saturating_add(1);
-        }
-    }
-
-    output
-}
-
-fn strip_jsonc(input: &str) -> String {
-    let without_comments = strip_comments(input);
-    strip_trailing_commas(&without_comments)
-}
-
-// ---------------------------------------------------------------------------
-// Diff structures
-// ---------------------------------------------------------------------------
 
 /// Semantic operation describing a change at a selector.
 ///
@@ -985,10 +557,6 @@ pub struct DiffResult {
     pub formatting_warnings: Vec<DiffWarning>,
 }
 
-// ---------------------------------------------------------------------------
-// Diff implementation
-// ---------------------------------------------------------------------------
-
 /// Produce semantic ops, lexical diff, and redaction spans for `old` vs `new`.
 ///
 /// Neither buffer is written to disk. `kind` selects the parser for semantic
@@ -1011,16 +579,11 @@ pub fn diff(old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
     }
 }
 
-/// DOC-10 formatting-change warnings: produced from the codec that owns the
-/// document, surfaced when a semantic edit is accompanied by unavoidable
-/// surrounding-layout rewrites.
+/// DOC-10 formatting-change warnings from the codec that owns the document.
 ///
-/// Fires only when both hold:
-/// - the buffers differ (an edit is happening), and
-/// - semantic operations exist (the edit changes values, not just layout).
-///
-/// The codec layer decides whether its layout-normalizing write would
-/// rewrite anything beyond the edited values.
+/// Fires only when the buffers differ and semantic ops exist: the edit
+/// changes values, and the codec's layout-normalizing write would reach
+/// beyond them.
 fn formatting_change_warnings(
     old: &[u8],
     new: &[u8],
@@ -1123,15 +686,7 @@ fn lexical_diff(old: &[u8], new: &[u8]) -> String {
 }
 
 fn redact_line_for_preview(line: &str) -> String {
-    let lower = line.to_ascii_lowercase();
-    let needs = lower.contains("apikey")
-        || lower.contains("api_key")
-        || lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("password")
-        || lower.contains("authorization")
-        || lower.contains("bearer");
-    if !needs {
+    if !contains_secret_marker(&line.to_ascii_lowercase()) {
         return line.to_owned();
     }
     if let Some(pos) = line.find(':') {
@@ -1146,9 +701,6 @@ fn redact_line_for_preview(line: &str) -> String {
 }
 
 fn semantic_diff(old: &[u8], new: &[u8], kind: DocumentKind) -> Vec<SemanticOp> {
-    // Try to parse both; if either fails, no semantic ops (lexical diff still covers it)
-    // For valid parse, compare semantic values.
-
     match kind {
         DocumentKind::StrictJson => json_semantic_diff(old, new),
         DocumentKind::JsonC => jsonc_semantic_diff(old, new),
@@ -1175,11 +727,11 @@ fn json_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
     if old_text.trim().is_empty() && new_text.trim().is_empty() {
         return Vec::new();
     }
-    let old_val = match parse_strict_json_value(old_text) {
+    let old_val = match crate::json::parse_strict_raw(old_text) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let new_val = match parse_strict_json_value(new_text) {
+    let new_val = match crate::json::parse_strict_raw(new_text) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -1199,16 +751,16 @@ fn jsonc_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let old_stripped = strip_jsonc(old_text);
-    let new_stripped = strip_jsonc(new_text);
+    let old_stripped = crate::jsonc::strip_jsonc(old_text);
+    let new_stripped = crate::jsonc::strip_jsonc(new_text);
     if old_stripped.trim().is_empty() && new_stripped.trim().is_empty() {
         return Vec::new();
     }
-    let old_val = match parse_strict_json_value(&old_stripped) {
+    let old_val = match crate::json::parse_strict_raw(&old_stripped) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let new_val = match parse_strict_json_value(&new_stripped) {
+    let new_val = match crate::json::parse_strict_raw(&new_stripped) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -1231,12 +783,12 @@ fn yaml_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
     if old_text.trim().is_empty() && new_text.trim().is_empty() {
         return Vec::new();
     }
-    let old_val: Value = match yaml_serde::from_str::<StrictYamlValue>(old_text) {
-        Ok(v) => v.0,
+    let old_val = match crate::yaml::parse_strict_raw(old_text) {
+        Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let new_val: Value = match yaml_serde::from_str::<StrictYamlValue>(new_text) {
-        Ok(v) => v.0,
+    let new_val = match crate::yaml::parse_strict_raw(new_text) {
+        Ok(v) => v,
         Err(_) => return Vec::new(),
     };
     diff_json_values(&old_val, &new_val, String::new())
@@ -1266,19 +818,15 @@ fn toml_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    // Compare via serialized normalized form: if to_string equal, no semantic diff.
-    // This captures data changes while ignoring decor differences where possible.
-    // toml_edit's to_string preserves comments, so we need a data-only comparison.
-    // Fallback: compare item keys/values via iteration.
+    // to_string comparison catches equal serializations cheaply; per-key
+    // comparison gives per-selector ops, with a whole-document fallback when
+    // only decor changed.
     let old_str = old_doc.to_string();
     let new_str = new_doc.to_string();
     if old_str == new_str {
         return Vec::new();
     }
-    // Deeper comparison: collect keys and compare values as strings.
-    // Simple: if number of differing keys, produce ops.
     let mut ops = Vec::new();
-    // Collect all keys from both docs
     let mut keys: BTreeSet<String> = BTreeSet::new();
     for (k, _) in old_doc.iter() {
         keys.insert(k.to_owned());
@@ -1300,7 +848,7 @@ fn toml_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
             });
         }
     }
-    // Also check table headers differences via string comparison already caught
+    // Decor-only change below the top-level keys.
     if ops.is_empty() && old_str != new_str {
         ops.push(SemanticOp {
             selector: "root".to_owned(),
@@ -1478,7 +1026,6 @@ fn diff_json_values(old: &Value, new: &Value, prefix: String) -> Vec<SemanticOp>
             ops
         }
         (Value::Array(old_arr), Value::Array(new_arr)) => {
-            // For arrays, simple length/value comparison without identity logic.
             if old_arr == new_arr {
                 return Vec::new();
             }
@@ -1507,19 +1054,14 @@ fn diff_json_values(old: &Value, new: &Value, prefix: String) -> Vec<SemanticOp>
 }
 
 fn value_to_string(v: &Value) -> String {
-    // Use compact JSON for stable representation.
     serde_json::to_string(v).unwrap_or_else(|_| format!("{v:?}"))
 }
 
-// ---------------------------------------------------------------------------
-// Redaction spans
-// ---------------------------------------------------------------------------
-
 /// Find secret-bearing spans in `content` for UI redaction.
 ///
-/// Scans for keys containing `apikey`, `api_key`, `secret`, `token`,
-/// `password`, `authorization`, `bearer` (case-insensitive) and marks the
-/// value region after `:` or `=` as sensitive. Binary content yields no spans.
+/// Marks the value region after `:` or `=` on lines whose key mentions
+/// `apikey`, `api_key`, `secret`, `token`, `password`, `authorization`,
+/// `bearer`, or `auth` (case-insensitive). Binary content yields no spans.
 #[expect(clippy::manual_let_else, reason = "explicit match is clearer")]
 pub fn find_redaction_spans(content: &[u8], _kind: DocumentKind) -> Vec<RedactionSpan> {
     let text = match std::str::from_utf8(content) {
@@ -1532,75 +1074,36 @@ pub fn find_redaction_spans(content: &[u8], _kind: DocumentKind) -> Vec<Redactio
 fn find_redaction_spans_str(text: &str) -> Vec<RedactionSpan> {
     let mut spans = Vec::new();
     let mut offset = 0usize;
-    // Split while preserving offsets: iterate over lines including empty.
-    // Use split_inclusive to keep newline lengths.
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let Some(nl_pos) = remaining.find('\n') else {
-            // Last line without newline
-            let line = remaining;
-            if let Some(span) = redaction_span_for_line(line, offset) {
-                spans.push(span);
-            }
-            break;
-        };
-        let line_end = nl_pos.saturating_add(1);
-        let Some(line_with_nl) = remaining.get(0..line_end) else {
-            break;
-        };
-        // line without trailing newline (and possible \r)
-        let line = if line_with_nl.ends_with("\r\n") {
-            line_with_nl
-                .get(0..line_with_nl.len().saturating_sub(2))
-                .unwrap_or_default()
-        } else if line_with_nl.ends_with('\n') {
-            line_with_nl
-                .get(0..line_with_nl.len().saturating_sub(1))
-                .unwrap_or_default()
-        } else {
-            line_with_nl
-        };
+    for line_with_nl in text.split_inclusive('\n') {
+        let line = line_with_nl
+            .strip_suffix('\n')
+            .and_then(|l| l.strip_suffix('\r'))
+            .unwrap_or(line_with_nl.trim_end_matches('\n'));
         if let Some(span) = redaction_span_for_line(line, offset) {
             spans.push(span);
         }
-        offset = offset.saturating_add(line_end);
-        remaining = remaining.get(line_end..).unwrap_or_default();
+        offset = offset.saturating_add(line_with_nl.len());
     }
     spans
 }
 
 fn redaction_span_for_line(line: &str, line_offset: usize) -> Option<RedactionSpan> {
     let lower = line.to_ascii_lowercase();
-    let needs = lower.contains("apikey")
-        || lower.contains("api_key")
-        || lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("password")
-        || lower.contains("authorization")
-        || lower.contains("bearer")
-        || lower.contains("auth");
-    if !needs {
+    if !contains_secret_marker(&lower) && !lower.contains("auth") {
         return None;
     }
-    // Find value start after ':' or '='
-    let sep_pos = line.find(':').or_else(|| line.find('='));
-    let Some(pos) = sep_pos else {
-        // No separator, redact whole line
-        let start = line_offset;
-        let end = line_offset.saturating_add(line.len());
+    let Some(pos) = line.find(':').or_else(|| line.find('=')) else {
+        // No separator to anchor on: redact the whole line.
         return Some(RedactionSpan {
-            start,
-            end,
+            start: line_offset,
+            end: line_offset.saturating_add(line.len()),
             reason: "secret-bearing line without separator".to_owned(),
         });
     };
-    // Value starts after separator, skipping spaces and quotes
-    let val_start_in_line = pos.saturating_add(1);
-    // Skip leading spaces
-    let rest = line.get(val_start_in_line..).unwrap_or_default();
+    let rest = line.get(pos.saturating_add(1)..).unwrap_or_default();
     let trimmed_start = rest.len().saturating_sub(rest.trim_start().len());
     let start = line_offset
-        .saturating_add(val_start_in_line)
+        .saturating_add(pos.saturating_add(1))
         .saturating_add(trimmed_start);
     let end = line_offset.saturating_add(line.len());
     if start >= end {
@@ -1613,15 +1116,22 @@ fn redaction_span_for_line(line: &str, line_offset: usize) -> Option<RedactionSp
     })
 }
 
-// ---------------------------------------------------------------------------
-// Read
-// ---------------------------------------------------------------------------
+/// Case-insensitive secret markers shared by preview redaction and span
+/// detection (span detection additionally matches the broader `auth`).
+fn contains_secret_marker(lower: &str) -> bool {
+    lower.contains("apikey")
+        || lower.contains("api_key")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+}
 
 /// Read a document fresh from disk, detecting kind via extension.
 ///
-/// Returns [`RawDocument`] with sensitive content, digest, snapshot, and
-/// syntax diagnostics. Missing file yields `Err(ConfigError::Io)` with
-/// `NotFound`, keeping missing vs empty distinct. Disk is the truth.
+/// A missing file is an `Io`/`NotFound` error, keeping missing vs empty
+/// distinct.
 pub fn read(path: &Path) -> Result<RawDocument> {
     let bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let kind = DocumentKind::from_path(path);
@@ -1645,20 +1155,12 @@ pub fn read(path: &Path) -> Result<RawDocument> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Commit
-// ---------------------------------------------------------------------------
-
 /// Create a missing config file transactionally (RAW-05).
 ///
-/// Creation is refused when the target already exists (the caller's
-/// expectation is "missing"), and staged through the compensated
-/// [`Transaction`](crate::transaction::Transaction): parents that do not
-/// exist are created as owned steps, the file is written atomically with
-/// read-back verification, and a failure rolls back EXACTLY the created file
-/// plus the now-empty owned parents — nothing foreign is touched. The
-/// format's empty-document rule applies (an empty buffer is not an empty
-/// JSON object).
+/// An existing target is refused as a conflict. Missing parents are created
+/// as owned steps of a compensated [`Transaction`](crate::transaction::Transaction);
+/// a failure rolls back exactly the created file plus the now-empty owned
+/// parents. The format's empty-document rule applies.
 pub fn create_file(path: &Path, new_content: &[u8]) -> Result<CommitReport> {
     create_file_with_injector(path, new_content, None)
 }
@@ -1695,10 +1197,9 @@ pub fn create_file_with_injector(
             digest,
         ));
     }
-    // EVERY missing ancestor becomes its own owned CreateDir step (ordered
-    // parents-first): rollback walks them in reverse — deepest first — so a
-    // failed create removes exactly the created file plus the now-empty
-    // owned parents, never anything foreign.
+    // Each missing ancestor becomes its own owned CreateDir step, ordered
+    // parents-first so rollback removes exactly the created file plus the
+    // now-empty owned parents, never anything foreign.
     let mut steps: Vec<crate::transaction::FileAction> = Vec::new();
     let mut missing_ancestors: Vec<PathBuf> = Vec::new();
     let mut probe = path.parent();
@@ -1744,12 +1245,9 @@ pub fn create_file_with_injector(
     }
     let outcome = tx.execute()?;
     if !outcome.success {
-        // The transaction compensated the steps it could. Staged temps are
-        // cleaned after its dir-removal pass, so empty owned parents can be
-        // left behind as rollback residuals; finish the job here — only the
-        // paths THIS operation created, only while empty, deepest first, and
-        // never anything foreign. The target itself did not exist at entry,
-        // so anything at `path` now is ours and is removed.
+        // The compensation pass may leave empty owned parents behind; remove
+        // only paths this operation created, only while empty, deepest first.
+        // The target did not exist at entry, so anything at `path` is ours.
         if path.exists() {
             drop(std::fs::remove_file(path));
         }
@@ -1798,11 +1296,9 @@ pub struct CommitReport {
 
 /// Commit `new_content` to `path` after validation and conflict check.
 ///
-/// `expected_digest` is the digest observed at `read` time. If `Some`, the
-/// current on-disk digest must match exactly or a `ConcurrentModification`
-/// error is returned. If `None`, the file is expected not to exist.
-/// Rejected invalid content (syntax error) never touches disk and creates no
-/// backup.
+/// `Some(expected_digest)` must match the on-disk digest exactly or the
+/// commit aborts with `ConcurrentModification`. Invalid content never
+/// touches disk.
 pub fn commit(
     path: &Path,
     new_content: &[u8],
@@ -1821,15 +1317,11 @@ pub fn commit_with_snapshot(
     commit_inner(path, new_content, digest_opt, expected)
 }
 
-/// DOC-08 commit gate for text fragments: the change between the current
-/// file and `new_content` must be confined to managed spans.
-///
-/// Both sides must carry well-formed, non-overlapping sentinels (fail
-/// closed with [`ConfigError::InvalidSpans`] otherwise) and their bytes
-/// outside all spans must be identical, else the write is refused with
-/// [`ConfigError::UnmanagedSpanWrite`]. A missing file compares against
-/// empty content, so creating a fragment is only possible with span-only
-/// content. No disk mutation happens here.
+/// DOC-08 commit gate for text fragments: the change must be confined to
+/// managed spans. Both sides need well-formed sentinels ([`ConfigError::InvalidSpans`]
+/// otherwise) and identical bytes outside all spans, else the write is
+/// refused with [`ConfigError::UnmanagedSpanWrite`]. A missing file compares
+/// against empty content, so creation requires span-only content.
 fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
     let old_bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -1871,10 +1363,8 @@ fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
 
 fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Result<()> {
     let diagnostics = validate(content, kind);
-    // Only Error-severity diagnostics block a commit. Warning/Hint/Deprecation
-    // diagnostics (RAW-06 env duplicates, deprecation notes) are surfaced to
-    // callers but must not change on-disk behavior: env commits keep
-    // preserving duplicate definitions exactly as they are.
+    // Only Error-severity diagnostics block a commit; RAW-06 duplicate
+    // warnings and deprecation notes must not change on-disk behaviour.
     let blocking: Vec<&Diagnostic> = diagnostics
         .iter()
         .filter(|d| d.severity == crate::document::DiagnosticSeverity::Error)
@@ -1893,7 +1383,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
     match kind {
         DocumentKind::StrictJson | DocumentKind::JsonC => {
             let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
-            match parse_strict_json_value(text) {
+            match crate::json::parse_strict_raw(text) {
                 Ok(_) => Err(ConfigError::Io {
                     path: path.to_path_buf(),
                     source: std::io::Error::new(std::io::ErrorKind::InvalidData, msg),
@@ -1920,7 +1410,7 @@ fn validate_for_commit(path: &Path, content: &[u8], kind: DocumentKind) -> Resul
         }
         DocumentKind::Yaml => {
             let text = std::str::from_utf8(bytes_without_bom(content)).unwrap_or_default();
-            match yaml_serde::from_str::<StrictYamlValue>(text) {
+            match crate::yaml::parse_strict_raw(text) {
                 Ok(_) => Err(ConfigError::Io {
                     path: path.to_path_buf(),
                     source: std::io::Error::new(std::io::ErrorKind::InvalidData, msg),
@@ -1965,7 +1455,7 @@ fn commit_inner(
     // Validate before any disk mutation.
     validate_for_commit(path, new_content, kind)?;
 
-    // DOC-08: text fragments accept managed-span edits only — bytes outside
+    // DOC-08: text fragments accept managed-span edits only: bytes outside
     // managed spans must be identical between the current file and the new
     // content; whole-file rewrites stay opaque/read-only.
     if kind == DocumentKind::TextFragment {
@@ -1975,7 +1465,6 @@ fn commit_inner(
     // Fresh snapshot and conflict check.
     let current_snapshot = snapshot(path);
 
-    // If caller supplied a snapshot token, use snapshot comparison.
     if let Some(expected) = expected_snapshot {
         if is_modified(expected, &current_snapshot) {
             let exp = expected.digest.as_deref().unwrap_or_default().to_owned();
@@ -1995,20 +1484,9 @@ fn commit_inner(
                 actual.to_owned(),
             ));
         }
-    } else {
-        // expected_digest == None from caller means they thought file missing.
-        // But if our read path was without token, we skip conflict check.
-        // Only enforce when explicit None was provided as "expect missing"
-        // We distinguish by whether the overload was called with Some(&"")? For now,
-        // if expected_digest is None and we are in commit(path, new_content, None)
-        // where caller explicitly expects missing, we should enforce missing.
-        // To avoid breaking the simple `commit(path, bytes)` where expected_digest=None
-        // means "no expectation", we only enforce when the caller used
-        // commit_with_snapshot with expected missing snapshot.
-        // So here, do not enforce missing when expected_digest is None and no snapshot.
     }
 
-    // Special handling: if expected_digest is Some("") it means expect missing, enforce.
+    // `Some("")` is the explicit expect-missing token.
     if let Some(exp) = expected_digest
         && exp.is_empty()
         && current_snapshot.exists
@@ -2026,22 +1504,17 @@ fn commit_inner(
     }
 
     // No-op check: if file exists and content already equal, no write.
-    if current_snapshot.exists {
-        if let Ok(existing) = std::fs::read(path)
-            && existing == new_content
-        {
-            let new_digest = compute_digest(new_content);
-            return Ok(CommitReport {
-                backup: None,
-                new_digest,
-                new_snapshot: current_snapshot,
-                is_noop: true,
-            });
-        }
-    } else if new_content.is_empty() {
-        // Creating an empty file from missing: treat as valid but check if empty is expected to be no-op?
-        // For some formats empty may be considered not needing creation; but we still create if caller requested.
-        // If new_content empty and file missing, is_noop false (we create).
+    if current_snapshot.exists
+        && let Ok(existing) = std::fs::read(path)
+        && existing == new_content
+    {
+        let new_digest = compute_digest(new_content);
+        return Ok(CommitReport {
+            backup: None,
+            new_digest,
+            new_snapshot: current_snapshot,
+            is_noop: true,
+        });
     }
 
     // Reject directory targets
@@ -2059,13 +1532,9 @@ fn commit_inner(
         None
     };
 
-    // Plan-02 fold: the replacement itself goes through the shared
-    // transaction commit core — `stage_temp_file` + `commit_staged_file`, the
-    // exact primitives [`crate::transaction::Transaction::commit_write`]
-    // commits through. The §4.2 token is the caller's expected snapshot when
-    // supplied (guarding the full read→commit window); otherwise the fresh
-    // snapshot taken above, whose pre-rename recheck is the same mid-window
-    // conflict detection the previous expected-digest layer performed.
+    // The replacement goes through the shared transaction commit core. The
+    // conflict token is the caller's expected snapshot when supplied; the
+    // fresh snapshot's pre-rename recheck covers the no-token case.
     let token = expected_snapshot.unwrap_or(&current_snapshot);
     let staged = crate::transaction::stage_temp_file(path, new_content, None)?;
     if let Err(e) = crate::transaction::commit_staged_file(path, &staged, Some(token), None) {
@@ -2102,10 +1571,6 @@ fn commit_inner(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2120,8 +1585,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{prefix}-{now}-{pid}{suffix}"))
     }
-
-    // ---- SensitiveContent ----
 
     #[test]
     fn sensitive_content_debug_is_redacted() {
@@ -2147,8 +1610,6 @@ mod tests {
         assert!(dbg.contains("[REDACTED]") || !dbg.contains("super-secret"));
         drop(std::fs::remove_file(&path));
     }
-
-    // ---- validate ----
 
     #[test]
     fn validate_rejects_invalid_json() {
@@ -2192,8 +1653,6 @@ mod tests {
         assert!(diags[0].message.contains("invalid utf-8"));
     }
 
-    // ---- read ----
-
     #[test]
     fn read_detects_kind_via_extension() {
         let json_path = unique_scratch("detect", ".json");
@@ -2227,8 +1686,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    // ---- commit: invalid never touches disk ----
-
     #[test]
     fn invalid_json_rejected_without_touching_disk() {
         let path = unique_scratch("invalid-commit", ".json");
@@ -2258,9 +1715,7 @@ mod tests {
             "no file change on invalid"
         );
 
-        // No backup should have been created because we validate before backup.
-        // Check that no backup with newer timestamp appears beyond initial state.
-        // We can list backups and ensure none contain invalid content.
+        // Validation runs before backup, so no backup may carry the invalid draft.
         let backups = crate::backup::list_backups(&path).unwrap();
         for entry in &backups {
             let bytes = std::fs::read(&entry.backup_path).unwrap();
@@ -2308,8 +1763,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    // ---- commit: no-op ----
-
     #[test]
     fn commit_noop_creates_no_backup() {
         let path = unique_scratch("noop", ".json");
@@ -2333,8 +1786,6 @@ mod tests {
             drop(std::fs::remove_file(entry.backup_path));
         }
     }
-
-    // ---- commit: conflict detection ----
 
     #[test]
     fn external_edit_after_open_causes_conflict() {
@@ -2372,8 +1823,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    // ---- commit: unknown keys survive ----
-
     #[test]
     fn unknown_key_survives_commit() {
         let path = unique_scratch("unknown", ".json");
@@ -2394,8 +1843,6 @@ mod tests {
             drop(std::fs::remove_file(b.backup_path));
         }
     }
-
-    // ---- diff: lexical vs semantic ----
 
     #[test]
     fn diff_shows_lexical_vs_semantic() {
@@ -2451,8 +1898,6 @@ mod tests {
         }
     }
 
-    // ---- redaction ----
-
     #[test]
     fn diff_marks_redaction_spans() {
         let old = br#"{"api_key":"old"}"#;
@@ -2494,8 +1939,6 @@ mod tests {
         assert!(spans.is_empty());
     }
 
-    // ---- opaque read-only ----
-
     #[test]
     fn opaque_is_read_only() {
         let path = unique_scratch("opaque", ".bin");
@@ -2507,8 +1950,6 @@ mod tests {
         }
         drop(std::fs::remove_file(&path));
     }
-
-    // ---- missing file create ----
 
     #[test]
     fn create_missing_file_and_commit() {
@@ -2542,8 +1983,6 @@ mod tests {
         }
         assert!(!path.exists(), "invalid content should not create file");
     }
-
-    // ---- RawEditor service (open / validate / diff / commit) ----
 
     #[test]
     fn raw_editor_service_open_detects_kind() {
@@ -2743,7 +2182,7 @@ mod tests {
             drop(std::fs::remove_file(b.backup_path));
         }
 
-        // Text fragment: DOC-08 — span-managed writes only.
+        // Text fragment: DOC-08 span-managed writes only.
         let path_txt = unique_scratch("svc-txt", ".txt");
         drop(std::fs::remove_file(&path_txt));
         // Plain whole-file creation is opaque and refused.
@@ -3004,10 +2443,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
-    // RAW-06 env duplicate diagnostics
-    // -------------------------------------------------------------------
-
     #[test]
     fn validate_env_reports_duplicate_keys_with_effective_definition() {
         let content = "API_KEY=first\nMODEL=opus\nAPI_KEY=second\nexport API_KEY=third\n";
@@ -3060,7 +2495,6 @@ mod tests {
 
     #[test]
     fn env_commit_preserves_duplicates_on_disk_despite_diagnostics() {
-        // `echo`-equivalent scratch path via a unique temp file.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -3084,10 +2518,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -------------------------------------------------------------------
-    // RAW-02 size validation + RAW-05 empty-buffer rule
-    // -------------------------------------------------------------------
-
     #[test]
     fn validate_reports_oversize_documents_before_parsing() {
         let huge = vec![b'a'; MAX_VALIDATION_BYTES + 1];
@@ -3102,7 +2532,7 @@ mod tests {
 
     #[test]
     fn empty_buffer_is_not_automatically_an_empty_json_object() {
-        // JSON kinds: the format decides — an empty buffer is NOT `{}`.
+        // JSON kinds: the format decides; an empty buffer is NOT `{}`.
         for kind in [DocumentKind::StrictJson, DocumentKind::JsonC] {
             let diags = validate(b"   \n", kind);
             assert!(
@@ -3125,9 +2555,6 @@ mod tests {
         // The explicit empty object remains valid.
         assert!(validate(b"{}", DocumentKind::StrictJson).is_empty());
     }
-    // -------------------------------------------------------------------
-    // RAW-05 create-file rollback
-    // -------------------------------------------------------------------
 
     #[derive(Debug)]
     struct FailAtPoint(crate::injector::Point);
@@ -3210,7 +2637,7 @@ mod tests {
         let target = base.join("nested/owned/deep/settings.json");
         // Fail the creation transaction at the real atomic-replace boundary
         // (QAL-06 discipline): the owned parents had already been created,
-        // and the compensated transaction removes exactly them — no file
+        // and the compensated transaction removes exactly them; no file
         // lands, foreign content keeps its directories.
         let err = create_file_with_injector(
             &target,

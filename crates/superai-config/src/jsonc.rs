@@ -1,300 +1,69 @@
-//! JSONC — JSON with comments and trailing commas.
+//! JSONC: JSON with comments and trailing commas.
 //!
-//! Crate research (DOC-05):
-//! - `jsonc-parser` 0.33.1 (dprint/jsonc-parser) exists on crates.io, MIT, maintained,
-//!   handles comments/trailing commas and offers CST/serde features. Its serializer,
-//!   however, normalizes output (loses comments, reformats), so it does **not** satisfy
-//!   the lexical-preservation requirement ("reject a codec that parses JSONC but
-//!   serializes normalized JSON") for write-preservation.
-//! - `comment-json` does not exist on crates.io (verified via `cargo search`).
-//! - `jsonc` 0.1.0 exists but is single-owner, minimal docs, and also normalizes.
-//!
-//! Decision: implement read/validation support via comment/trailing-comma
-//! stripping before strict `serde_json` parsing. Per DOC-05 a codec that
-//! cannot preserve lexical content must not perform changing writes, so a
-//! write that would destroy JSONC material is refused with
-//! [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite). A write
-//! proceeds only when it is provably lossless: the target file is missing
-//! (creation) or its bytes contain no JSONC extensions
-//! (`strip_jsonc(bytes) == bytes`), in which case normalized pretty JSON
-//! preserves every lexical feature the file has. No-op edits never write and
-//! keep byte identity. A future lexical-preserving JSONC codec can replace
-//! this gate.
+//! Read support is comment/trailing-comma stripping before the strict
+//! `serde_json` parse (duplicate keys still rejected). Per DOC-05 a codec
+//! that cannot preserve lexical content must not perform changing writes, so
+//! a write is refused with
+//! [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite) unless
+//! it is provably lossless: the target is missing (creation) or its bytes
+//! carry no JSONC extensions (`strip_jsonc(bytes) == bytes`). No-op edits
+//! never write and keep byte identity.
 
 use std::path::Path;
 
-use serde::de::{self, Deserialize, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use crate::error::{ConfigError, Result};
 
-// ---------------------------------------------------------------------------
-// Stripping — comments (//, /* */) and trailing commas, string-aware
-// ---------------------------------------------------------------------------
-
-/// Strip `//` line comments and `/* */` block comments, string-aware.
-///
-/// Escaped quotes inside strings are respected, so `//` or `/*` inside a
-/// JSON string literal is not treated as a comment. Line comments preserve the
-/// terminating newline to keep line numbers stable for diagnostics.
-#[expect(clippy::excessive_nesting, reason = "comment scan")]
-fn strip_comments(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else if ch == '"' {
-            in_string = true;
-            output.push(ch);
-        } else if ch == '/' {
-            match chars.peek().copied() {
-                Some('/') => {
-                    chars.next();
-                    // Skip until newline, preserve the newline itself.
-                    while let Some(&peek) = chars.peek() {
-                        if peek == '\n' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                }
-                Some('*') => {
-                    chars.next();
-                    // Skip until */
-                    loop {
-                        match chars.next() {
-                            Some('*') => {
-                                if chars.peek().copied() == Some('/') {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
-                    }
-                }
-                _ => output.push(ch),
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-
-    output
-}
-
 /// Strip trailing commas before `}` or `]`, string-aware.
 ///
-/// A comma that is followed only by whitespace and then `}` or `]` is a
-/// trailing comma. Commas inside strings are ignored.
-#[expect(clippy::excessive_nesting, reason = "string-aware scan")]
+/// A comma followed only by whitespace and then `}` or `]` is a trailing
+/// comma. Commas inside strings are ignored. Byte-oriented scan: JSON
+/// structure characters are ASCII, and UTF-8 continuation bytes never alias
+/// them, so this allocates nothing beyond the output.
 fn strip_trailing_commas(input: &str) -> String {
+    let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
+    let mut run = 0usize;
     let mut in_string = false;
     let mut escaped = false;
     let mut idx = 0usize;
 
-    while idx < chars.len() {
-        let Some(&ch) = chars.get(idx) else {
-            break;
-        };
+    while let Some(&ch) = bytes.get(idx) {
         if in_string {
-            output.push(ch);
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if ch == b'\\' {
                 escaped = true;
-            } else if ch == '"' {
+            } else if ch == b'"' {
                 in_string = false;
             }
             idx += 1;
-        } else if ch == '"' {
+        } else if ch == b'"' {
             in_string = true;
-            output.push(ch);
             idx += 1;
-        } else if ch == ',' {
-            // Look ahead skipping ASCII whitespace to find next significant char.
+        } else if ch == b',' {
             let mut look = idx + 1;
-            loop {
-                match chars.get(look).copied() {
-                    Some(c) if c == ' ' || c == '\t' || c == '\n' || c == '\r' => {
-                        look += 1;
-                    }
-                    _ => break,
-                }
+            while matches!(bytes.get(look), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                look += 1;
             }
-            if let Some(next) = chars.get(look).copied()
-                && (next == '}' || next == ']')
-            {
-                // Trailing comma — skip it.
-                idx += 1;
-                continue;
+            if matches!(bytes.get(look), Some(b'}' | b']')) {
+                output.push_str(input.get(run..idx).unwrap_or_default());
+                run = idx + 1;
             }
-            output.push(ch);
             idx += 1;
         } else {
-            output.push(ch);
             idx += 1;
         }
     }
-
+    output.push_str(input.get(run..).unwrap_or_default());
     output
 }
 
 /// Strip JSONC extensions (comments + trailing commas) to produce strict JSON.
-fn strip_jsonc(input: &str) -> String {
-    let without_comments = strip_comments(input);
-    strip_trailing_commas(&without_comments)
+pub(crate) fn strip_jsonc(input: &str) -> String {
+    strip_trailing_commas(&crate::document::strip_jsonc_comments(input))
 }
-
-// ---------------------------------------------------------------------------
-// Strict parsing (same duplicate-key guard as `json`)
-// ---------------------------------------------------------------------------
-
-struct StrictValue(Value);
-
-impl<'de> Deserialize<'de> for StrictValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        struct StrictVisitor;
-
-        impl<'de> Visitor<'de> for StrictVisitor {
-            type Value = StrictValue;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("any valid JSON value")
-            }
-
-            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::Bool(v)))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::Number(Number::from(v))))
-            }
-
-            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::Number(Number::from(v))))
-            }
-
-            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Number::from_f64(v).map_or_else(
-                    || Err(de::Error::custom("invalid f64")),
-                    |n| Ok(StrictValue(Value::Number(n))),
-                )
-            }
-
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::String(v.to_owned())))
-            }
-
-            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::String(v)))
-            }
-
-            fn visit_borrowed_str<E>(self, v: &'de str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::String(v.to_owned())))
-            }
-
-            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::Null))
-            }
-
-            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(StrictValue(Value::Null))
-            }
-
-            #[expect(clippy::excessive_nesting, reason = "visitor boilerplate")]
-            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut vec = Vec::new();
-                while let Some(elem) = seq.next_element::<StrictValue>()? {
-                    vec.push(elem.0);
-                }
-                Ok(StrictValue(Value::Array(vec)))
-            }
-
-            #[expect(clippy::excessive_nesting, reason = "visitor boilerplate")]
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut m = Map::new();
-                while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
-                    }
-                    m.insert(key, value.0);
-                }
-                Ok(StrictValue(Value::Object(m)))
-            }
-        }
-
-        deserializer.deserialize_any(StrictVisitor)
-    }
-}
-
-fn parse_jsonc_strict(text: &str, path: &Path) -> Result<Value> {
-    let stripped = strip_jsonc(text);
-    let mut de = serde_json::Deserializer::from_str(&stripped);
-    let value = StrictValue::deserialize(&mut de).map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    de.end().map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(value.0)
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Read a JSONC config fresh from disk. A missing file reads as an empty object.
 ///
@@ -312,7 +81,7 @@ pub fn load(path: &Path) -> Result<Map<String, Value>> {
         return Ok(Map::new());
     }
 
-    let value = parse_jsonc_strict(&text, path)?;
+    let value = crate::json::parse_strict(&strip_jsonc(&text), path)?;
     match value {
         Value::Object(map) => Ok(map),
         _ => Err(ConfigError::NotAnObject {
@@ -333,7 +102,7 @@ pub fn load_value(path: &Path) -> Result<Value> {
         return Ok(Value::Object(Map::new()));
     }
 
-    parse_jsonc_strict(&text, path)
+    crate::json::parse_strict(&strip_jsonc(&text), path)
 }
 
 /// Refuse writes that would destroy JSONC lexical material already on disk.
@@ -356,21 +125,30 @@ fn ensure_lossless_write(path: &Path) -> Result<()> {
 /// Changing writes are refused with [`ConfigError::LossyWrite`] when `path`
 /// already exists and carries JSONC lexical material (comments or trailing
 /// commas): normalized pretty JSON cannot preserve it (DOC-05). Missing files
-/// are created, and existing files without JSONC extensions are rewritten
-/// losslessly since they carry no lexical material to destroy. Key order and
-/// unknown values are preserved (via `preserve_order`).
+/// are created, and extension-free files are rewritten losslessly. Key order
+/// and unknown values are preserved.
 pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
-    store_value(path, &Value::Object(config.clone()))
+    ensure_lossless_write(path)?;
+
+    let mut text = serde_json::to_string_pretty(config).map_err(|source| ConfigError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    text.push('\n');
+
+    crate::transaction::commit_file(
+        "jsonc-store",
+        path,
+        text.as_bytes(),
+        crate::document::DocumentKind::JsonC,
+    )?;
+    Ok(())
 }
 
 /// Back up, then write an arbitrary `value` to `path` as normalized JSON.
 ///
-/// Plan-02 fold: the write goes through the crate's one mutation boundary
-/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
-/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
-/// replacement, read-back verify.
-///
-/// See [`store`] for the lossless-write gate (DOC-05).
+/// Same gate as [`store`]; this entry point preserves a non-object root for
+/// raw-editor use.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     ensure_lossless_write(path)?;
 
@@ -391,10 +169,8 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
 
 /// Read fresh JSONC, apply `edit`, write back only if changed.
 ///
-/// No-op edits leave the file byte-identical (comments/trailing commas are
-/// preserved because no write occurs). Changing edits are refused with
-/// [`ConfigError::LossyWrite`] when the on-disk file carries comments or
-/// trailing commas; otherwise the write is lossless (see [`store`]).
+/// No-op edits leave the file byte-identical (no write occurs). Changing
+/// edits follow the [`store`] lossless-write gate.
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Map<String, Value>),
@@ -410,7 +186,7 @@ where
 
 /// Read fresh JSONC as `Value`, apply `edit`, write back only if changed.
 ///
-/// See [`edit`] for the lossless-write gate (DOC-05).
+/// See [`edit`] for the lossless-write gate.
 pub fn edit_value<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Value),
@@ -424,14 +200,11 @@ where
     store_value(path, &value)
 }
 
-/// DOC-10: disclosure when a changing write must reformat surrounding
-/// layout.
+/// DOC-10: disclosure when a changing write must reformat surrounding layout.
 ///
-/// Files carrying JSONC lexical material (comments/trailing commas) have
-/// their changing writes refused with `LossyWrite`, so no reformatting
-/// happens for them. Extension-free files are written as normalized pretty
-/// JSON: when such a file is not already in that form, a changing write
-/// reformats surrounding layout even where semantics do not change.
+/// Files carrying JSONC material have changing writes refused, so they never
+/// reformat. Extension-free files are written as normalized pretty JSON; the
+/// warning fires when such a file is not already in that form.
 pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
     if text.trim().is_empty() || strip_jsonc(text) != text {
         return None;

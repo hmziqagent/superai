@@ -5,16 +5,11 @@ use serde_json::{Map, Number, Value};
 
 use crate::error::{ConfigError, Result};
 
-// ---------------------------------------------------------------------------
-// Strict JSON parsing — duplicate key detection + float/int preservation
-// ---------------------------------------------------------------------------
-
 /// Wrapper that deserializes any JSON value but rejects duplicate object keys.
 ///
 /// `serde_json::Map` with `preserve_order` keeps the last value for a duplicate,
-/// so we need a custom visitor that errors on duplicates. This wrapper also
-/// preserves the numeric type (i64 / u64 / f64) via `Number` so `1` and `1.0`
-/// remain distinct (DOC-03: avoid float coercion).
+/// so duplicate detection needs a custom visitor. Numeric type (i64 / u64 / f64)
+/// is preserved via `Number` so `1` and `1.0` stay distinct (DOC-03).
 struct StrictValue(Value);
 
 impl<'de> Deserialize<'de> for StrictValue {
@@ -129,43 +124,27 @@ impl<'de> Deserialize<'de> for StrictValue {
     }
 }
 
-/// Parse `text` strictly: reject duplicate keys, preserve number types, reject
-/// trailing content after the top-level value.
-///
-/// Used by both `json` and `jsonc` (after stripping). Errors are mapped to
-/// `ConfigError::Json` by the caller.
-fn parse_strict(text: &str, path: &Path) -> Result<Value> {
-    let mut de = serde_json::Deserializer::from_str(text);
-    let value = StrictValue::deserialize(&mut de).map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    de.end().map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(value.0)
-}
-
-/// Parse `text` strictly and return the raw `serde_json::Error` for testing.
-#[cfg(test)]
-fn parse_strict_raw(text: &str) -> std::result::Result<Value, serde_json::Error> {
+/// Parse `text` strictly: duplicate keys rejected, number types preserved,
+/// trailing content after the top-level value rejected.
+pub(crate) fn parse_strict_raw(text: &str) -> std::result::Result<Value, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(text);
     let v = StrictValue::deserialize(&mut de)?;
     de.end()?;
     Ok(v.0)
 }
 
-// ---------------------------------------------------------------------------
-// Public API — strict JSON (DOC-03)
-// ---------------------------------------------------------------------------
+pub(crate) fn parse_strict(text: &str, path: &Path) -> Result<Value> {
+    parse_strict_raw(text).map_err(|source| ConfigError::Json {
+        path: path.to_path_buf(),
+        source,
+    })
+}
 
 /// Read a JSON config fresh from disk. A missing file reads as an empty object.
 ///
-/// Strict: duplicate keys are rejected, `1` vs `1.0` are kept distinct,
-/// and key order is preserved (`serde_json/preserve_order`). The root must be
-/// an object; use [`load_value`] for raw reads that preserve an arbitrary root
-/// type. Each call reads the file fresh (disk is the truth).
+/// Strict: duplicate keys rejected, `1` vs `1.0` kept distinct, key order
+/// preserved. The root must be an object; use [`load_value`] for arbitrary
+/// roots.
 pub fn load(path: &Path) -> Result<Map<String, Value>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -209,24 +188,31 @@ pub fn load_value(path: &Path) -> Result<Value> {
 
 /// Back up, then write `config` to `path`, creating parent directories as needed.
 ///
-/// The file is written as pretty-printed JSON with a trailing newline.
-/// Lexical preservation guarantee: key order and unknown values are preserved
-/// (via `preserve_order`), but whitespace and indentation are normalized. For
-/// a no-op (semantic value unchanged) callers should prefer [`edit`] which
-/// skips the write entirely and leaves the original bytes untouched (DOC-03).
+/// Written as pretty-printed JSON with a trailing newline. Key order and
+/// unknown values are preserved; whitespace and indentation are normalized.
+/// No-op edits should go through [`edit`], which skips the write entirely.
 pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
-    store_value(path, &Value::Object(config.clone()))
+    let mut text = serde_json::to_string_pretty(config).map_err(|source| ConfigError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    text.push('\n');
+
+    crate::transaction::commit_file(
+        "json-store",
+        path,
+        text.as_bytes(),
+        crate::document::DocumentKind::StrictJson,
+    )?;
+    Ok(())
 }
 
 /// Back up, then write an arbitrary JSON `value` to `path`.
 ///
-/// Plan-02 fold: the write goes through the crate's one mutation boundary
-/// ([`crate::transaction::commit_file`]) — fresh snapshot, backup of the
-/// existing contents, staged parse-validation, §4.2 conflict recheck, atomic
-/// replacement, read-back verify — not around it.
-///
-/// See [`store`] for the lexical guarantee. This entry point preserves a
-/// non-object root (array, string, number, bool, null) for raw-editor use.
+/// The write goes through the crate's one mutation boundary
+/// ([`crate::transaction::commit_file`]): fresh snapshot, backup, staged
+/// parse-validation, conflict recheck, atomic replacement, read-back verify.
+/// Unlike [`store`] this preserves a non-object root for raw-editor use.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     let mut text = serde_json::to_string_pretty(value).map_err(|source| ConfigError::Json {
         path: path.to_path_buf(),
@@ -245,10 +231,8 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
 
 /// Read fresh, apply `edit`, write back only if the value changed.
 ///
-/// This is the only supported way to mutate a config. Disk is the truth:
-/// nothing is cached between calls. For no-op edits (the closure leaves the
-/// map equal to the on-disk value) no write and no backup are performed, so
-/// the file's byte identity is preserved (DOC-03).
+/// The only supported way to mutate a config. For no-op edits no write and no
+/// backup happen, so the file's byte identity is preserved.
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Map<String, Value>),
@@ -279,15 +263,13 @@ where
     store_value(path, &value)
 }
 
-/// DOC-10: disclosure when a changing write must reformat surrounding
-/// layout.
+/// DOC-10: disclosure when a changing write must reformat surrounding layout.
 ///
-/// This codec serializes the whole document on changing writes, so a file
-/// that is not already in normalized pretty form gets its surrounding
-/// formatting rewritten even where semantics do not change. Returns the
-/// warning message when `text` (the pre-edit content) would be reformatted,
-/// or `None` when the layout already matches the codec's output form (or
-/// `text` does not parse — syntax diagnostics cover that case).
+/// This codec reserializes the whole document, so a file not already in
+/// normalized pretty form gets reformatted even where semantics do not change.
+/// Returns the warning for such `text`, or `None` when the layout already
+/// matches the codec's output (unparsable `text` is left to syntax
+/// diagnostics).
 pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
     if text.trim().is_empty() {
         return None;

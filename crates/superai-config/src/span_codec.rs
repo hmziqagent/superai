@@ -12,7 +12,7 @@
 //! Rules enforced here (all fail closed):
 //! - Every byte outside a managed span is preserved verbatim.
 //! - Duplicate begin or end sentinels for one name are an error.
-//! - Partial (unbalanced) sentinels — a begin without an end or vice versa —
+//! - Partial (unbalanced) sentinels (a begin without an end or vice versa)
 //!   are an error.
 //! - Nested or overlapping differently-named spans are an error.
 //! - Removal removes exactly one complete owned span (both sentinels and the
@@ -21,6 +21,8 @@
 //! Shell quoting inside span bodies is *not* interpreted here. Executable
 //! configs (crushrc-style surfaces) are not eligible for this codec; they
 //! stay command-backed through their adapters.
+
+use std::collections::HashMap;
 
 use crate::error::{ConfigError, Result};
 
@@ -120,10 +122,12 @@ impl SpanCodec {
     /// Parse and validate all managed spans in `text`.
     ///
     /// Fail closed on duplicate, partial, mis-ordered, or overlapping
-    /// sentinels. Returned ranges are ordered by position.
+    /// sentinels. Returned ranges are ordered by position. Pairing is a
+    /// per-name lookup so a hostile fragment full of sentinel lines stays
+    /// linear in its length.
     pub fn validate(&self, text: &str) -> std::result::Result<Vec<SpanRange>, SpanError> {
-        let mut begins: Vec<(String, usize, usize)> = Vec::new(); // (name, line, offset)
-        let mut ends: Vec<(String, usize, usize, usize)> = Vec::new(); // (name, line, offset, line_end)
+        let mut begins: Vec<(&str, usize, usize)> = Vec::new(); // (name, line, offset)
+        let mut ends: Vec<(&str, usize, usize, usize)> = Vec::new(); // (name, line, offset, line_end)
 
         let begin_marker = format!("{}superai:begin:", prefix_with_space(self));
         let end_marker = format!("{}superai:end:", prefix_with_space(self));
@@ -137,39 +141,48 @@ impl SpanCodec {
             if let Some(rest) = line.strip_prefix(&begin_marker) {
                 let name = rest.trim_end();
                 Self::validate_name(name).map_err(|e| SpanError::new(line_no, e.reason))?;
-                begins.push((name.to_owned(), line_no, offset));
+                begins.push((name, line_no, offset));
             } else if let Some(rest) = line.strip_prefix(&end_marker) {
                 let name = rest.trim_end();
                 Self::validate_name(name).map_err(|e| SpanError::new(line_no, e.reason))?;
-                ends.push((
-                    name.to_owned(),
-                    line_no,
-                    offset,
-                    offset.saturating_add(line.len()),
-                ));
+                ends.push((name, line_no, offset, offset.saturating_add(line.len())));
             }
             offset = offset.saturating_add(line.len());
         }
 
         // Pair begins with ends, fail closed on every anomaly.
+        let mut ends_by_name: HashMap<&str, Vec<(usize, usize, usize)>> = HashMap::new();
+        for (name, line_no, offset, line_end) in &ends {
+            ends_by_name
+                .entry(name)
+                .or_default()
+                .push((*line_no, *offset, *line_end));
+        }
+        let mut begin_counts: HashMap<&str, usize> = HashMap::new();
+        for (name, _, _) in &begins {
+            *begin_counts.entry(name).or_default() += 1;
+        }
+
         let mut ranges = Vec::new();
         for (name, line_no, begin_offset) in &begins {
-            let range = pair_single_span(name, *line_no, *begin_offset, &ends)?;
-            ranges.push(range);
+            let matching = ends_by_name.get(*name).map_or(&[][..], Vec::as_slice);
+            ranges.push(pair_single_span(name, *line_no, *begin_offset, matching)?);
         }
         for (name, line_no, _, _) in &ends {
-            let count = begins.iter().filter(|(n, _, _)| n == name).count();
-            if count == 0 {
-                return Err(SpanError::new(
-                    *line_no,
-                    format!("unbalanced span `{name}`: end sentinel has no begin sentinel"),
-                ));
-            }
-            if count > 1 {
-                return Err(SpanError::new(
-                    *line_no,
-                    format!("duplicate begin sentinel for span `{name}`"),
-                ));
+            match begin_counts.get(*name).copied().unwrap_or(0) {
+                0 => {
+                    return Err(SpanError::new(
+                        *line_no,
+                        format!("unbalanced span `{name}`: end sentinel has no begin sentinel"),
+                    ));
+                }
+                1 => {}
+                _ => {
+                    return Err(SpanError::new(
+                        *line_no,
+                        format!("duplicate begin sentinel for span `{name}`"),
+                    ));
+                }
             }
         }
 
@@ -219,9 +232,9 @@ impl SpanCodec {
                 let body_end = range.end.saturating_sub(self.end_sentinel(name).len() + 1);
                 let body = text
                     .get(body_start..body_end)
-                    .map(str::to_owned)
+                    .map(|s| s.trim_end_matches(['\r', '\n']).to_owned())
                     .unwrap_or_default();
-                Ok(Some(body.trim_end_matches(['\r', '\n']).to_owned()))
+                Ok(Some(body))
             }
         }
     }
@@ -331,16 +344,15 @@ fn prefix_with_space(codec: &SpanCodec) -> String {
 }
 
 /// Pair one begin sentinel with its end, failing closed on duplicates,
-/// missing ends, and mis-ordered sentinels.
+/// missing ends, and mis-ordered sentinels. `ends` holds the
+/// `(line, offset, line_end)` tuples already filtered to this span's name.
 fn pair_single_span(
     name: &str,
     line_no: usize,
     begin_offset: usize,
-    ends: &[(String, usize, usize, usize)],
+    ends: &[(usize, usize, usize)],
 ) -> std::result::Result<SpanRange, SpanError> {
-    let matching: Vec<&(String, usize, usize, usize)> =
-        ends.iter().filter(|(n, _, _, _)| n == name).collect();
-    let one = match matching.as_slice() {
+    let one = match ends {
         [] => {
             return Err(SpanError::new(
                 line_no,
@@ -355,7 +367,7 @@ fn pair_single_span(
             ));
         }
     };
-    if one.2 < begin_offset {
+    if one.1 < begin_offset {
         return Err(SpanError::new(
             line_no,
             format!("unbalanced span `{name}`: end sentinel precedes begin"),
@@ -364,7 +376,7 @@ fn pair_single_span(
     Ok(SpanRange {
         name: name.to_owned(),
         begin: begin_offset,
-        end: one.3,
+        end: one.2,
     })
 }
 
@@ -375,13 +387,29 @@ pub fn ensure_valid_spans(text: &str, path: &std::path::Path) -> Result<Vec<Span
         .map_err(|e| e.into_config_error(path))
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_many_distinct_spans_in_position_order() {
+        // Pairing is per-name; a fragment stuffed with sentinel lines must
+        // still report every span, in order, without cross-name confusion.
+        let codec = SpanCodec::default();
+        let mut text = String::new();
+        for i in 0..500 {
+            let name = format!("span{i}");
+            let inserted = codec.insert_span(&text, &name, "body").unwrap();
+            text = inserted;
+        }
+        let ranges = codec.validate(&text).unwrap();
+        assert_eq!(ranges.len(), 500);
+        let offsets: Vec<usize> = ranges.iter().map(|r| r.begin).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "ranges must be position-ordered");
+        assert!(codec.find_span(&text, "span499").unwrap().is_some());
+    }
 
     #[test]
     fn insert_find_and_read_span_body() {
