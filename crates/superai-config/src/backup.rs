@@ -97,6 +97,26 @@ fn generate_backup_path(original: &Path) -> Result<(PathBuf, u128, String)> {
     Ok((target, millis, suffix))
 }
 
+/// Pick a backup name, steering away from names `taken` reports while a
+/// free one appears. The probe is advisory: after 5 collisions the last
+/// candidate is returned and the copy overwrites whatever holds it.
+fn pick_backup_path(
+    original: &Path,
+    mut taken: impl FnMut(&Path) -> bool,
+) -> Result<(PathBuf, u128, String)> {
+    let mut attempts = 0;
+    loop {
+        let candidate = generate_backup_path(original)?;
+        if !taken(&candidate.0) {
+            return Ok(candidate);
+        }
+        attempts += 1;
+        if attempts >= 5 {
+            return Ok(candidate);
+        }
+    }
+}
+
 /// Stable identifier for a backup artifact: `<millis>-<4hex>` (e.g.
 /// `1714123456789-a1b2`). Validation is lenient here; core enforces stricter
 /// rules.
@@ -228,19 +248,7 @@ fn backup_inner(
         ));
     }
 
-    // Steer away from an existing backup name while one is free; the probe is
-    // advisory only, so after 5 collisions the copy overwrites that candidate.
-    let mut attempts = 0;
-    let (target, millis, suffix) = loop {
-        let (candidate, m, s) = generate_backup_path(path)?;
-        if !candidate.exists() {
-            break (candidate, m, s);
-        }
-        attempts += 1;
-        if attempts >= 5 {
-            break (candidate, m, s);
-        }
-    };
+    let (target, millis, suffix) = pick_backup_path(path, Path::exists)?;
 
     let original_bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let digest = compute_digest(&original_bytes);
@@ -796,6 +804,82 @@ mod tests {
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&e1.backup_path));
         drop(std::fs::remove_file(&e2.backup_path));
+    }
+
+    #[test]
+    fn pick_backup_path_takes_the_first_free_name() {
+        let path = scratch("steer-free").with_file_name("cfg.json");
+        let mut probes: Vec<PathBuf> = Vec::new();
+        let (target, millis, suffix) = pick_backup_path(&path, |c| {
+            probes.push(c.to_path_buf());
+            false
+        })
+        .unwrap();
+        assert_eq!(probes.len(), 1, "a free name needs exactly one probe");
+        assert_eq!(probes.first().map(PathBuf::as_path), Some(target.as_path()));
+        let expected = PathBuf::from(format!("cfg.json.bak.{millis}.{suffix}"));
+        assert_eq!(
+            target.file_name().and_then(|n| n.to_str()),
+            expected.file_name().and_then(|n| n.to_str()),
+            "the returned name keeps the <name>.bak.<millis>.<suffix> shape"
+        );
+        assert_eq!(suffix.len(), 4);
+    }
+
+    /// Records every probed candidate and reports the first `busy` of them
+    /// as taken.
+    fn busy_prober(
+        busy: usize,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>,
+        impl FnMut(&Path) -> bool,
+    ) {
+        let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorder = std::rc::Rc::clone(&probes);
+        let seen = std::cell::Cell::new(0usize);
+        let taken = move |candidate: &Path| {
+            recorder.borrow_mut().push(candidate.to_path_buf());
+            let n = seen.get();
+            seen.set(n + 1);
+            n < busy
+        };
+        (probes, taken)
+    }
+
+    fn assert_all_distinct(paths: &[PathBuf]) {
+        let mut sorted = paths.to_vec();
+        sorted.sort();
+        let duplicates = sorted.windows(2).any(|pair| pair[0] == pair[1]);
+        assert!(!duplicates, "candidates must differ: {paths:?}");
+    }
+
+    /// Busy names steer the pick forward until a free candidate appears; the
+    /// free one is used, not the busy ones.
+    #[test]
+    fn pick_backup_path_steers_to_the_first_free_name() {
+        let path = scratch("steer-busy").with_file_name("cfg.json");
+        let (probes, taken) = busy_prober(2);
+        let (target, _, _) = pick_backup_path(&path, taken).unwrap();
+        let candidates = probes.borrow().clone();
+        assert_eq!(candidates.len(), 3, "two busy candidates, then a free one");
+        assert_all_distinct(&candidates);
+        assert_eq!(target, candidates[2], "the first free candidate wins");
+    }
+
+    /// Five consecutive collisions exhaust the steering: the fifth candidate
+    /// is returned even though it is taken, so the copy overwrites it.
+    #[test]
+    fn pick_backup_path_gives_up_after_five_busy_candidates() {
+        let path = scratch("steer-full").with_file_name("cfg.json");
+        let (probes, taken) = busy_prober(usize::MAX);
+        let (target, _, _) = pick_backup_path(&path, taken).unwrap();
+        let candidates = probes.borrow().clone();
+        assert_eq!(candidates.len(), 5, "the give-up bound is five probes");
+        assert_all_distinct(&candidates);
+        assert_eq!(
+            target, candidates[4],
+            "the fifth busy candidate is returned for overwrite"
+        );
     }
 
     #[test]
