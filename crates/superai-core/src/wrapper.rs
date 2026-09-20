@@ -1163,7 +1163,8 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
 // until layer 3 consumes them.
 
 /// Outcome of a bounded, no-auth diagnostic launch of a wrapper (WRP-04).
-#[cfg(test)]
+/// Unix-only: the sole caller execs a `#!/bin/sh` wrapper.
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiagnosticProbe {
     /// Whether the probe exited zero within the bound.
@@ -1175,7 +1176,7 @@ struct DiagnosticProbe {
 }
 
 /// Redact secret-shaped tokens (`sk-…` and friends) from probe output.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn redact_probe_output(text: &str) -> String {
     let mut out = text.to_owned();
     for prefix in ["sk-", "ghp_", "xoxb-"] {
@@ -1216,7 +1217,7 @@ fn redact_probe_output(text: &str) -> String {
 /// argument (e.g. `--version`) under a CLEAN environment (the wrapper
 /// installs its own isolation env) with a hard timeout and output cap.
 /// Never passes credentials; output is redacted before return.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn diagnostic_probe(
     path: &Path,
     probe_arg: &str,

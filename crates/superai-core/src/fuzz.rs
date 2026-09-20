@@ -11,7 +11,6 @@
     clippy::case_sensitive_file_extension_comparisons,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::cloned_ref_to_slice_refs,
     clippy::collapsible_if,
     clippy::excessive_nesting,
     clippy::format_push_string,
@@ -949,7 +948,7 @@ mod tests {
             }
             let before = snapshot_dir(&dir);
 
-            let path_dirs = gen_path_shaped(&mut prng, &[bin.clone()]);
+            let path_dirs = gen_path_shaped(&mut prng, std::slice::from_ref(&bin));
             // Hermetic: every live package-manager probe is disabled.
             let opts = DetectOptions {
                 path_dirs: Some(path_dirs.clone()),
