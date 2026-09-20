@@ -59,7 +59,8 @@ fn validate_url(url: &str) -> Result<()> {
         });
     }
     // '&' and '=' are how a query string pairs parameters; everywhere else
-    // they stay shell metachars and are refused.
+    // they stay shell metachars and are refused. A doubled '&' is the shell
+    // command separator, refused in the query too.
     let (before_query, query) = match url.split_once('?') {
         Some((head, tail)) => (head, Some(tail)),
         None => (url, None),
@@ -71,7 +72,8 @@ fn validate_url(url: &str) -> Result<()> {
         });
     }
     if let Some(query) = query
-        && query.contains(['`', '$', '"', '\'', '<', '>', '|', ';', '\\', '!'])
+        && (query.contains(['`', '$', '"', '\'', '<', '>', '|', ';', '\\', '!'])
+            || query.contains("&&"))
     {
         return Err(CoreError::Validation {
             field: "mcp.url".to_owned(),
@@ -2137,6 +2139,14 @@ mod tests {
             "https://example.com/mcp?a=1;rm%20-rf",
         );
         assert!(inject.is_err(), "shell metachar in query must be refused");
+        // The doubled form is the shell command separator: refused even in
+        // the query, where a single '&' is a parameter separator.
+        let doubled_amp = McpServerDef::remote(
+            McpServerId::new("query-doubled-amp").unwrap(),
+            McpTransport::StreamableHttp,
+            "https://example.com/mcp?a=1&&rm%20-rf",
+        );
+        assert!(doubled_amp.is_err(), "doubled '&' in query must be refused");
     }
 
     /// One invalid foreign entry must not fail the whole inspect: the good
