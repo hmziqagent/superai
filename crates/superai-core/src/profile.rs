@@ -1744,7 +1744,7 @@ mod tests {
         // dev/ino check: its inode was allocated while the classified inode
         // was still live, so no allocator order can collide the two.
         let swap = dir.join("intruder");
-        std::fs::write(&swap, b"replaced bytes!").unwrap();
+        std::fs::write(&swap, b"replaced bytes!!").unwrap();
         std::fs::rename(&swap, &target).unwrap();
         assert!(matches!(
             read_real_file_verified(&target, &meta),
