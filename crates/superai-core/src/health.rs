@@ -184,13 +184,13 @@ pub fn validate_timeout(timeout: Duration) -> Result<Duration> {
 /// Host of an http(s) URL, lowercased. Strips userinfo (`user:pass@`) and
 /// unwraps bracketed IPv6 literals (`[::1]:8443` -> `::1`), the two forms
 /// that otherwise hide the real host from the private-range check. The
-/// authority ends at the first '/', '?', or '#' (WHATWG); a '?'/'#' before
-/// any '@' means the '@' sits in the query or fragment and is not userinfo.
+/// authority ends at the first '/', '?', '#', or '\' (WHATWG special
+/// schemes treat '\' like '/'); anything before that is host, not decoy.
 fn extract_host(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let host_port = rest.get(0..end)?;
     let host_port = host_port.rsplit('@').next().unwrap_or_default();
     let host = if let Some(bracketed) = host_port.strip_prefix('[') {
@@ -1464,11 +1464,21 @@ mod tests {
             "https://[::ffff:127.0.0.1]/",
             "https://[::ffff:10.0.0.5]:8443/",
             "https://[::1]/",
-            // The authority ends at '?' or '#': the public-looking tail
-            // after the delimiter is query/fragment, not the host.
+            // The authority ends at '?', '#', or '\': the public-looking
+            // tail after the delimiter is query/fragment/path, not the host.
             "https://127.0.0.1?@x.example.com/",
             "https://169.254.169.254#@api.example.com/",
             "https://127.1?@api.example.com/",
+            "https://127.0.0.1\\@x.example.com/",
+            "https://169.254.169.254\\@api.example.com/",
+            "https://127.1\\@api.example.com/",
+            // Extra slashes after the scheme are skipped by the url crate;
+            // the empty host here is private, so the gate refuses.
+            "https:///127.0.0.1/",
+            "https://\\127.0.0.1/",
+            // The url crate strips tabs before parsing; control chars are
+            // rejected before extraction instead.
+            "https://127.0.0.1\t?@x.example.com/",
         ] {
             assert!(
                 validate_base_url_for_probe(url, false).is_err(),
@@ -1496,6 +1506,7 @@ mod tests {
             "https://[::ffff:10.0.0.5]/",
             "https://127.0.0.1?@x.example.com/",
             "https://169.254.169.254#@api.example.com/",
+            "https://127.0.0.1\\@x.example.com/",
         ] {
             let err = validate_execution_url(hop, &provider, &probe, &cfg)
                 .expect_err("{hop} must be refused at the redirect hop");
