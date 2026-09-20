@@ -682,20 +682,7 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
                     ),
                 });
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = meta.permissions().mode();
-                if mode & 0o200 == 0 && mode & 0o020 == 0 && mode & 0o002 == 0 {
-                    return Ok(false);
-                }
-                Ok(true)
-            }
-            // Windows has no portable write-bit probe; report writable.
-            #[cfg(not(unix))]
-            {
-                Ok(true)
-            }
+            Ok(dir_is_writable(path, &meta))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Missing destination is fine only when its parent exists, is a
@@ -709,15 +696,7 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
                         if !meta.is_dir() {
                             return Ok(false);
                         }
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let mode = meta.permissions().mode();
-                            if mode & 0o200 == 0 && mode & 0o020 == 0 && mode & 0o002 == 0 {
-                                return Ok(false);
-                            }
-                        }
-                        Ok(true)
+                        Ok(dir_is_writable(parent, &meta))
                     }
                     Err(_) => Ok(false),
                 }
@@ -729,6 +708,42 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
             field: "destination".to_owned(),
             reason: format!("failed to check destination `{}`: {e}", path.display()),
         }),
+    }
+}
+
+/// Whether new files can be created inside `dir`. Unix: the mode bits
+/// carry the owner/group/other write permission.
+#[cfg(unix)]
+fn dir_is_writable(_dir: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode();
+    mode & 0o200 != 0 || mode & 0o020 != 0 || mode & 0o002 != 0
+}
+
+/// Whether new files can be created inside `dir`. Windows has no write
+/// bit, so writability is proven by creating and removing an exclusive
+/// probe file; a create failure of any kind reports not writable.
+#[cfg(not(unix))]
+fn dir_is_writable(dir: &Path, _meta: &std::fs::Metadata) -> bool {
+    let probe = dir.join(format!(
+        ".superai-write-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    // create_new refuses an existing name, so the probe never truncates
+    // a foreign file.
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match created {
+        Ok(handle) => {
+            drop(handle);
+            std::fs::remove_file(&probe).is_ok()
+        }
+        Err(_) => false,
     }
 }
 

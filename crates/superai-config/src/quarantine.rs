@@ -398,26 +398,20 @@ fn move_to_quarantine_with_dest_in_base(
         {
             same_filesystem = false;
             let meta = std::fs::symlink_metadata(path).map_err(|e2| ConfigError::io(path, e2))?;
-            if meta.is_dir() {
-                copy_dir_recursively(path, &final_dest)?;
-                std::fs::remove_dir_all(path).map_err(|e2| ConfigError::io(path, e2))?;
-            } else if meta.file_type().is_symlink() {
-                #[cfg(unix)]
-                {
-                    let target =
-                        std::fs::read_link(path).map_err(|e2| ConfigError::io(path, e2))?;
-                    std::os::unix::fs::symlink(&target, &final_dest)
-                        .map_err(|e2| ConfigError::io(&final_dest, e2))?;
+            match classify_copy_entry(meta.file_type().is_symlink(), meta.is_dir()) {
+                CopyEntryKind::Link => {
+                    recreate_link(path, &final_dest)?;
+                    remove_link_at(path).map_err(|e2| ConfigError::io(path, e2))?;
                 }
-                #[cfg(not(unix))]
-                {
+                CopyEntryKind::Directory => {
+                    copy_tree_preserving_links(path, &final_dest)?;
+                    std::fs::remove_dir_all(path).map_err(|e2| ConfigError::io(path, e2))?;
+                }
+                CopyEntryKind::File => {
                     std::fs::copy(path, &final_dest)
                         .map_err(|e2| ConfigError::io(&final_dest, e2))?;
+                    std::fs::remove_file(path).map_err(|e2| ConfigError::io(path, e2))?;
                 }
-                std::fs::remove_file(path).map_err(|e2| ConfigError::io(path, e2))?;
-            } else {
-                std::fs::copy(path, &final_dest).map_err(|e2| ConfigError::io(&final_dest, e2))?;
-                std::fs::remove_file(path).map_err(|e2| ConfigError::io(path, e2))?;
             }
         }
         Err(e) => return Err(ConfigError::io(path, e)),
@@ -451,7 +445,73 @@ fn move_to_quarantine_with_dest_in_base(
     })
 }
 
-fn copy_dir_recursively(from: &Path, to: &Path) -> Result<()> {
+/// How a copy step must treat an entry, decided only from its own
+/// unfollowed file type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyEntryKind {
+    Directory,
+    Link,
+    File,
+}
+
+/// Link before directory: a Windows junction or directory symlink carries
+/// the directory attribute too, and only the link reading is safe to act on.
+fn classify_copy_entry(is_symlink: bool, is_dir: bool) -> CopyEntryKind {
+    if is_symlink {
+        CopyEntryKind::Link
+    } else if is_dir {
+        CopyEntryKind::Directory
+    } else {
+        CopyEntryKind::File
+    }
+}
+
+/// Recreate the link at `from` as a new link at `to`, never following it:
+/// a copy would land the referent's bytes or fail on a dangling link.
+fn recreate_link(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let target = std::fs::read_link(from).map_err(|e| ConfigError::io(from, e))?;
+        std::os::unix::fs::symlink(&target, to).map_err(|e| ConfigError::io(to, e))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let target = std::fs::read_link(from).map_err(|e| ConfigError::io(from, e))?;
+        // std cannot create junctions: a junction is recreated as a
+        // directory symlink to the same target, and a privilege failure
+        // surfaces as an error rather than a copy through the link.
+        // A healthy link takes its target's flavour; a dangling one falls
+        // back to the file flavour (stable std names no kind for it).
+        let dir_flavored = std::fs::metadata(from).is_ok_and(|m| m.is_dir());
+        let made = if dir_flavored {
+            std::os::windows::fs::symlink_dir(&target, to)
+        } else {
+            std::os::windows::fs::symlink_file(&target, to)
+        };
+        made.map_err(|e| ConfigError::io(to, e))
+    }
+}
+
+/// Remove the link itself: Windows refuses `remove_file` on a
+/// directory-flavoured link, and `remove_dir` removes only the link.
+fn remove_link_at(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let is_dir_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::metadata(path).is_ok_and(|m| m.is_dir());
+        if is_dir_link {
+            return std::fs::remove_dir(path);
+        }
+    }
+    std::fs::remove_file(path)
+}
+
+/// Copy the tree `from` to `to` recursively, recreating link entries
+/// (junctions included on Windows) as links instead of reading through
+/// them, so a link cycle cannot hang the copy and a dangling link cannot
+/// abort it. A mid-copy failure leaves the partial destination in place.
+pub fn copy_tree_preserving_links(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).map_err(|e| ConfigError::io(to, e))?;
     let entries = std::fs::read_dir(from).map_err(|e| ConfigError::io(from, e))?;
     for ent in entries {
@@ -460,24 +520,15 @@ fn copy_dir_recursively(from: &Path, to: &Path) -> Result<()> {
         let file_name = ent.file_name();
         let dest = to.join(file_name);
         // lstat, never the followed metadata: a link entry must reach the
-        // symlink branch, or a link-to-directory would recurse into itself
+        // link branch, or a link-to-directory would recurse into itself
         // forever and a dangling link would abort the whole copy.
         let meta = std::fs::symlink_metadata(&src).map_err(|e| ConfigError::io(&src, e))?;
-        if meta.is_dir() {
-            copy_dir_recursively(&src, &dest)?;
-        } else if meta.file_type().is_symlink() {
-            #[cfg(unix)]
-            {
-                let target = std::fs::read_link(&src).map_err(|e| ConfigError::io(&src, e))?;
-                std::os::unix::fs::symlink(&target, &dest)
-                    .map_err(|e| ConfigError::io(&dest, e))?;
-            }
-            #[cfg(not(unix))]
-            {
+        match classify_copy_entry(meta.file_type().is_symlink(), meta.is_dir()) {
+            CopyEntryKind::Link => recreate_link(&src, &dest)?,
+            CopyEntryKind::Directory => copy_tree_preserving_links(&src, &dest)?,
+            CopyEntryKind::File => {
                 std::fs::copy(&src, &dest).map_err(|e| ConfigError::io(&dest, e))?;
             }
-        } else {
-            std::fs::copy(&src, &dest).map_err(|e| ConfigError::io(&dest, e))?;
         }
     }
     Ok(())
@@ -516,22 +567,11 @@ pub fn restore_from_quarantine(entry: &QuarantineEntry) -> Result<()> {
             if meta.file_type().is_symlink() {
                 // Recreate the link itself; copying would follow it and
                 // land the referent's bytes (or fail on a dangling link).
-                #[cfg(unix)]
-                {
-                    let target = std::fs::read_link(&entry.quarantine_path)
-                        .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
-                    std::os::unix::fs::symlink(&target, &entry.original_path)
-                        .map_err(|er| ConfigError::io(&entry.original_path, er))?;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::copy(&entry.quarantine_path, &entry.original_path)
-                        .map_err(|er| ConfigError::io(&entry.original_path, er))?;
-                }
-                std::fs::remove_file(&entry.quarantine_path)
+                recreate_link(&entry.quarantine_path, &entry.original_path)?;
+                remove_link_at(&entry.quarantine_path)
                     .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
             } else if meta.is_dir() {
-                copy_dir_recursively(&entry.quarantine_path, &entry.original_path)?;
+                copy_tree_preserving_links(&entry.quarantine_path, &entry.original_path)?;
                 std::fs::remove_dir_all(&entry.quarantine_path)
                     .map_err(|er| ConfigError::io(&entry.quarantine_path, er))?;
             } else {
@@ -1214,12 +1254,23 @@ mod tests {
         drop(std::fs::remove_dir_all(&qdir));
     }
 
+    /// A dir-flavoured link (a Windows junction or directory symlink
+    /// carries the directory attribute too) classifies as a link, so the
+    /// directory bit can never route a copy into the referent.
+    #[test]
+    fn copy_entry_classifier_puts_links_before_directories() {
+        assert_eq!(classify_copy_entry(true, true), CopyEntryKind::Link);
+        assert_eq!(classify_copy_entry(true, false), CopyEntryKind::Link);
+        assert_eq!(classify_copy_entry(false, true), CopyEntryKind::Directory);
+        assert_eq!(classify_copy_entry(false, false), CopyEntryKind::File);
+    }
+
     /// A tree with a symlink cycle and a dangling link copies to completion:
     /// links are recreated as links (lstat), so the cycle cannot recurse
     /// forever and the dangling link cannot abort the copy.
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursively_preserves_symlinks_and_survives_link_cycles() {
+    fn copy_tree_preserving_links_survives_link_cycles() {
         let root = crate::test_util::temp_dir_unique("quarantine-copydir");
         let src = root.join("src");
         std::fs::create_dir_all(src.join("nested")).unwrap();
@@ -1229,7 +1280,7 @@ mod tests {
         std::os::unix::fs::symlink("/definitely/not/present", src.join("dangling")).unwrap();
 
         let dst = root.join("dst");
-        copy_dir_recursively(&src, &dst).unwrap();
+        copy_tree_preserving_links(&src, &dst).unwrap();
 
         assert_eq!(std::fs::read(dst.join("file.txt")).unwrap(), b"plain");
         assert_eq!(

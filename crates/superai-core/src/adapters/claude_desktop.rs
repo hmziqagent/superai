@@ -232,11 +232,19 @@ pub fn commit_third_party_inference(
     Ok(path)
 }
 
-/// A plain file name: rejecting separators and parent components keeps the
-/// write inside `configLibrary` no matter who supplies the name.
+/// A plain file name: rejecting separators, drive colons, parent
+/// components, and DOS device basenames keeps the write inside
+/// `configLibrary` no matter who supplies the name.
 fn validated_library_file(library_file: &str) -> Result<&str, CoreError> {
+    if is_windows_device_basename(library_file) {
+        return Err(CoreError::InvalidPath {
+            kind: "library_file".to_owned(),
+            value: library_file.to_owned(),
+            reason: "reserved as a Windows device name".to_owned(),
+        });
+    }
     let is_plain = !library_file.is_empty()
-        && !library_file.contains(['/', '\\'])
+        && !library_file.contains(['/', '\\', ':'])
         && library_file != "."
         && library_file != ".."
         && Path::new(library_file)
@@ -251,6 +259,24 @@ fn validated_library_file(library_file: &str) -> Result<&str, CoreError> {
             reason: "must be a plain file name inside configLibrary".to_owned(),
         })
     }
+}
+
+/// DOS device basenames (`CON`, `COM1`, ...) resolve to devices on
+/// Windows regardless of case or extension: the key is the stem before
+/// the first dot with trailing dots and spaces trimmed.
+fn is_windows_device_basename(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(s, _)| s);
+    let key = stem.trim_end_matches(['.', ' ', '\t']).to_ascii_lowercase();
+    let numbered = |prefix: &str| {
+        key.strip_prefix(prefix).is_some_and(|digits| {
+            digits.len() == 1
+                && digits
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|&b| b.is_ascii_digit() && b != b'0')
+        })
+    };
+    matches!(key.as_str(), "aux" | "con" | "nul" | "prn") || numbered("com") || numbered("lpt")
 }
 
 /// Unix: 0600 because the file carries the gateway key; Windows already
@@ -1178,7 +1204,7 @@ mod tests {
             &key,
             super::ThirdPartyAuthScheme::Bearer,
         );
-        for escape in ["../escape.json", "a/b.json", "..", ""] {
+        for escape in ["../escape.json", "a/b.json", "..", "", "C:con"] {
             let err = super::commit_third_party_inference(&root, escape, &config).unwrap_err();
             assert!(
                 matches!(err, CoreError::InvalidPath { .. }),
@@ -1190,6 +1216,69 @@ mod tests {
             superai_config::json::load(&root.join("configLibrary").join("inference.json"))
                 .is_ok_and(|m| m.is_empty())
         );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// DOS device basenames resolve to devices on Windows with any
+    /// extension and any case; nearby ordinary names stay legal.
+    #[test]
+    fn windows_device_basenames_are_matched_case_folded_with_extensions() {
+        for name in [
+            "con",
+            "CON",
+            "Con",
+            "cOn.json",
+            "aux.cfg",
+            "nul",
+            "nul.tar.gz",
+            "prn.",
+            "com3 .txt",
+            "com1",
+            "COM9.data",
+            "lpt1",
+            "LPT9",
+        ] {
+            assert!(super::is_windows_device_basename(name), "{name}");
+        }
+        for name in [
+            "config.json",
+            "console.log",
+            "com",
+            "com0",
+            "com10",
+            "lpt0",
+            "lptx",
+            "nully",
+            "constants.json",
+            "auxiliary",
+        ] {
+            assert!(!super::is_windows_device_basename(name), "{name}");
+        }
+    }
+
+    /// Writing a 3P library file named after a Windows device is refused
+    /// before any file is created.
+    #[test]
+    fn third_party_library_file_windows_device_names_are_refused() {
+        let root = crate::test_util::temp_dir_unique("claude-3p-devices");
+        std::fs::create_dir_all(&root).unwrap();
+        let key = crate::error::RedactedString::new("dummy-gateway-token");
+        let config = super::ThirdPartyInference::gateway(
+            "http://127.0.0.1:8787",
+            &key,
+            super::ThirdPartyAuthScheme::Bearer,
+        );
+        for name in ["con", "CON.json", "aux", "com1.cfg", "lpt9"] {
+            let err = super::commit_third_party_inference(&root, name, &config).unwrap_err();
+            assert!(
+                matches!(err, CoreError::InvalidPath { .. }),
+                "{name}: {err:?}"
+            );
+            assert!(
+                !root.join("configLibrary").join(name).exists(),
+                "{name} must not be written"
+            );
+        }
         drop(std::fs::remove_dir_all(&root));
     }
 

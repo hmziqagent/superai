@@ -845,6 +845,61 @@ pub fn activate_profile(
     })
 }
 
+/// Move the backup entry back to `fixed_path`. A same-volume rename
+/// preserves the inode (returned true, so callers can re-verify it); a
+/// cross-volume restore copies the tree without following links (a
+/// junction inside the backup must not be copied through) and then drops
+/// the backup copy.
+fn restore_backup_entry(entry: &Path, fixed_path: &Path) -> Result<bool> {
+    match std::fs::rename(entry, fixed_path) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) =>
+        {
+            let meta = std::fs::symlink_metadata(entry).map_err(|e| CoreError::Commit {
+                path: entry.to_path_buf(),
+                reason: format!("cannot re-read backup {}: {e}", entry.display()),
+            })?;
+            if meta.file_type().is_symlink() {
+                // Same refusal as the pre-move check: a link at the entry
+                // root means the recorded backup was displaced.
+                return Err(CoreError::ForeignOwnership {
+                    path: entry.to_path_buf(),
+                    owner: "recorded backup entry is a symlink; restore refused".to_owned(),
+                });
+            }
+            if meta.is_dir() {
+                superai_config::quarantine::copy_tree_preserving_links(entry, fixed_path)
+                    .map_err(CoreError::Config)?;
+                std::fs::remove_dir_all(entry).map_err(|e| CoreError::Commit {
+                    path: entry.to_path_buf(),
+                    reason: format!(
+                        "cannot drop the restored backup copy {}: {e}",
+                        entry.display()
+                    ),
+                })?;
+            } else {
+                std::fs::copy(entry, fixed_path).map_err(|e| CoreError::Commit {
+                    path: fixed_path.to_path_buf(),
+                    reason: format!("cannot restore backup {}: {e}", entry.display()),
+                })?;
+                std::fs::remove_file(entry).map_err(|e| CoreError::Commit {
+                    path: entry.to_path_buf(),
+                    reason: format!(
+                        "cannot drop the restored backup copy {}: {e}",
+                        entry.display()
+                    ),
+                })?;
+            }
+            Ok(false)
+        }
+        Err(e) => Err(CoreError::Commit {
+            path: fixed_path.to_path_buf(),
+            reason: format!("cannot restore backup {}: {e}", entry.display()),
+        }),
+    }
+}
+
 /// Deactivate the active profile at `fixed_path`: remove the managed symlink
 /// and restore the backed-up pre-existing content byte-identically.
 ///
@@ -853,10 +908,6 @@ pub fn activate_profile(
 /// content is foreign and must not be touched), or when the recorded backup
 /// entry has been replaced by a symlink (restoring through it would hand
 /// the fixed path to whatever the link points at).
-#[expect(
-    clippy::too_many_lines,
-    reason = "restore refuses inline, one path per check"
-)]
 pub fn deactivate_profile(
     base_dir: &Path,
     harness: &HarnessId,
@@ -934,11 +985,11 @@ pub fn deactivate_profile(
     let mut restored = false;
     if let Some(backup) = swap.backup_path.as_deref() {
         let entry = PathBuf::from(backup);
-        std::fs::rename(&entry, fixed_path).map_err(|e| CoreError::Commit {
-            path: fixed_path.to_path_buf(),
-            reason: format!("cannot restore backup {}: {e}", entry.display()),
-        })?;
-        if let Some(expected) = backup_meta.as_ref()
+        let renamed_in_place = restore_backup_entry(&entry, fixed_path)?;
+        // The inode re-check applies only to the rename path; a
+        // cross-volume copy lands a fresh inode by design.
+        if renamed_in_place
+            && let Some(expected) = backup_meta.as_ref()
             && !still_same_inode(fixed_path, expected)
         {
             return Err(CoreError::ConcurrentModification {
@@ -1462,6 +1513,105 @@ mod tests {
             std::fs::read(&attacker).unwrap(),
             b"attacker bytes".to_vec()
         );
+    }
+
+    /// A scratch dir on another filesystem when one is available
+    /// (/dev/shm tmpfs vs the temp base's filesystem); `tag` keeps
+    /// parallel tests off each other's scratch trees.
+    #[cfg(unix)]
+    fn cross_device_scratch(tag: &str) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return None;
+        }
+        let probe = crate::test_util::temp_dir_unique("profile-xdev-probe");
+        std::fs::create_dir_all(&probe).ok()?;
+        let dev = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+        if dev(shm)? == dev(&probe)? {
+            drop(std::fs::remove_dir_all(&probe));
+            return None;
+        }
+        drop(std::fs::remove_dir_all(&probe));
+        let scratch = shm.join(format!("superai-profile-xdev-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).ok()?;
+        Some(scratch)
+    }
+
+    /// Deactivate restores a cross-volume backup by copying the tree back
+    /// without following links: an inner link is recreated, never read
+    /// through. Unix-only fixture (/dev/shm vs the temp base).
+    #[cfg(unix)]
+    #[test]
+    fn deactivate_restores_cross_device_dir_backups_without_following_links() {
+        let Some(scratch) = cross_device_scratch("dir") else {
+            return; // no second filesystem on this host
+        };
+        let b = base("xdev-dir");
+        let record = create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("xdev")),
+        )
+        .unwrap();
+        std::fs::write(record.root.join("owned.txt").unwrap(), b"managed").unwrap();
+        let fixed = scratch.join("Claude");
+        std::fs::create_dir_all(fixed.join("real")).unwrap();
+        std::fs::write(fixed.join("real").join("user.txt"), b"user bytes").unwrap();
+        std::os::unix::fs::symlink("real", fixed.join("alias")).unwrap();
+
+        activate_profile(&b, &harness("claude-desktop"), "xdev", &fixed).unwrap();
+        assert!(fixed.is_symlink());
+
+        let out = deactivate_profile(&b, &harness("claude-desktop"), &fixed).unwrap();
+        assert!(out.restored);
+        assert!(!fixed.is_symlink(), "the fixed path is the real tree again");
+        assert_eq!(
+            std::fs::read(fixed.join("real").join("user.txt")).unwrap(),
+            b"user bytes".to_vec()
+        );
+        assert!(
+            std::fs::symlink_metadata(fixed.join("alias"))
+                .is_ok_and(|m| m.file_type().is_symlink()),
+            "an inner link is recreated as a link, never read through"
+        );
+        drop(std::fs::remove_dir_all(&scratch));
+        drop(std::fs::remove_dir_all(&b));
+    }
+
+    /// A cross-volume single-file backup copies back and still passes the
+    /// recorded-digest verification. Unix-only fixture.
+    #[cfg(unix)]
+    #[test]
+    fn deactivate_restores_cross_device_file_backups_with_matching_digest() {
+        let Some(scratch) = cross_device_scratch("file") else {
+            return; // no second filesystem on this host
+        };
+        let b = base("xdev-file");
+        create_profile(
+            &b,
+            &ProfileSpec::new(harness("claude-desktop"), name("xdevf")),
+        )
+        .unwrap();
+        let fixed = scratch.join("settings.json");
+        std::fs::write(&fixed, b"cross-volume user bytes").unwrap();
+
+        let activation = activate_profile(&b, &harness("claude-desktop"), "xdevf", &fixed).unwrap();
+        assert!(
+            activation.preexisting_digest.is_some(),
+            "file backups record a digest"
+        );
+        assert!(fixed.is_symlink());
+
+        deactivate_profile(&b, &harness("claude-desktop"), &fixed).unwrap();
+        assert!(!fixed.is_symlink());
+        assert_eq!(
+            std::fs::read(&fixed).unwrap(),
+            b"cross-volume user bytes".to_vec(),
+            "the digest-verified restore returns the original bytes"
+        );
+        drop(std::fs::remove_file(&fixed));
+        drop(std::fs::remove_dir_all(&scratch));
+        drop(std::fs::remove_dir_all(&b));
     }
 
     #[test]
