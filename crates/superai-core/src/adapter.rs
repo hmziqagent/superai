@@ -1589,9 +1589,14 @@ impl Adapter for GenericAdapter {
             });
         }
         let mut plan = WrapperPlan::new(&format!("generic wrapper for {}", self.display_name));
-        // Provide a relocated-root style hint; real adapters use the correct env var.
+        // Provide a relocated-root style hint; real adapters use the correct
+        // env var. Dashes would leave the generated launcher dialect with a
+        // non-identifier key, so they fold to underscores.
         plan.env_vars.push((
-            format!("{}_CONFIG_DIR", self.id.as_str().to_uppercase()),
+            format!(
+                "{}_CONFIG_DIR",
+                self.id.as_str().to_uppercase().replace('-', "_")
+            ),
             instance.config_root.to_string(),
         ));
         Ok(plan)
