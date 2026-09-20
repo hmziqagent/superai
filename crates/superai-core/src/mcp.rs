@@ -1,26 +1,13 @@
 //! MCP canonical definition and lifecycle (EXT-08..10).
 //!
-//! Implements:
-//! - `McpServerDef { id, command, args, env, url, disabled }` plus transport,
-//!   headers, timeout, OAuth and tool filtering (EXT-08)
-//! - Adapter declares source/destination (config file path, key, container
-//!   shape, read-only honesty) via [`crate::adapter::McpAdapterDecl`]
-//!   (EXT-08/09)
-//! - Preserve foreign entries: read fresh, merge the one owned entry being
-//!   written, retain every unmodelled key — including unknown fields the
-//!   owned entry already carries (EXT-08/09)
-//! - Multi-format round-trip: JSON destinations serialize semantically;
-//!   TOML destinations (codex `[mcp_servers.<name>]` tables, mistral
-//!   `[[mcp_servers]]` identity lists) are written through `toml_edit` so
-//!   comments and decor outside the mutated entry survive byte-for-byte;
-//!   JSONC/YAML destinations parse for inspection but refuse changing
-//!   writes with the typed `LossyWrite` error until a preserving codec
-//!   exists (EXT-09, codec honesty DOC-05/DOC-06); read-only-declared
-//!   surfaces refuse writes with their declared reason.
-//! - Lifecycle: validate, inspect, collisions, backup, transaction,
-//!   commit/verify, removal leaves foreign (EXT-10)
-//! - Secrets are ephemeral and only rendered to adapter-declared sinks; diffs redact.
-//! - Round-trip and foreign preservation tests.
+//! `McpServerDef` is the canonical server shape; the adapter declares the
+//! destination (file, key, container shape, read-only honesty) via
+//! [`crate::adapter::McpAdapterDecl`]. Writes are per-entry merges through a
+//! compensated transaction: foreign servers, unmodelled keys, and (for TOML)
+//! comments and decor outside the mutated entry survive byte-for-byte.
+//! JSONC/YAML destinations parse for inspection but refuse writes with the
+//! typed `LossyWrite` error until a preserving codec exists. Secrets are
+//! ephemeral, written only to adapter-declared sinks, and redacted in diffs.
 
 #![expect(clippy::all, reason = "mcp module reviewed for pedantic lints")]
 #![expect(clippy::pedantic, reason = "mcp comprehensive")]
@@ -30,27 +17,22 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::adapter::{DocumentKind, McpAdapterDecl, McpTransport};
 use crate::error::{CoreError, Result};
 use crate::ids::McpServerId;
-
-// ---------------------------------------------------------------------------
-// Helpers: validation, redaction, digest
-// ---------------------------------------------------------------------------
 
 const SHELL_PATTERNS: &[&str] = &[
     "`", "$(", "${", "&&", "||", ";", "|", ">", "<", "&", "!", "\\", "\"", "'", "\n", "\r",
 ];
 
 fn contains_shell_metachars(value: &str) -> bool {
-    for pat in SHELL_PATTERNS {
-        if value.contains(pat) {
-            return true;
-        }
-    }
-    false
+    SHELL_PATTERNS.iter().any(|pat| value.contains(pat))
+}
+
+// NUL is itself a control char, so one pass over the chars covers both.
+fn has_control_chars(value: &str) -> bool {
+    value.chars().any(char::is_control)
 }
 
 fn validate_url(url: &str) -> Result<()> {
@@ -60,7 +42,7 @@ fn validate_url(url: &str) -> Result<()> {
             reason: "url must not be empty".to_owned(),
         });
     }
-    if url.contains('\0') || url.chars().any(char::is_control) {
+    if has_control_chars(url) {
         return Err(CoreError::Validation {
             field: "mcp.url".to_owned(),
             reason: "url must not contain NUL or control".to_owned(),
@@ -98,7 +80,7 @@ fn validate_command(cmd: &str) -> Result<()> {
             reason: "command must not be empty".to_owned(),
         });
     }
-    if cmd.contains('\0') || cmd.chars().any(char::is_control) {
+    if has_control_chars(cmd) {
         return Err(CoreError::Validation {
             field: "mcp.command".to_owned(),
             reason: "command must not contain NUL or control".to_owned(),
@@ -110,7 +92,6 @@ fn validate_command(cmd: &str) -> Result<()> {
             reason: format!("command must not contain shell metachars: `{cmd}`"),
         });
     }
-    // Disallow path traversal if command looks like a path
     for comp in Path::new(cmd).components() {
         if matches!(comp, Component::ParentDir) {
             return Err(CoreError::Validation {
@@ -123,14 +104,13 @@ fn validate_command(cmd: &str) -> Result<()> {
 }
 
 fn validate_arg(arg: &str) -> Result<()> {
-    if arg.contains('\0') || arg.chars().any(char::is_control) {
+    if has_control_chars(arg) {
         return Err(CoreError::Validation {
             field: "mcp.args".to_owned(),
             reason: "arg must not contain NUL or control".to_owned(),
         });
     }
     if contains_shell_metachars(arg) {
-        // Allow some shell patterns inside args? For safety reject.
         return Err(CoreError::Validation {
             field: "mcp.args".to_owned(),
             reason: format!("arg must not contain shell metachars: `{arg}`"),
@@ -146,7 +126,7 @@ fn validate_env_key(key: &str) -> Result<()> {
             reason: "env key must not be empty".to_owned(),
         });
     }
-    if key.contains('\0') || key.chars().any(char::is_control) {
+    if has_control_chars(key) {
         return Err(CoreError::Validation {
             field: "mcp.env".to_owned(),
             reason: "env key must not contain NUL/control".to_owned(),
@@ -186,21 +166,7 @@ fn redacted_value(key: &str, value: &str) -> String {
     }
 }
 
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-// ---------------------------------------------------------------------------
-// Canonical MCP definition (EXT-08)
-// ---------------------------------------------------------------------------
-
-/// Canonical MCP server definition.
-///
-/// Required fields per task: `id`, `command`, `args`, `env`, `url`, `disabled`.
-/// Extended with transport, headers, timeout, OAuth and tool filters to cover
-/// EXT-08 richness.
+/// Canonical MCP server definition (EXT-08).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerDef {
     /// Stable server identifier (validated via `McpServerId`).
@@ -294,9 +260,8 @@ impl McpServerDef {
         })
     }
 
-    /// Validate the definition field-by-field (EXT-07 plan: validate source).
+    /// Validate the definition field-by-field (id is validated by the newtype).
     pub fn validate(&self) -> Result<()> {
-        // id already validated via newtype
         if let Some(cmd) = &self.command {
             validate_command(cmd)?;
         }
@@ -305,7 +270,7 @@ impl McpServerDef {
         }
         for (k, v) in &self.env {
             validate_env_key(k)?;
-            if v.contains('\0') || v.chars().any(char::is_control) {
+            if has_control_chars(v) {
                 return Err(CoreError::Validation {
                     field: "mcp.env".to_owned(),
                     reason: format!("env value for `{k}` must not contain NUL/control"),
@@ -316,20 +281,19 @@ impl McpServerDef {
             validate_url(url)?;
         }
         for (k, v) in &self.headers {
-            if k.trim().is_empty() || k.contains('\0') || k.chars().any(char::is_control) {
+            if k.trim().is_empty() || has_control_chars(k) {
                 return Err(CoreError::Validation {
                     field: "mcp.headers".to_owned(),
                     reason: format!("header key `{k}` invalid"),
                 });
             }
-            if v.contains('\0') || v.chars().any(char::is_control) {
+            if has_control_chars(v) {
                 return Err(CoreError::Validation {
                     field: "mcp.headers".to_owned(),
                     reason: format!("header value for `{k}` must not contain NUL/control"),
                 });
             }
         }
-        // Transport consistency
         match self.transport {
             McpTransport::Stdio => {
                 if self.command.is_none() {
@@ -355,10 +319,7 @@ impl McpServerDef {
                         reason: format!("{} transport requires url", self.transport),
                     });
                 }
-                if self.command.is_some() {
-                    // Some harnesses allow command alongside url for auth wrappers; allow but warn via validation
-                    // For strictness, allow command with network transport (e.g., npx wrapper). Don't error.
-                }
+                // A command alongside a url is allowed (auth wrappers).
             }
         }
         if matches!(self.include_tools, Some(ref v) if v.is_empty()) {
@@ -375,29 +336,10 @@ impl McpServerDef {
         }
         Ok(())
     }
-
-    /// Compute content digest for this server definition (sorted JSON).
-    pub fn digest(&self) -> String {
-        let mut bytes = serde_json::to_vec(self).unwrap_or_default();
-        // Ensure deterministic by sorting keys via serde_json preserve_order? Use BTreeMap already.
-        bytes.sort();
-        compute_digest(&bytes)
-    }
-
-    /// Whether this definition is semantically equal to another (ignoring ordering).
-    pub fn semantic_eq(&self, other: &Self) -> bool {
-        self == other
-    }
 }
 
-// ---------------------------------------------------------------------------
-// Native rendering (EXT-09)
-// ---------------------------------------------------------------------------
-
-/// Render a canonical definition to the native JSON value for a given adapter.
-///
-/// Preserves unknown fields by merging via the outer preservation layer; this
-/// function only produces the per-server value.
+/// Render a canonical definition to the native JSON value for one server
+/// entry; unknown-field preservation happens in the merge layer.
 pub fn to_native_value(server: &McpServerDef) -> Value {
     let mut map = Map::new();
     if let Some(cmd) = &server.command {
@@ -414,7 +356,6 @@ pub fn to_native_value(server: &McpServerDef) -> Value {
     if !server.env.is_empty() {
         let mut env_map = Map::new();
         for (k, v) in &server.env {
-            // Secret values are still written to adapter-declared sink; they are not omitted here.
             env_map.insert(k.clone(), Value::String(v.clone()));
         }
         map.insert("env".to_owned(), Value::Object(env_map));
@@ -455,16 +396,17 @@ pub fn to_native_value(server: &McpServerDef) -> Value {
         map.insert("exclude_tools".to_owned(), Value::Array(arr.clone()));
         map.insert("excludeTools".to_owned(), Value::Array(arr));
     }
-    // Transport hint for harnesses that store it explicitly (e.g., opencode)
-    match server.transport {
-        McpTransport::Stdio => {
-            // stdio is implicit via command; no need to store
-        }
-        other => {
-            map.insert("transport".to_owned(), Value::String(other.to_string()));
-            // Some schemas use "type"
-            map.insert("type".to_owned(), Value::String(other.to_string()));
-        }
+    // stdio is implicit via command; other transports are stored explicitly,
+    // under both "transport" and the "type" spelling some schemas use.
+    if server.transport != McpTransport::Stdio {
+        map.insert(
+            "transport".to_owned(),
+            Value::String(server.transport.to_string()),
+        );
+        map.insert(
+            "type".to_owned(),
+            Value::String(server.transport.to_string()),
+        );
     }
     Value::Object(map)
 }
@@ -645,10 +587,6 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
     Ok(def)
 }
 
-// ---------------------------------------------------------------------------
-// Foreign-preserving file helpers (EXT-08/09)
-// ---------------------------------------------------------------------------
-
 /// Keys the canonical renderer manages on a server entry (EXT-09: unknown
 /// fields of an OWNED server survive rewrites; managed keys the new
 /// rendering no longer emits are dropped so toggles stick).
@@ -737,11 +675,8 @@ fn toml_document_to_value(doc: &toml_edit::DocumentMut) -> Value {
 }
 
 /// Load the outer semantic value of an MCP destination file, fresh from
-/// disk, through the document-engine codec for the declared kind (EXT-09:
-/// the read path is no longer JSON-only — JSONC parses via the comment
-/// stripping loader, YAML via the yaml codec, TOML via `toml_edit`).
-///
-/// Missing and empty files read as an empty object; no file is created.
+/// disk, through the codec for the declared kind. Missing and empty files
+/// read as an empty object; no file is created.
 fn read_outer_value(path: &Path, kind: DocumentKind) -> Result<Value> {
     let value = match kind {
         DocumentKind::Json => superai_config::json::load_value(path)?,
@@ -901,7 +836,7 @@ fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()
             reason: format!("mcp commit failed: {diag}"),
         });
     }
-    // Post-commit verify: the written bytes must parse under the same codec.
+    // The written bytes must parse under the same codec.
     read_outer_value(path, kind).map_err(|e| CoreError::Verification {
         path: path.to_path_buf(),
         kind: "parse".to_owned(),
@@ -918,8 +853,6 @@ fn write_server_entry(
     id: &str,
     write: ServerWrite,
 ) -> Result<()> {
-    // Read-only surfaces refuse honestly with the declared reason (EXT-09
-    // inspect/diff-only destinations).
     if let Some(reason) = &decl.read_only {
         return Err(CoreError::UnsupportedOperation {
             harness: "mcp".to_owned(),
@@ -927,9 +860,8 @@ fn write_server_entry(
             reason: reason.clone(),
         });
     }
-    // codec-honesty (DOC-05/DOC-06): the only rewriters available normalize
-    // JSONC/YAML lexical material (comments, anchors, tags, scalar style).
-    // Refuse instead of corrupting; the typed config error propagates.
+    // The only rewriters available normalize JSONC/YAML lexical material;
+    // refuse instead of corrupting.
     let lossy_format = match decl.kind {
         DocumentKind::Jsonc => Some("jsonc"),
         DocumentKind::Yaml => Some("yaml"),
@@ -1071,10 +1003,6 @@ fn write_json_server(
     commit_document(path, decl.kind, bytes)
 }
 
-// ---------------------------------------------------------------------------
-// TOML server writes (comments and decor preserved via toml_edit, EXT-09)
-// ---------------------------------------------------------------------------
-
 /// Convert a semantic JSON value into a `toml_edit` item.
 fn json_to_toml_item(value: &Value) -> std::result::Result<toml_edit::Item, String> {
     use toml_edit::value as toml_value;
@@ -1164,9 +1092,8 @@ fn toml_container_table<'a>(
 }
 
 /// Write one server entry into a TOML destination through `toml_edit`, so
-/// comments, formatting, foreign keys, and foreign servers survive the
-/// write byte-for-byte outside the mutated entry (EXT-09; area-1 DOC-04
-/// discipline).
+/// comments, formatting, foreign keys, and foreign servers survive the write
+/// byte-for-byte outside the mutated entry.
 fn write_toml_server(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -1189,8 +1116,7 @@ fn write_toml_server(
                         .map_err(|e| schema_err(format!("server `{id}`: {e}")))?;
                     let item = toml_edit::Item::Table(new_table);
                     if table.contains_key(id) {
-                        // Index assignment preserves the existing key's
-                        // position (DOC-04 discipline).
+                        // Index assignment preserves the key's position.
                         table[id] = item;
                     } else {
                         table.insert(id, item);
@@ -1250,14 +1176,9 @@ fn write_toml_server(
     commit_document(path, decl.kind, doc.to_string().into_bytes())
 }
 
-// ---------------------------------------------------------------------------
-// Public lifecycle API (EXT-10)
-// ---------------------------------------------------------------------------
-
 /// Inspect effective MCP servers from `path` using `decl` (read fresh, no
-/// mutation). Works across destination kinds (JSON/JSONC/YAML/TOML) and
-/// container shapes; read-only declarations inspect the same as writable
-/// ones — refusing writes never blinds reads.
+/// mutation). Works across destination kinds and container shapes; read-only
+/// declarations inspect the same as writable ones.
 pub fn inspect_servers(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -1269,15 +1190,9 @@ pub fn inspect_servers(
             Ok(def) => {
                 out.insert(def.id.clone(), def);
             }
-            Err(e) => {
-                // Unknown server fields are preserved but we still surface them as raw? For inspect we treat parse error as validation failure unless we can preserve.
-                // If a foreign server has unknown schema, we still preserve it via outer, but inspect should not fail the whole operation.
-                // Instead, log and skip? For strictness, return error with path.
-                // We choose to skip parse failures for foreign servers that superai doesn't own, but we need to identify owned vs foreign.
-                // Heuristic: if value is not an object, skip.
-                // For now, surface error.
-                return Err(e);
-            }
+            // A single unparseable entry fails the whole inspect rather
+            // than being silently dropped from the report.
+            Err(e) => return Err(e),
         }
     }
     Ok(out)
@@ -1318,7 +1233,6 @@ pub fn preview_install(
     };
     let is_update = existing.is_some();
     let mut conflicts: Vec<String> = Vec::new();
-    // Detect case-fold collision with different id
     for existing_key in inner.keys() {
         if existing_key.to_lowercase() == server.id.as_str().to_lowercase()
             && existing_key != server.id.as_str()
@@ -1329,18 +1243,14 @@ pub fn preview_install(
             ));
         }
     }
-    // Remote transport downgrade forbidden unless explicitly equivalent: we treat any transport change as conflict requiring explicit replace
     if let Some(ref ex) = existing {
         if ex.transport != server.transport {
-            // Check equivalence: stdio <-> network downgrade forbidden unless caller explicitly replaces
-            // We surface as conflict; caller can force by removing first.
             conflicts.push(format!(
                 "transport change {} -> {} requires explicit replace",
                 ex.transport, server.transport
             ));
         }
-        if ex.semantic_eq(server) {
-            // Same semantic definition -> no-op/adopt choice, no conflict
+        if *ex == *server {
             conflicts.clear();
         }
     }
@@ -1351,7 +1261,7 @@ pub fn preview_install(
         server.id,
         if server.disabled { "(disabled)" } else { "" }
     );
-    // Redact secrets in diff: we just don't include env values; we show keys redacted
+    // Diff text never carries env or header values, only key names.
     let mut redacted_parts: Vec<String> = Vec::new();
     for (k, _) in &server.env {
         redacted_parts.push(format!("env:{}=[REDACTED]", k));
@@ -1377,12 +1287,8 @@ pub fn preview_install(
 
 /// Install or update a single MCP server, preserving foreign entries.
 ///
-/// Lifecycle: validate, inspect existing, detect collisions, backup foreign
-/// config, stage via transaction, commit/verify. The write is a per-entry
-/// merge: unknown fields already present on the entry survive, foreign
-/// servers and top-level keys are untouched, and for TOML destinations
-/// comments and formatting outside the entry survive byte-for-byte.
-/// Returns the installed definition on success.
+/// Validate, preview collisions, merge per-entry, commit through the
+/// compensated transaction. Returns the installed definition on success.
 pub fn install_mcp_server(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -1397,13 +1303,12 @@ pub fn install_mcp_server(
             reason: preview.conflicts.join("; "),
         });
     }
-    // If same semantic, no-op (adopt)
     if let Some(ref ex) = preview.existing {
-        if ex.semantic_eq(server) {
+        if *ex == *server {
             return Ok(server.clone());
         }
     }
-    // Read fresh again for the merge (disk is truth).
+    // Read fresh for the merge; disk is truth.
     let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let existing_native = inner.get(server.id.as_str());
     let merged = merge_server_native(existing_native, &to_native_value(server));
@@ -1449,8 +1354,6 @@ pub fn remove_mcp_server(
         None => return Ok(None),
     };
     let def = from_native_value(id.as_str(), &existing_val)?;
-    // Only owned entries should be removed; heuristic: if def validates, it's owned.
-    // Foreign entries that fail parse would have been preserved as outer keys; here we just remove.
     write_server_entry(path, decl, id.as_str(), ServerWrite::Remove)?;
     Ok(Some(def))
 }
@@ -1475,10 +1378,6 @@ pub fn redacted_diff(server: &McpServerDef) -> String {
     }
     parts.join(" ")
 }
-
-// ---------------------------------------------------------------------------
-// EXT-10 — move/copy between scopes with conflict preview
-// ---------------------------------------------------------------------------
 
 /// Whether a scope transfer removes the source entry (move) or keeps it (copy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1552,7 +1451,7 @@ pub fn preview_scope_transfer(
 
     let mut conflicts = Vec::new();
     if let Some(dest) = &dest_existing
-        && !dest.semantic_eq(&source_existing)
+        && *dest != source_existing
     {
         conflicts.push(format!(
             "destination already defines `{id}` differently ({} -> {}); remove or rename first",
@@ -1582,10 +1481,9 @@ pub fn preview_scope_transfer(
 
 /// Move or copy server `id` between two declared destinations (EXT-10).
 ///
-/// The destination is written FIRST (additive); the source entry is removed
+/// The destination is written first (additive); the source entry is removed
 /// only for [`ScopeTransfer::Move`] after the destination write verified, so
-/// a mid-transfer failure never loses the server. A same-semantic destination
-/// entry short-circuits to the remove (move) or no-op (copy).
+/// a mid-transfer failure never loses the server.
 pub fn transfer_between_scopes(
     source_path: &Path,
     source_decl: &McpAdapterDecl,
@@ -1604,9 +1502,9 @@ pub fn transfer_between_scopes(
         });
     }
     if let Some(dest) = &preview.dest_existing
-        && dest.semantic_eq(&preview.source_existing)
+        && *dest == preview.source_existing
     {
-        // Adopt: destination already carries the same definition.
+        // The destination already carries the same definition.
         if action == ScopeTransfer::Move {
             write_server_entry(source_path, source_decl, id.as_str(), ServerWrite::Remove)?;
         }
@@ -1626,10 +1524,6 @@ pub fn transfer_between_scopes(
     Ok(Some(preview.source_existing))
 }
 
-// ---------------------------------------------------------------------------
-// EXT-11 — bulk cross-instance operations
-// ---------------------------------------------------------------------------
-
 /// One instance target of a bulk operation (EXT-11).
 pub struct BulkTarget {
     /// Instance display name for reports.
@@ -1642,7 +1536,7 @@ pub struct BulkTarget {
 
 impl std::fmt::Debug for BulkTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Adapters are not Debug; identify by harness id + root instead.
+        // Adapters are not Debug; identify by harness id + root.
         f.debug_struct("BulkTarget")
             .field("instance", &self.instance)
             .field("config_root", &self.config_root)
@@ -1696,7 +1590,7 @@ pub struct BulkTargetPlan {
     pub supported: bool,
     /// Why the target is unsupported (no decl, verified absence, read-only).
     pub unsupported_reason: Option<String>,
-    /// Non-blocking notes (e.g. destination missing — it will be created).
+    /// Non-blocking notes (e.g. destination missing; it will be created).
     pub constrained_notes: Vec<String>,
     /// Existing definition for the addressed id, read fresh.
     pub existing: Option<McpServerDef>,
@@ -1716,8 +1610,8 @@ pub struct BulkPlan {
 }
 
 impl BulkPlan {
-    /// Targets that would refuse (unsupported or conflicting) — surfaced
-    /// BEFORE commit so callers can decide.
+    /// Targets that would refuse (unsupported or conflicting), surfaced
+    /// before commit so callers can decide.
     pub fn refusing_targets(&self) -> Vec<&BulkTargetPlan> {
         self.targets
             .iter()
@@ -1934,7 +1828,7 @@ fn ensure_plan_token_unchanged(
 ///
 /// Every target is applied through the compensated per-write MCP transaction
 /// (backup + atomic replace + read-back verify, area-2 machinery), so a
-/// failure on one target rolls back THAT TARGET only — other targets proceed
+/// failure on one target rolls back that target only; other targets proceed
 /// and are reported independently. Refusals never touch disk. External edits
 /// between plan and apply surface as `RolledBack` with the digest evidence.
 pub fn bulk_apply(targets: &[BulkTarget], plan: &BulkPlan, action: &BulkAction) -> BulkResult {
@@ -2001,10 +1895,6 @@ pub fn bulk_apply(targets: &[BulkTarget], plan: &BulkPlan, action: &BulkAction) 
     }
     BulkResult { results }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -2310,7 +2200,7 @@ mod tests {
             let id = McpServerId::new("owned").unwrap();
             let server = McpServerDef::stdio(id, "node", vec!["server.js".to_owned()]).unwrap();
 
-            // Absent file: even creation is refused — the serialized bytes
+            // Absent file: even creation is refused; the serialized bytes
             // would not match the declared surface kind.
             let err = install_mcp_server(&path, &d, &server).unwrap_err();
             match err {
@@ -2333,10 +2223,6 @@ mod tests {
             drop(std::fs::remove_file(&path));
         }
     }
-
-    // -------------------------------------------------------------------
-    // Multi-format round-trips (EXT-09)
-    // -------------------------------------------------------------------
 
     fn toml_decl() -> McpAdapterDecl {
         McpAdapterDecl::new(
@@ -2640,10 +2526,6 @@ mod tests {
         let def = from_native_value("remote", &remote).unwrap();
         assert_eq!(def.url.as_deref(), Some("https://example.com/mcp"));
     }
-
-    // -------------------------------------------------------------------
-    // EXT-10 scope transfer + EXT-11 bulk operations
-    // -------------------------------------------------------------------
 
     use crate::adapter::{
         ConfigSurface, DetectionResult, PathResolver, ProductStatus, SurfaceOwnership,

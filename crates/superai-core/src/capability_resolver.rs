@@ -1,32 +1,18 @@
-//! Capability resolution — fresh, source-fed, precedence-explicit (plan 09).
+//! Capability resolution: fresh, source-fed, precedence-explicit (CAP-03/05).
 //!
-//! Support is not a boolean: a capability can be native, substituted, or
-//! absent, and it depends on the harness *and_ provider together.
+//! Support depends on the harness and provider together. Sources, in order:
+//! 1. adapter declaration (an `absent` transport claim is final; nothing can
+//!    override an incompatible harness transport),
+//! 2. provider data (`substituted`/`absent` replaces the transport default),
+//! 3. template capability map (pair-specific overrides),
+//! 4. installed plugin/MCP state (may raise `absent` to `substituted` only
+//!    where the adapter can verify it),
+//! 5. policy (downgrades only, never upgrades).
 //!
-//! Resolution consults CURRENT data (CAP-03/CAP-05), in this precedence:
-//!
-//! 1. **Adapter declaration** — the harness transport constraint. An `absent`
-//!    transport claim is final: provider, template, plugin, and policy data
-//!    cannot override an incompatible harness transport.
-//! 2. **Provider data** — `ProviderDefinition::capabilities` (server-side or
-//!    modal capabilities). A provider `substituted`/`absent` claim replaces
-//!    the transport default; a provider `native` claim alongside a `native`
-//!    transport keeps the harness as the satisfying source.
-//! 3. **Template capability map** — pair-specific overrides from the applied
-//!    template.
-//! 4. **Installed plugin/MCP state** — may raise `absent` to `substituted`
-//!    only where the adapter can verify it (an MCP declaration plus
-//!    installed servers read fresh from the instance config).
-//! 5. **Policy** — may disable (downgrade) support, never upgrade it.
-//!
-//! Nothing is persisted: every query resolves fresh from its inputs (CAP-05),
-//! and results are returned keyed by [`crate::ids::InstanceId`] for the
-//! public instance queries — harness identity stays internal diagnostic
-//! metadata.
-//!
-//! The legacy `MATRIX` const and its completeness validator are retained as
-//! reference data for the invariant tests only; resolution NEVER consults
-//! compile-time data.
+//! Every query resolves fresh from its inputs; nothing is cached or persisted.
+//! Results are keyed by [`crate::ids::InstanceId`]; harness identity stays
+//! internal diagnostic metadata. The legacy `MATRIX` const is reference data
+//! for the invariant tests only; resolution never consults compile-time data.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -40,15 +26,11 @@ use crate::ids::{HarnessId, InstanceId, ProviderId};
 use crate::instance::Instance;
 use crate::provider::ProviderDefinition;
 
-pub use crate::capability::ALL_CAPABILITIES;
-// Single public path for the catalog vocabulary (capability.rs is private).
 pub use crate::capability::{
-    CAPABILITY_CATALOG, CapabilityCatalogEntry, parse_capability_id, parse_support,
+    ALL_CAPABILITIES, CAPABILITY_CATALOG, CapabilityCatalogEntry, parse_capability_id,
+    parse_support,
 };
-
-// ---------------------------------------------------------------------------
-// Support source
-// ---------------------------------------------------------------------------
+// The capability module is private; this is the only public path to its catalog.
 
 /// Which data source satisfies a capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +46,7 @@ pub enum CapabilitySource {
     Plugin,
     /// Local or admin policy controls it.
     Policy,
-    /// Unknown — no source resolved the capability.
+    /// No source resolved the capability.
     Unknown,
 }
 
@@ -82,11 +64,7 @@ impl std::fmt::Display for CapabilitySource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Resolved entry (CAP-02: source, explanation, evidence, limitations)
-// ---------------------------------------------------------------------------
-
-/// Resolved capability — support plus source, explanation, evidence, and
+/// A resolved capability: support plus source, explanation, evidence, and
 /// limitations (CAP-02).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCapability {
@@ -144,10 +122,6 @@ impl ResolvedCapability {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Resolution inputs (CAP-03 sources)
-// ---------------------------------------------------------------------------
-
 /// Installed extension state for one instance (CAP-03 source 4).
 ///
 /// Supplied by the caller or built fresh from the instance config; only
@@ -188,7 +162,7 @@ impl ExtensionState {
 
 /// All resolution inputs for one resolution call (CAP-03).
 ///
-/// Everything here is CURRENT data supplied per call — the resolver holds no
+/// Everything here is current data supplied per call; the resolver holds no
 /// caches and persists nothing (CAP-05).
 #[derive(Debug)]
 pub struct CapabilitySources<'a> {
@@ -252,10 +226,6 @@ impl<'a> CapabilitySources<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Source-driven resolution (CAP-03/CAP-05)
-// ---------------------------------------------------------------------------
-
 fn support_rank(support: Support) -> u8 {
     match support {
         Support::Native => 2,
@@ -275,12 +245,12 @@ pub fn resolve_with_sources(
     cap: Capability,
     sources: &CapabilitySources<'_>,
 ) -> ResolvedCapability {
-    // Source 1 — the harness transport constraint.
+    // Source 1: the harness transport constraint.
     let Some(decl) = sources.adapter_decls.iter().find(|d| d.capability == cap) else {
         // The adapter has not modeled this capability's transport. A
         // template declaration still resolves the pair (the template author
         // takes responsibility); otherwise the capability is honestly
-        // Unknown — never silently absent.
+        // Never silently absent.
         if let Some(map) = sources.template_map
             && let Some(support) = map.get(&cap)
         {
@@ -335,9 +305,8 @@ pub fn resolve_with_sources(
     let mut evidence = format!("adapter `{}` transport declaration", sources.harness_label);
     let mut version_range = decl.version_req.clone();
 
-    // Source 2 — provider capability data. An incompatible (absent or
-    // version-blocked) transport is FINAL here: provider data cannot
-    // override it.
+    // Source 2: provider capability data. An incompatible (absent or
+    // version-blocked) transport is final; provider data cannot override it.
     if !transport_absent
         && let Some(provider) = sources.provider
         && let Some(provider_decl) = provider.capability_decl(cap)
@@ -364,8 +333,7 @@ pub fn resolve_with_sources(
         }
     }
 
-    // Source 3 — template overrides (also blocked by an incompatible
-    // transport, same precedence rule).
+    // Source 3: template overrides, also blocked by an incompatible transport.
     if !transport_absent
         && let Some(map) = sources.template_map
         && let Some(override_support) = map.get(&cap)
@@ -377,7 +345,7 @@ pub fn resolve_with_sources(
         version_range = None;
     }
 
-    // Source 4 — verifiable extension state raises absent to substituted.
+    // Source 4: verifiable extension state raises absent to substituted.
     if support == Support::Absent
         && cap == Capability::Mcp
         && sources.adapter_verifies_mcp
@@ -392,7 +360,7 @@ pub fn resolve_with_sources(
         "instance MCP config read fresh at query time".clone_into(&mut evidence);
     }
 
-    // Source 5 — policy may only disable (downgrade), never upgrade.
+    // Source 5: policy may only downgrade, never upgrade.
     for row in &sources.policy {
         if !row.harness.eq_ignore_ascii_case(&sources.harness_label)
             || !row.provider.eq_ignore_ascii_case(provider_id.as_str())
@@ -439,10 +407,6 @@ pub fn resolve_all_with_sources(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Default-source resolution (fresh adapter + bundled provider data)
-// ---------------------------------------------------------------------------
-
 /// Gather the default sources for a pair: a fresh adapter from the harness
 /// catalog and the bundled provider data. No template/plugin/policy input.
 fn gather_default_sources<'a>(
@@ -472,7 +436,7 @@ fn gather_default_sources<'a>(
 /// Resolve a single capability for a harness/provider pair.
 ///
 /// Default sources: fresh adapter inspection (harness catalog) plus the
-/// bundled provider data — resolution never consults compile-time tables.
+/// bundled provider data; resolution never consults compile-time tables.
 /// Callers with template/plugin/policy context use
 /// [`resolve_with_sources`] / [`resolve_all_with_sources`].
 pub fn resolve(harness: &HarnessId, provider: &ProviderId, cap: Capability) -> ResolvedCapability {
@@ -491,10 +455,6 @@ pub fn resolve_all(
     resolve_all_with_sources(harness, provider, &sources)
 }
 
-// ---------------------------------------------------------------------------
-// Instance-keyed public queries (CAP-05)
-// ---------------------------------------------------------------------------
-
 /// Inputs for the instance-level capability queries (CAP-05).
 ///
 /// Consumers never branch on harness identity: the query takes instances and
@@ -508,7 +468,7 @@ pub struct InstanceCapabilitySources<'a> {
     /// instance actually uses (from template metadata or PRV-05 detection).
     /// Instances without an entry are resolved against the provider FRESHLY
     /// detected from their config; when detection also finds nothing, no
-    /// capability claim is made — resolution never falls back to an
+    /// capability claim is made; resolution never falls back to an
     /// arbitrary other provider.
     pub instance_providers: &'a BTreeMap<InstanceId, ProviderId>,
     /// Per-instance template capability overrides, keyed by instance id.
@@ -550,6 +510,18 @@ pub fn resolve_for_instance(
     } else {
         sources.providers
     };
+    let adapters = crate::harness_catalog::all_adapters();
+    resolve_for_instance_with(instance, sources, effective, &adapters)
+}
+
+/// The per-instance body of [`resolve_for_instance`], with the provider list
+/// and adapter catalog supplied by the caller so batch queries parse them once.
+fn resolve_for_instance_with(
+    instance: &Instance,
+    sources: &InstanceCapabilitySources<'_>,
+    effective: &[ProviderDefinition],
+    adapters: &[Box<dyn Adapter>],
+) -> Vec<(Capability, ResolvedCapability)> {
     let empty_map = BTreeMap::new();
     let empty_ext = ExtensionState::default();
     let template_map = sources
@@ -557,13 +529,14 @@ pub fn resolve_for_instance(
         .get(&instance.id)
         .unwrap_or(&empty_map);
     let extensions = sources.extensions.get(&instance.id).unwrap_or(&empty_ext);
-    let adapter = crate::harness_catalog::all_adapters()
-        .into_iter()
+    let adapter: Option<&dyn Adapter> = adapters
+        .iter()
+        .map(AsRef::as_ref)
         .find(|a| a.id().eq_case_fold(&instance.harness));
 
     // The instance's OWN provider, never an arbitrary one (CAP-05): an
     // explicit caller-supplied mapping wins (template metadata / PRV-05
-    // detection result); otherwise the provider is detected FRESH from the
+    // detection result); otherwise the provider is detected fresh from the
     // instance's current config; if nothing is detected, no capability
     // claim is made.
     let provider = sources
@@ -571,7 +544,7 @@ pub fn resolve_for_instance(
         .get(&instance.id)
         .and_then(|wanted| effective.iter().find(|p| p.id.eq_case_fold(wanted)))
         .or_else(|| {
-            let adapter = adapter.as_deref()?;
+            let adapter = adapter?;
             let report =
                 crate::provider_render::inspect_effective_provider(instance, adapter, effective)
                     .ok()?;
@@ -585,10 +558,9 @@ pub fn resolve_for_instance(
     };
     let cap_sources = CapabilitySources {
         adapter_decls: adapter
-            .as_deref()
             .map(Adapter::capability_declarations)
             .unwrap_or_default(),
-        adapter_verifies_mcp: adapter.as_deref().is_some_and(|a| a.mcp_decl().is_some()),
+        adapter_verifies_mcp: adapter.is_some_and(|a| a.mcp_decl().is_some()),
         provider: Some(provider),
         template_map: Some(template_map),
         extensions: extensions.clone(),
@@ -611,9 +583,18 @@ pub fn filter_instances_by_capability(
     support: Option<Support>,
     sources: &InstanceCapabilitySources<'_>,
 ) -> Vec<(InstanceId, ResolvedCapability)> {
+    // Parse the provider bundle and adapter catalog once for the whole batch;
+    // per-instance state is still read fresh inside each resolution.
+    let bundled = crate::provider::load_bundled_providers().unwrap_or_default();
+    let effective: &[ProviderDefinition] = if sources.providers.is_empty() {
+        &bundled
+    } else {
+        sources.providers
+    };
+    let adapters = crate::harness_catalog::all_adapters();
     let mut out = Vec::new();
     for instance in instances {
-        let resolved = resolve_for_instance(instance, sources)
+        let resolved = resolve_for_instance_with(instance, sources, effective, &adapters)
             .into_iter()
             .find(|(cap, _)| *cap == capability)
             .map(|(_, resolved)| resolved);
@@ -626,15 +607,11 @@ pub fn filter_instances_by_capability(
     out
 }
 
-// ---------------------------------------------------------------------------
-// Completeness validation (CAP-04)
-// ---------------------------------------------------------------------------
-
-/// Validate that the given sources resolve EVERY catalog capability for the
+/// Validate that the given sources resolve every catalog capability for the
 /// pair, with no duplicate/conflicting rules (CAP-04).
 ///
 /// Called from template validation: an incomplete matrix blocks template
-/// publication/use instead of defaulting to absent.
+/// publication instead of defaulting to absent.
 pub fn validate_resolution_completeness(
     harness: &HarnessId,
     provider_id: &ProviderId,
@@ -672,15 +649,7 @@ pub fn validate_resolution_completeness(
     Ok(resolved)
 }
 
-// ---------------------------------------------------------------------------
-// Legacy static matrix — reference data for invariant tests ONLY
-// ---------------------------------------------------------------------------
-
 /// One row in the static harness/provider/capability matrix.
-///
-/// The static matrix is RETAINED AS REFERENCE DATA for the completeness
-/// invariant tests; the live resolution path ([`resolve`],
-/// [`resolve_with_sources`]) never consults it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatrixEntry {
     /// Harness identifier lowercased slug (e.g. `claude-code`).
@@ -697,12 +666,9 @@ pub struct MatrixEntry {
     pub explanation: &'static str,
 }
 
-/// Active harness/provider pairs that must be fully covered.
-///
-/// Adding a provider is data-only for the provider file, but the capability
-/// matrix must gain rows for new pairs before they are considered complete.
-/// Completeness validation fails if any pair here lacks a row for any
-/// capability in [`ALL_CAPABILITIES`].
+/// Active harness/provider pairs that must be fully covered. A new pair needs
+/// matrix rows before it counts as complete; validation fails if any pair
+/// here lacks a row for any capability in [`ALL_CAPABILITIES`].
 pub const ACTIVE_PAIRS: &[(&str, &str)] = &[
     ("claude-code", "anthropic"),
     ("claude-code", "glm"),
@@ -716,14 +682,10 @@ pub const ACTIVE_PAIRS: &[(&str, &str)] = &[
     ("cline", "anthropic"),
 ];
 
-/// Static harness/provider/capability matrix — REFERENCE DATA ONLY.
-///
-/// Retained for the invariant tests (`validate_matrix_completeness`) and as
-/// the documented expectation table for the reference scenarios. The
-/// resolution path feeds on adapter/provider/template/plugin/policy data;
-/// it never reads this const.
+/// Static harness/provider/capability matrix, reference data only: the
+/// invariant tests and reference scenarios read it, the live resolution path
+/// never does.
 pub const MATRIX: &[MatrixEntry] = &[
-    // claude-code + anthropic — native across the board
     MatrixEntry {
         harness: "claude-code",
         provider: "anthropic",
@@ -756,7 +718,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         source: CapabilitySource::Harness,
         explanation: "Claude Code MCP native",
     },
-    // claude-code + glm — web_search substituted, vision absent (transport incompatible)
     MatrixEntry {
         harness: "claude-code",
         provider: "glm",
@@ -771,7 +732,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         capability: Capability::Vision,
         support: Support::Absent,
         source: CapabilitySource::Provider,
-        explanation: "Claude Code vision absent on GLM — transport incompatible even though model advertises vision",
+        explanation: "Claude Code vision absent on GLM; transport incompatible even though the model advertises vision",
     },
     MatrixEntry {
         harness: "claude-code",
@@ -822,7 +783,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         source: CapabilitySource::Harness,
         explanation: "Claude Code MCP native",
     },
-    // codex-cli + openai — full native
     MatrixEntry {
         harness: "codex-cli",
         provider: "openai",
@@ -855,7 +815,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         source: CapabilitySource::Harness,
         explanation: "Codex CLI MCP native",
     },
-    // codex-cli + anthropic — vision absent (provider transport)
     MatrixEntry {
         harness: "codex-cli",
         provider: "anthropic",
@@ -921,7 +880,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         source: CapabilitySource::Harness,
         explanation: "OpenCode MCP native",
     },
-    // opencode + glm — computer_use absent, web_search substituted
     MatrixEntry {
         harness: "opencode",
         provider: "glm",
@@ -954,7 +912,6 @@ pub const MATRIX: &[MatrixEntry] = &[
         source: CapabilitySource::Harness,
         explanation: "OpenCode MCP native",
     },
-    // pi + anthropic — MCP absent natively
     MatrixEntry {
         harness: "pi",
         provider: "anthropic",
@@ -1121,7 +1078,6 @@ fn validate_matrix_completeness_with(
     pairs: &[(&str, &str)],
     caps: &[Capability],
 ) -> Result<()> {
-    // No duplicate rows.
     let mut seen: std::collections::HashSet<(String, String, Capability)> =
         std::collections::HashSet::new();
     for e in matrix {
@@ -1141,7 +1097,6 @@ fn validate_matrix_completeness_with(
         }
         seen.insert(key);
     }
-    // Every active pair has every capability.
     for (harness, provider) in pairs {
         for cap in caps {
             let mut found = false;
@@ -1151,15 +1106,13 @@ fn validate_matrix_completeness_with(
                     && &e.capability == cap
                 {
                     found = true;
-                    // Substituted must name provider/template/plugin source, not harness alone unless provider source.
+                    // A substituted claim must name who substitutes it.
                     if e.support == Support::Substituted
                         && matches!(
                             e.source,
                             CapabilitySource::Harness | CapabilitySource::Unknown
                         )
                     {
-                        // For substituted, harness alone is not sufficient unless provider is named— but we allow Provider/Template/Plugin.
-                        // Enforce that substituted rows have Provider, Template, or Plugin source.
                         return Err(CoreError::Validation {
                             field: "matrix".to_owned(),
                             reason: format!(
@@ -1168,7 +1121,6 @@ fn validate_matrix_completeness_with(
                             ),
                         });
                     }
-                    // Explanation non-empty.
                     if e.explanation.trim().is_empty() {
                         return Err(CoreError::Validation {
                             field: "matrix".to_owned(),
@@ -1192,10 +1144,6 @@ fn validate_matrix_completeness_with(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// File-driven policy rows (CAP-03 source 5)
-// ---------------------------------------------------------------------------
 
 /// File-driven matrix row (JSON/YAML deserializable). Doubles as the policy
 /// override input for [`CapabilitySources`].
@@ -1267,10 +1215,6 @@ fn parse_matrix_yaml(text: &str, path: &Path) -> Result<Vec<FileMatrixEntry>> {
         }),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1628,7 +1572,7 @@ mod tests {
     #[test]
     fn instance_query_resolves_each_instance_against_its_own_provider() {
         // FINDING-1 regression: two SAME-harness instances with DIFFERENT
-        // providers must resolve (and filter) differently — never against
+        // providers must resolve (and filter) differently, never against
         // the first bundled provider.
         let tmp = crate::test_util::temp_dir_unique("cap-own-provider");
         let make_instance = |name: &str| Instance {
@@ -1679,7 +1623,7 @@ mod tests {
         assert_eq!(vision_absent[0].1.source, CapabilitySource::Provider);
 
         // Web search: native on anthropic (harness tool), substituted on glm
-        // (server-side) — same harness, different provider, different support.
+        // (server-side): same harness, different provider, different support.
         let web_substituted = filter_instances_by_capability(
             &instances,
             Capability::WebSearch,
@@ -1689,7 +1633,7 @@ mod tests {
         assert_eq!(web_substituted.len(), 1);
         assert_eq!(web_substituted[0].0.as_str(), "id-on-glm");
 
-        // The unconfigured instance makes NO claim either way — it is not
+        // The unconfigured instance makes no claim either way; it is not
         // silently resolved against the first bundled provider.
         let claimed: Vec<&str> = vision_native
             .iter()
@@ -1699,7 +1643,7 @@ mod tests {
         assert!(!claimed.contains(&"id-unconfigured"));
 
         // Fresh-detection fallback: write a codex config pointing at glm and
-        // resolve WITHOUT the explicit mapping — glm-specific results prove
+        // resolve without the explicit mapping; glm-specific results prove
         // the provider came from the instance's config, not the bundle order.
         let codex_root = tmp.join("codex-inst");
         std::fs::create_dir_all(&codex_root).unwrap();
@@ -1729,7 +1673,7 @@ mod tests {
             .map(|(_, res)| res.clone())
             .expect("codex resolves all capabilities");
         // glm declares vision absent; the first bundled provider (anthropic)
-        // would have said native — detection must win.
+        // would have said native; detection must win.
         assert_eq!(vision.support, Support::Absent);
         assert_eq!(vision.source, CapabilitySource::Provider);
         drop(std::fs::remove_dir_all(&tmp));
@@ -1802,7 +1746,7 @@ mod tests {
 
     #[test]
     fn capability_delta_visible() {
-        // Template update preview: GLM vision absent vs Anthropic native — delta is visible.
+        // Template update preview: GLM vision absent vs Anthropic native.
         let before = resolve(&hid("claude-code"), &pid("glm"), Capability::Vision);
         let after = resolve(&hid("claude-code"), &pid("anthropic"), Capability::Vision);
         assert_ne!(before.support, after.support);

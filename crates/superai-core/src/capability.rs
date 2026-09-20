@@ -1,19 +1,13 @@
-//! Capability model and catalog (plan 09 CAP-01).
-//!
-//! Typed known capability IDs give ergonomic Rust use; the catalog carries
-//! each capability's stable meaning, aliases, and validation notes. Schema
-//! validation rejects unknown capability IDs cleanly — unknown is never
-//! silently treated as absent.
+//! Capability vocabulary and catalog (CAP-01): typed ids, aliases, and the
+//! rule that an unknown id is a validation error, never silent absence.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 
-/// How an instance satisfies a capability.
-///
-/// Support is not a boolean: it depends on the harness and the provider together.
-/// Claude Code's web search is a client-side tool on Anthropic ([`Support::Native`]),
-/// while the same harness on GLM gets search server-side ([`Support::Substituted`]).
+/// How an instance satisfies a capability. Depends on the harness and the
+/// provider together: the same harness can be native on one provider and
+/// substituted on another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Support {
@@ -36,10 +30,8 @@ impl std::fmt::Display for Support {
     }
 }
 
-/// A capability the interface layer may ask an instance about.
-///
-/// The interface asks "can this instance search the web", never "is this harness
-/// Claude Code" — harness identity does not leak upward.
+/// A capability the interface layer may ask an instance about. Consumers ask
+/// "can this instance search the web", never "is this harness Claude Code".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
@@ -115,14 +107,12 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
 
 /// Parse a capability id (or documented alias) into the typed capability.
 ///
-/// Unknown ids are a typed validation error — never silently treated as
-/// absent (CAP-01). Matching is case-insensitive on the `snake_case` id and
-/// the catalog aliases.
+/// Unknown ids are a typed validation error, never silent absence (CAP-01).
+/// Matching is case-insensitive on the `snake_case` id and the catalog aliases.
 pub fn parse_capability_id(input: &str) -> Result<Capability> {
     let normalized = input.trim().to_ascii_lowercase();
     for entry in CAPABILITY_CATALOG {
-        let id_str = serde_plain_id(entry.id);
-        if normalized == id_str {
+        if normalized == entry.id.to_string() {
             return Ok(entry.id);
         }
         if entry.aliases.iter().any(|alias| normalized == **alias) {
@@ -135,15 +125,11 @@ pub fn parse_capability_id(input: &str) -> Result<Capability> {
             "unknown capability id `{input}`; known ids: {}",
             CAPABILITY_CATALOG
                 .iter()
-                .map(|e| serde_plain_id(e.id))
+                .map(|e| e.id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     })
-}
-
-fn serde_plain_id(capability: Capability) -> String {
-    capability.to_string()
 }
 
 impl std::fmt::Display for Capability {

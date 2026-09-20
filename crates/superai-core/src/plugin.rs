@@ -1,19 +1,13 @@
 //! Plugin abstraction and lifecycle (EXT-06/07).
 //!
-//! Implements:
-//! - Adapter-specific plugin types: `DirectoryBundle`, `ConfigEntry`, `NpmRef`,
-//!   `MarketplaceRecord`, `ExtensionScript` via [`crate::adapter::PluginKind`]
-//! - Adapter declares source/dest, execution requirement, enable/disable/remove
-//!   semantics, dependency effects, restart (via [`crate::adapter::PluginAdapterDecl`])
-//! - Safe scope: file/config plugins only; package installer execution requires
-//!   `RequiresApproval` instead of executing (EXT-06)
-//! - Lifecycle: validate id/version/digest, inspect existing, detect collisions,
-//!   backup foreign config, stage via transaction, discovery-verify, commit,
-//!   removal only owned entries, shared dep retained until no consumer (EXT-07)
+//! Plugin kinds and destinations come from the adapter decl
+//! ([`crate::adapter::PluginAdapterDecl`]). Safe scope: file/config plugins
+//! only; kinds needing package-installer execution return `RequiresApproval`
+//! instead of running anything. Removal touches exactly the recorded owned
+//! entries, and a shared dependency is retained until no consumer remains.
 
 #![expect(clippy::all, reason = "plugin module reviewed")]
 #![expect(clippy::pedantic, reason = "plugin comprehensive")]
-#![expect(clippy::redundant_clone, reason = "clones needed")]
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -26,10 +20,6 @@ use sha2::{Digest as ShaDigest, Sha256};
 use crate::adapter::{PluginAdapterDecl, PluginKind};
 use crate::error::{CoreError, Result};
 use crate::ids::PluginId;
-
-// ---------------------------------------------------------------------------
-// Constants and helpers
-// ---------------------------------------------------------------------------
 
 /// Plugin registry schema version.
 pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
@@ -82,8 +72,6 @@ fn validate_plugin_locator(locator: &str, kind: PluginKind) -> Result<()> {
             });
         }
     }
-    // For DirectoryBundle/ConfigEntry, locator is a path – must be absolute or clean relative without traversal already checked.
-    // For NpmRef/Marketplace, it should look like package identifier, not a path traversal; above check suffices.
     match kind {
         PluginKind::DirectoryBundle | PluginKind::ConfigEntry | PluginKind::ExtensionScript => {
             if locator.contains(':') && !locator.starts_with("file://") {
@@ -110,7 +98,7 @@ fn validate_plugin_locator(locator: &str, kind: PluginKind) -> Result<()> {
             }
         }
         PluginKind::NpmRef | PluginKind::MarketplaceRecord => {
-            // npm name validation: must be lowercase-ish, no path separators except maybe /
+            // Scoped npm names contain '/', so traversal needs both.
             if locator.contains('/') && locator.contains("..") {
                 return Err(CoreError::Validation {
                     field: "plugin.locator".to_owned(),
@@ -164,47 +152,7 @@ fn validate_digest(digest: &str) -> Result<()> {
     Ok(())
 }
 
-fn now_iso8601() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    unix_secs_to_rfc3339(secs)
-}
-
-fn unix_secs_to_rfc3339(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let secs_of_day = secs % 86400;
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i32, m as u32, d as u32)
-}
-
-#[expect(dead_code, reason = "digest helper for future use")]
-fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-// ---------------------------------------------------------------------------
-// Plugin source and record
-// ---------------------------------------------------------------------------
+use crate::registry::now_iso8601;
 
 /// Source descriptor for installing a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +174,6 @@ pub struct PluginSource {
 impl PluginSource {
     /// Validate the source fields.
     pub fn validate(&self) -> Result<()> {
-        // id already validated via PluginId
         validate_plugin_locator(&self.locator, self.kind)?;
         if let Some(v) = &self.version {
             validate_version(v)?;
@@ -287,10 +234,6 @@ impl PluginRecord {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Registry (superai-owned, foreign preserving)
-// ---------------------------------------------------------------------------
-
 /// Plugin registry persisted at `root/registry.json`, preserving foreign keys.
 #[derive(Debug, Clone)]
 pub struct PluginRegistry {
@@ -348,7 +291,7 @@ impl PluginRegistry {
             Value::Object(m) => m,
             _ => {
                 return Err(CoreError::SchemaValidation {
-                    path: file.clone(),
+                    path: file,
                     details: "plugin registry must be an object".to_owned(),
                 });
             }
@@ -366,14 +309,12 @@ impl PluginRegistry {
                 out
             })
             .unwrap_or_default();
-        // Foreign keys are all except schema_version and plugins
         let mut foreign = Map::new();
         for (k, v) in obj {
             if k != "schema_version" && k != "plugins" {
                 foreign.insert(k, v);
             }
         }
-        // Validate records
         for rec in &records {
             rec.validate()?;
         }
@@ -387,7 +328,6 @@ impl PluginRegistry {
     /// Store registry to disk via transaction, preserving foreign.
     pub fn store(&self) -> Result<()> {
         let file = self.file();
-        // Build new outer
         let mut outer = self.foreign.clone();
         outer.insert(
             "schema_version".to_owned(),
@@ -405,7 +345,6 @@ impl PluginRegistry {
                 reason: format!("serialize failed: {e}"),
             }
         })?;
-        // Transaction
         let parent = file.parent().unwrap_or_else(|| Path::new("."));
         let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
         if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -467,7 +406,6 @@ impl PluginRegistry {
         let existing = self.get(&source.id).cloned();
         let is_update = existing.is_some();
         let mut conflicts: Vec<String> = Vec::new();
-        // Case-fold collision check
         let norm = source.id.normalized();
         for rec in &self.records {
             if rec.id.normalized() == norm && rec.id != source.id {
@@ -477,7 +415,6 @@ impl PluginRegistry {
                 ));
             }
         }
-        // If same id exists with different kind, treat as collision requiring explicit replace
         if let Some(ref ex) = existing {
             if ex.kind != source.kind {
                 conflicts.push(format!(
@@ -485,7 +422,6 @@ impl PluginRegistry {
                     ex.kind, source.kind
                 ));
             }
-            // Same semantic check: if all fields equal, no conflict (no-op)
             if ex.source_locator == source.locator
                 && ex.version == source.version
                 && ex.digest == source.digest
@@ -505,17 +441,16 @@ impl PluginRegistry {
         })
     }
 
-    /// Install a plugin source via registry (file/config safe scope) OR return RequiresApproval for execution kinds.
+    /// Install a plugin source via the registry (file/config safe scope).
     ///
-    /// Validates, inspects existing, detects collisions, stages via transaction, verifies.
-    /// For `NpmRef`/`MarketplaceRecord` with `requires_execution=true`, returns `RequiresApproval` instead of executing.
+    /// Kinds that would need package-installer execution return
+    /// `RequiresApproval` instead of executing.
     pub fn install(
         &mut self,
         source: &PluginSource,
         decl: Option<&PluginAdapterDecl>,
     ) -> Result<PluginRecord> {
         source.validate()?;
-        // Safe-scope gate: if decl requires execution and source kind needs it, return RequiresApproval
         let needs_execution = matches!(
             source.kind,
             PluginKind::NpmRef | PluginKind::MarketplaceRecord
@@ -532,7 +467,6 @@ impl PluginRegistry {
                 });
             }
         } else if needs_execution {
-            // No decl provided but kind needs execution -> still requires approval per safe scope
             return Err(CoreError::RequiresApproval {
                 plugin: source.id.to_string(),
                 operation: "install".to_owned(),
@@ -551,7 +485,6 @@ impl PluginRegistry {
                 reason: preview.conflicts.join("; "),
             });
         }
-        // No-op if same semantic exists
         if let Some(ref ex) = preview.existing {
             if ex.source_locator == source.locator
                 && ex.version == source.version
@@ -562,9 +495,6 @@ impl PluginRegistry {
             }
         }
 
-        // For DirectoryBundle/ConfigEntry we could also validate that source locator exists if it's a path
-        // For DirectoryBundle, locator should be a directory; for ConfigEntry, it's a config key or file path?
-        // We'll validate existence only for DirectoryBundle when locator looks like a path and file exists.
         if matches!(source.kind, PluginKind::DirectoryBundle)
             && Path::new(&source.locator).is_absolute()
         {
@@ -595,7 +525,6 @@ impl PluginRegistry {
             staged_files: None,
         };
         record.validate()?;
-        // Insert or replace
         if let Some(pos) = self.records.iter().position(|r| r.id == source.id) {
             if let Some(slot) = self.records.get_mut(pos) {
                 *slot = record.clone();
@@ -603,7 +532,6 @@ impl PluginRegistry {
         } else {
             self.records.push(record.clone());
         }
-        // Sort for determinism
         self.records
             .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         self.store()?;
@@ -618,9 +546,8 @@ impl PluginRegistry {
 
     /// Remove an owned plugin entry and report shared-dependency retention
     /// (EXT-06/07: a shared package dependency is not removed until no
-    /// consumer remains — the removal outcome names every dependency key
-    /// still referenced by other installed plugins, so callers surface the
-    /// retention instead of guessing).
+    /// consumer remains; the outcome names every dependency key still
+    /// referenced by other installed plugins).
     pub fn remove_with_report(&mut self, id: &PluginId) -> Result<Option<PluginRemoval>> {
         let idx = match self.records.iter().position(|r| &r.id == id) {
             Some(i) => i,
@@ -714,8 +641,8 @@ pub struct PluginInstallPreview {
 }
 
 /// Outcome of a plugin removal (EXT-06/07): the removed record plus every
-/// shared dependency key still referenced by other installed plugins —
-/// those dependencies are retained, not removed.
+/// shared dependency key still referenced by other installed plugins (those
+/// dependencies are retained, not removed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRemoval {
     /// The removed record.
@@ -723,10 +650,6 @@ pub struct PluginRemoval {
     /// Shared dependency keys retained because consumers remain.
     pub retained_shared_deps: Vec<String>,
 }
-
-// ---------------------------------------------------------------------------
-// DirectoryBundle staging (EXT-07)
-// ---------------------------------------------------------------------------
 
 /// Maximum number of files staged from one plugin bundle.
 const MAX_BUNDLE_FILES: usize = 512;
@@ -744,8 +667,8 @@ struct BundleFile {
 }
 
 /// Read every regular file under `source_dir` (bounded; symlinks and special
-/// files refused — bundle content is untrusted and must not escape the
-/// destination through links).
+/// files refused: bundle content must not escape the destination through
+/// links).
 fn read_bundle_files(source_dir: &Path) -> Result<Vec<BundleFile>> {
     fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<BundleFile>) -> Result<()> {
         if depth > MAX_BUNDLE_DEPTH {
@@ -847,20 +770,12 @@ fn bundle_digest(files: &[BundleFile]) -> String {
 }
 
 /// Stage a DirectoryBundle plugin's files into the adapter-declared
-/// destination through a compensated transaction (EXT-07 steps 4-7):
-///
-/// - source identity/version/digest validated (declared digest verified
-///   against the staged content);
-/// - existing destination inspected: a foreign bundle (no registry record
-///   for the id) is refused with `ForeignOwnership`, an owned bundle is
-///   backed up and replaced;
-/// - every file written atomically with read-back verification; bundle
-///   bytes are opaque — nothing is parsed or executed;
-/// - harness discovery verified post-install when the adapter declares a
-///   discovery manifest.
-///
-/// Returns the registry record (already persisted) with the staged file
-/// list attached.
+/// destination through a compensated transaction (EXT-07). The declared
+/// digest is verified against the staged content; a foreign bundle at the
+/// destination is refused with `ForeignOwnership`; bundle bytes stay opaque
+/// (nothing is parsed or executed); harness discovery is verified when the
+/// adapter declares a manifest. Returns the persisted registry record with
+/// the staged file list attached.
 pub fn install_directory_bundle(
     registry: &mut PluginRegistry,
     source: &PluginSource,
@@ -912,13 +827,13 @@ pub fn install_directory_bundle(
         });
     }
 
-    // Collision detection (EXT-07 step 3): a destination bundle that exists
-    // without a matching registry record is foreign — refuse, never replace.
+    // A destination bundle without a matching registry record is foreign:
+    // refuse, never replace.
     let dest_root = instance_root.join(dest_dir_name);
     let dest_bundle = dest_root.join(source.id.as_str());
     if dest_bundle.exists() && registry.get(&source.id).is_none() {
         return Err(CoreError::ForeignOwnership {
-            path: dest_bundle.clone(),
+            path: dest_bundle,
             owner: "foreign bundle already installed at the destination".to_owned(),
         });
     }
@@ -932,7 +847,6 @@ pub fn install_directory_bundle(
         });
     }
 
-    // Stage: read the bundle, verify the declared digest if any.
     let files = read_bundle_files(source_dir)?;
     let digest = bundle_digest(&files);
     if let Some(declared) = &source.digest
@@ -945,10 +859,8 @@ pub fn install_directory_bundle(
         });
     }
 
-    // Harness-discovery pre-check (EXT-07 step 6, fail-fast leg): where the
-    // adapter declares a required manifest, a source bundle that does not
-    // even contain it can never be discovered — refuse BEFORE anything is
-    // staged, so nothing lands on disk and no cleanup is needed.
+    // Fail-fast: a source bundle missing the required manifest can never
+    // be discovered, so refuse before anything is staged.
     if let Some(manifest) = decl.discovery_manifest.as_deref()
         && !files.iter().any(|f| f.rel_path == manifest)
     {
@@ -959,8 +871,7 @@ pub fn install_directory_bundle(
         });
     }
 
-    // Commit through the transaction: foreign destinations are backed up by
-    // the Write actions themselves.
+    // The Write actions back up any foreign destination content themselves.
     let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
     steps.push(superai_config::transaction::FileAction::CreateDir {
         path: dest_bundle.clone(),
@@ -972,8 +883,6 @@ pub fn install_directory_bundle(
         steps.push(superai_config::transaction::FileAction::Write {
             path: target,
             content: file.bytes.clone(),
-            // Bundle payloads are opaque: parsed by nothing, executed by
-            // nothing (EXT-06 safe scope).
             kind: superai_config::document::DocumentKind::Opaque,
         });
         staged_rel.push(rel_in_instance);
@@ -1002,7 +911,7 @@ pub fn install_directory_bundle(
     })?;
     if !outcome.success {
         return Err(CoreError::Commit {
-            path: dest_bundle.clone(),
+            path: dest_bundle,
             reason: format!(
                 "bundle staging failed: {}",
                 outcome.diagnostics_redacted.join("; ")
@@ -1010,13 +919,9 @@ pub fn install_directory_bundle(
         });
     }
 
-    // Harness-discovery verification (EXT-07 step 6): where the adapter
-    // declares a required manifest, the harness cannot discover the plugin
-    // without it — a staged bundle missing it is a failed install. This runs
-    // BEFORE any cleanup: on failure the staged files and the prepare-phase
-    // recovery backups are still in place, and the error names both so the
-    // caller can recover instead of guessing (recovery backups live beside
-    // the staged files as `<name>.bak.<millis>.<suffix>`).
+    // Discovery verification runs before cleanup: on failure the staged
+    // files and the prepare-phase recovery backups (beside the staged files
+    // as `<name>.bak.<millis>.<suffix>`) are left in place for recovery.
     if let Some(manifest) = decl.discovery_manifest.as_deref()
         && !dest_bundle.join(manifest).is_file()
     {
@@ -1055,11 +960,9 @@ pub fn install_directory_bundle(
         }
     }
 
-    // A re-stage over owned files leaves prepare-phase backups of the old
-    // superai-owned content inside the harness plugin directory. Only now —
-    // with discovery verification and read-back complete — are they dead
-    // weight; remove them so the harness sees a clean directory. Every
-    // earlier failure path deliberately retains them for recovery.
+    // Backups of the old owned content are dead weight only now, after
+    // discovery and read-back verification; every earlier failure path
+    // retains them for recovery.
     if let Some(commit) = &outcome.commit {
         for backup in &commit.backups {
             let path = backup.backup_path.as_path();
@@ -1149,18 +1052,15 @@ pub fn remove_directory_bundle(
         })?;
         if !outcome.success {
             return Err(CoreError::Commit {
-                path: bundle_dir.clone(),
+                path: bundle_dir,
                 reason: format!(
                     "bundle removal failed: {}",
                     outcome.diagnostics_redacted.join("; ")
                 ),
             });
         }
-        // The prepare phase backs up every existing target — including the
-        // superai-owned files being removed. Once the removal is verified
-        // successful those recovery backups are dead weight inside the
-        // harness plugin directory; remove them so discovery sees a clean
-        // uninstall.
+        // The removal's prepare-phase backups are dead weight once the
+        // removal verified; remove them so discovery sees a clean uninstall.
         if let Some(commit) = &outcome.commit {
             for backup in &commit.backups {
                 let path = backup.backup_path.as_path();
@@ -1174,9 +1074,8 @@ pub fn remove_directory_bundle(
                 }
             }
         }
-        // Prune now-empty owned directories deepest-first. `remove_dir`
-        // only succeeds on empty directories, so foreign content inside the
-        // bundle keeps its directories by construction.
+        // `remove_dir` only succeeds on empty directories, so foreign
+        // content keeps its directories by construction.
         let mut owned_dirs: Vec<PathBuf> = record
             .staged_files
             .as_deref()
@@ -1202,8 +1101,8 @@ pub fn remove_directory_bundle(
 }
 
 /// Enable or disable an installed plugin with per-adapter enforcement
-/// (EXT-06): config-entry plugins toggle their destination entry
-/// (disable removes the entry, enable re-adds it — reversible); directory
+/// (EXT-06): config-entry plugins toggle their destination entry (disable
+/// removes the entry, enable re-adds it); directory
 /// bundles toggle their staged files the same way. The registry record's
 /// enabled flag is the superai-owned source of truth either way.
 pub fn set_plugin_enabled(
@@ -1273,10 +1172,6 @@ pub fn set_plugin_enabled(
     }
     Ok(registry.get(&source.id).cloned().unwrap_or(record))
 }
-
-// ---------------------------------------------------------------------------
-// Config-entry plugin helpers (preserve foreign entries in destination config)
-// ---------------------------------------------------------------------------
 
 /// Read a JSON config file at `path` fresh, returning outer map and inner plugin map under `key`.
 ///
@@ -1411,15 +1306,13 @@ pub fn install_config_entry(
         });
     }
     let (outer, mut inner) = read_outer_and_inner_json(dest_path, dest_key)?;
+    let new_val = serde_json::json!({
+        "version": source.version,
+        "digest": source.digest,
+        "locator": source.locator,
+    });
     if let Some(existing) = inner.get(source.id.as_str()) {
-        // Detect collision: if existing differs, report; if same, no-op
-        let existing_val = existing.clone();
-        let new_val = serde_json::json!({
-            "version": source.version,
-            "digest": source.digest,
-            "locator": source.locator,
-        });
-        if existing_val != new_val {
+        if *existing != new_val {
             return Err(CoreError::NameCollision {
                 kind: "PluginId".to_owned(),
                 name: source.id.to_string(),
@@ -1428,15 +1321,9 @@ pub fn install_config_entry(
                     source.id
                 ),
             });
-        } else {
-            return Ok(existing_val);
         }
+        return Ok(existing.clone());
     }
-    let new_val = serde_json::json!({
-        "version": source.version,
-        "digest": source.digest,
-        "locator": source.locator,
-    });
     inner.insert(source.id.to_string(), new_val.clone());
     write_outer_with_inner_json(dest_path, dest_key, &outer, &inner)?;
     Ok(new_val)
@@ -1456,10 +1343,6 @@ pub fn remove_config_entry(
     write_outer_with_inner_json(dest_path, dest_key, &outer, &inner)?;
     Ok(removed)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1612,9 +1495,7 @@ mod tests {
         let mut val: Value = serde_json::from_slice(&bytes).unwrap();
         let obj = val.as_object_mut().unwrap();
         obj.insert("foreignKey".to_owned(), Value::String("keep-me".to_owned()));
-        // Also inject a foreign plugin entry that is not owned? Actually plugins array only contains owned; foreign plugin would be preserved via foreign map? We'll test foreign top-level.
         std::fs::write(&file, serde_json::to_vec_pretty(&val).unwrap()).unwrap();
-        // Reload to capture foreign
         let mut reg2 = PluginRegistry::load(&root).unwrap();
         assert_eq!(
             reg2.foreign.get("foreignKey").and_then(|v| v.as_str()),
@@ -1696,8 +1577,7 @@ mod tests {
             PluginKind::ConfigEntry,
             RestartBehavior::None,
         );
-        // Simulate two plugins that would share a package (though ConfigEntry doesn't have shared dep, we use dependency_key)
-        // We'll directly test the dependency_key logic via registry internals: create two records with same dependency_key
+        // Two records sharing one dependency_key exercise the retention logic.
         let rec1 = PluginRecord {
             id: PluginId::new("plug-a").unwrap(),
             kind: PluginKind::ConfigEntry,
@@ -1784,7 +1664,7 @@ mod tests {
             kind: PluginKind::DirectoryBundle,
             version: Some("1.2.3".to_owned()),
             digest: Some("b".repeat(64)),
-            source_locator: tmp_root.clone(),
+            source_locator: tmp_root,
             installed_at: now_iso8601(),
             enabled: true,
             dependency_key: None,
@@ -1795,10 +1675,6 @@ mod tests {
         let back2: PluginRecord = serde_json::from_str(&json2).unwrap();
         assert_eq!(rec, back2);
     }
-
-    // -------------------------------------------------------------------
-    // EXT-07 DirectoryBundle staging
-    // -------------------------------------------------------------------
 
     fn make_bundle(dir: &Path, manifest: bool) {
         std::fs::create_dir_all(dir.join("skills")).unwrap();
@@ -1956,8 +1832,8 @@ mod tests {
             }
             other => panic!("expected discovery Verification, got {other:?}"),
         }
-        // No registry record for a failed install, and (fail-fast pre-check)
-        // nothing staged on disk either — no cleanup needed.
+        // No registry record for a failed install, and nothing staged on
+        // disk either (fail-fast pre-check).
         assert!(reg.get(&PluginId::new("manifestless").unwrap()).is_none());
         assert!(
             !instance_root.join("plugins").join("manifestless").exists(),
@@ -1968,12 +1844,9 @@ mod tests {
 
     #[test]
     fn restage_over_owned_install_cleans_backups_only_after_verification() {
-        // FINDING-2 (round 1): backup cleanup is ordered AFTER the
-        // harness-discovery verification and the read-back verify. A
-        // successful re-stage over an owned install creates prepare-phase
-        // backups of the old owned files (the Write targets exist); the
-        // cleaned-up end state proves cleanup ran — and only ran — once
-        // verification completed.
+        // Backup cleanup is ordered after discovery verification and the
+        // read-back verify; the cleaned-up end state proves cleanup ran only
+        // once verification completed.
         let home = tmp_root("bundle-restage");
         let instance_root = home.join("instance");
         let source_dir = home.join("bundle-src");
