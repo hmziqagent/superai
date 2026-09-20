@@ -181,7 +181,8 @@ mod tests {
             content_digest: "abc".to_owned(),
         });
         let plan = crate::wrapper::plan_wrapper_for_instance(&inst2, None);
-        let (content_wrapper, digest) = crate::wrapper::generate_shell_wrapper(&inst2, &plan);
+        let (content_wrapper, digest) =
+            crate::wrapper::generate_shell_wrapper(&inst2, &plan).unwrap();
         assert!(
             !content_wrapper.contains(SENTINEL),
             "wrapper must not contain sentinel"
@@ -343,11 +344,12 @@ mod tests {
         let mut plan = crate::wrapper::plan_wrapper_for_instance(&inst, None);
         plan.env_vars
             .push(("API_KEY".to_owned(), SENTINEL.to_owned()));
-        let (content, _) = crate::wrapper::generate_shell_wrapper(&inst, &plan);
+        let (content, _) = crate::wrapper::generate_shell_wrapper(&inst, &plan).unwrap();
         let (clean_content, _) = crate::wrapper::generate_shell_wrapper(
             &inst,
             &crate::wrapper::plan_wrapper_for_instance(&inst, None),
-        );
+        )
+        .unwrap();
         assert!(
             !clean_content.contains(SENTINEL),
             "clean wrapper must not contain sentinel"

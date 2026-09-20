@@ -599,8 +599,11 @@ mod tests {
                     }
                 };
                 let plan = crate::wrapper::plan_wrapper_for_instance(&dummy_instance, None);
-                let (generated, digest) =
-                    crate::wrapper::generate_shell_wrapper(&dummy_instance, &plan);
+                let Ok((generated, digest)) =
+                    crate::wrapper::generate_shell_wrapper(&dummy_instance, &plan)
+                else {
+                    continue;
+                };
                 assert!(!generated.contains(SENTINEL));
                 assert!(!digest.contains(SENTINEL));
                 assert!(

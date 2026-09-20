@@ -889,7 +889,7 @@ pub fn create_alias(
             e,
         ));
     }
-    let (wrapper_content, _) = crate::wrapper::generate_shell_wrapper(&instance, &plan);
+    let (wrapper_content, _) = crate::wrapper::generate_shell_wrapper(&instance, &plan)?;
     let wrapper_ref = match generate_alias_wrapper(&instance, &plan, wrapper) {
         Ok(wrapper_ref) => wrapper_ref,
         Err(e) => {
@@ -1255,7 +1255,7 @@ fn generate_alias_wrapper(
     let Some(path) = wrapper else {
         return Ok(None);
     };
-    let (content, digest) = wrapper_helper::generate_shell_wrapper(instance, plan);
+    let (content, digest) = wrapper_helper::generate_shell_wrapper(instance, plan)?;
     wrapper_helper::write_wrapper(path, &content)?;
     Ok(Some(WrapperRef {
         path: path.clone(),
@@ -1395,7 +1395,7 @@ pub fn launch_composition(
         compose_provider_env(harness, &record.root, provider_secrets, &mut warnings)?;
     let env = overlay_env(plan.env_vars.clone(), overlay);
     refuse_path_override(&env)?;
-    let (script, _digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan);
+    let (script, _digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan)?;
     Ok(LaunchComposition {
         argv,
         env,

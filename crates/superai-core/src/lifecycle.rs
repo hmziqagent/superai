@@ -2686,7 +2686,7 @@ fn isolate_and_configure(
             adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
         };
         let plan = wrapper_plan_for(&instance, adapter);
-        let (content, _digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan);
+        let (content, _digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan)?;
         steps.push(FileAction::Write {
             path: wrapper_path.as_path().to_path_buf(),
             content: content.into_bytes(),
@@ -3338,7 +3338,7 @@ pub fn rename_instance(
             // verbatim byte move would read as WrapperDrift on the next
             // repair scan. Regenerate through the wrapper writer (marker +
             // digest under the new name, atomic, moved bytes backed up).
-            let (content, _) = expected_wrapper_for(&removed, adapter);
+            let (content, _) = expected_wrapper_for(&removed, adapter)?;
             if let Some(wrapper_ref) = &mut removed.wrapper {
                 wrapper_ref.path = new_wrapper_path;
                 wrapper_ref.command_name = new_name.clone();
@@ -5163,7 +5163,7 @@ pub struct RepairItem {
 
 /// The wrapper content and digest a repair would regenerate for `instance`:
 /// the adapter's plan when it provides one, else the generic env-var plan.
-fn expected_wrapper_for(instance: &Instance, adapter: &dyn Adapter) -> (String, String) {
+fn expected_wrapper_for(instance: &Instance, adapter: &dyn Adapter) -> Result<(String, String)> {
     let plan = wrapper_plan_for(instance, adapter);
     wrapper_helper::generate_shell_wrapper(instance, &plan)
 }
@@ -5212,7 +5212,24 @@ pub fn detect_repairs_with_home(
             let wrapper_path = wrapper.path.as_path();
             if wrapper_path.exists() {
                 let content = std::fs::read_to_string(wrapper_path).unwrap_or_default();
-                let (expected_content, _) = expected_wrapper_for(inst, adapter);
+                let expected_content = match expected_wrapper_for(inst, adapter) {
+                    Ok((content, _)) => content,
+                    // A record whose plan cannot regenerate is surfaced as
+                    // drift with the reason, never silently skipped.
+                    Err(e) => {
+                        items.push(RepairItem {
+                            instance: inst.id.clone(),
+                            name: inst.name.clone(),
+                            kind: RepairKind::WrapperDrift,
+                            description: format!(
+                                "wrapper regeneration failed for {}: {e}",
+                                inst.name
+                            ),
+                            requires_adoption: false,
+                        });
+                        continue;
+                    }
+                };
                 // Full-content comparison: any byte difference from the
                 // deterministic regeneration is drift, even when a digest
                 // substring survives inside an edited file.
@@ -5452,7 +5469,7 @@ pub fn preview_repair(
             RepairKind::MissingWrapper | RepairKind::WrapperDrift
         ) && let Some(wrapper) = &instance.wrapper
         {
-            let (expected_content, _) = expected_wrapper_for(instance, adapter);
+            let (expected_content, _) = expected_wrapper_for(instance, adapter)?;
             let actual_content =
                 std::fs::read_to_string(wrapper.path.as_path()).unwrap_or_default();
             diffs.push(RedactedDiff {
@@ -5560,7 +5577,7 @@ pub fn repair(
             RepairKind::MissingWrapper | RepairKind::WrapperDrift => {
                 if let Some(wrapper) = &instance.wrapper {
                     let wrapper_path = wrapper.path.as_path();
-                    let (content, new_digest) = expected_wrapper_for(&instance, adapter);
+                    let (content, new_digest) = expected_wrapper_for(&instance, adapter)?;
                     // write_wrapper refuses foreign files (WRP-08)
                     wrapper_helper::write_wrapper(&wrapper.path, &content)?;
                     let mut updated = instance.clone();
@@ -5981,7 +5998,7 @@ pub fn adopt_with_wrapper(
             reason: "adopted record missing before wrapper creation".to_owned(),
         })?;
     let plan = wrapper_plan_for(&instance, adapter);
-    let (content, digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan);
+    let (content, digest) = wrapper_helper::generate_shell_wrapper(&instance, &plan)?;
     if let Err(e) = wrapper_helper::write_wrapper(wrapper_path, &content) {
         // Roll the record back: adoption without its wrapper is not a
         // half-state the user asked for.
@@ -7778,7 +7795,7 @@ mod tests {
                 ));
                 p
             });
-        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan).unwrap();
 
         let owned = tmp.join("owned-cli");
         std::fs::write(&owned, &content).unwrap();
@@ -7850,7 +7867,7 @@ mod tests {
                 ));
                 p
             });
-        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan).unwrap();
         std::fs::write(&wrapper_path, &content).unwrap();
         inst.wrapper = Some(WrapperRef {
             path: WrapperPath::from_path(&wrapper_path).unwrap(),
@@ -8964,7 +8981,7 @@ mod tests {
             crate::wrapper::env_var_for_harness(&harness),
             root.display().to_string(),
         ));
-        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan).unwrap();
         std::fs::write(bin.join("work"), &content).unwrap();
 
         let mut registry = Registry::load(&registry_path).unwrap();
@@ -9016,7 +9033,7 @@ mod tests {
         // On-disk bytes equal the deterministic regeneration from the record
         // (what detect_repairs compares against); the recorded digest is the
         // marker digest is_owned_wrapper verifies.
-        let (expected_regen, regen_digest) = expected_wrapper_for(renamed, &adapter);
+        let (expected_regen, regen_digest) = expected_wrapper_for(renamed, &adapter).unwrap();
         assert_eq!(
             std::fs::read_to_string(&new_wrapper).unwrap(),
             expected_regen,
@@ -9059,7 +9076,7 @@ mod tests {
             crate::wrapper::env_var_for_harness(&harness),
             root.display().to_string(),
         ));
-        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan).unwrap();
         std::fs::write(bin.join("work"), &content).unwrap();
 
         let mut registry = Registry::load(&registry_path).unwrap();
@@ -9200,7 +9217,7 @@ mod tests {
         let adapter = make_adapter("claude-code");
         let inst = make_instance("work", &root, "claude-code");
         let plan = adapter.plan_wrapper(&inst).unwrap();
-        let (expected, digest) = crate::wrapper::generate_shell_wrapper(&inst, &plan);
+        let (expected, digest) = crate::wrapper::generate_shell_wrapper(&inst, &plan).unwrap();
         // Drifted content: a redacted-looking credential line was added.
         let drifted = expected.replace(
             "set -eu\n",
@@ -9300,7 +9317,7 @@ mod tests {
             crate::wrapper::env_var_for_harness(&HarnessId::new("claude-code").unwrap()),
             orphan_root.display().to_string(),
         ));
-        let (content, digest) = crate::wrapper::generate_shell_wrapper(&orphan, &plan);
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&orphan, &plan).unwrap();
         let wrapper_file = bin.join("orphaned");
         std::fs::write(&wrapper_file, &content).unwrap();
 

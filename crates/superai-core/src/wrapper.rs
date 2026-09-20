@@ -72,6 +72,33 @@ pub fn executable_for_harness(harness: &HarnessId) -> String {
 
 /// Build the wrapper script content deterministically.
 ///
+/// Env keys reach every launcher dialect unquoted (`export KEY=...`,
+/// `unset KEY`, `$env:KEY`, `set "KEY=..."`); only identifier-shaped keys
+/// can never inject, so generation refuses the rest (the same rule the
+/// template boundary applies to `wrapper_env` keys).
+fn env_key_is_identifier(key: &str) -> bool {
+    key.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// First plan env key (set or unset) that is not identifier-shaped.
+fn first_invalid_env_key(plan: &WrapperPlan) -> Option<&str> {
+    plan.env_vars
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .chain(plan.env_unset.iter().map(String::as_str))
+        .find(|k| !env_key_is_identifier(k))
+}
+
+fn invalid_env_key_error(key: &str) -> CoreError {
+    CoreError::Validation {
+        field: "wrapper_env".to_owned(),
+        reason: format!("env key must be an identifier ([A-Za-z_][A-Za-z0-9_]*): `{key}`"),
+    }
+}
+
 /// The script:
 /// - starts with `#!/bin/sh`
 /// - contains a marker comment with instance id, name, harness, generator, digest placeholder
@@ -82,7 +109,7 @@ pub fn executable_for_harness(harness: &HarnessId) -> String {
 /// - execs the binary with plan args and `"$@"`
 ///
 /// Returns `(content, digest)` where digest is hex of the final content.
-pub fn generate_shell_wrapper(instance: &Instance, plan: &WrapperPlan) -> (String, String) {
+pub fn generate_shell_wrapper(instance: &Instance, plan: &WrapperPlan) -> Result<(String, String)> {
     generate_shell_wrapper_with_version(instance, plan, GENERATOR_VERSION)
 }
 
@@ -120,7 +147,10 @@ pub fn generate_shell_wrapper_with_version(
     instance: &Instance,
     plan: &WrapperPlan,
     generator_version: &str,
-) -> (String, String) {
+) -> Result<(String, String)> {
+    if let Some(key) = first_invalid_env_key(plan) {
+        return Err(invalid_env_key_error(key));
+    }
     let binary_name = plan_executable(instance, plan);
 
     let mut lines: Vec<String> = vec!["#!/bin/sh".to_owned()];
@@ -144,7 +174,7 @@ pub fn generate_shell_wrapper_with_version(
     }
     exec_parts.push("\"$@\"".to_owned());
     lines.push(exec_parts.join(" "));
-    finalize_digest(&lines)
+    Ok(finalize_digest(&lines))
 }
 
 /// Quote a value for PowerShell single-quoted strings (`'` doubles to `''`).
@@ -164,7 +194,10 @@ pub fn powershell_quote(value: &str) -> String {
 /// remaining arguments. PowerShell has no `exec` replacement, so the
 /// launcher runs the harness in the foreground and propagates its exit code
 /// with `exit $LASTEXITCODE`.
-pub fn generate_powershell_wrapper(instance: &Instance, plan: &WrapperPlan) -> (String, String) {
+pub fn generate_powershell_wrapper(
+    instance: &Instance,
+    plan: &WrapperPlan,
+) -> Result<(String, String)> {
     generate_powershell_wrapper_with_version(instance, plan, GENERATOR_VERSION)
 }
 
@@ -173,7 +206,10 @@ pub fn generate_powershell_wrapper_with_version(
     instance: &Instance,
     plan: &WrapperPlan,
     generator_version: &str,
-) -> (String, String) {
+) -> Result<(String, String)> {
+    if let Some(key) = first_invalid_env_key(plan) {
+        return Err(invalid_env_key_error(key));
+    }
     let binary = plan_executable(instance, plan);
     let mut lines: Vec<String> = vec![
         marker_line(instance, generator_version),
@@ -196,7 +232,7 @@ pub fn generate_powershell_wrapper_with_version(
     invoke.push("@args".to_owned());
     lines.push(invoke.join(" "));
     lines.push("exit $LASTEXITCODE".to_owned());
-    finalize_digest(&lines)
+    Ok(finalize_digest(&lines))
 }
 
 /// Quote a value for cmd.exe (`"` doubles; `%` is escaped with `%%` so a
@@ -218,7 +254,7 @@ fn cmd_env_value(value: &str) -> String {
 /// UNSET via `set "VAR="`, then run the executable with plan args and
 /// forward `%*`. `cmd` runs the child attached to the same console; there
 /// is no replacement semantic to claim.
-pub fn generate_cmd_wrapper(instance: &Instance, plan: &WrapperPlan) -> (String, String) {
+pub fn generate_cmd_wrapper(instance: &Instance, plan: &WrapperPlan) -> Result<(String, String)> {
     generate_cmd_wrapper_with_version(instance, plan, GENERATOR_VERSION)
 }
 
@@ -227,7 +263,10 @@ pub fn generate_cmd_wrapper_with_version(
     instance: &Instance,
     plan: &WrapperPlan,
     generator_version: &str,
-) -> (String, String) {
+) -> Result<(String, String)> {
+    if let Some(key) = first_invalid_env_key(plan) {
+        return Err(invalid_env_key_error(key));
+    }
     let binary = plan_executable(instance, plan);
     let mut lines: Vec<String> = vec![
         "@echo off".to_owned(),
@@ -246,7 +285,7 @@ pub fn generate_cmd_wrapper_with_version(
     }
     run.push("%*".to_owned());
     lines.push(run.join(" "));
-    finalize_digest(&lines)
+    Ok(finalize_digest(&lines))
 }
 
 /// Plan a wrapper for an instance via its adapter when possible, otherwise
@@ -1028,7 +1067,7 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
         });
     }
     // Verify digest
-    let (expected_content, expected_digest) = generate_shell_wrapper(instance, plan);
+    let (expected_content, expected_digest) = generate_shell_wrapper(instance, plan)?;
     let actual_digest = parsed
         .digest
         .clone()
@@ -1238,8 +1277,12 @@ pub struct IsolationEvidence {
 /// [`IsolationVerdict::Constrained`] whenever the plan declares shared
 /// state that no wrapper can split (keychain/subscription/cloud).
 pub fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationEvidence {
-    let (content, _) = generate_shell_wrapper(instance, plan);
-    let parsed = parse_wrapper_content(&content);
+    // A plan whose keys cannot generate degrades like an unparseable
+    // wrapper: nothing verifies, so the verdict is honestly Constrained.
+    let generated = generate_shell_wrapper(instance, plan).ok();
+    let parsed = generated
+        .as_ref()
+        .and_then(|(content, _)| parse_wrapper_content(content));
     let mut verified: Vec<String> = Vec::new();
     for (key, value) in &plan.env_vars {
         let present = parsed
@@ -1258,7 +1301,10 @@ pub fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationE
         }
     }
     for arg in &plan.args {
-        if content.contains(arg) {
+        if generated
+            .as_ref()
+            .is_some_and(|(content, _)| content.contains(arg))
+        {
             verified.push(format!("arg {arg}"));
         }
     }
@@ -1307,8 +1353,8 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content1, digest1) = generate_shell_wrapper(&inst, &plan);
-        let (content2, digest2) = generate_shell_wrapper(&inst, &plan);
+        let (content1, digest1) = generate_shell_wrapper(&inst, &plan).unwrap();
+        let (content2, digest2) = generate_shell_wrapper(&inst, &plan).unwrap();
         assert_eq!(content1, content2);
         assert_eq!(digest1, digest2);
         assert!(content1.starts_with("#!/bin/sh\n"));
@@ -1331,7 +1377,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         // Value with space and $ must be single-quoted, not expanded
         assert!(content.contains(&format!("'{root}'")));
         // Ensure no unquoted export
@@ -1348,7 +1394,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         let written_digest = write_wrapper(&wrapper_path, &content).unwrap();
         assert_eq!(written_digest, digest);
         let read_back = std::fs::read_to_string(wrapper_path.as_path()).unwrap();
@@ -1374,7 +1420,7 @@ mod tests {
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
         // Simulate secret not in plan
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         let secret = "super-secret-sentinel-xyz";
         assert!(!content.contains(secret));
         assert!(!content.contains("sk-"));
@@ -1402,7 +1448,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         let wrapper_path_str = dir.join("detect-wrapper").to_string_lossy().into_owned();
         let wrapper_path = WrapperPath::new(&wrapper_path_str).unwrap();
         let _ = write_wrapper(&wrapper_path, &content).unwrap();
@@ -1516,7 +1562,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         // Tricky chars must be quoted safely (single-quoted, dollar not expanded)
         assert!(content.contains(&format!("'{tricky_prefix}")));
         assert!(content.contains("$dollar"));
@@ -1540,7 +1586,7 @@ mod tests {
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
         plan.env_unset.push("ANTHROPIC_API_KEY".to_owned());
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         assert!(
             content.contains("\nunset ANTHROPIC_API_KEY\n"),
             "wrapper must unset declared vars: {content}"
@@ -1558,7 +1604,7 @@ mod tests {
         // A wrapper missing the unset fails verification.
         let mut stripped_plan = plan.clone();
         stripped_plan.env_unset.clear();
-        let (stripped_content, _) = generate_shell_wrapper(&inst, &stripped_plan);
+        let (stripped_content, _) = generate_shell_wrapper(&inst, &stripped_plan).unwrap();
         std::fs::write(path.as_path(), &stripped_content).unwrap();
         match verify_wrapper(path.as_path(), &inst, &plan) {
             Err(e) => assert!(e.to_string().contains("unset"), "{e}"),
@@ -1567,9 +1613,70 @@ mod tests {
     }
 
     /// WRP-02: PowerShell and cmd launchers are deterministic, carry the same
-    /// marker/digest discipline, quote per dialect, unset env, forward args,
-    /// and never embed a secret. Content assertions run on every platform,
-    /// the goldens are strings.
+    /// Env keys (set or unset) reach every dialect unquoted; a
+    /// non-identifier key is refused for all three generators instead of
+    /// being embedded.
+    #[test]
+    fn generators_refuse_non_identifier_env_keys_in_every_dialect() {
+        for hostile in [
+            "X; rm -rf",
+            "A$(cmd)",
+            "1LEADS_WITH_DIGIT",
+            "HAS-DASH",
+            "SP ACE",
+        ] {
+            let inst = sample_instance_with_root("/tmp/wrapper-keys");
+            let mut set_plan = WrapperPlan::new("test");
+            set_plan
+                .env_vars
+                .push((hostile.to_owned(), "value".to_owned()));
+            for err in [
+                generate_shell_wrapper(&inst, &set_plan).unwrap_err(),
+                generate_powershell_wrapper(&inst, &set_plan).unwrap_err(),
+                generate_cmd_wrapper(&inst, &set_plan).unwrap_err(),
+            ] {
+                assert!(err.to_string().contains("identifier"), "{hostile}: {err}");
+            }
+            let mut unset_plan = WrapperPlan::new("test");
+            unset_plan.env_unset.push(hostile.to_owned());
+            let err = generate_shell_wrapper(&inst, &unset_plan).unwrap_err();
+            assert!(err.to_string().contains("identifier"), "{hostile}: {err}");
+        }
+    }
+
+    /// Values are embedded with per-dialect escaping: POSIX single quotes
+    /// (with `'''` for an embedded quote), PowerShell quote doubling, and
+    /// cmd `"`/`%` doubling inside `set "VAR=..."`.
+    #[test]
+    fn env_values_are_escaped_per_dialect() {
+        let inst = sample_instance_with_root("/tmp/wrapper-values");
+        let tricky = "it's 100% \"quoted\"";
+        let mut plan = WrapperPlan::new("test");
+        plan.env_vars.push(("NOTE".to_owned(), tricky.to_owned()));
+
+        let (sh, _) = generate_shell_wrapper(&inst, &plan).unwrap();
+        assert!(
+            sh.contains(&format!("export NOTE={}", shell_quote(tricky))),
+            "shell line must carry the safely quoted value: {sh}"
+        );
+        assert!(!sh.contains("export NOTE=it's"), "raw value leaked: {sh}");
+
+        let (ps, _) = generate_powershell_wrapper(&inst, &plan).unwrap();
+        assert!(
+            ps.contains(&format!("$env:NOTE = {}", powershell_quote(tricky))),
+            "powershell line must double the quote: {ps}"
+        );
+
+        let (cmd, _) = generate_cmd_wrapper(&inst, &plan).unwrap();
+        let expected_inner = tricky.replace('"', "\"\"").replace('%', "%%");
+        assert!(
+            cmd.contains(&format!("set \"NOTE={expected_inner}\"")),
+            "cmd line must double quotes and percent: {cmd}"
+        );
+    }
+
+    /// PowerShell and cmd launchers keep the same marker/digest discipline,
+    /// quote per dialect, unset env, forward args, and never embed a secret.
     #[test]
     fn powershell_and_cmd_golden_launchers() {
         let tmp_root = crate::test_util::tmp_abs_str("my claude work");
@@ -1580,8 +1687,8 @@ mod tests {
         plan.env_unset.push("ANTHROPIC_API_KEY".to_owned());
         plan.args.push("--settings".to_owned());
 
-        let (ps1, ps1_digest) = generate_powershell_wrapper(&inst, &plan);
-        let (ps1_again, ps1_digest2) = generate_powershell_wrapper(&inst, &plan);
+        let (ps1, ps1_digest) = generate_powershell_wrapper(&inst, &plan).unwrap();
+        let (ps1_again, ps1_digest2) = generate_powershell_wrapper(&inst, &plan).unwrap();
         assert_eq!(ps1, ps1_again, "deterministic");
         assert_eq!(ps1_digest, ps1_digest2);
         assert!(ps1.contains("superai wrapper"), "marker present");
@@ -1602,8 +1709,8 @@ mod tests {
         assert!(ps1.contains("exit $LASTEXITCODE"));
         assert!(!ps1.contains("sk-"));
 
-        let (cmd, cmd_digest) = generate_cmd_wrapper(&inst, &plan);
-        let (cmd_again, cmd_digest2) = generate_cmd_wrapper(&inst, &plan);
+        let (cmd, cmd_digest) = generate_cmd_wrapper(&inst, &plan).unwrap();
+        let (cmd_again, cmd_digest2) = generate_cmd_wrapper(&inst, &plan).unwrap();
         assert_eq!(cmd, cmd_again);
         assert_eq!(cmd_digest, cmd_digest2);
         assert!(cmd.starts_with("@echo off"));
@@ -1629,7 +1736,7 @@ mod tests {
         plan2
             .env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tricky.clone()));
-        let (ps2, _) = generate_powershell_wrapper(&inst2, &plan2);
+        let (ps2, _) = generate_powershell_wrapper(&inst2, &plan2).unwrap();
         assert!(
             ps2.contains(&format!("'{tricky_prefix}''s here")),
             "PS quote doubling: {ps2}"
@@ -1646,7 +1753,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), hostile.to_owned()));
-        let (cmd, _) = generate_cmd_wrapper(&inst, &plan);
+        let (cmd, _) = generate_cmd_wrapper(&inst, &plan).unwrap();
         assert!(
             cmd.contains("set \"CLAUDE_CONFIG_DIR=a\"\" & del /q C:\\ & rem 100%%\""),
             "value must be escaped in place: {cmd}"
@@ -1677,7 +1784,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
 
         match write_wrapper(&wrapper_path, &content) {
             Err(CoreError::ForeignOwnership { path, .. }) => {
@@ -1710,7 +1817,7 @@ mod tests {
         let mut plan = WrapperPlan::new("test");
         plan.env_vars
             .push(("CLAUDE_CONFIG_DIR".to_owned(), tmp_root));
-        let (content, digest) = generate_shell_wrapper(&inst, &plan);
+        let (content, digest) = generate_shell_wrapper(&inst, &plan).unwrap();
         let real = dir.join("real");
         std::fs::write(&real, &content).unwrap();
         assert!(is_owned_wrapper(&real, Some(&digest)));
@@ -1738,7 +1845,7 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_owned(),
             crate::test_util::tmp_abs_str(".claude-other"),
         ));
-        let (other_content, other_digest) = generate_shell_wrapper(&inst, &other_plan);
+        let (other_content, other_digest) = generate_shell_wrapper(&inst, &other_plan).unwrap();
         assert_ne!(other_digest, digest);
         std::fs::write(&other, other_content).unwrap();
         assert!(!is_owned_wrapper(&other, Some(&digest)));
@@ -1778,7 +1885,7 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_owned(),
             inst_root.to_string_lossy().into_owned(),
         ));
-        let (content, _) = generate_shell_wrapper(&inst, &plan);
+        let (content, _) = generate_shell_wrapper(&inst, &plan).unwrap();
         let wrapper_file = dir.join("work");
         std::fs::write(&wrapper_file, &content).unwrap();
         #[cfg(unix)]
@@ -1919,8 +2026,8 @@ mod tests {
         );
 
         // Both wrappers generate, parse, and verify independently.
-        let (content_a, _) = generate_shell_wrapper(&inst_a, &plan_a);
-        let (content_b, _) = generate_shell_wrapper(&inst_b, &plan_b);
+        let (content_a, _) = generate_shell_wrapper(&inst_a, &plan_a).unwrap();
+        let (content_b, _) = generate_shell_wrapper(&inst_b, &plan_b).unwrap();
         assert_ne!(content_a, content_b);
         let parsed_a = parse_wrapper_content(&content_a).expect("a parses");
         let parsed_b = parse_wrapper_content(&content_b).expect("b parses");

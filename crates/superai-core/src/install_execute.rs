@@ -3140,7 +3140,8 @@ mod tests {
             "docs/harness-configs/codex-cli.md",
         );
         let wrapper_plan = adapter.plan_wrapper(&instance).unwrap();
-        let (content, _) = crate::wrapper::generate_shell_wrapper(&instance, &wrapper_plan);
+        let (content, _) =
+            crate::wrapper::generate_shell_wrapper(&instance, &wrapper_plan).unwrap();
         assert!(
             content.contains(selected.to_str().unwrap_or("")),
             "wrapper must embed the pinned absolute path: {content}"

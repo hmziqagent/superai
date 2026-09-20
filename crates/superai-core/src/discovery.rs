@@ -1820,32 +1820,45 @@ fn pick_primary_category(categories: &[DriftCategory]) -> DriftCategory {
 
 /// Detect duplicate config roots and duplicate wrapper commands among the
 /// registry records (DRF drift categories).
-fn detect_record_duplicates(registry: &Registry) -> Vec<(DriftCategory, RiskLevel, String)> {
-    let mut out: Vec<(DriftCategory, RiskLevel, String)> = Vec::new();
+/// One duplicate-record finding: what collides, how risky it is, the
+/// human description naming both instances, and the path the finding is
+/// attached to (the colliding root or wrapper itself, never an arbitrary
+/// first record's root).
+struct RecordDuplicate {
+    category: DriftCategory,
+    risk: RiskLevel,
+    description: String,
+    subject: PathBuf,
+}
+
+fn detect_record_duplicates(registry: &Registry) -> Vec<RecordDuplicate> {
+    let mut out: Vec<RecordDuplicate> = Vec::new();
     let instances = registry.instances();
     for (i, a) in instances.iter().enumerate() {
         for b in instances.iter().skip(i + 1) {
             if normalize_path(a.config_root.as_path()) == normalize_path(b.config_root.as_path()) {
-                out.push((
-                    DriftCategory::DuplicateRoot,
-                    RiskLevel::High,
-                    format!(
+                out.push(RecordDuplicate {
+                    category: DriftCategory::DuplicateRoot,
+                    risk: RiskLevel::High,
+                    description: format!(
                         "instances {} and {} share config root {}",
                         a.name, b.name, a.config_root
                     ),
-                ));
+                    subject: a.config_root.as_path().to_path_buf(),
+                });
             }
             if let (Some(wa), Some(wb)) = (&a.wrapper, &b.wrapper)
                 && wa.command_name.normalized() == wb.command_name.normalized()
             {
-                out.push((
-                    DriftCategory::DuplicateWrapper,
-                    RiskLevel::High,
-                    format!(
+                out.push(RecordDuplicate {
+                    category: DriftCategory::DuplicateWrapper,
+                    risk: RiskLevel::High,
+                    description: format!(
                         "instances {} and {} share wrapper command {}",
                         a.name, b.name, wa.command_name
                     ),
-                ));
+                    subject: wa.path.as_path().to_path_buf(),
+                });
             }
         }
     }
@@ -1938,19 +1951,15 @@ pub fn drift_report_with_options(
         }
     }
 
-    // Duplicate records (DRF drift categories).
-    let duplicates = detect_record_duplicates(registry);
-    for (category, risk, description) in &duplicates {
-        let target = registry.instances().first().map_or_else(
-            || home.to_path_buf(),
-            |i| i.config_root.as_path().to_path_buf(),
-        );
+    // Duplicate records (DRF drift categories), attached to the colliding
+    // path itself so the report points at what actually conflicts.
+    for dup in detect_record_duplicates(registry) {
         findings.push(DriftFinding {
-            path: target,
+            path: dup.subject,
             fingerprint: Fingerprint {
                 harness: None,
                 confidence: Confidence::None,
-                evidence: vec![description.clone()],
+                evidence: vec![dup.description],
             },
             ownership: Ownership::Unmanaged,
             foreign: ForeignCheck {
@@ -1960,8 +1969,8 @@ pub fn drift_report_with_options(
                 ambiguous: false,
             },
             is_recorded: true,
-            category: category.clone(),
-            risk: *risk,
+            category: dup.category,
+            risk: dup.risk,
             next_operations: vec![
                 "resolve: rename or remove one of the colliding records".to_owned(),
             ],
@@ -2001,28 +2010,54 @@ fn meets_adoption_floor(confidence: Confidence) -> bool {
 
 /// Validate that a candidate can be adopted.
 ///
-/// Checks: the candidate is a real directory or file (a symlink is refused;
-/// it points outside the scan root's trust and the home crawl already
-/// skips links), harness fingerprint at or above
-/// [`ADOPTION_CONFIDENCE_FLOOR`] (a canonical config file must prove the
-/// harness; a directory name alone never does), a readable canonical config
-/// file, no foreign ownership, and a fresh readable candidate. Returns the
-/// fingerprint on success. Never copies, migrates, normalizes, or
-/// reformats the harness config.
+/// Checks: the candidate is a real directory or file, harness fingerprint
+/// at or above [`ADOPTION_CONFIDENCE_FLOOR`] (a canonical config file must
+/// prove the harness; a directory name alone never does), a readable
+/// canonical config file, no foreign ownership, and a fresh readable
+/// candidate. Returns the fingerprint on success. Never copies, migrates,
+/// normalizes, or reformats the harness config.
+///
+/// A symlinked candidate (dotfiles/stow setups point `~/.claude` at a
+/// repository checkout) is adopted through the link iff its fully resolved
+/// target stays inside `home`'s tree; a link escaping the scanned root is
+/// refused, and a symlink with no `home` boundary to check is refused too.
 pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
     let meta = std::fs::symlink_metadata(candidate).map_err(|e| CoreError::Validation {
         field: "candidate".to_owned(),
         reason: format!("cannot stat {}: {e}", candidate.display()),
     })?;
-    if meta.file_type().is_symlink() {
-        return Err(CoreError::Validation {
+    let resolved_target: PathBuf;
+    let candidate: &Path = if meta.file_type().is_symlink() {
+        let root = home.ok_or_else(|| CoreError::Validation {
             field: "candidate".to_owned(),
             reason: format!(
-                "candidate {} is a symlink; adoption requires a real path under the scan root",
+                "candidate {} is a symlink and no scan root was given to bound its target",
                 candidate.display()
             ),
-        });
-    }
+        })?;
+        let target = std::fs::canonicalize(candidate).map_err(|e| CoreError::Validation {
+            field: "candidate".to_owned(),
+            reason: format!("cannot resolve symlink {}: {e}", candidate.display()),
+        })?;
+        let resolved_root = std::fs::canonicalize(root).map_err(|e| CoreError::Validation {
+            field: "candidate".to_owned(),
+            reason: format!("cannot resolve scan root {}: {e}", root.display()),
+        })?;
+        if !target.starts_with(&resolved_root) {
+            return Err(CoreError::Validation {
+                field: "candidate".to_owned(),
+                reason: format!(
+                    "candidate {} resolves outside the scan root to {}; adoption refuses to follow it",
+                    candidate.display(),
+                    target.display()
+                ),
+            });
+        }
+        resolved_target = target;
+        &resolved_target
+    } else {
+        candidate
+    };
     let fingerprint = fingerprint_candidate(candidate);
     if !meets_adoption_floor(fingerprint.confidence) {
         return Err(CoreError::InsufficientEvidence {
@@ -2695,7 +2730,7 @@ mod tests {
             let mut plan = crate::adapter::WrapperPlan::new("test");
             plan.env_vars
                 .push(("CLAUDE_CONFIG_DIR".to_owned(), inst.config_root.to_string()));
-            let (content, _) = crate::wrapper::generate_shell_wrapper(inst, &plan);
+            let (content, _) = crate::wrapper::generate_shell_wrapper(inst, &plan).unwrap();
             std::fs::write(bin.join(file), content).unwrap();
         };
         make_wrapper(registry.get("recorded").unwrap(), "recorded-tool");
@@ -2795,25 +2830,47 @@ mod tests {
     /// links (they are neither dirs nor files), and a link can point anywhere.
     #[cfg(unix)]
     #[test]
-    fn adoption_refuses_symlinked_root() {
+    fn adoption_follows_in_root_symlinks_and_refuses_out_of_root_ones() {
         let home = tmp_home("adopt_symlink");
-        let real = home.join(".claude-real");
+        let real = home.join("dotfiles").join(".claude-real");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("settings.json"), r#"{"model":"x"}"#).unwrap();
-        let link = home.join(".claude-link");
+        // Stow-style: ~/.claude-work points at the checkout inside $HOME.
+        let link = home.join(".claude-work");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        can_adopt(&real, Some(&home)).unwrap();
-        match can_adopt(&link, Some(&home)) {
-            Err(CoreError::Validation { reason, .. }) => {
-                assert!(reason.contains("symlink"), "{reason}");
-            }
-            other => panic!("expected symlink refusal, got {other:?}"),
-        }
+        let fingerprint = can_adopt(&link, Some(&home)).unwrap();
+        assert!(
+            meets_adoption_floor(fingerprint.confidence),
+            "in-root symlink must adopt through the link"
+        );
         assert!(
             real.join("settings.json").is_file(),
-            "refused adoption must not touch the target"
+            "adoption must not touch the target"
         );
+
+        // A link escaping the scanned root (here: /tmp outside $HOME) is
+        // refused even when its target looks adoptable.
+        let outside_parent = tmp_home("adopt_symlink_outside");
+        let outside = outside_parent.join(".claude-evil");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("settings.json"), r#"{"model":"x"}"#).unwrap();
+        let escaping = home.join(".claude-escape");
+        std::os::unix::fs::symlink(&outside, &escaping).unwrap();
+        match can_adopt(&escaping, Some(&home)) {
+            Err(CoreError::Validation { reason, .. }) => {
+                assert!(reason.contains("outside the scan root"), "reason: {reason}");
+            }
+            other => panic!("expected out-of-root refusal, got {other:?}"),
+        }
+        // No scan root to bound the target: fail closed.
+        can_adopt(&link, None).unwrap_err();
+        // A dangling link is a typed refusal, not a panic.
+        let dangling = home.join(".claude-dangling");
+        std::os::unix::fs::symlink(home.join("nowhere"), &dangling).unwrap();
+        can_adopt(&dangling, Some(&home)).unwrap_err();
+
+        drop(std::fs::remove_dir_all(&home));
+        drop(std::fs::remove_dir_all(&outside_parent));
     }
 
     /// DRF-05: reconciliation matches the `InstanceId` marker FIRST, a moved
@@ -2862,6 +2919,53 @@ mod tests {
 
     /// DRF-08: the drift report groups findings by harness/instance with risk
     /// levels, adapter support/version, and recommended next operations.
+    /// Duplicate-record findings attach to the colliding root or wrapper
+    /// path, not to whichever record happens to be first.
+    #[test]
+    fn drift_report_attaches_duplicates_to_the_colliding_path() {
+        let home = tmp_home("drift_dups");
+        let root_a = crate::test_util::tmp_abs_str("u/.claude-dup-a");
+        // Insert and load both refuse a duplicated config_root; the
+        // duplicate-record findings are the defense for a registry that
+        // carries one anyway, so the test builds the shape unchecked.
+        let first = sample_instance(
+            "alpha",
+            root_a.as_str(),
+            "id-dup-1",
+            Ownership::SuperaiCreated,
+        );
+        let second = sample_instance(
+            "beta",
+            root_a.as_str(),
+            "id-dup-2",
+            Ownership::SuperaiCreated,
+        );
+        let registry = Registry::from_instances_unchecked(vec![first, second]);
+        let dups = detect_record_duplicates(&registry);
+        assert_eq!(dups.len(), 1, "one shared-root duplicate");
+        assert_eq!(dups[0].category, DriftCategory::DuplicateRoot);
+        assert_eq!(
+            dups[0].subject,
+            PathBuf::from(root_a.as_str()),
+            "finding must attach to the shared root"
+        );
+        assert!(
+            dups[0].description.contains("alpha") && dups[0].description.contains("beta"),
+            "description names both records: {}",
+            dups[0].description
+        );
+        // The full report attaches the same subject, not the first record's
+        // own root.
+        let report = drift_report(&registry, &home);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == DriftCategory::DuplicateRoot)
+            .expect("duplicate finding in report");
+        assert_eq!(finding.path, PathBuf::from(root_a.as_str()));
+        drop(std::fs::remove_dir_all(&home));
+    }
+
     #[test]
     fn drift_report_groups_by_harness_with_risk_and_next_ops() {
         let home = tmp_home("drift_groups");

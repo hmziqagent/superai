@@ -1019,7 +1019,7 @@ pub fn apply_update_with_catalog_digests(
             }
         }
         let (wrapper_content, _digest) =
-            crate::wrapper::generate_shell_wrapper(&temp_instance, &merged_plan);
+            crate::wrapper::generate_shell_wrapper(&temp_instance, &merged_plan)?;
         steps.push(FileAction::Write {
             path: wrapper_path,
             content: wrapper_content.into_bytes(),

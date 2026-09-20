@@ -615,8 +615,8 @@ impl Registry {
     fn validate(&self) -> Result<()> {
         let mut names: HashMap<String, &Instance> = HashMap::new();
         let mut ids: HashSet<String> = HashSet::new();
-        let mut roots: HashSet<String> = HashSet::new();
-        let mut wrapper_paths: HashSet<String> = HashSet::new();
+        let mut roots: HashMap<String, String> = HashMap::new();
+        let mut wrapper_paths: HashMap<String, String> = HashMap::new();
         let mut wrapper_commands: HashMap<String, &Instance> = HashMap::new();
 
         for inst in &self.instances {
@@ -643,22 +643,22 @@ impl Registry {
             }
 
             let root_str = inst.config_root.to_string();
-            if !roots.insert(root_str.clone()) {
+            if let Some(prev_owner) = roots.insert(root_str.clone(), inst.name.to_string()) {
                 return Err(CoreError::Validation {
                     field: "config_root".to_owned(),
                     reason: format!(
-                        "duplicate config_root `{root_str}` collides with another instance"
+                        "duplicate config_root `{root_str}` collides with instance `{prev_owner}`"
                     ),
                 });
             }
 
             if let Some(wrapper) = &inst.wrapper {
                 let wp = wrapper.path.to_string();
-                if !wrapper_paths.insert(wp.clone()) {
+                if let Some(prev_owner) = wrapper_paths.insert(wp.clone(), inst.name.to_string()) {
                     return Err(CoreError::Validation {
                         field: "wrapper.path".to_owned(),
                         reason: format!(
-                            "duplicate wrapper path `{wp}` collides with another instance"
+                            "duplicate wrapper path `{wp}` collides with instance `{prev_owner}`"
                         ),
                     });
                 }
@@ -698,97 +698,29 @@ impl Registry {
         Ok(())
     }
 
-    /// Add an instance, or fail if the `name`/`id`/`config_root`/`wrapper` collides.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "insert checks multiple collision kinds"
-    )]
+    /// Add an instance, or fail if the `name`/`id`/`config_root`/`wrapper`
+    /// collides. [`Registry::validate`] is the single collision authority;
+    /// its errors name the conflicting key and instance, and a failed
+    /// insert leaves the registry untouched.
     pub fn insert(&mut self, instance: Instance) -> Result<()> {
         instance.validate()?;
-        // Pre-check gives insert-specific error text; validate() after push is the safety net.
-        let new_norm = instance.name.normalized();
-        for existing in &self.instances {
-            if existing.name.normalized() == new_norm {
-                return Err(CoreError::NameCollision {
-                    kind: "InstanceName".to_owned(),
-                    name: instance.name.to_string(),
-                    reason: format!(
-                        "case-fold collision with existing instance '{}' (normalized `{}`)",
-                        existing.name, new_norm
-                    ),
-                });
-            }
-            if existing.id.as_str() == instance.id.as_str() {
-                return Err(CoreError::NameCollision {
-                    kind: "InstanceId".to_owned(),
-                    name: instance.id.to_string(),
-                    reason: "duplicate id".to_owned(),
-                });
-            }
-            if existing.config_root == instance.config_root {
-                return Err(CoreError::Validation {
-                    field: "config_root".to_owned(),
-                    reason: format!(
-                        "duplicate config_root `{}` collides with instance '{}'",
-                        instance.config_root, existing.name
-                    ),
-                });
-            }
-            if let (Some(existing_w), Some(new_w)) = (&existing.wrapper, &instance.wrapper) {
-                if existing_w.path == new_w.path {
-                    return Err(CoreError::Validation {
-                        field: "wrapper.path".to_owned(),
-                        reason: format!(
-                            "duplicate wrapper path `{}` collides with instance '{}'",
-                            new_w.path, existing.name
-                        ),
-                    });
-                }
-                if existing_w.command_name.normalized() == new_w.command_name.normalized() {
-                    return Err(CoreError::NameCollision {
-                        kind: "WrapperCommand".to_owned(),
-                        name: new_w.command_name.to_string(),
-                        reason: format!(
-                            "case-fold collision with wrapper command of '{}'",
-                            existing.name
-                        ),
-                    });
-                }
-            }
-            if let Some(new_w) = &instance.wrapper
-                && existing.name.normalized() == new_w.command_name.normalized()
-                && existing.id.as_str() != instance.id.as_str()
-            {
-                return Err(CoreError::NameCollision {
-                    kind: "WrapperCommand/InstanceName".to_owned(),
-                    name: new_w.command_name.to_string(),
-                    reason: format!(
-                        "wrapper command `{}` collides with existing instance '{}'",
-                        new_w.command_name, existing.name
-                    ),
-                });
-            }
-            if let Some(existing_w) = &existing.wrapper
-                && existing_w.command_name.normalized() == instance.name.normalized()
-                && existing.id.as_str() != instance.id.as_str()
-            {
-                return Err(CoreError::NameCollision {
-                    kind: "InstanceName/WrapperCommand".to_owned(),
-                    name: instance.name.to_string(),
-                    reason: format!(
-                        "instance name `{}` collides with wrapper command of '{}'",
-                        instance.name, existing.name
-                    ),
-                });
-            }
-        }
-
         self.instances.push(instance);
         if let Err(e) = self.validate() {
             self.instances.pop();
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Test-only constructor that skips validation: defensive consumers
+    /// (e.g. duplicate-record drift findings) must be testable for record
+    /// shapes that `load` and `insert` rightly refuse.
+    #[cfg(test)]
+    pub(crate) fn from_instances_unchecked(instances: Vec<Instance>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            instances,
+        }
     }
 
     /// Remove an instance by name (exact case-sensitive), returning it. This touches no files on disk.
@@ -996,6 +928,28 @@ mod tests {
             CoreError::NameCollision { kind, .. } => assert_eq!(kind, "InstanceId"),
             other => panic!("expected duplicate id, got {other:?}"),
         }
+    }
+
+    /// Insert collision errors name the conflicting key and the existing
+    /// instance, so the message is actionable without a debugger.
+    #[test]
+    fn insert_collision_errors_name_the_conflict() {
+        let tmp_root = crate::test_util::tmp_abs_str(".claude-work");
+        let mut r = Registry::default();
+        r.insert(sample_instance(
+            "work",
+            tmp_root.as_str(),
+            "id-conflict-1",
+            None,
+        ))
+        .unwrap();
+        let dup = sample_instance("other", tmp_root.as_str(), "id-conflict-2", None);
+        let err = r.insert(dup).unwrap_err().to_string();
+        assert!(
+            err.contains(".claude-work") && err.contains("`work`"),
+            "collision text must name key and instance: {err}"
+        );
+        assert_eq!(r.instances().len(), 1, "failed insert must not mutate");
     }
 
     #[test]
