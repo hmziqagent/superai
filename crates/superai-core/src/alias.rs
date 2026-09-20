@@ -864,8 +864,13 @@ pub fn create_alias(
     .to_instance()?;
     let plan = wrapper_plan_for_alias(adapter, &instance, spec.home_virt)?;
 
+    let started_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     create_alias_root(&root, &spec.harness, &spec.name)?;
-    let seeded = seed_mcp_set(
+    // Wrapper generation runs LAST, so a seed failure leaves nothing at the
+    // wrapper path and its rollback must not run at all.
+    if let Err(e) = seed_mcp_set(
         &root,
         &spec.harness,
         adapter,
@@ -874,27 +879,152 @@ pub fn create_alias(
     )
     .and_then(|()| seed_plugin_set(&root, &spec.harness, adapter, &spec.plugins))
     .and_then(|()| seed_provider_profile(&root, spec))
-    .and_then(|()| generate_alias_wrapper(&instance, &plan, wrapper));
-    let wrapper_ref = match seeded {
+    {
+        return Err(rollback_partial_alias(
+            base_dir,
+            root.as_path(),
+            None,
+            started_millis,
+            &[],
+            e,
+        ));
+    }
+    let (wrapper_content, _) = crate::wrapper::generate_shell_wrapper(&instance, &plan);
+    let wrapper_ref = match generate_alias_wrapper(&instance, &plan, wrapper) {
         Ok(wrapper_ref) => wrapper_ref,
         Err(e) => {
-            drop(quarantine_alias_root(base_dir, root.as_path()));
-            return Err(e);
+            return Err(rollback_partial_alias(
+                base_dir,
+                root.as_path(),
+                wrapper,
+                started_millis,
+                wrapper_content.as_bytes(),
+                e,
+            ));
         }
     };
 
     let record = AliasRecord {
         harness: spec.harness.clone(),
         name: spec.name.clone(),
-        root,
+        root: root.clone(),
         binary: spec.binary.clone(),
         wrapper: wrapper_ref,
         home_virt: spec.home_virt,
         created_at: instance.created_at,
         adapter_revision: adapter.adapter_revision().to_owned(),
     };
-    insert_manifest_record(base_dir, &record)?;
-    Ok(record)
+    match insert_manifest_record(base_dir, &record) {
+        Ok(()) => Ok(record),
+        Err(e) => Err(rollback_partial_alias(
+            base_dir,
+            root.as_path(),
+            wrapper,
+            started_millis,
+            wrapper_content.as_bytes(),
+            e,
+        )),
+    }
+}
+
+/// Undo a partially created alias and report exactly what was left where:
+/// the root goes to quarantine (recoverable), and a wrapper this run wrote
+/// (byte-equal to `wrapper_content`) returns to its pre-create bytes or is
+/// removed when nothing pre-existed. The original error survives when the
+/// rollback fully succeeds; otherwise a Commit error carries the notes, so a
+/// half-created alias is never silent and a retry starts clean.
+fn rollback_partial_alias(
+    base_dir: &Path,
+    root: &Path,
+    wrapper: Option<&WrapperPath>,
+    started_millis: u128,
+    wrapper_content: &[u8],
+    failure: CoreError,
+) -> CoreError {
+    let mut notes = Vec::new();
+    let mut clean = true;
+    match quarantine_alias_root(base_dir, root) {
+        Ok(path) => notes.push(format!("alias root quarantined at {}", path.display())),
+        Err(e) => {
+            clean = false;
+            notes.push(format!(
+                "alias root {} could NOT be quarantined: {e}",
+                root.display()
+            ));
+        }
+    }
+    if let Some(wrapper) = wrapper {
+        match rollback_wrapper_file(wrapper.as_path(), wrapper_content, started_millis) {
+            Ok(note) => notes.push(note),
+            Err(note) => {
+                clean = false;
+                notes.push(note);
+            }
+        }
+    }
+    if clean {
+        failure
+    } else {
+        CoreError::Commit {
+            path: root.to_path_buf(),
+            reason: format!(
+                "alias creation failed ({failure}); rollback left state: {}",
+                notes.join("; ")
+            ),
+        }
+    }
+}
+
+/// Return the wrapper path to its pre-create state. Only bytes provably this
+/// run's wrapper (byte-equal to `wrapper_content`) are touched, so a foreign
+/// launcher or an untouched pre-existing wrapper is left alone.
+fn rollback_wrapper_file(
+    path: &Path,
+    wrapper_content: &[u8],
+    started_millis: u128,
+) -> std::result::Result<String, String> {
+    match std::fs::read(path) {
+        Ok(current) if current == wrapper_content => {}
+        Ok(_) => {
+            return Ok(format!(
+                "wrapper {} is not this run's generation, left untouched",
+                path.display()
+            ));
+        }
+        Err(_) => return Ok(format!("wrapper {} already absent", path.display())),
+    }
+    // A backup from this run is the pre-create state write_wrapper saved.
+    let ours = superai_config::backup::list_backups(path)
+        .ok()
+        .and_then(|mut all| {
+            all.retain(|b| b.timestamp_millis >= started_millis);
+            all.pop()
+        });
+    match ours {
+        Some(entry) => superai_config::backup::restore(&entry.backup_path, path)
+            .map(|()| {
+                format!(
+                    "wrapper {} restored to its pre-create bytes from {}",
+                    path.display(),
+                    entry.backup_path.display()
+                )
+            })
+            .map_err(|e| {
+                format!(
+                    "wrapper {} is this run's generation and could NOT be restored from {}: {e}",
+                    path.display(),
+                    entry.backup_path.display()
+                )
+            }),
+        None => std::fs::remove_file(path)
+            .map(|()| format!("wrapper {} removed (nothing pre-existed)", path.display()))
+            .map_err(|e| {
+                format!(
+                    "wrapper {} is this run's generation and could NOT be removed: {e}",
+                    path.display()
+                )
+            }),
+    }
 }
 
 /// Create the alias root directory plus the ownership marker via a
@@ -1321,16 +1451,13 @@ pub fn remove_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<
         });
     }
     verify_alias_marker(record.root.as_path(), harness, name)?;
-    if let Some(wrapper) = &record.wrapper
-        && wrapper.path.as_path().exists()
-        && wrapper_helper::is_owned_wrapper(wrapper.path.as_path(), Some(&wrapper.content_digest))
-    {
-        std::fs::remove_file(wrapper.path.as_path()).map_err(|e| {
-            CoreError::Config(superai_config::ConfigError::Io {
-                path: wrapper.path.as_path().to_path_buf(),
-                source: e,
-            })
-        })?;
+    if let Some(wrapper) = &record.wrapper {
+        // Verified rename-shuffle removal: a swap between verify and delete
+        // is refused instead of deleting foreign bytes.
+        wrapper_helper::remove_owned_wrapper_verified(
+            wrapper.path.as_path(),
+            Some(&wrapper.content_digest),
+        )?;
     }
     if record.root.as_path().exists() {
         // Recovery state stays under the alias base, never the user's home.
@@ -1716,6 +1843,128 @@ mod tests {
             home_ops_before,
             "no alias quarantine entry may appear under the real home"
         );
+    }
+
+    #[test]
+    fn wrapper_rollback_returns_only_this_runs_bytes_to_pre_create_state() {
+        let dir = crate::test_util::temp_dir_unique("alias-wrapper-rollback");
+        let path = dir.join("cli");
+        let generated = b"#!/bin/sh\n# superai wrapper generated\nexec tool\n";
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+
+        // Foreign bytes at the path: left untouched.
+        std::fs::write(&path, b"foreign launcher").unwrap();
+        let note = rollback_wrapper_file(&path, generated, started).unwrap();
+        assert!(note.contains("left untouched"), "{note}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"foreign launcher".to_vec());
+
+        // This run's wrapper with nothing pre-existing: removed.
+        std::fs::write(&path, generated).unwrap();
+        let note = rollback_wrapper_file(&path, generated, started).unwrap();
+        assert!(note.contains("removed"), "{note}");
+        assert!(!path.exists(), "a wrapper nobody owned must be cleaned up");
+
+        // This run's wrapper over a backed-up pre-state: the pre-create
+        // bytes come back.
+        std::fs::write(&path, b"pre-create launcher").unwrap();
+        superai_config::backup::backup(&path).unwrap();
+        std::fs::write(&path, generated).unwrap();
+        let note = rollback_wrapper_file(&path, generated, started).unwrap();
+        assert!(note.contains("restored"), "{note}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"pre-create launcher".to_vec()
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A wrapper-stage failure quarantines the root and leaves nothing at
+    /// the wrapper path; the error is the original one (rollback was clean).
+    #[test]
+    #[cfg(unix)]
+    fn wrapper_write_failure_rolls_the_alias_back_cleanly() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = base("rollback-wrapper");
+        let workbuddy = adapter("workbuddy");
+        let wrapper_dir = base.join("bin");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::set_permissions(&wrapper_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let wrapper = WrapperPath::from_path(&wrapper_dir.join("cli")).unwrap();
+
+        let err = create_alias(
+            &base,
+            &AliasSpec::new(harness("workbuddy"), name("seedfail")),
+            workbuddy.as_ref(),
+            Some(&wrapper),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("permission"),
+            "expected the underlying write failure, got: {err}"
+        );
+        assert!(
+            !wrapper.as_path().exists(),
+            "nothing may linger at the wrapper path"
+        );
+        let root = base.join("workbuddy").join("seedfail");
+        assert!(
+            !root.exists(),
+            "the partially seeded root must be quarantined"
+        );
+        assert!(
+            base.join(".superai").join("quarantine").exists(),
+            "recovery state must exist under the alias base"
+        );
+        assert_eq!(list_aliases(&base).unwrap().len(), 0);
+        std::fs::set_permissions(&wrapper_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(std::fs::remove_dir_all(&base));
+    }
+
+    /// A manifest-insert failure after a full seed must not vanish silently:
+    /// the wrapper is removed, and the error records exactly where the
+    /// un-quarantinable root sits, so the user can inspect and retry.
+    #[test]
+    #[cfg(unix)]
+    fn manifest_insert_failure_records_leftover_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = base("rollback-manifest");
+        // The harness dir is pre-created so root creation survives the base
+        // becoming read-only; only the manifest write needs base write
+        // access, and that is what must fail.
+        std::fs::create_dir_all(base.join("workbuddy")).unwrap();
+        let wrapper_dir = base.join("bin");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        let wrapper = WrapperPath::from_path(&wrapper_dir.join("cli")).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = create_alias(
+            &base,
+            &AliasSpec::new(harness("workbuddy"), name("stuck")),
+            adapter("workbuddy").as_ref(),
+            Some(&wrapper),
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("could NOT be quarantined"),
+            "the rollback state must be recorded in the error: {text}"
+        );
+        assert!(
+            text.contains("workbuddy") && text.contains("stuck"),
+            "the leftover root must be named: {text}"
+        );
+        assert!(
+            !wrapper.as_path().exists(),
+            "this run's wrapper must be removed even when the root cannot move"
+        );
+        assert!(
+            base.join("workbuddy").join("stuck").exists(),
+            "the root itself stays put (read-only base)"
+        );
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(std::fs::remove_dir_all(&base));
     }
 
     #[test]
