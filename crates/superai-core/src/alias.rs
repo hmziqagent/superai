@@ -1573,12 +1573,13 @@ mod tests {
             assert!(dest.is_file(), "{harness_id} seeded dest missing at {dest}");
             let effective = mcp::inspect_servers(dest.as_path(), &decl).unwrap();
             assert_eq!(
-                effective.len(),
+                effective.servers.len(),
                 2,
                 "{harness_id}: both seeded servers must round-trip"
             );
             let alpha = McpServerId::new("alpha").unwrap();
             let seeded_alpha = effective
+                .servers
                 .get(&alpha)
                 .unwrap_or_else(|| panic!("{harness_id}: seeded server alpha missing"));
             assert_eq!(seeded_alpha.command.as_deref(), Some("node"));
@@ -2579,7 +2580,7 @@ mod tests {
             "HOME-virt MCP dest must be XDG-shaped: {dest}"
         );
         let effective = mcp::inspect_servers(dest.as_path(), &decl).unwrap();
-        assert_eq!(effective.len(), 1);
+        assert_eq!(effective.servers.len(), 1);
         assert!(effective.contains_key(&McpServerId::new("echo-test").unwrap()));
         // The flat dest the 1P decl names is NOT written (the binary would
         // never read it under HOME relocation, factory-droid lesson).

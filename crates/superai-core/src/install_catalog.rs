@@ -303,7 +303,11 @@ pub struct InstallCatalogEntry {
     /// Whether installation requires admin/elevated privileges.
     #[serde(default)]
     pub requires_admin: bool,
-    /// Optional checksum or signature guard (hex digest or URL).
+    /// Optional checksum or signature guard (hex digest or URL). Verified
+    /// for well-formedness on load: a 64-hex SHA-256 or an `https://` URL.
+    /// No direct-download path exists today (PKG-10 refuses Direct and
+    /// External methods), so nothing downloads an artifact to check it
+    /// against yet; when one does, this field is the digest it must match.
     #[serde(default)]
     pub checksum: Option<String>,
     /// Harness IDs that conflict or are replaced by this harness.
@@ -360,6 +364,19 @@ impl InstallCatalogEntry {
         }
         if let Some(cmd) = self.uninstall.as_ref() {
             cmd.validate()?;
+        }
+        if let Some(checksum) = self.checksum.as_deref() {
+            let is_sha256 = checksum.trim().len() == 64
+                && checksum.trim().chars().all(|c| c.is_ascii_hexdigit());
+            let is_https = checksum.starts_with("https://") && !checksum.contains(char::is_control);
+            if !is_sha256 && !is_https {
+                return Err(CoreError::Validation {
+                    field: "checksum".to_owned(),
+                    reason: format!(
+                        "checksum must be a 64-hex sha256 or an https URL, got `{checksum}`"
+                    ),
+                });
+            }
         }
         if self.docs.is_empty() {
             return Err(CoreError::Validation {
@@ -579,6 +596,40 @@ mod tests {
         assert_eq!(e.harness, "claude-code");
         assert!(e.executables.contains(&"claude".to_owned()));
         assert!(e.methods.iter().any(|m| m.kind == InstallMethodKind::Npm));
+    }
+
+    /// A carried checksum is verified for well-formedness on load: 64-hex
+    /// sha256 or an https URL. Absent checksums stay legitimate until a
+    /// direct-download path exists to verify an artifact against them.
+    #[test]
+    fn catalog_checksum_field_is_verified_on_load() {
+        let mut good_hex = minimal_entry("checksum-hex");
+        good_hex.checksum = Some("a".repeat(64));
+        InstallCatalog::from_entries(vec![good_hex]).unwrap();
+        let mut good_url = minimal_entry("checksum-url");
+        good_url.checksum = Some("https://example.com/claude.sha256".to_owned());
+        InstallCatalog::from_entries(vec![good_url]).unwrap();
+        let mut absent = minimal_entry("checksum-none");
+        absent.checksum = None;
+        InstallCatalog::from_entries(vec![absent]).unwrap();
+
+        for bad in [
+            "zzz",                              // not hex-shaped
+            &"a".repeat(63),                    // hex but wrong length
+            &format!("0x{}", "a".repeat(64)),   // 0x prefix is not a digest
+            "http://example.com/claude.sha256", // plaintext URL refused
+            "file:///etc/passwd",
+        ] {
+            let mut entry = minimal_entry("checksum-bad");
+            entry.checksum = Some((*bad).to_owned());
+            let err = InstallCatalog::from_entries(vec![entry])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("checksum must be"),
+                "checksum `{bad}` must be refused: {err}"
+            );
+        }
     }
 
     #[test]

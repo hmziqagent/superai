@@ -48,18 +48,6 @@ fn validate_url(url: &str) -> Result<()> {
             reason: "url must not contain NUL or control".to_owned(),
         });
     }
-    if contains_shell_metachars(url) {
-        return Err(CoreError::Validation {
-            field: "mcp.url".to_owned(),
-            reason: format!("url must not contain shell metachars: `{url}`"),
-        });
-    }
-    if url.contains("/../") || url.contains("/./") {
-        return Err(CoreError::Validation {
-            field: "mcp.url".to_owned(),
-            reason: format!("url must not contain traversal: `{url}`"),
-        });
-    }
     if !(url.starts_with("https://")
         || url.starts_with("http://")
         || url.starts_with("ws://")
@@ -68,6 +56,32 @@ fn validate_url(url: &str) -> Result<()> {
         return Err(CoreError::Validation {
             field: "mcp.url".to_owned(),
             reason: format!("url must be http(s):// or ws(s)://, got `{url}`"),
+        });
+    }
+    // '&' and '=' are how a query string pairs parameters; everywhere else
+    // they stay shell metachars and are refused.
+    let (before_query, query) = match url.split_once('?') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (url, None),
+    };
+    if contains_shell_metachars(before_query) {
+        return Err(CoreError::Validation {
+            field: "mcp.url".to_owned(),
+            reason: format!("url must not contain shell metachars: `{url}`"),
+        });
+    }
+    if let Some(query) = query
+        && query.contains(['`', '$', '"', '\'', '<', '>', '|', ';', '\\', '!'])
+    {
+        return Err(CoreError::Validation {
+            field: "mcp.url".to_owned(),
+            reason: format!("url query must not contain shell metachars: `{url}`"),
+        });
+    }
+    if url.contains("/../") || url.contains("/./") {
+        return Err(CoreError::Validation {
+            field: "mcp.url".to_owned(),
+            reason: format!("url must not contain traversal: `{url}`"),
         });
     }
     Ok(())
@@ -1179,20 +1193,37 @@ fn write_toml_server(
 /// Inspect effective MCP servers from `path` using `decl` (read fresh, no
 /// mutation). Works across destination kinds and container shapes; read-only
 /// declarations inspect the same as writable ones.
-pub fn inspect_servers(
-    path: &Path,
-    decl: &McpAdapterDecl,
-) -> Result<BTreeMap<McpServerId, McpServerDef>> {
+/// One destination scan: every parseable server plus, per foreign entry
+/// that failed validation, its id and the reason it was excluded. The
+/// invalid list is surfaced, never silently dropped: one bad entry must
+/// not blind the report on the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InspectedServers {
+    /// Servers that parsed and validated, keyed by id.
+    pub servers: BTreeMap<McpServerId, McpServerDef>,
+    /// Entries the scan skipped: `(key, reason)`.
+    pub invalid: Vec<(String, String)>,
+}
+
+impl InspectedServers {
+    /// Whether the id string is among the valid servers.
+    pub fn contains_key(&self, id: &str) -> bool {
+        self.servers.contains_key(id)
+    }
+}
+
+/// Read and parse every server entry at `path`: valid ones keyed by id,
+/// invalid ones named in [`InspectedServers::invalid`] so a single foreign
+/// entry with e.g. hostile command bytes cannot blind the whole report.
+pub fn inspect_servers(path: &Path, decl: &McpAdapterDecl) -> Result<InspectedServers> {
     let (_outer, inner) = read_outer_and_inner(path, decl)?;
-    let mut out = BTreeMap::new();
+    let mut out = InspectedServers::default();
     for (k, v) in inner {
         match from_native_value(&k, &v) {
             Ok(def) => {
-                out.insert(def.id.clone(), def);
+                out.servers.insert(def.id.clone(), def);
             }
-            // A single unparseable entry fails the whole inspect rather
-            // than being silently dropped from the report.
-            Err(e) => return Err(e),
+            Err(e) => out.invalid.push((k, e.to_string())),
         }
     }
     Ok(out)
@@ -2073,6 +2104,70 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
+    /// '&' and '=' are legal inside a query string; everywhere else they
+    /// stay refused as metachars.
+    #[test]
+    fn remote_urls_may_carry_query_strings() {
+        let id = McpServerId::new("remote-query").unwrap();
+        let with_query = McpServerDef::remote(
+            id,
+            McpTransport::StreamableHttp,
+            "https://example.com/mcp?token-env= A&v=2",
+        )
+        .unwrap();
+        assert_eq!(
+            with_query.url.as_deref(),
+            Some("https://example.com/mcp?token-env= A&v=2")
+        );
+        with_query.validate().unwrap();
+        // '&' before any '?' is malformed, not a query separator.
+        let amp_outside = McpServerDef::remote(
+            McpServerId::new("amp-outside").unwrap(),
+            McpTransport::StreamableHttp,
+            "https://example.com/a&b/c",
+        );
+        assert!(
+            amp_outside.is_err(),
+            "metachar outside query must be refused"
+        );
+        // Metachars inside the query are still refused.
+        let inject = McpServerDef::remote(
+            McpServerId::new("query-inject").unwrap(),
+            McpTransport::StreamableHttp,
+            "https://example.com/mcp?a=1;rm%20-rf",
+        );
+        assert!(inject.is_err(), "shell metachar in query must be refused");
+    }
+
+    /// One invalid foreign entry must not fail the whole inspect: the good
+    /// servers still land in `servers` and the bad one is named in `invalid`.
+    #[test]
+    fn inspect_continues_past_an_invalid_foreign_entry() {
+        let dir = crate::test_util::temp_dir_unique("mcp-inspect-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {
+                "good": {"command": "node", "args": ["s.js"]},
+                "hostile": {"command": "node; rm -rf /", "args": []}
+            }}"#,
+        )
+        .unwrap();
+        let d = decl();
+        let inspected = inspect_servers(&path, &d).unwrap();
+        assert!(inspected.contains_key("good"), "good entry must survive");
+        assert!(
+            !inspected.contains_key("hostile"),
+            "invalid entry must not appear as a server"
+        );
+        assert_eq!(inspected.invalid.len(), 1);
+        let (key, reason) = &inspected.invalid[0];
+        assert_eq!(key, "hostile");
+        assert!(!reason.is_empty(), "skip reason must be surfaced");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     #[test]
     fn install_validation_rejects_traversal_and_shell() {
         let bad_id = McpServerId::new("bad/../id");
@@ -2147,7 +2242,7 @@ mod tests {
         let disabled = set_mcp_enabled(&path, &d, &id, false).unwrap();
         assert!(disabled.disabled);
         let inspected = inspect_servers(&path, &d).unwrap();
-        assert!(inspected.get(&id).is_some_and(|v| v.disabled));
+        assert!(inspected.servers.get(&id).is_some_and(|v| v.disabled));
         // enable
         let enabled = set_mcp_enabled(&path, &d, &id, true).unwrap();
         assert!(!enabled.disabled);
@@ -2341,7 +2436,7 @@ mod tests {
         let inspected = inspect_servers(&path, &d).unwrap();
         assert!(inspected.contains_key(&McpServerId::new("developer-tools").unwrap()));
         let key = McpServerId::new("developer-tools").unwrap();
-        let def = &inspected[&key];
+        let def = &inspected.servers[&key];
         assert_eq!(def.command.as_deref(), Some("npx"));
         // Writes refuse with the typed lossy error and leave bytes intact.
         let before = std::fs::read(&path).unwrap();

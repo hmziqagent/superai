@@ -243,6 +243,23 @@ pub struct PluginRegistry {
     pub records: Vec<PluginRecord>,
     /// Foreign top-level keys preserved from file.
     pub foreign: Map<String, Value>,
+    /// Entries that failed to deserialize on load, surfaced instead of
+    /// silently dropped: each carries its array index, the `id` hint when
+    /// one is readable, and the parse reason. They are NOT part of
+    /// `records`; a store() rewrites the file without them, so a caller
+    /// acting on a registry with skips must report them first.
+    pub skipped: Vec<SkippedPluginRecord>,
+}
+
+/// One registry entry that could not be deserialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedPluginRecord {
+    /// Index of the entry inside the `plugins` array.
+    pub index: usize,
+    /// The `id` field when it is readable despite the parse failure.
+    pub id_hint: Option<String>,
+    /// Why the entry failed to deserialize.
+    pub reason: String,
 }
 
 impl PluginRegistry {
@@ -252,6 +269,7 @@ impl PluginRegistry {
             root,
             records: Vec::new(),
             foreign: Map::new(),
+            skipped: Vec::new(),
         }
     }
 
@@ -268,6 +286,7 @@ impl PluginRegistry {
                 root: root.to_path_buf(),
                 records: Vec::new(),
                 foreign: Map::new(),
+                skipped: Vec::new(),
             });
         }
         let bytes = std::fs::read(&file).map_err(|e| CoreError::InvalidPath {
@@ -280,6 +299,7 @@ impl PluginRegistry {
                 root: root.to_path_buf(),
                 records: Vec::new(),
                 foreign: Map::new(),
+                skipped: Vec::new(),
             });
         }
         let val: Value = serde_json::from_slice(&bytes).map_err(|e| CoreError::Parse {
@@ -296,19 +316,23 @@ impl PluginRegistry {
                 });
             }
         };
-        let records = obj
-            .get("plugins")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let mut out = Vec::new();
-                for v in arr {
-                    if let Ok(rec) = serde_json::from_value::<PluginRecord>(v.clone()) {
-                        out.push(rec);
-                    }
+        // Records that fail to deserialize are reported, never hidden: a
+        // corrupted entry used to vanish silently, and the next store()
+        // would drop it for good.
+        let mut records: Vec<PluginRecord> = Vec::new();
+        let mut skipped: Vec<SkippedPluginRecord> = Vec::new();
+        if let Some(arr) = obj.get("plugins").and_then(|v| v.as_array()) {
+            for (index, v) in arr.iter().enumerate() {
+                match serde_json::from_value::<PluginRecord>(v.clone()) {
+                    Ok(rec) => records.push(rec),
+                    Err(e) => skipped.push(SkippedPluginRecord {
+                        index,
+                        id_hint: v.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
+                        reason: e.to_string(),
+                    }),
                 }
-                out
-            })
-            .unwrap_or_default();
+            }
+        }
         let mut foreign = Map::new();
         for (k, v) in obj {
             if k != "schema_version" && k != "plugins" {
@@ -322,6 +346,7 @@ impl PluginRegistry {
             root: root.to_path_buf(),
             records,
             foreign,
+            skipped,
         })
     }
 
@@ -1356,6 +1381,39 @@ mod tests {
     fn tmp_file(prefix: &str) -> PathBuf {
         let dir = crate::test_util::temp_dir_unique("plugin");
         dir.join(format!("{prefix}-cfg.json"))
+    }
+
+    /// A record that fails to deserialize is reported on load with its
+    /// index, id hint, and reason; the healthy records still load.
+    #[test]
+    fn load_surfaces_undeserializable_records_instead_of_dropping_them() {
+        let root = tmp_root("skipped-records");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join(REGISTRY_FILE_NAME);
+        std::fs::write(
+            &file,
+            r#"{"schema_version":1,"plugins":[
+                {"id":"healthy","kind":"config_entry","source_locator":"local-path",
+                 "installed_at":"2026-01-01T00:00:00Z","enabled":true},
+                {"id":"broken","kind":"not_a_real_kind","source_locator":"x",
+                 "installed_at":"2026-01-01T00:00:00Z","enabled":true},
+                {"kind":"config_entry","source_locator":"no-id-at-all",
+                 "installed_at":"2026-01-01T00:00:00Z","enabled":true}
+            ]}"#,
+        )
+        .unwrap();
+        let reg = PluginRegistry::load(&root).unwrap();
+        assert_eq!(reg.records.len(), 1, "healthy record must load");
+        assert_eq!(reg.records[0].id.as_str(), "healthy");
+        assert_eq!(reg.skipped.len(), 2, "both broken records must be surfaced");
+        let first = &reg.skipped[0];
+        assert_eq!(first.index, 1);
+        assert_eq!(first.id_hint.as_deref(), Some("broken"));
+        assert!(!first.reason.is_empty());
+        let second = &reg.skipped[1];
+        assert_eq!(second.index, 2);
+        assert_eq!(second.id_hint, None, "missing id leaves no hint");
+        drop(std::fs::remove_dir_all(&root));
     }
 
     #[test]
