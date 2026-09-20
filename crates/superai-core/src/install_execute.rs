@@ -2068,13 +2068,24 @@ mod tests {
 
     #[test]
     fn run_structured_minimal_env_still_resolves_echo() {
-        // Even with clear_env, minimal_env preserves PATH so the echo program
-        // (`echo` on unix, `cmd` in System32 on windows) resolves
+        // The structured child starts from a cleared base with
+        // minimal_env_vars composed on top, so ordinary commands still run.
         let (prog, prefix) = echo_program();
         let mut args = prefix;
         args.push("hello".to_owned());
         let out = run_structured_command(prog, &args, false).unwrap();
         assert_eq!(out.stdout.trim(), "hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_structured_child_sees_minimal_env_vars() {
+        // minimal_env_vars must survive clear_env and reach the child.
+        let out = run_structured_command("printenv", &["PATH".to_owned()], false).unwrap();
+        assert!(
+            !out.stdout.trim().is_empty(),
+            "minimal PATH must reach the structured child"
+        );
     }
 
     // ---- PKG-06 ----

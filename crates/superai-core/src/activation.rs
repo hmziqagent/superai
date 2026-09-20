@@ -177,11 +177,9 @@ pub struct LaunchOutcome {
 }
 
 /// Launch the app per `instruction` (WRP-06 "launch app if requested"),
-/// cleared of inherited credentials.
-///
-/// Env hazard: `clear_env: true` plus `env` entries currently DISCARDS the
-/// entries (see `run_command`'s "Env composition hazard"); the plan's
-/// isolation env does not reach the child until that ordering is fixed.
+/// cleared of inherited credentials: the child starts from an empty env and
+/// `instruction.env_vars` are applied on top, so the plan's isolation env
+/// reaches the child without leaking the parent's variables.
 pub fn launch_app(
     instruction: &LaunchInstruction,
     timeout: std::time::Duration,
@@ -1369,6 +1367,36 @@ mod tests {
             Some(home.join(".superai").join("journal"))
         );
     }
+    /// The launch env must actually reach the child: `env_vars` ride on top of
+    /// the cleared base (`run_command` composes them; see its env docs).
+    #[cfg(unix)]
+    #[test]
+    fn launch_app_env_vars_reach_child_despite_cleared_env() {
+        let dir = tmp_dir("wrp06_env");
+        let app = dir.join("env-app.sh");
+        fs::write(
+            &app,
+            "#!/bin/sh\nprintf 'iso=%s\\n' \"${SUPERAI_TEST_ISO:-missing}\"\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&app).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&app, perms).unwrap();
+        }
+        let instruction = LaunchInstruction {
+            executable: app.display().to_string(),
+            args: Vec::new(),
+            env_vars: vec![("SUPERAI_TEST_ISO".to_owned(), "delivered".to_owned())],
+            env_unset: Vec::new(),
+            working_dir: None,
+        };
+        let outcome = launch_app(&instruction, std::time::Duration::from_secs(10)).unwrap();
+        assert!(outcome.exited_zero, "stdout: {}", outcome.stdout);
+        assert_eq!(outcome.stdout.trim(), "iso=delivered");
+    }
+
     /// WRP-06 leftovers: "launch app if requested" (bounded, clean-env
     /// launch after the verified swap) and "never auto-swap back while the
     /// app may still write" (the recorded write window blocks the next

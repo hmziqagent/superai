@@ -1,16 +1,17 @@
 //! Duct-backed process execution wrapper (PKG-01, PKG-05).
 //!
-//! `run_command` spawns with explicit argv (never a shell), applies the env
-//! options, captures stdout/stderr up to `output_limit` combined bytes, and
-//! enforces a wall-clock timeout that kills the child. Duct composes env
-//! wrappers in reverse build order; see [`run_command`] for the composition
-//! hazard that implies. Dependency provenance for `duct` 1.1.x is recorded in
-//! `docs/dependency-review.md`.
+//! `run_command` spawns with explicit argv (never a shell), composes the
+//! child env before spawn (see [`run_command`] for the guaranteed order),
+//! captures stdout/stderr up to `output_limit` combined bytes, and enforces a
+//! wall-clock timeout that kills the child. Dependency provenance for `duct`
+//! 1.1.x is recorded in `docs/dependency-review.md`.
 
 #![expect(
     clippy::excessive_nesting,
     reason = "intentional deep branching for redaction and version parsing"
 )]
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -80,11 +81,12 @@ pub struct ExecuteOpts {
     pub timeout: Option<Duration>,
     /// Working directory for the child.
     pub cwd: Option<PathBuf>,
-    /// Extra env vars to set.
+    /// Extra env vars to set; they survive `clear_env`, but a matching
+    /// `env_remove` entry wins.
     pub env: Vec<(String, String)>,
-    /// Env vars to remove.
+    /// Env vars removed after the `env` additions are applied.
     pub env_remove: Vec<String>,
-    /// Start from a clean environment when true.
+    /// Start the child from an empty environment instead of the inherited one.
     pub clear_env: bool,
     /// Combined byte cap on captured stdout+stderr.
     pub output_limit: Option<usize>,
@@ -178,6 +180,40 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     }
 }
 
+/// Canonical key for the composed child env map: Windows env names are
+/// ASCII-case-insensitive, so fold them there (duct's wrappers matched the
+/// same way); other platforms match exactly.
+#[cfg(windows)]
+fn env_map_key(name: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let folded: Vec<u16> = name.encode_wide().map(u16::to_ascii_uppercase).collect();
+    OsString::from_wide(&folded)
+}
+
+#[cfg(not(windows))]
+fn env_map_key(name: &OsStr) -> OsString {
+    name.to_os_string()
+}
+
+/// Compose the child env: inherited (or empty when `clear_env`), then the
+/// `env` additions, then `env_remove`, which wins on the same key.
+fn compose_child_env(opts: &ExecuteOpts) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = if opts.clear_env {
+        BTreeMap::new()
+    } else {
+        std::env::vars_os()
+            .map(|(k, v)| (env_map_key(&k), v))
+            .collect()
+    };
+    for (key, val) in &opts.env {
+        env.insert(env_map_key(OsStr::new(key)), OsString::from(val));
+    }
+    for key in &opts.env_remove {
+        env.remove(&env_map_key(OsStr::new(key)));
+    }
+    env
+}
+
 /// Run a command with explicit argv (no shell interpolation), bounded capture,
 /// timeout, and optional redaction.
 ///
@@ -189,19 +225,16 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
 /// - Timeout kills the child and returns `CoreError::BinaryDetection` with
 ///   timeout context (caller can map to install-specific errors).
 ///
-/// # Env composition hazard
+/// # Env composition
 ///
-/// Duct applies env wrappers in reverse build order and `full_env` replaces
-/// the whole map. As the source below is ordered (`full_env`, `env_remove`,
-/// `env`), the child actually sees: `env` additions applied first, then
-/// `env_remove`, then `full_env(empty)` running LAST. So with `clear_env:
-/// true` every `env` addition is silently discarded, and a key listed in both
-/// `env_remove` and `env` ends up removed. Callers that need additions to
-/// reach the child must not set `clear_env`. Affected call-site families
-/// today (all pass `clear_env: true` plus `env` entries): activation
-/// instruction envs, `install_execute` structured/probe envs, detect package
-/// probes (HOME), skills, wrapper generation. Fixing the composition order
-/// is a behaviour change at those sites and is deferred.
+/// The child env is composed up front (see `compose_child_env`) and handed
+/// to duct as one `full_env` map: start from the inherited environment, or
+/// empty when `clear_env` is set; then apply the `env` additions; then
+/// `env_remove`, which wins over an addition on the same key. Additions
+/// therefore survive `clear_env`, and inherited vars reach the child exactly
+/// when `clear_env` is false. (Composing up front replaced duct's env wraps,
+/// which apply in reverse build order and made `clear_env` silently discard
+/// every addition.)
 pub fn run_command(
     executable: &str,
     args: &[String],
@@ -235,17 +268,10 @@ pub fn run_command(
         cmd = cmd.dir(cwd);
     }
 
-    // Reverse-order composition: full_env(empty) runs after the env/env_remove
-    // wraps and replaces the map; see the Env composition hazard above.
-    if opts.clear_env {
-        cmd = cmd.full_env(Vec::<(String, String)>::new());
-    }
-    for key in &opts.env_remove {
-        cmd = cmd.env_remove(key);
-    }
-    for (k, v) in &opts.env {
-        cmd = cmd.env(k, v);
-    }
+    // One composed map is duct's only env input: its wraps apply in reverse
+    // build order, so mixing env/env_remove wraps here would let build order,
+    // not compose_child_env, decide precedence.
+    cmd = cmd.full_env(compose_child_env(opts));
 
     cmd = cmd.stdout_capture().stderr_capture();
 
@@ -588,31 +614,80 @@ mod tests {
     }
 
     #[test]
+    fn compose_child_env_clear_start_adds_then_removes() {
+        let opts = ExecuteOpts {
+            env: vec![
+                ("SUPERAI_TEST_DUP".to_owned(), "leaked".to_owned()),
+                ("SUPERAI_TEST_ADD".to_owned(), "kept".to_owned()),
+            ],
+            env_remove: vec!["SUPERAI_TEST_DUP".to_owned()],
+            clear_env: true,
+            ..Default::default()
+        };
+        let env = compose_child_env(&opts);
+        assert_eq!(
+            env.get(OsStr::new("SUPERAI_TEST_ADD")),
+            Some(&OsString::from("kept"))
+        );
+        assert!(
+            !env.contains_key(OsStr::new("SUPERAI_TEST_DUP")),
+            "env_remove must beat an env addition on the same key"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
-    fn run_command_env_remove_beats_env_on_same_key() {
-        // Duct runs the env_remove wrap after the env wrap, so removal wins;
-        // the deferred composition reorder flips this and must be re-decided.
+    fn run_command_env_additions_survive_clear_env() {
+        // End-to-end pin of the composed precedence: additions survive
+        // clear_env, env_remove wins on a same-key addition, and an
+        // inherited var (PATH) stays cleared. printenv omits missing vars.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             env: vec![
                 ("SUPERAI_TEST_DUP".to_owned(), "leaked".to_owned()),
-                ("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned()),
+                ("SUPERAI_TEST_ADD".to_owned(), "reaches-child".to_owned()),
             ],
             env_remove: vec!["SUPERAI_TEST_DUP".to_owned()],
+            clear_env: true,
             ..Default::default()
         };
         let out = run_command(
             "printenv",
             &[
                 "SUPERAI_TEST_DUP".to_owned(),
-                "SUPERAI_TEST_KEEP".to_owned(),
+                "SUPERAI_TEST_ADD".to_owned(),
+                "PATH".to_owned(),
             ],
             &opts,
         )
         .unwrap();
         assert_eq!(
-            out.stdout, "yes\n",
-            "a key in both env and env_remove must not reach the child"
+            out.stdout, "reaches-child\n",
+            "addition must survive clear_env; same-key removal must win; PATH must stay cleared"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_inherits_ambient_env_when_clear_env_false() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned())],
+            ..Default::default()
+        };
+        // printenv itself resolves through ambient PATH, so an unset PATH
+        // fails the spawn rather than letting this pass vacuously.
+        let out = run_command(
+            "printenv",
+            &["PATH".to_owned(), "SUPERAI_TEST_KEEP".to_owned()],
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            out.stdout.lines().count(),
+            2,
+            "ambient PATH and the addition must both reach the child"
+        );
+        assert_eq!(out.stdout.lines().last(), Some("yes"));
     }
 }
