@@ -181,13 +181,31 @@ pub fn validate_timeout(timeout: Duration) -> Result<Duration> {
 
 // URL validation: scheme, host, private policy, secrecy
 
+/// Host of an http(s) URL, lowercased. Strips userinfo (`user:pass@`) and
+/// unwraps bracketed IPv6 literals (`[::1]:8443` -> `::1`), the two forms
+/// that otherwise hide the real host from the private-range check.
+fn extract_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    let host_port = rest.get(0..end)?;
+    let host_port = host_port.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    Some(host.to_ascii_lowercase())
+}
+
 /// Whether `host` is loopback, private, or link-local.
 ///
 /// Covers `inet_aton` digit shorthands (`127.1`, `2130706433`), the
 /// trailing-dot root label (`localhost.`), cloud metadata space
 /// (`169.254.*`), and IPv6 loopback/link-local/ULA/v4-mapped literals.
-/// Mirrors the hardened `template_fetch` check (private there);
-/// helper needs a home outside both files.
+/// Mirrors the hardened `template_fetch` check (private there); sharing
+/// one helper needs a home outside both files.
 pub fn is_private_host(host: &str) -> bool {
     // A trailing dot is the DNS root label: "localhost." is localhost.
     let h = host.to_ascii_lowercase();
@@ -245,7 +263,6 @@ fn is_private_v4_literal(h: &str) -> bool {
     false
 }
 
-#[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 fn is_valid_base_url_inner(url: &str) -> (bool, String) {
     if url.trim().is_empty() {
         return (false, "must not be empty".to_owned());
@@ -266,14 +283,8 @@ fn is_valid_base_url_inner(url: &str) -> (bool, String) {
     if scheme_rest.is_empty() {
         return (false, "missing host".to_owned());
     }
-    let host_end = scheme_rest.find('/').unwrap_or(scheme_rest.len());
-    let host_with_port = match scheme_rest.get(0..host_end) {
-        Some(v) => v,
-        None => return (false, "missing host".to_owned()),
-    };
-    let host = match host_with_port.split(':').next() {
-        Some(h) => h,
-        None => return (false, "missing host".to_owned()),
+    let Some(host) = extract_host(url) else {
+        return (false, "missing host".to_owned());
     };
     if host.is_empty() {
         return (false, "missing host".to_owned());
@@ -288,7 +299,6 @@ fn is_valid_base_url_inner(url: &str) -> (bool, String) {
 }
 
 /// Validate `url` for health probing, respecting private-network policy.
-#[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()> {
     let (valid, reason) = is_valid_base_url_inner(url);
     if !valid {
@@ -298,18 +308,13 @@ pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()>
         });
     }
     if !allow_private {
-        let after_scheme = match url.split("://").nth(1) {
-            Some(v) => v,
-            None => {
-                return Err(CoreError::Validation {
-                    field: "base_url".to_owned(),
-                    reason: "invalid url scheme extraction".to_owned(),
-                });
-            }
+        let Some(host) = extract_host(url) else {
+            return Err(CoreError::Validation {
+                field: "base_url".to_owned(),
+                reason: "invalid url scheme extraction".to_owned(),
+            });
         };
-        let host_port = after_scheme.split('/').next().unwrap_or_default();
-        let host = host_port.split(':').next().unwrap_or_default();
-        if is_private_host(host) {
+        if is_private_host(&host) {
             return Err(CoreError::Validation {
                 field: "base_url".to_owned(),
                 reason: format!("private host `{host}` requires allow_private_network=true"),
@@ -1445,11 +1450,18 @@ mod tests {
         }
         assert!(!is_private_host("8.8.4.4"));
         assert!(!is_private_host("2001:db8::1"));
-        // End to end: the probe URL gate rejects them without local intent.
+        // End to end: the probe URL gate rejects them without local intent,
+        // including userinfo-prefixed and bracketed spellings.
         for url in [
             "https://127.1:8443",
             "https://localhost./v1",
             "https://169.254.169.254/meta",
+            "https://x@169.254.169.254/meta",
+            "https://user:pass@127.0.0.1/",
+            "https://x@2130706433/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:10.0.0.5]:8443/",
+            "https://[::1]/",
         ] {
             assert!(
                 validate_base_url_for_probe(url, false).is_err(),
@@ -1457,6 +1469,30 @@ mod tests {
             );
         }
         assert!(validate_base_url_for_probe("https://api.example.com", false).is_ok());
+    }
+
+    /// Every redirect hop re-validates its Location through
+    /// `validate_execution_url` (the same call the redirect loop makes), so
+    /// a public endpoint bouncing to a userinfo-masked or bracketed private
+    /// host is refused mid-hop.
+    #[test]
+    fn redirect_hop_revalidates_private_host_extraction() {
+        let cfg = HealthConfig::default();
+        let provider = test_provider("https://api.example.com", AuthStyle::Bearer);
+        let probe = model_list_probe();
+        for hop in [
+            "https://x@169.254.169.254/latest/meta-data",
+            "https://attacker@127.0.0.1:8080/",
+            "https://[::ffff:10.0.0.5]/",
+        ] {
+            let err = validate_execution_url(hop, &provider, &probe, &cfg)
+                .expect_err("{hop} must be refused at the redirect hop");
+            assert!(format!("{err}").contains("private host"), "got: {err}");
+        }
+        // A public hop still validates.
+        assert!(
+            validate_execution_url("https://api.example.com/v2", &provider, &probe, &cfg).is_ok()
+        );
     }
 
     #[test]

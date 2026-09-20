@@ -2372,9 +2372,8 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&codex_path, perms).unwrap();
 
-        // Version probes spawn real subprocesses; the 5s default budget once
-        // timed out under full-suite load (round-12 flake), so this test
-        // grants a generous explicit budget.
+        // Version probes spawn real subprocesses; the 5s default once timed
+        // out under full-suite load (round-12 flake), so grant a wide budget.
         let opts = DetectOptions {
             path_dirs: Some(vec![tmp.clone()]),
             home_dir: Some(home.clone()),
