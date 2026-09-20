@@ -6,68 +6,10 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::ids::{BackupId, HarnessId, InstanceName, OperationId};
 use crate::paths::AbsolutePath;
-
-/// Wrapper for secret-bearing values that never exposes the inner value.
-///
-/// Debug, Display, and Serialize all emit a fixed placeholder. The raw secret
-/// is only reachable via [`Self::expose_secret`], which callers must use
-/// explicitly at the harness-write boundary.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RedactedString(String);
-
-impl RedactedString {
-    /// Create a new redacted wrapper from a secret value.
-    pub fn new(secret: &str) -> Self {
-        Self(secret.to_owned())
-    }
-
-    /// Borrow the raw secret. Use only at the sink that writes to the harness
-    /// config; never log or serialize this value.
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-
-    /// Redacted placeholder used in serialization and display.
-    pub fn placeholder() -> &'static str {
-        "[REDACTED]"
-    }
-}
-
-impl fmt::Debug for RedactedString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RedactedString([REDACTED])")
-    }
-}
-
-impl fmt::Display for RedactedString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl Serialize for RedactedString {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(Self::placeholder())
-    }
-}
-
-impl<'de> Deserialize<'de> for RedactedString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        // Round-trip yields the placeholder, never the original secret.
-        Ok(Self(s))
-    }
-}
 
 /// High-level kind of a mutating operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,43 +590,14 @@ mod tests {
         let mut result = sample_result();
         // Put a diagnostic that has been redacted prior to insertion.
         let secret = "another-super-secret-99";
-        let diagnostic_redacted = format!("apiKey was {}", RedactedString::placeholder());
+        let diagnostic_redacted =
+            format!("apiKey was {}", crate::error::RedactedString::placeholder());
         result.diagnostics_redacted.push(diagnostic_redacted);
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains(secret));
         assert!(json.contains("[REDACTED]"));
         let back: OperationResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, back);
-    }
-
-    #[test]
-    fn redacted_string_debug_and_display_do_not_leak() {
-        let secret = "my-very-secret-api-key-xyz";
-        let redacted = RedactedString::new(secret);
-        let debug = format!("{redacted:?}");
-        let display = format!("{redacted}");
-        let json = serde_json::to_string(&redacted).unwrap();
-        for output in [debug, display, json] {
-            assert!(
-                !output.contains(secret),
-                "redacted output must not contain secret: {output}"
-            );
-            assert!(
-                output.contains("[REDACTED]"),
-                "redacted output must contain placeholder: {output}"
-            );
-        }
-        // Expose is explicit.
-        assert_eq!(redacted.expose_secret(), secret);
-    }
-
-    #[test]
-    fn redacted_string_equality_is_based_on_secret() {
-        let a = RedactedString::new("same");
-        let b = RedactedString::new("same");
-        let c = RedactedString::new("different");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
     }
 
     #[test]

@@ -26,7 +26,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -113,21 +112,8 @@ fn derive_alias_instance_id(
     })
 }
 
-fn unique_operation_string(prefix: &str) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut hasher = DefaultHasher::new();
-    millis.hash(&mut hasher);
-    count.hash(&mut hasher);
-    let suffix = hasher.finish() & 0xffff;
-    format!("{prefix}-{millis:013}-{suffix:04x}-{count:04x}")
-}
-
 fn transaction_operation_id(prefix: &str) -> Result<superai_config::transaction::OperationId> {
-    let candidate = unique_operation_string(prefix);
+    let candidate = crate::registry::unique_operation_string(prefix);
     superai_config::transaction::OperationId::new(&candidate).map_err(|e| CoreError::Validation {
         field: "operation_id".to_owned(),
         reason: format!("generated operation id invalid: {e}"),
@@ -1268,7 +1254,7 @@ fn generate_alias_wrapper(
 /// Quarantine a half-created alias root. Recovery state stays under the
 /// alias base (`<base>/.superai/quarantine/...`), never the user's home.
 fn quarantine_alias_root(base_dir: &Path, root: &Path) -> std::result::Result<PathBuf, CoreError> {
-    let op = unique_operation_string("alias-failure");
+    let op = crate::registry::unique_operation_string("alias-failure");
     superai_config::quarantine::move_to_quarantine_under(base_dir, root, &op)
         .map(|entry| entry.quarantine_path)
         .map_err(CoreError::Config)
@@ -1461,7 +1447,7 @@ pub fn remove_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<
     }
     if record.root.as_path().exists() {
         // Recovery state stays under the alias base, never the user's home.
-        let op = unique_operation_string("alias-remove");
+        let op = crate::registry::unique_operation_string("alias-remove");
         superai_config::quarantine::move_to_quarantine_under(
             base.as_path(),
             record.root.as_path(),

@@ -464,6 +464,8 @@ mod tests {
             );
         }
         assert_eq!(redacted.expose_secret(), secret);
+        assert_eq!(RedactedString::new("same"), RedactedString::new("same"));
+        assert_ne!(redacted, RedactedString::new("different"));
     }
 
     #[test]

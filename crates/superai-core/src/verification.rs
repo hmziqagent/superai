@@ -1454,24 +1454,6 @@ mod tests {
             "expose_secret should return original"
         );
 
-        // operation RedactedString
-        let r2 = crate::operation::RedactedString::new(secret);
-        for out in [
-            format!("{r2:?}"),
-            format!("{r2}"),
-            serde_json::to_string(&r2).unwrap(),
-        ] {
-            assert!(
-                !out.contains(secret),
-                "op redacted must not contain secret: {out}"
-            );
-            assert!(
-                out.contains("[REDACTED]"),
-                "op redacted must contain placeholder: {out}"
-            );
-        }
-        assert_eq!(r2.expose_secret(), secret);
-
         // error containing redacted must not leak via Debug/Display
         let err = crate::error::CoreError::SecretValidation {
             field: "apiKey".to_owned(),

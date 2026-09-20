@@ -1,32 +1,18 @@
-//! Symlink-swap profiles over fixed config paths (run-5 area A, decision 2).
+//! Symlink-swap profiles over fixed config paths.
 //!
-//! Fixed-path harnesses (claude-desktop is the declared
-//! [`Isolation::FixedPathSingle`] case) honor no relocation env var, so an
-//! instance is a superai-managed profile tree swapped into the fixed path by
-//! an atomic symlink flip: `create_profile` makes the marked root,
-//! `activate_profile` backs pre-existing real content up under the base and
-//! links the path at the root, `deactivate_profile` removes the link and
-//! restores the backup digest-verified. The fixed path is always a parameter;
-//! nothing here resolves or writes the real user home.
-//!
-//! Layout under the caller-chosen base directory:
-//!
-//! ```text
-//! <base>/profiles.json                                  profile manifest
-//! <base>/<harness>/<profile-name>/                      managed profile tree
-//! <base>/<harness>/<profile-name>/.superai-profile      ownership marker
-//! <base>/.superai/profile-active/<harness>.json         active-swap state
-//! <base>/.superai/profile-locks/<harness>/activation.lock
-//! <base>/.superai/quarantine/<operation_id>/            pre-swap backups
-//! ```
-//!
-//! Caveats (run-5 research A.1): deactivate or switch only while the app is
-//! quit, since Electron `Singleton*` locks live inside the swapped tree;
-//! Windows MSIX virtualizes AppData, so the mechanism is Linux/macOS only.
+//! Fixed-path harnesses (the declared [`Isolation::FixedPathSingle`] case)
+//! honor no relocation env var, so an instance is a managed profile tree
+//! swapped into the fixed path by an atomic symlink flip: create marks the
+//! root, activate backs pre-existing content up and links the path at it,
+//! deactivate removes the link and restores the backup digest-verified.
+//! State (manifest, ownership markers, active-swap records, locks, and
+//! quarantine backups) lives under the caller-chosen base; the fixed path
+//! is always a parameter, so nothing here resolves or writes the real user
+//! home. Switch profiles only while the app is quit: Electron `Singleton*`
+//! locks sit in the swapped tree, and Windows MSIX virtualizes AppData.
 //! Concurrent activations serialize through the WRP-06 activation lock.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +23,7 @@ use crate::activation::ActivationLock;
 use crate::error::{CoreError, Result};
 use crate::ids::{HarnessId, InstanceName};
 use crate::paths::AbsolutePath;
-use crate::registry::now_iso8601;
+use crate::registry::{now_iso8601, unique_operation_string};
 use crate::template::compute_digest;
 
 /// Marker file inside every managed profile root proving superai ownership.
@@ -58,23 +44,6 @@ const PROFILE_STATE_DIR: &str = ".superai";
 const ACTIVE_DIR_NAME: &str = "profile-active";
 /// Activation lock directory (one lockfile per harness).
 const LOCK_DIR_NAME: &str = "profile-locks";
-
-fn unique_operation_string(prefix: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut hasher = DefaultHasher::new();
-    millis.hash(&mut hasher);
-    count.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    let suffix = hasher.finish() & 0xffff;
-    format!("{prefix}-{millis:013}-{suffix:04x}-{count:04x}")
-}
 
 /// Request to create a profile: a harness and a name. The managed tree the
 /// fixed path will point at is created fresh; seeding harness config into it

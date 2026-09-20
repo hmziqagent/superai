@@ -26,8 +26,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
@@ -118,19 +116,6 @@ fn edit_to_engine_operation(edit: &Edit, owned_keys: &[String]) -> Result<Engine
         .with_owned_keys(owned_keys.to_vec())
         .with_expected_old(edit.from.clone())
         .with_create_parent(true))
-}
-
-fn operation_id_string() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    millis.hash(&mut hasher);
-    count.hash(&mut hasher);
-    let suffix = hasher.finish() & 0xffff;
-    format!("op-{millis:013}-{suffix:04x}-{count:04x}")
 }
 
 fn quarantine_target(path: &Path, op_id: &str) {
@@ -975,7 +960,7 @@ pub fn apply_update_with_catalog_digests(
     let new_content = new_bytes_serialized.into_bytes();
 
     // Prepare file actions
-    let op_id_str = operation_id_string();
+    let op_id_str = crate::registry::unique_operation_string("op");
     let tx_op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
         CoreError::Validation {
             field: "operation_id".to_owned(),

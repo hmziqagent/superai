@@ -82,6 +82,25 @@ pub(crate) fn now_iso8601() -> String {
     unix_secs_to_rfc3339(secs)
 }
 
+/// Operation-id string unique across threads and processes: millis,
+/// pid, and an in-process counter feed the hash. profile, alias, and
+/// `template_update` all draw from this one home.
+pub(crate) fn unique_operation_string(prefix: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = DefaultHasher::new();
+    millis.hash(&mut hasher);
+    count.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let suffix = hasher.finish() & 0xffff;
+    format!("{prefix}-{millis:013}-{suffix:04x}-{count:04x}")
+}
+
 // SSRF gate, shared by template_fetch, health, and skills fetch. One home so
 // a new bypass spelling is fixed once, not per copy.
 

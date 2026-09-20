@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn diff_redaction_does_not_leak_secrets() {
-        use crate::operation::RedactedString as OpRedacted;
+        use crate::error::RedactedString as OpRedacted;
         let secret = OpRedacted::new("super-secret-key");
         let diff_text = format!("set api key to {secret}");
         assert!(!diff_text.contains("super-secret-key"));
