@@ -1926,9 +1926,8 @@ impl SkillRegistry {
         let skill_dir = self.root.join(skill_id.as_str());
         let registry_file = registry_file_for_root(&self.root);
         if skill_dir.exists() {
-            // The tree goes to quarantine (recoverable); the registry update
-            // below is transactional. A removal that fails must error before
-            // the registry entry disappears, or tree and records diverge.
+            // Tree to quarantine (recoverable); the registry update is
+            // transactional, so a failure errors before records diverge.
             let op_id_str = format!(
                 "skill-remove-{}-{}",
                 skill_id.as_str(),

@@ -3,18 +3,12 @@
 //! No existing crate round-trips env files losslessly (dotenvy and friends
 //! are loaders: they drop comments, blank lines, export prefixes, quoting
 //! style, and duplicates on write), so this module implements its own
-//! line-preserving parser (DOC-07).
-//!
-//! Preservation contract:
-//! - Comments (`# ...`), blank lines, `export` prefix, quoting style
-//!   (`'`, `"`, or unquoted), spacing around `=`, and newline style (LF vs
-//!   CRLF) are preserved where untouched.
-//! - Duplicate keys are preserved; the effective value is the last
-//!   occurrence. Edits update the **last** occurrence and never silently
-//!   deduplicate. Stricter duplicate policy is the adapter's call.
-//! - Single/double quotes and escapes are handled (`\"`, `\\`, `\n`, `\r`,
-//!   `\t` in double quotes; `\'`, `\\` in single quotes; `\#` in unquoted).
-//!   Values are kept literal: no `$VAR` expansion is performed or honored.
+//! line-preserving parser (DOC-07). Comments, blank lines, `export`
+//! prefixes, quoting style, spacing around `=`, and newline style survive
+//! untouched; duplicate keys are preserved with the last occurrence
+//! effective, and edits update the last occurrence without deduplicating.
+//! Double quotes honor `\"` `\\` `\n` `\r` `\t`, single quotes `\'` `\\`,
+//! unquoted `\#`; values stay literal (no `$VAR` expansion).
 
 use std::collections::BTreeMap;
 use std::path::Path;

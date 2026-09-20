@@ -1805,9 +1805,7 @@ pub fn execute_uninstall_and_mark(
     Ok((out, marked))
 }
 
-// ---------------------------------------------------------------------------
 // PKG-09: pin-exact-binary selection
-// ---------------------------------------------------------------------------
 
 /// A user-selected exact binary pin (PKG-09).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2743,9 +2741,7 @@ mod tests {
         assert!(plan.command_preview.validate().is_err());
     }
 
-    // -------------------------------------------------------------------
     // PKG-06 persisted receipts / PKG-07 skip / PKG-10 typed external
-    // -------------------------------------------------------------------
 
     /// Build an executable plan whose install command runs `marker_prog`
     /// (writing a marker file when it runs, so tests can prove the command
@@ -2967,9 +2963,7 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
     // PKG-08 receipt ownership + binary-missing marking
-    // -------------------------------------------------------------------
 
     #[cfg(unix)]
     #[test]
@@ -3074,9 +3068,7 @@ mod tests {
         drop(fs::remove_dir_all(&home));
     }
 
-    // -------------------------------------------------------------------
     // PKG-09 pin-exact-binary selection
-    // -------------------------------------------------------------------
 
     #[cfg(unix)]
     #[test]

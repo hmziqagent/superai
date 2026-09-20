@@ -478,11 +478,8 @@ fn recreate_link(from: &Path, to: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         let target = std::fs::read_link(from).map_err(|e| ConfigError::io(from, e))?;
-        // std cannot create junctions: a junction is recreated as a
-        // directory symlink to the same target, and a privilege failure
-        // surfaces as an error rather than a copy through the link.
-        // A healthy link takes its target's flavour; a dangling one falls
-        // back to the file flavour (stable std names no kind for it).
+        // std cannot create junctions, so one is recreated as a directory
+        // symlink; a dangling link falls back to the file flavour.
         let dir_flavored = std::fs::metadata(from).is_ok_and(|m| m.is_dir());
         let made = if dir_flavored {
             std::os::windows::fs::symlink_dir(&target, to)

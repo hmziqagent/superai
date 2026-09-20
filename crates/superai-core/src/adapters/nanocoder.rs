@@ -274,7 +274,7 @@ impl Adapter for NanocoderAdapter {
         };
 
         // Absent forces High, so the Low "config root exists" arm can never
-        // survive; it is not computed.
+        // survive.
         let confidence = match (&binary_path, &version) {
             (Some(_), None) => DetectionConfidence::Medium,
             (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,

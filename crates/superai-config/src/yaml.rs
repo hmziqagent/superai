@@ -1,20 +1,15 @@
 //! YAML configs: anchors, merge keys, scalars, flow style, duplicate handling.
 //!
-//! Preservation contract (DOC-06):
-//! - Write policy: a `serde`-based writer normalizes comments, anchor names,
-//!   alias structure, tags, scalar style, and document markers, and lexical
-//!   detection of that material cannot be made hole-free (two audit rounds
-//!   each found a scanner blind spot). Every changing write to an existing
-//!   YAML file is therefore refused with
-//!   [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite);
-//!   only creating a missing file is allowed. Reads and validation always
-//!   work, and no-op edits never write, so byte identity is preserved.
-//! - The `serde` layer resolves aliases to duplicated values (anchor names
-//!   are lost), so alias-aware mutation is rejected: adapters must not plan
-//!   edits that assume alias sharing.
-//! - Duplicate keys are rejected (strict) via a custom visitor. Merge keys
-//!   (`<<: *anchor`) stay an ordinary `<<` key with a duplicated mapping
-//!   value; they are not expanded into the parent mapping.
+//! Preservation contract (DOC-06): a `serde`-based writer normalizes
+//! comments, anchors, tags, scalar style, and document markers, and lexical
+//! detection of that cannot be made hole-free, so every changing write to
+//! an existing YAML file is refused with
+//! [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite);
+//! only creating a missing file is allowed. No-op edits never write, so
+//! byte identity is preserved. The `serde` layer resolves aliases (anchor
+//! names are lost), so alias-aware mutation is rejected. Duplicate keys
+//! are rejected strict; merge keys (`<<: *anchor`) stay an ordinary `<<`
+//! key and are not expanded.
 
 use std::path::Path;
 

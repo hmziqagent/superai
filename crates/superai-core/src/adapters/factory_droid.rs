@@ -233,7 +233,7 @@ impl Adapter for FactoryDroidAdapter {
         };
 
         // Absent forces High: the Low "config root exists" arm below can
-        // never survive that override, so it is not computed at all.
+        // never survive that override.
         let confidence = match (&binary_path, &version) {
             (Some(_), None) => DetectionConfidence::Medium,
             (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,

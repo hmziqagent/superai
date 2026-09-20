@@ -289,14 +289,11 @@ impl Adapter for SweAgentAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
+        // Absent forces High, so the Low "config root exists" arm can never
+        // survive.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         let confidence = if present == InstallPresence::Absent {

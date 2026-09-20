@@ -1,7 +1,7 @@
 # Dependency review (QAL-12)
 
 Per-crate review evidence for every external dependency, recorded in-repo so
-the AGENTS.MD rule ("dependency additions need verification: crates.io
+the AGENTS.md rule ("dependency additions need verification: crates.io
 existence, exact spelling, active maintenance") has an artifact, not just a
 process. Re-review whenever `Cargo.lock` diff shows a new participant.
 

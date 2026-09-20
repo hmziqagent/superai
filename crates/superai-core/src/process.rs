@@ -687,7 +687,11 @@ mod tests {
     fn run_command_env_remove_drops_variable_from_child() {
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
-            env: vec![("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned())],
+            env: vec![
+                ("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned()),
+                // Injected so the drop is provable even with no ambient HOME.
+                ("HOME".to_owned(), "must-not-reach-child".to_owned()),
+            ],
             env_remove: vec!["HOME".to_owned()],
             ..Default::default()
         };

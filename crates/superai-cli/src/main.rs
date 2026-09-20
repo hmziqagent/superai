@@ -17,7 +17,8 @@ fn main() -> ExitCode {
 
 fn run() -> superai_core::Result<()> {
     // Crash recovery (MUT-09): finish or roll back whatever was abandoned
-    // mid-transaction, judged from actual filesystem state, never a blind replay.
+    // mid-transaction, judging from actual filesystem state instead of
+    // blindly replaying recorded steps.
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)

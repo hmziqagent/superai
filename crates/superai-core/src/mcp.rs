@@ -69,9 +69,8 @@ fn validate_url(url: &str) -> Result<()> {
             reason: format!("url must be http(s):// or ws(s)://, got `{url}`"),
         });
     }
-    // '&' and '=' are how a query string pairs parameters; everywhere else
-    // they stay shell metachars and are refused. A doubled '&' is the shell
-    // command separator, refused in the query too.
+    // A single '&' (with '=') pairs query parameters; a doubled '&' is
+    // the shell command separator and is refused even in the query.
     let (before_query, query) = match url.split_once('?') {
         Some((head, tail)) => (head, Some(tail)),
         None => (url, None),

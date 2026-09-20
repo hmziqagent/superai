@@ -21,9 +21,7 @@ pub const FRESHNESS_AS_OF: &str = "2026-09-18";
 /// last recorded recheck.
 pub const MAX_ENTRY_AGE_DAYS: i64 = 365;
 
-// ---------------------------------------------------------------------------
 // Evidence model
-// ---------------------------------------------------------------------------
 
 /// A piece of evidence backing one ledger row.
 #[derive(Debug, Clone, Copy)]
@@ -713,9 +711,7 @@ pub fn staleness_days(last_verified: &str, as_of: &str) -> Option<i64> {
     Some(days_from_civil(ay, am, ad) - days_from_civil(ly, lm, ld))
 }
 
-// ---------------------------------------------------------------------------
 // Tests: the ledger is a tested artifact (QAL-13)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -1444,9 +1444,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -----------------------------------------------------------------------
     // Fixture-backed conformance tests (QAL-02 corpus)
-    // -----------------------------------------------------------------------
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/workbuddy")

@@ -453,7 +453,7 @@ impl Adapter for ClaudeCodeAdapter {
                 .to_owned(),
         ];
         plan.auth_prerequisites = vec![crate::adapter::AuthPrerequisite::harness_login(
-            "claude /login (OAuth): or export ANTHROPIC_API_KEY before launching",
+            "claude /login (OAuth), or export ANTHROPIC_API_KEY before launching",
         )];
         Ok(plan)
     }

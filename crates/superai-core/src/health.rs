@@ -248,9 +248,7 @@ pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()>
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Redaction, never emit raw secrets
-// ---------------------------------------------------------------------------
 
 const SECRET_QUERY_KEYS: &[&str] = &[
     "api_key", "apikey", "api-key", "key", "token", "secret", "password", "auth", "bearer", "sk-",
@@ -1208,9 +1206,7 @@ fn failed_before_network(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1516,9 +1512,7 @@ mod tests {
         assert!(res2.base_url_redacted.contains("[REDACTED]") || !res2.valid);
     }
 
-    // -----------------------------------------------------------------------
     // PRV-06 / PRV-07, probe derivation + real execution guards
-    // -----------------------------------------------------------------------
 
     fn model_list_probe() -> ProbeDefinition {
         ProbeDefinition {
