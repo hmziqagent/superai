@@ -1,31 +1,18 @@
-//! Install planning — validates and previews harness installs (PKG-04).
+//! Install planning: validates and previews harness installs (PKG-04).
 //!
 //! Given a request `{ harness, version/channel, method, destination }` the
-//! planner validates:
-//! - platform/architecture support (via catalog constraints)
-//! - official package identity (method + package_name must match catalog)
-//! - version availability (REAL per-method registry probe via the process
-//!   module: `npm view` / `brew info --json=v2` / `cargo search` /
-//!   `mise ls-remote` / `pip index versions`; offline, timeout, and
-//!   missing-manager outcomes become typed unavailable-with-reason, never a
-//!   silent `true`)
-//! - writable destination
-//! - network and admin requirements
-//! - conflicts with existing installs (via `InstallCatalogEntry.conflicts`)
-//! - expected executable after install
-//!
-//! The plan is previewed — no filesystem or network mutation occurs here.
-//! The preview contains the exact `executable + argv` tokens that would be
-//! executed, so callers can display and confirm before running.
+//! planner validates platform support, official package identity against the
+//! catalog, version availability (real per-method registry probe: `npm view`,
+//! `brew info`, `cargo search`, `mise ls-remote`, `pip index versions`; every
+//! failure becomes a typed unavailable-with-reason, never a silent `true`),
+//! writable destination, network/admin needs, conflicts, and the expected
+//! executable. The preview carries the exact `executable + argv` tokens that
+//! would run; nothing is mutated here.
 //!
 //! External and direct methods have no safe non-interactive install command
-//! (PKG-10): their plans are marked `external_install` with the documented
-//! docs URL and executing them refuses with the typed
-//! [`CoreError::ExternalInstallRequired`]. No `mise install` command is ever
-//! fabricated for a non-mise package.
-//!
-//! Prefer mise-backed versioned installs when supported (see
-//! `InstallMethodKind::Mise`).
+//! (PKG-10): their plans are marked `external_install` with the docs URL, and
+//! executing them refuses with [`CoreError::ExternalInstallRequired`]. No
+//! `mise install` command is ever fabricated for a non-mise package.
 
 #![expect(
     clippy::excessive_nesting,
@@ -42,10 +29,6 @@ use crate::install_catalog::{
 };
 use crate::process::{ExecuteOpts, extract_version, run_command};
 
-// ---------------------------------------------------------------------------
-// Request and preview types
-// ---------------------------------------------------------------------------
-
 /// Request to plan an installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRequest {
@@ -53,7 +36,7 @@ pub struct InstallRequest {
     pub harness: HarnessId,
     /// Optional requested version (semver or channel like `latest`, `stable`).
     pub version: Option<String>,
-    /// Optional channel (e.g., `stable`, `beta`, `nightly`) — mutually
+    /// Optional channel (e.g., `stable`, `beta`, `nightly`); mutually
     /// exclusive with `version` in strict semver flows, but both may be
     /// supplied for mise's `channel@version` syntax; planner prefers `version`
     /// when both are present.
@@ -102,7 +85,7 @@ impl InstallRequest {
 
 /// Outcome of a real per-method version availability probe (PKG-04).
 ///
-/// `Unavailable` always carries a reason — offline, timeout, missing package
+/// `Unavailable` always carries a reason: offline, timeout, missing package
 /// manager, or a concrete registry answer that does not cover the requested
 /// version. Availability is never silently reported as true.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,8 +172,8 @@ impl VersionProbe for SystemVersionProbe {
         let unavailable = |reason: String| VersionAvailability::Unavailable { reason };
         match method {
             InstallMethodKind::Npm => {
-                // For a concrete requested version ask the registry for that
-                // exact spec; for channels/latest ask for the latest.
+                // Concrete versions ask the registry for that exact spec;
+                // channels and latest ask for the newest.
                 let spec = match requested {
                     Some(r) if !is_channel(r) => format!("{package}@{r}"),
                     _ => package.to_owned(),
@@ -396,7 +379,7 @@ pub struct ExternalInstall {
     pub reason: String,
 }
 
-/// Preview of a planned install — the validated, displayable plan.
+/// Preview of a planned install: the validated, displayable plan.
 ///
 /// No mutation has occurred. The caller should display `command_preview`,
 /// `requires_network`, `requires_admin`, `conflicts`, and
@@ -450,10 +433,6 @@ impl InstallPlan {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Platform helpers
-// ---------------------------------------------------------------------------
-
 /// Current platform OS string (`linux`, `macos`, `windows`).
 pub fn current_os() -> String {
     if cfg!(target_os = "linux") {
@@ -477,10 +456,6 @@ pub fn current_arch() -> String {
         "any".to_owned()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Core planner
-// ---------------------------------------------------------------------------
 
 /// Plan an install for `request`, validating against the embedded catalog and
 /// the host platform. On success returns a preview that can be displayed to
@@ -537,7 +512,6 @@ pub fn plan_install_for_entry_with_probe(
     platform_arch: &str,
     probe: &dyn VersionProbe,
 ) -> Result<InstallPlan, CoreError> {
-    // 1) Platform/arch support
     if !entry.supports_platform(platform_os, platform_arch) {
         return Err(CoreError::UnsupportedHarness {
             harness: entry.harness.clone(),
@@ -548,8 +522,7 @@ pub fn plan_install_for_entry_with_probe(
         });
     }
 
-    // 2) Official package identity — method must be in catalog and package_name
-    //    must be the official one (no caller-supplied package override).
+    // Package identity comes from the catalog; callers cannot override it.
     let method = entry
         .methods
         .iter()
@@ -569,17 +542,13 @@ pub fn plan_install_for_entry_with_probe(
         })?;
     let package_name = method.package_name.clone();
 
-    // 3) Version availability — REAL per-method registry probe (PKG-04).
-    //    The syntactic checks below reject injection-shaped inputs outright;
-    //    availability itself is the probe's typed answer (never a silent true).
+    // Syntactic gate rejects injection-shaped inputs outright; whether a
+    // well-formed version is actually offered is the probe's typed answer.
     validate_version_shape(request.version.as_deref(), request.channel.as_deref())?;
     let requested_version = request.version.as_deref().or(request.channel.as_deref());
     let version_availability =
         probe.check_availability(&request.method, &package_name, requested_version);
 
-    // 4) Writable destination — if destination is Some, check that the parent
-    //    exists and is writable (via metadata + permissions). On missing parent,
-    //    treat as not writable (caller must create it).
     let destination_writable = check_destination_writable(request.destination.as_deref())?;
     if !destination_writable {
         return Err(CoreError::Validation {
@@ -594,21 +563,15 @@ pub fn plan_install_for_entry_with_probe(
         });
     }
 
-    // 5) Network and admin requirements
-    let requires_network = true; // all catalog methods except External require network
+    // Every non-External catalog method reaches a registry over the network.
+    let requires_network = true;
     let requires_admin = entry.requires_admin;
-
-    // 6) Conflicts — surface known conflicts; do not block, just report.
     let conflicts = entry.conflicts.clone();
-
-    // 7) Expected executable after install — derive from destination or method defaults.
     let expected_executable =
         derive_expected_executable(entry, method, request.destination.as_deref());
 
-    // 8) PKG-10: External/Direct methods have no safe non-interactive install
-    //    command. Mark the plan external with docs guidance; NO install
-    //    command is fabricated for them (in particular, a non-mise package is
-    //    never misattributed to `mise install`).
+    // PKG-10: External/Direct methods have no safe non-interactive install
+    // command; no installer (in particular `mise install`) is fabricated.
     let external_install = match request.method {
         InstallMethodKind::External => Some(ExternalInstall {
             docs: entry.docs.clone(),
@@ -625,10 +588,7 @@ pub fn plan_install_for_entry_with_probe(
         _ => None,
     };
 
-    // 9) Build command preview — method-specific argv tokens, no shell pipeline.
     let command_preview = build_command_preview(entry, method, request)?;
-
-    // Validate the preview contains no shell pipeline (defense in depth)
     command_preview.validate()?;
 
     Ok(InstallPlan {
@@ -711,7 +671,6 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
             reason: "must not contain NUL".to_owned(),
         });
     }
-    // If path exists, check metadata
     match std::fs::metadata(path) {
         Ok(meta) => {
             if !meta.is_dir() {
@@ -723,25 +682,24 @@ fn check_destination_writable(dest: Option<&Path>) -> Result<bool, CoreError> {
                     ),
                 });
             }
-            // On Unix, check write bit; on Windows, try to create a temp file probe
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = meta.permissions().mode();
-                // Check owner write; if not, report not writable (best effort)
                 if mode & 0o200 == 0 && mode & 0o020 == 0 && mode & 0o002 == 0 {
                     return Ok(false);
                 }
                 Ok(true)
             }
+            // Windows has no portable write-bit probe; report writable.
             #[cfg(not(unix))]
             {
-                // Try to open a probe file?
                 Ok(true)
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Parent must exist and be writable
+            // Missing destination is fine only when its parent exists, is a
+            // directory, and is writable.
             if let Some(parent) = path.parent() {
                 if parent.as_os_str().is_empty() {
                     return Ok(false);
@@ -783,11 +741,8 @@ fn derive_expected_executable(
     if let Some(dest) = destination {
         return dest.join(exe);
     }
-    // Method-specific defaults
     match method.kind {
         InstallMethodKind::Mise => {
-            // mise installs to shims dir: ~/.local/share/mise/shims/<exe>
-            // Use HOME if available, else fallback to /home/user
             let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
             home.join(".local/share/mise/shims").join(exe)
         }
@@ -816,14 +771,8 @@ fn build_command_preview(
     method: &InstallMethod,
     request: &InstallRequest,
 ) -> Result<CommandTokens, CoreError> {
-    let version_suffix = |ver: Option<&String>| -> String {
-        if let Some(v) = ver {
-            // For npm/cargo, version is `@version`; for mise, `@version`; for brew, `@version`
-            format!("@{v}")
-        } else {
-            String::new()
-        }
-    };
+    let version_suffix =
+        |ver: Option<&String>| -> String { ver.map_or_else(String::new, |v| format!("@{v}")) };
     let ver = request.version.as_ref().or(request.channel.as_ref());
     let pkg_with_ver = if ver.is_some() {
         format!("{}{}", method.package_name, version_suffix(ver))
@@ -832,8 +781,7 @@ fn build_command_preview(
     };
 
     // PKG-10: External and Direct methods have no safe non-interactive install
-    // command. The preview is the documented docs URL — no `mise install` (or
-    // any installer) is fabricated for a package the method does not own.
+    // command; the preview opens the docs URL instead.
     if matches!(
         method.kind,
         InstallMethodKind::External | InstallMethodKind::Direct
@@ -885,20 +833,10 @@ fn build_command_preview(
     Ok(tokens)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-#[expect(
-    redundant_imports,
-    reason = "test helpers import catalog types explicitly"
-)]
 mod tests {
     use super::*;
-    use crate::install_catalog::{
-        DetectHints, InstallCatalogEntry, InstallMethod, PlatformConstraints,
-    };
+    use crate::install_catalog::{DetectHints, PlatformConstraints};
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -1005,7 +943,8 @@ mod tests {
         }
     }
 
-    /// Platform: all — `plan_install_for_entry` rejects `windows`/`aarch64` when entry only allows `linux`/`x86_64`; Linux, macOS, Windows each validated via `PlatformConstraints::supports` with `any` wildcard.
+    /// Rejection is per-OS and per-arch via `PlatformConstraints::supports`
+    /// with the `any` wildcard.
     #[test]
     fn plan_rejects_unsupported_platform() {
         let entry = minimal_entry("test-harness", &["linux"], &["x86_64"]);
@@ -1015,10 +954,8 @@ mod tests {
         assert!(
             format!("{err}").contains("not supported") || format!("{err}").contains("platform")
         );
-        // Same arch but different os still fails
         let err2 = plan_install_for_entry(&req, &entry, "macos", "x86_64").unwrap_err();
         assert!(format!("{err2}").contains("not supported"));
-        // Supported succeeds
         let ok = plan(&req, &entry, &available_probe()).unwrap();
         assert_eq!(ok.platform_os, "linux");
     }
@@ -1087,7 +1024,7 @@ mod tests {
         let err = plan(&req2, &entry, &probe).unwrap_err();
         assert!(format!("{err}").contains("not writable") || format!("{err}").contains("writable"));
 
-        // Cleanup: restore perms so remove_dir_all succeeds
+        // Restore write bits so cleanup can remove the tree.
         let mut perms = fs::metadata(&ro_dir).unwrap().permissions();
         perms.set_mode(0o700);
         drop(fs::set_permissions(&ro_dir, perms));
@@ -1111,7 +1048,6 @@ mod tests {
         assert!(plan_result.requires_network);
         assert!(!plan_result.requires_admin);
         assert_eq!(plan_result.command_preview.executable, "mise");
-        // Preview must have no shell pipeline
         plan_result.command_preview.validate().unwrap();
         assert!(!plan_result.command_display().contains('|'));
         assert!(!plan_result.command_display().contains("&&"));
@@ -1119,22 +1055,17 @@ mod tests {
 
     #[test]
     fn plan_preview_has_no_shell_concatenation() {
-        // Fake process verifies argv has no shell concatenation — ensure preview
-        // is structured as executable + argv, not a single shell string.
         let entry = minimal_entry("test-harness", &["linux"], &["x86_64"]);
         let harness = HarnessId::new("test-harness").unwrap();
         let req = InstallRequest::new(harness, InstallMethodKind::Npm).with_version("1.2.3");
         let plan_result = plan(&req, &entry, &available_probe()).unwrap();
-        // Executable must be a single binary name, not "npm install ..."
         assert!(!plan_result.command_preview.executable.contains(' '));
-        // Args must be separate tokens, not shell-joined
         for arg in &plan_result.command_preview.args {
             assert!(!arg.contains("&&"));
             assert!(!arg.contains("||"));
             assert!(!arg.contains('|'));
             assert!(!arg.contains('`'));
         }
-        // The display string is for humans; the structured tokens are the source of truth
         assert_eq!(plan_result.command_preview.executable, "npm");
         assert!(
             plan_result
@@ -1164,10 +1095,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // PKG-04 real availability + PKG-10 external plans
-    // -------------------------------------------------------------------
-
     #[test]
     fn plan_surfaces_typed_unavailable_with_reason_never_silent_true() {
         let entry = minimal_entry("test-harness", &["any"], &["any"]);
@@ -1190,8 +1117,7 @@ mod tests {
 
     #[test]
     fn availability_reconciles_requested_version_against_registry_answer() {
-        // Registry reports 2.0.0; the caller asked for 1.2.3 -> typed
-        // unavailable naming both.
+        // Registry reports 2.0.0 while 1.2.3 was requested: typed unavailable.
         let reconciled = Available {
             resolved: Some("2.0.0".to_owned()),
         }
@@ -1205,7 +1131,6 @@ mod tests {
             }
             Available { .. } => panic!("expected Unavailable"),
         }
-        // Matching and prefix-compatible answers stay available.
         assert!(
             Available {
                 resolved: Some("1.2.3".to_owned())
@@ -1233,7 +1158,6 @@ mod tests {
     #[test]
     fn external_and_direct_methods_are_typed_external_installs_not_mise() {
         let entry = minimal_entry("test-harness", &["any"], &["any"]);
-        // The catalog entry must actually list the methods for the planner.
         let mut entry = entry;
         entry.methods.push(InstallMethod {
             kind: InstallMethodKind::Direct,
@@ -1259,7 +1183,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{method:?} plan must carry external_install"));
             assert_eq!(ext.docs, "https://example.com");
             assert!(!ext.reason.is_empty());
-            // No installer command is fabricated — the preview opens docs.
+            // No installer command is fabricated, the preview opens docs.
             assert_eq!(plan_result.command_preview.executable, "open");
             assert!(
                 plan_result
@@ -1280,13 +1204,9 @@ mod tests {
         assert!(plan_result.version_available());
     }
 
-    /// The system probe's honesty contract, tested WITHOUT live network:
-    /// the external/direct arm performs no subprocess at all and answers
-    /// typed Unavailable-with-reason (PKG-10). The spawn-error mapping
-    /// (`Err(e) => unavailable("<manager> probe failed: {e}")`) is exercised
-    /// the same way in every arm — offline machines and manager-less hosts
-    /// hit it on the first real call — so the default suite stays hermetic
-    /// (judge round-1 finding 1: no live registry round-trips).
+    /// The external/direct probe arm runs no subprocess and answers typed
+    /// Unavailable-with-reason; the default suite stays hermetic (no live
+    /// registry round-trips).
     #[test]
     fn system_probe_answers_typed_unavailable_without_live_network() {
         let probe = SystemVersionProbe;

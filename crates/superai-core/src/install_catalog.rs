@@ -1,41 +1,26 @@
-//! Installation catalog — data-driven harness package registry (PKG-02).
+//! Installation catalog: data-driven harness package registry (PKG-02).
 //!
-//! Per harness/platform the catalog records: `HarnessId`, executable and app
-//! identifiers, supported install methods with official package names, version
-//! sources and constraints, detect commands and filesystem paths, update and
-//! uninstall command tokens (executable + argv, never a shell pipeline),
-//! checksum/signature guards, known conflicts, documentation links, and the
-//! last-verified date. All data lives in `assets/install_catalog.json` and is
-//! validated on load — no package identity or command is hard-coded in Rust.
-//!
-//! PKG-01 verification is documented in [`crate::process`]; this module
-//! records the duct/mise decision for auditability.
+//! Per harness/platform the catalog records install methods with official
+//! package names, platform constraints, detect/update/uninstall command
+//! tokens (executable + argv, never a shell pipeline), and docs. All data
+//! lives in `assets/install_catalog.json` and is validated on load; no
+//! package identity or command is hard-coded in Rust.
 
 #![expect(
     clippy::excessive_nesting,
     reason = "intentional deep validation branching"
 )]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
 use crate::ids::HarnessId;
 
-// ---------------------------------------------------------------------------
-// Embedded catalog asset path
-// ---------------------------------------------------------------------------
-
-/// Embedded catalog JSON (compile-time include). Mirrors
-/// `assets/install_catalog.json` so data is available without filesystem I/O
-/// in tests and single-binary deployments. Filesystem load is still provided
-/// for hot-reload / operator-supplied catalogs.
+/// Embedded catalog JSON (compile-time include). Filesystem load via
+/// `from_file` is still provided for operator-supplied catalogs.
 const EMBEDDED_CATALOG: &str = include_str!("../assets/install_catalog.json");
-
-// ---------------------------------------------------------------------------
-// Install method kind
-// ---------------------------------------------------------------------------
 
 /// Supported install method for a harness.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -78,16 +63,10 @@ impl std::fmt::Display for InstallMethodKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Command tokens (executable + argv, no shell pipeline)
-// ---------------------------------------------------------------------------
-
 /// A structured command: executable plus argv tokens, never a shell pipeline.
 ///
-/// Every command in the catalog must be representable as `executable` + `args`.
-/// Strings containing shell metacharacters (`|`, `&&`, `;`, `` ` ``, `$(`,
-/// `>`, `<`) are rejected on validation to ensure no shell interpolation
-/// occurs at execution time.
+/// Tokens carrying shell metacharacters (`|`, `&&`, `;`, `` ` ``, `$(`, `>`)
+/// are rejected on validation so no catalog entry can smuggle a pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandTokens {
     /// Program to execute (looked up via `PATH` unless absolute).
@@ -96,10 +75,6 @@ pub struct CommandTokens {
     #[serde(default)]
     pub args: Vec<String>,
 }
-
-const FORBIDDEN_TOKENS: &[&str] = &[
-    "|", "&&", "||", ";", "`", "$(", "${", ">", "<", ">>", "<<", "&",
-];
 
 impl CommandTokens {
     /// Validate that the command contains no shell metacharacters and no empty
@@ -111,12 +86,6 @@ impl CommandTokens {
                 reason: "executable must not be empty".to_owned(),
             });
         }
-        if self.executable.contains('\0')
-            || self.executable.contains('/') && self.executable.contains('`')
-        {
-            // NUL is always forbidden; backticks are shell metachar
-        }
-        // Forbid shell metachars in executable and args.
         let check = |field: &str, value: &str| -> Result<(), CoreError> {
             if value.contains('\0') {
                 return Err(CoreError::Validation {
@@ -124,44 +93,26 @@ impl CommandTokens {
                     reason: "must not contain NUL".to_owned(),
                 });
             }
-            for pat in FORBIDDEN_TOKENS {
-                // Exact shell pipeline tokens are forbidden; substring check is
-                // intentionally strict — catalog commands should be pure argv.
-                // Allow `|` inside a package name? No package name should
-                // contain shell operators, so we reject any occurrence where
-                // the arg is exactly a shell operator or contains the classic
-                // interpolation patterns.
-                if *pat == "|" && value == "|" {
-                    return Err(CoreError::Validation {
-                        field: field.to_owned(),
-                        reason: "arg must not be shell pipeline token `|`".to_owned(),
-                    });
-                }
-                if (*pat == "$(" || *pat == "${" || *pat == "`") && value.contains(pat) {
+            if value == "|" {
+                return Err(CoreError::Validation {
+                    field: field.to_owned(),
+                    reason: "arg must not be shell pipeline token `|`".to_owned(),
+                });
+            }
+            for pat in ["$(", "${", "`", "&&", "||", ";", ">>", "<<"] {
+                if value.contains(pat) {
                     return Err(CoreError::Validation {
                         field: field.to_owned(),
                         reason: format!("must not contain shell pattern `{pat}`"),
-                    });
-                }
-                if (*pat == "&&" || *pat == "||" || *pat == ";" || *pat == ">>" || *pat == "<<")
-                    && value.contains(pat)
-                {
-                    return Err(CoreError::Validation {
-                        field: field.to_owned(),
-                        reason: format!("must not contain shell pattern `{pat}`"),
-                    });
-                }
-                if (*pat == ">" || *pat == "<") && value == *pat {
-                    return Err(CoreError::Validation {
-                        field: field.to_owned(),
-                        reason: format!("arg must not be shell redirect `{pat}`"),
                     });
                 }
             }
-            // Also forbid bare `-c` sh invocation patterns hidden as args
-            // e.g. ["sh", "-c", "curl ... | sh"] — the `"curl | sh"` case is
-            // already caught by the pipeline check, but we also reject an arg
-            // that is exactly "-c" when the executable is sh/bash.
+            if value == ">" || value == "<" {
+                return Err(CoreError::Validation {
+                    field: field.to_owned(),
+                    reason: format!("arg must not be shell redirect `{value}`"),
+                });
+            }
             Ok(())
         };
         check("command.executable", &self.executable)?;
@@ -189,10 +140,6 @@ impl CommandTokens {
         out
     }
 }
-
-// ---------------------------------------------------------------------------
-// Install method
-// ---------------------------------------------------------------------------
 
 /// One install method for a harness: kind plus official package identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,10 +195,6 @@ impl InstallMethod {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Constraints and detect hints
-// ---------------------------------------------------------------------------
 
 /// Platform constraints for an install entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -325,10 +268,6 @@ impl DetectHints {
     }
 }
 
-// ---------------------------------------------------------------------------
-// InstallCatalogEntry
-// ---------------------------------------------------------------------------
-
 /// One harness's install registry entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallCatalogEntry {
@@ -381,7 +320,6 @@ pub struct InstallCatalogEntry {
 impl InstallCatalogEntry {
     /// Validate the entry.
     pub fn validate(&self) -> Result<(), CoreError> {
-        // HarnessId must be valid
         HarnessId::new(&self.harness).map_err(|e| CoreError::Validation {
             field: "harness".to_owned(),
             reason: format!("invalid HarnessId `{}`: {e}", self.harness),
@@ -452,7 +390,6 @@ fn validate_last_verified(value: &str) -> Result<(), CoreError> {
             reason: "must not be empty (YYYY-MM-DD)".to_owned(),
         });
     }
-    // Expect 10 chars: 4-2-2 with dashes
     if value.len() != 10 {
         return Err(CoreError::Validation {
             field: "last_verified".to_owned(),
@@ -460,7 +397,6 @@ fn validate_last_verified(value: &str) -> Result<(), CoreError> {
         });
     }
     let bytes = value.as_bytes();
-    // Check dash positions without indexing panic: use get
     let dash1 = bytes.get(4).copied().unwrap_or(b' ');
     let dash2 = bytes.get(7).copied().unwrap_or(b' ');
     if dash1 != b'-' || dash2 != b'-' {
@@ -469,7 +405,6 @@ fn validate_last_verified(value: &str) -> Result<(), CoreError> {
             reason: format!("expected YYYY-MM-DD, got `{value}`"),
         });
     }
-    // Check digits
     for (idx, b) in bytes.iter().enumerate() {
         if idx == 4 || idx == 7 {
             continue;
@@ -484,9 +419,7 @@ fn validate_last_verified(value: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Catalog load and lookup
-// ---------------------------------------------------------------------------
 
 /// Loaded install catalog: harness id -> entry mapping plus ordered list.
 #[derive(Debug, Clone)]
@@ -531,12 +464,20 @@ impl InstallCatalog {
     }
 
     /// Load from the embedded asset (`assets/install_catalog.json`).
+    ///
+    /// The asset is a compile-time constant, so the parse is memoized; disk
+    /// catalogs via `from_file` are always read fresh.
     pub fn embedded() -> Result<Self, CoreError> {
-        Self::from_json_str(EMBEDDED_CATALOG)
+        static CACHED: std::sync::OnceLock<InstallCatalog> = std::sync::OnceLock::new();
+        if let Some(cached) = CACHED.get() {
+            return Ok(cached.clone());
+        }
+        let parsed = Self::from_json_str(EMBEDDED_CATALOG)?;
+        Ok(CACHED.get_or_init(|| parsed.clone()).clone())
     }
 
-    /// Load from a file path on disk. Preserves data-driven semantics: the
-    /// file is read fresh, not cached between operations.
+    /// Load from a file path on disk. The file is read fresh, not cached
+    /// between operations.
     pub fn from_file(path: &Path) -> Result<Self, CoreError> {
         let bytes = std::fs::read(path).map_err(|e| CoreError::Validation {
             field: "install_catalog".to_owned(),
@@ -570,20 +511,12 @@ impl InstallCatalog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    /// Return the path to the embedded asset file (for tooling).
-    pub fn embedded_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/install_catalog.json")
-    }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn minimal_entry(harness: &str) -> InstallCatalogEntry {
         InstallCatalogEntry {
@@ -650,10 +583,9 @@ mod tests {
 
     #[test]
     fn catalog_data_driven_not_code() {
-        // Prove the JSON file on disk and the embedded string agree, and that
-        // changing the file changes the catalog (data-driven). We do not
-        // assert on Rust constants directly.
-        let path = InstallCatalog::embedded_path();
+        // The JSON file on disk and the embedded string must agree; the
+        // catalog changes by editing the file, not Rust code.
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/install_catalog.json");
         assert!(path.exists(), "asset file must exist at {}", path.display());
         let file_catalog = InstallCatalog::from_file(&path).unwrap();
         let embedded = InstallCatalog::embedded().unwrap();

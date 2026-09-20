@@ -1,4 +1,4 @@
-//! Property tests for QAL-03 — manual loops with deterministic RNG, no external dep.
+//! Property tests for QAL-03: manual loops with a deterministic RNG, no external dep.
 //!
 //! Covers: registry no forbidden fields, preview deterministic,
 //! restore exact, collision-safe normalization, capability complete.
@@ -26,9 +26,7 @@ mod tests {
     use crate::state::{InstanceOrigin, Isolation, Ownership};
     use crate::test_util::temp_dir_unique;
 
-    // -----------------------------------------------------------------------
-    // Deterministic PRNG — SplitMix64, no external crate.
-    // -----------------------------------------------------------------------
+    // Deterministic PRNG: SplitMix64, no external crate.
 
     struct Prng {
         state: u64,
@@ -81,15 +79,14 @@ mod tests {
     const SIMPLE_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
     fn random_valid_name(rng: &mut Prng, prefix: &str) -> String {
-        // Generate a valid InstanceName / HarnessId-like string.
-        // Must not be reserved windows name, must not contain NUL/control, separators, trailing dot/space.
+        // Valid id shape: no NUL/control/separators, and not a reserved
+        // Windows device name.
         let len = rng.gen_range(3, 12);
         let mut s = prefix.to_owned();
         for _ in 0..len {
             let idx = rng.gen_range(0, SIMPLE_CHARSET.len());
             s.push(SIMPLE_CHARSET[idx] as char);
         }
-        // Ensure not reserved: append extra char if needed.
         let lower = s.to_lowercase();
         let reserved = [
             "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
@@ -193,9 +190,7 @@ mod tests {
         dir.join(format!("registry-{iter}.json"))
     }
 
-    // -----------------------------------------------------------------------
     // 1. Registry no forbidden fields
-    // -----------------------------------------------------------------------
     #[test]
     fn property_registry_no_forbidden_fields() {
         let forbidden = [
@@ -246,9 +241,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 2. Preview deterministic — install plan and capability resolver
-    // -----------------------------------------------------------------------
+    // 2. Preview deterministic: install plan and capability resolver
     /// Deterministic, offline availability probe (judge round-1 finding 1):
     /// property tests must never reach a live package registry. The fake
     /// answers deterministically so the preview property covers availability
@@ -310,7 +303,7 @@ mod tests {
                 destination: None,
             };
 
-            // Injected probe: deterministic AND offline — no live registry
+            // Injected probe: deterministic AND offline, no live registry
             // round-trips in the default suite.
             let plan1 = crate::install_plan::plan_install_for_entry_with_probe(
                 &req, entry, "linux", "x64", &probe,
@@ -407,9 +400,7 @@ mod tests {
         out
     }
 
-    // -----------------------------------------------------------------------
-    // 3. Restore exact — registry file backup/restore
-    // -----------------------------------------------------------------------
+    // 3. Restore exact: registry file backup/restore
     #[test]
     fn property_restore_exact_registry() {
         for iter in 0..50 {
@@ -458,9 +449,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 4. Collision-safe normalization — ids
-    // -----------------------------------------------------------------------
+    // 4. Collision-safe normalization, ids
     #[test]
     fn property_collision_safe_normalization_ids() {
         for iter in 0..100 {
@@ -543,9 +532,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 5. Collision-safe normalization — paths
-    // -----------------------------------------------------------------------
+    // 5. Collision-safe normalization, paths
     #[test]
     fn property_collision_safe_normalization_paths() {
         for iter in 0..100 {
@@ -629,9 +616,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // 6. Capability complete
-    // -----------------------------------------------------------------------
     #[test]
     fn property_capability_complete() {
         // Static matrix must be complete.
@@ -657,16 +642,14 @@ mod tests {
                         "empty explanation for {harness_str}/{provider_str} {:?} at {iter}",
                         cap
                     );
-                    // For active pairs, source should not be Unknown unless explicitly Absent? But many Absent are Harness source.
-                    // Just ensure not Unknown for active pairs where matrix has entry.
-                    // Our matrix has entries for all active pairs, so source should not be Unknown.
+                    // The matrix has entries for every active pair, so the
+                    // source must never be Unknown.
                     assert_ne!(
                         res.source,
                         CapabilitySource::Unknown,
                         "active pair {harness_str}/{provider_str} has Unknown source for {:?} at {iter}",
                         cap
                     );
-                    // Substituted must have Provider/Template/Plugin source.
                     if res.support == Support::Substituted {
                         assert!(
                             matches!(
@@ -687,7 +670,6 @@ mod tests {
                 HarnessId::new(&random_valid_name(&mut rng, "unknown-h-")).unwrap();
             let unknown_provider =
                 ProviderId::new(&random_valid_name(&mut rng, "unknown-p-")).unwrap();
-            // Use a harness/provider not in ACTIVE_PAIRS.
             let is_active = ACTIVE_PAIRS.iter().any(|(h, p)| {
                 h.to_lowercase() == unknown_harness.as_str().to_lowercase()
                     && p.to_lowercase() == unknown_provider.as_str().to_lowercase()
@@ -695,7 +677,6 @@ mod tests {
             if !is_active {
                 let cap = ALL_CAPABILITIES[rng.gen_range(0, ALL_CAPABILITIES.len())];
                 let res = resolve(&unknown_harness, &unknown_provider, cap);
-                // For unknown pair, should be Absent + Unknown.
                 assert_eq!(
                     res.support,
                     Support::Absent,
@@ -724,9 +705,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 7. Unrelated survive — registry
-    // -----------------------------------------------------------------------
+    // 7. Unrelated survive, registry
     #[test]
     fn property_registry_unrelated_survive() {
         for iter in 0..50 {
@@ -784,9 +763,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 8. No-op byte identity — raw_editor diff is_noop equals byte equality
-    // -----------------------------------------------------------------------
+    // 8. No-op byte identity: raw_editor is_noop equals byte equality
     #[test]
     fn property_no_op_byte_identity_raw_editor() {
         for iter in 0..80 {
@@ -834,10 +811,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 9. Transaction preview deterministic is covered via install plan; also check
-    //    registry store preview via operation preview structure.
-    // -----------------------------------------------------------------------
+    // 9. raw_editor diff and validate are deterministic for random bytes.
     #[test]
     fn property_preview_deterministic_raw_editor_commit() {
         for iter in 0..50 {
@@ -873,7 +847,8 @@ mod tests {
 
     #[test]
     fn mutant_registry_no_forbidden_fields_and_secret_redacted() {
-        // Mutant-killer: if forbidden field check or secret redaction is removed, this fails.
+        // Mutant-killer: deleting the forbidden-field check or secret
+        // redaction fails this.
         for iter in 0..30 {
             let mut rng = Prng::new(iter as u64 + 0xbbbb);
             let reg = {

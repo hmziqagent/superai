@@ -1,22 +1,14 @@
 //! QAL-13/QAL-14: goal-sentence and DoD ledgers as TESTED artifacts.
 //!
-//! This module machine-checks the two planning ledgers that were previously
-//! only prose:
-//!
-//! - every `docs/goal.md` requirement row of master-plan §9 maps to at least
-//!   one existing test (or an explicit unsupported-state citation), and
-//! - every master-plan §10 non-UI DoD checkbox maps the same way.
-//!
-//! The check is bidirectional against the plan document itself (embedded at
-//! compile time): if a §9 row is added or reworded, or a §10 checkbox is
-//! added or removed, the corresponding test here fails until the ledger is
-//! updated. Every cited test name is verified to exist in the cited source
-//! file, so renamed or deleted tests break the build, not just the docs.
-//!
-//! QAL-14 freshness lives here too: [`staleness_days`] gives the pre-release
-//! recheck workflow its age computation, and the freshness test enforces the
-//! catalog's `last_verified` discipline against a recorded recheck date.
+//! Every master-plan §9 requirement row and §10 non-UI DoD checkbox must map
+//! to at least one existing test (or an explicit artifact citation). The
+//! check is bidirectional against the plan document (embedded at compile
+//! time), and every cited test name is verified to exist as a `#[test]` in
+//! the cited file, so renamed or deleted tests break the build, not just the
+//! docs. QAL-14 freshness ([`staleness_days`]) enforces the catalog's
+//! `last_verified` discipline against a recorded recheck date.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Reference date for the freshness ledger (QAL-14). The pre-release recheck
@@ -53,25 +45,29 @@ pub enum Evidence {
     },
 }
 
+impl Evidence {
+    /// Source file the item cites.
+    fn file(&self) -> &str {
+        match self {
+            Self::Test { file, .. } | Self::Contains { file, .. } => file,
+        }
+    }
+}
+
 /// Resolve an evidence `file` (relative to this crate's manifest dir).
 fn resolve(file: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file)
 }
 
-/// Verify one evidence item; returns a human-readable problem on failure.
-pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
+/// Verify one evidence item against an already-read source text; returns a
+/// human-readable problem on failure.
+fn verify_evidence_src(evidence: &Evidence, src: &str) -> Result<(), String> {
     match evidence {
         Evidence::Test { file, name } => {
-            let path = resolve(file);
-            let src =
-                std::fs::read_to_string(&path).map_err(|e| format!("evidence file {file}: {e}"))?;
-            // The cited item must be a TEST, not a production function that
-            // happens to share the name: a `#[test]` attribute must sit in
-            // the attribute lines immediately above the `fn <name>(`
-            // definition (interleaved `#[cfg(...)]`/`#[expect(...)]`
-            // attributes are walked over). Production functions never
-            // satisfy this, so citations cannot silently drift onto
-            // non-test fns.
+            // The cited item must be a TEST, not a production fn sharing the
+            // name: a `#[test]` attribute must sit in the attribute lines
+            // directly above `fn <name>(` (interleaved cfg/expect attributes
+            // are walked over), so citations cannot drift onto non-test fns.
             let needle = format!("fn {name}(");
             let mut attrs_above: Vec<&str> = Vec::new();
             let mut cited_is_test = false;
@@ -91,16 +87,13 @@ pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
                 Ok(())
             } else if src.contains(&needle) {
                 Err(format!(
-                    "`{name}` in {file} is not a #[test] function — cite a test, not a production fn"
+                    "`{name}` in {file} is not a #[test] function; cite a test, not a production fn"
                 ))
             } else {
                 Err(format!("test `{name}` not found in {file}"))
             }
         }
         Evidence::Contains { file, needle } => {
-            let path = resolve(file);
-            let src =
-                std::fs::read_to_string(&path).map_err(|e| format!("evidence file {file}: {e}"))?;
             if src.contains(needle) {
                 Ok(())
             } else {
@@ -110,9 +103,25 @@ pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
     }
 }
 
-// ---------------------------------------------------------------------------
+/// Read an evidence file once per run, memoizing per caller-supplied cache.
+fn cached_source(file: &str, cache: &mut HashMap<String, String>) -> Result<String, String> {
+    if let Some(src) = cache.get(file) {
+        return Ok(src.clone());
+    }
+    let src =
+        std::fs::read_to_string(resolve(file)).map_err(|e| format!("evidence file {file}: {e}"))?;
+    cache.insert((*file).to_owned(), src.clone());
+    Ok(src)
+}
+
+/// Verify one evidence item; returns a human-readable problem on failure.
+pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
+    let mut cache = HashMap::new();
+    let src = cached_source(evidence.file(), &mut cache)?;
+    verify_evidence_src(evidence, &src)
+}
+
 // §9 ledger: goal.md requirement rows → owning tests
-// ---------------------------------------------------------------------------
 
 /// One master-plan §9 row: the goal requirement sentence (must match the
 /// plan's table text exactly), plus its evidence.
@@ -125,7 +134,7 @@ pub struct GoalRow {
 }
 
 /// The full §9 ledger. The bidirectional test guarantees this list covers
-/// exactly the plan's rows — no orphans, no missing.
+/// exactly the plan's rows, no orphans, no missing.
 pub const GOAL_ROWS: &[GoalRow] = &[
     GoalRow {
         requirement: "Existing/default installs are managed targets",
@@ -344,9 +353,7 @@ pub const GOAL_ROWS: &[GoalRow] = &[
     },
 ];
 
-// ---------------------------------------------------------------------------
 // §10 ledger: non-UI DoD checkboxes → owning tests
-// ---------------------------------------------------------------------------
 
 /// One master-plan §10 checkbox: the 1-based checkbox number plus evidence.
 #[derive(Debug)]
@@ -493,12 +500,10 @@ pub const DOD_ITEMS: &[DodItem] = &[
                 file: "src/skills.rs",
                 name: "copy_selected",
             },
-            // The update path is covered end-to-end by the git-pinned
-            // revision test (real content change v1→v2, digest advance,
-            // typed SourceFetch on a bad revision); disable/remove by the
-            // distinction test. The production fn names
-            // (update_skill/disable_skill/remove_skill) are NOT tests and
-            // verify_evidence now rejects them.
+            // update is covered end-to-end by the git-pinned revision test;
+            // disable/remove by the distinction test. The production fn names
+            // (update_skill/disable_skill/remove_skill) are not tests and
+            // verify_evidence rejects them.
             Evidence::Test {
                 file: "src/skills.rs",
                 name: "git_source_pins_revision_and_checkout_is_verified",
@@ -621,9 +626,7 @@ pub const DOD_ITEMS: &[DodItem] = &[
     },
 ];
 
-// ---------------------------------------------------------------------------
 // §9/§10 document parsing (provenance of the rows themselves)
-// ---------------------------------------------------------------------------
 
 /// Extract the §9 requirement sentences (first column of the goal-coverage
 /// table), skipping the header and separator rows.
@@ -676,9 +679,7 @@ pub fn section10_items(plan: &str) -> Vec<String> {
     items
 }
 
-// ---------------------------------------------------------------------------
 // QAL-14: freshness helpers
-// ---------------------------------------------------------------------------
 
 /// Parse `YYYY-MM-DD` into `(year, month, day)`.
 pub fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
@@ -713,7 +714,7 @@ pub fn staleness_days(last_verified: &str, as_of: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — the ledger is a tested artifact (QAL-13)
+// Tests: the ledger is a tested artifact (QAL-13)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -728,7 +729,7 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// The §9 ledger covers EXACTLY the plan's requirement rows — every plan
+    /// The §9 ledger covers EXACTLY the plan's requirement rows, every plan
     /// row has an entry, and no ledger entry is orphaned. Rewording a plan
     /// row or deleting its tests fails here (`DoD` #1).
     #[test]
@@ -742,13 +743,13 @@ mod tests {
         for plan_row in &plan_rows {
             assert!(
                 ledger_rows.contains(&plan_row.as_str()),
-                "§9 row `{plan_row}` has no ledger entry — map it to a test or an explicit unsupported-state citation"
+                "§9 row `{plan_row}` has no ledger entry; map it to a test or an explicit unsupported-state citation"
             );
         }
         for ledger_row in &ledger_rows {
             assert!(
                 plan_rows.iter().any(|p| p == ledger_row),
-                "ledger row `{ledger_row}` does not match any §9 plan row — fix the ledger text"
+                "ledger row `{ledger_row}` does not match any §9 plan row; fix the ledger text"
             );
         }
         assert_eq!(
@@ -759,8 +760,10 @@ mod tests {
     }
 
     /// Every §9 ledger row carries at least one resolvable evidence item.
+    /// Cited files are read once per run, not once per citation.
     #[test]
     fn goal_ledger_evidence_resolves() {
+        let mut cache = HashMap::new();
         for row in GOAL_ROWS {
             assert!(
                 !row.evidence.is_empty(),
@@ -768,13 +771,16 @@ mod tests {
                 row.requirement
             );
             for ev in row.evidence {
-                verify_evidence(ev).unwrap_or_else(|e| panic!("§9 `{}`: {e}", row.requirement));
+                let src = cached_source(ev.file(), &mut cache)
+                    .unwrap_or_else(|e| panic!("§9 `{}`: {e}", row.requirement));
+                verify_evidence_src(ev, &src)
+                    .unwrap_or_else(|e| panic!("§9 `{}`: {e}", row.requirement));
             }
         }
     }
 
     /// The §10 ledger covers exactly the plan's 16 checkboxes (by position),
-    /// each with resolvable evidence.
+    /// each with resolvable evidence, reading each cited file once.
     #[test]
     fn dod_ledger_covers_every_section10_item() {
         let items = section10_items(MASTER_PLAN);
@@ -785,6 +791,7 @@ mod tests {
             items.len()
         );
         assert_eq!(DOD_ITEMS.len(), 16, "ledger must track all 16 DoD items");
+        let mut cache = HashMap::new();
         for item in DOD_ITEMS {
             assert!(
                 (1..=items.len()).contains(&item.number),
@@ -798,7 +805,9 @@ mod tests {
                 item.label
             );
             for ev in item.evidence {
-                verify_evidence(ev)
+                let src = cached_source(ev.file(), &mut cache)
+                    .unwrap_or_else(|e| panic!("DoD #{} ({}): {e}", item.number, item.label));
+                verify_evidence_src(ev, &src)
                     .unwrap_or_else(|e| panic!("DoD #{} ({}): {e}", item.number, item.label));
             }
         }
@@ -931,7 +940,7 @@ mod tests {
     /// QAL-13 ledger completeness in the research direction: every harness
     /// research document under `docs/harness-configs/` (the README ledger
     /// itself excepted) must be claimed by at least one catalog entry's
-    /// `research_doc` — a new research file without a ledger entry fails
+    /// `research_doc`, a new research file without a ledger entry fails
     /// here instead of silently shipping unresearched.
     #[test]
     fn research_files_have_ledger_entries() {

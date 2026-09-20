@@ -1,15 +1,11 @@
-//! Parser fuzz scaffolding — QAL-04 (core layer).
+//! Parser fuzz scaffolding (QAL-04, core layer).
 //!
 //! Deterministic quick-loop fuzz for `Registry` migration, provider/template
-//! deserialization, and related schema detection. Complements
-//! `superai-config` fuzz which covers codecs. Each test loops 100
-//! iterations over truncated / huge / nested / deep inputs seeded from
-//! harness fixtures, asserting no panic/hang/unbounded allocation/path
-//! escape, re-parse succeeds if accepted, and rejected input causes no FS
-//! mutation.
-//!
-//! No external `cargo-fuzz` binary required; see `superai-config` fuzz docs
-//! for optional `cargo fuzz` integration.
+//! deserialization, and detection inputs, complementing `superai-config`
+//! fuzz. Each test loops 100 iterations over truncated / huge / nested /
+//! deep inputs seeded from harness fixtures, asserting no panic, no
+//! unbounded allocation, no path escape, and no FS mutation on reject.
+//! No external `cargo-fuzz` binary is required.
 
 #![expect(clippy::all, reason = "fuzz scaffolding uses manual loops")]
 #![expect(clippy::pedantic, reason = "fuzz helpers intentionally verbose")]
@@ -20,9 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
-// Deterministic PRNG — SplitMix64
-// ---------------------------------------------------------------------------
+// Deterministic PRNG: SplitMix64
 
 struct Prng {
     state: u64,
@@ -70,10 +64,9 @@ fn seed_registry_corpus() -> Vec<Vec<u8>> {
     if fixtures.is_dir() {
         collect_recursive(&fixtures, &mut corpus);
     }
-    // Hardcoded registry seeds
     // Valid-root seeds anchor under the platform temp dir so the deep
-    // validation paths (path normalization, serde) are exercised on Windows
-    // too, where `/home/...` literals are rejected as non-absolute.
+    // validation paths run on Windows too, where `/home/...` literals are
+    // rejected as non-absolute.
     let valid_root = crate::test_util::tmp_abs_str("user/.claude-work");
     let escape_root = crate::test_util::tmp_abs_str("escape");
     corpus.extend(vec![
@@ -317,7 +310,6 @@ mod tests {
                 _ => gen_random_text_with_bom(&mut prng),
             };
             assert!(input.len() <= MAX_INPUT_BYTES);
-            // Inject random malformed every 7th
             let input = if iter % 7 == 0 {
                 gen_random_malformed(&mut prng, 4096)
             } else {
@@ -340,10 +332,10 @@ mod tests {
             let res = result.expect("catch ok");
             match res {
                 Ok(reg) => {
-                    // Bounded
                     let serialized = serde_json::to_string(reg.instances()).unwrap_or_default();
                     assert_bounded(&input, serialized.as_bytes(), "registry-ok");
-                    // Re-parse: store then load again
+                    // Store then load again: the round-trip must preserve the
+                    // instance count and stay bounded.
                     let store_path = dir.join(format!("registry-store-{iter}.json"));
                     let store_res = std::panic::catch_unwind(|| reg.store(&store_path));
                     assert!(store_res.is_ok(), "Registry::store panicked at {iter}");
@@ -359,12 +351,9 @@ mod tests {
                             reg.instances().len(),
                             "instance count mismatch after round-trip at {iter}"
                         );
-                        // No path escape: every config_root inside /tmp should be checked, but we store outside real HOME
-                        // For fuzz, we just ensure stored path is inside dir and no escape
                         assert_no_escape(&dir, &store_path, "registry-store");
                         let stored_bytes = std::fs::read(&store_path).unwrap_or_default();
                         assert_bounded(&input, &stored_bytes, "registry-store-bytes");
-                        // Verify no forbidden fields leaked (model, endpoint etc.)
                         let stored_str =
                             String::from_utf8_lossy(&stored_bytes).to_ascii_lowercase();
                         for forbidden in ["\"model\"", "\"endpoint\"", "\"api_key\""] {
@@ -374,12 +363,12 @@ mod tests {
                             );
                         }
                     }
-                    // No FS mutation from load (read-only) — file unchanged
+                    // Load itself is read-only: the input file is unchanged.
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(before_bytes, after_bytes, "load mutated file at {iter}");
                     let after = snapshot_dir(&dir);
-                    // Allow one extra file for store_path if it was created; otherwise unchanged
-                    // Filter store_path out for load-only check
+                    // The store round-trip may add registry-store-* files;
+                    // everything else must be byte-identical.
                     let after_filtered: Vec<_> = after
                         .iter()
                         .filter(|(p, _)| {
@@ -393,11 +382,10 @@ mod tests {
                     assert_no_escape(&dir, &path, "registry-ok");
                 }
                 Err(_) => {
-                    // Rejected — no FS mutation
+                    // Rejected input must leave the tree untouched.
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(before_bytes, after_bytes, "rejected mutated at {iter}");
                     let after = snapshot_dir(&dir);
-                    // Filter store artifacts (none should exist on rejected)
                     let after_filtered: Vec<_> = after
                         .iter()
                         .filter(|(p, _)| !p.to_string_lossy().contains("registry-store"))
@@ -446,16 +434,13 @@ mod tests {
             assert!(result.is_ok(), "Registry load panicked variant {iter}");
             match result.expect("catch") {
                 Ok(reg) => {
-                    // Re-parse via store/load
                     let store_path = dir.join(format!("reg-store-{iter}.json"));
                     let store_res = reg.store(&store_path);
                     drop(store_res);
                     if store_path.exists() {
                         let stored = std::fs::read(&store_path).unwrap_or_default();
                         assert_bounded(&input, &stored, "registry-variant-store");
-                        // Verify stored digest not unbounded
                         assert_no_escape(&dir, &store_path, "registry-variant-store");
-                        // Ensure backup not leaving unbounded files
                         let after = snapshot_dir(&dir);
                         for (p, data) in &after {
                             assert_no_escape(&dir, p, "registry-variant-after");
@@ -471,7 +456,6 @@ mod tests {
                 }
                 Err(e) => {
                     let msg = format!("{e}");
-                    // Error must be bounded and not leak unbounded allocation
                     assert!(
                         msg.len() <= 8192,
                         "error message unbounded at {iter}: len {}",
@@ -499,7 +483,8 @@ mod tests {
 
     #[test]
     fn fuzz_template_and_provider_deser_no_panic_100() {
-        // Provider/template are serde_json deserialized; fuzz their parsing
+        // Provider/template payloads are serde_json-deserialized; fuzz the
+        // parse + re-serialize round-trip for panics and bound violations.
         let corpus = seed_registry_corpus();
         for iter in 0..100 {
             let mut prng = Prng::new(iter as u64 + 0x3333);
@@ -516,32 +501,22 @@ mod tests {
             assert!(input.len() <= MAX_INPUT_BYTES);
             let text = String::from_utf8_lossy(&input).into_owned();
 
-            // Provider deserialization (via serde_json Value, mimics template fetch)
-            let prov_res =
+            let parse_res =
                 std::panic::catch_unwind(|| serde_json::from_str::<serde_json::Value>(&text));
-            assert!(prov_res.is_ok(), "provider json parse panicked at {iter}");
-            if let Ok(Ok(val)) = prov_res {
+            assert!(parse_res.is_ok(), "json parse panicked at {iter}");
+            if let Ok(Ok(val)) = parse_res {
                 let ser = serde_json::to_string(&val).unwrap_or_default();
-                assert_bounded(input.as_slice(), ser.as_bytes(), "provider-roundtrip");
+                assert_bounded(input.as_slice(), ser.as_bytes(), "json-roundtrip");
                 let reparsed = serde_json::from_str::<serde_json::Value>(&ser);
-                assert!(reparsed.is_ok(), "provider re-parse failed at {iter}");
+                assert!(reparsed.is_ok(), "re-parse failed at {iter}");
             }
-
-            // Template-like: try to deserialize as generic Value then check bounded
-            let tmpl_res = std::panic::catch_unwind(|| {
-                serde_json::from_str::<serde_json::Value>(&text)
-                    .map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null))
-            });
-            assert!(tmpl_res.is_ok(), "template deser panicked at {iter}");
-
-            // No FS mutation — this test is pure in-memory, just check bounded
-            assert!(input.len() <= MAX_INPUT_BYTES);
         }
     }
 
     #[test]
     fn fuzz_wrapper_parse_no_panic_and_bounded_and_secret_free_100() {
-        // QAL-04: wrapper parser for generated grammar — no panic, bounded, no secret leak, re-parse stable
+        // QAL-04: wrapper parse/generate round-trip, no panic, bounded, no
+        // sentinel leak, stable re-parse.
         const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
         for iter in 0u64..100u64 {
             let mut prng = Prng::new(iter + 0x5555);
@@ -591,12 +566,11 @@ mod tests {
                     "wrapper ParsedWrapper leaked sentinel at {iter}"
                 );
                 assert!(repr.len() <= MAX_OUTPUT_BYTES);
-                // Kind detection must not panic and be bounded
+                // Kind detection on a not-yet-existing path must not panic.
                 let probe_base = crate::test_util::tmp_abs("fuzz-wrapper-kind");
                 let kind = std::panic::catch_unwind(|| {
                     crate::wrapper::detect_wrapper_kind(&probe_base.join(format!("wrapper-{iter}")))
                 });
-                // Detect via file path not panicking is enough; bounded check via content already
                 drop(kind);
                 // Re-parse via generate-then-parse roundtrip for generated wrapper must be stable
                 let dir = temp_dir_unique("fuzz-wrapper-parse");
@@ -637,12 +611,12 @@ mod tests {
                 assert!(reparsed.is_some(), "generated wrapper must parse at {iter}");
                 drop(std::fs::remove_dir_all(&dir));
             } else {
-                // Rejected wrappers must not have caused secret leak via error path (return None, not panic)
+                // Rejected wrappers return None, never panic.
                 assert!(text.len() <= MAX_INPUT_BYTES);
             }
-            // Detect wrapper kind on raw text via content-based helper
+            // Kind detection on the raw input written to disk must not leak
+            // the sentinel through its Debug form.
             let kind2 = std::panic::catch_unwind(|| {
-                // Use temporary file for detect_wrapper_kind when needed; content-based check is sufficient here
                 let tmp = temp_dir_unique("fuzz-wrapper-kind");
                 std::fs::create_dir_all(&tmp).unwrap();
                 let p = tmp.join(format!("wrapper-{iter}.sh"));
@@ -687,11 +661,9 @@ mod tests {
             if let Ok(Err(e)) = prov {
                 let msg = format!("{e}");
                 assert!(msg.len() <= 8192, "error unbounded at {iter}");
-                // Error must not contain raw sentinel unless payload itself contained it as path (which is okay to report path);
-                // but we ensure diagnostics-style errors are bounded and don't expose huge allocations
                 drop(msg);
             }
-            // Template path validation must reject traversal containing sentinel without leaking beyond expected path display
+            // Traversal-bearing paths and fetch URLs must be rejected.
             let traversal = format!("../{SENTINEL}.json");
             let path_res = crate::template::validate_template_path(&traversal);
             assert!(
@@ -709,7 +681,8 @@ mod tests {
 
     #[test]
     fn fuzz_path_escape_registry_no_write_outside_temp_100() {
-        // Direct path escape check: fuzzed config_root with traversal must not cause FS write outside temp dir
+        // Fuzzed config_root values with traversal must never cause a write
+        // outside the temp dir, and payloads containing `..` are rejected.
         for iter in 0u64..100u64 {
             let mut prng = Prng::new(iter + 0x4444);
             let escape_base = crate::test_util::tmp_abs_str("fuzz-escape");
@@ -744,18 +717,17 @@ mod tests {
             for (p, _) in &after {
                 assert_no_escape(&dir, p, &format!("escape {iter}"));
             }
-            // If Ok, the registry accepted the payload — check if it contains parent dir (should have been validated)
+            // If accepted, the payload must have been free of `..` and the
+            // stored config_root bounded; accepted roots may legitimately
+            // live outside the temp dir (user data).
             if let Ok(Ok(reg)) = result {
                 for inst in reg.instances() {
                     let root_str = inst.config_root.to_string();
-                    // If payload had `..`, validation should have rejected; acceptance is a failure
                     if payload.contains("..") {
                         panic!(
-                            "path escape payload accepted at iter {iter}: payload={payload:?} root={root_str:?} — should have been rejected"
+                            "path escape payload accepted at iter {iter}: payload={payload:?} root={root_str:?}: should have been rejected"
                         );
                     }
-                    // config_root is user data, may be anywhere (e.g. /home/...), not necessarily inside fuzz temp dir;
-                    // we only verify it doesn't contain `..` and is bounded, not that it is inside dir.
                     assert!(
                         !root_str.contains(".."),
                         "config_root contains `..` at iter {iter}: {root_str:?}"
@@ -781,7 +753,6 @@ mod tests {
                     }
                 }
             } else {
-                // Rejected — ensure no mutation
                 assert_dir_unchanged(&before, &after, &format!("escape-rejected {iter}"));
             }
 
@@ -789,12 +760,9 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // QAL-04: adapter version/schema detection fuzz family — detect.rs
-    // inputs (version-output fixtures, PATH-shaped strings, catalog
-    // entries) driven through the real detection path with injected
-    // PATH/home (no ambient environment, no live package-manager probes).
-    // ------------------------------------------------------------------
+    // QAL-04 adapter detection fuzz: version-output fixtures and PATH-shaped
+    // strings drive the real detection path with injected PATH/home; no
+    // ambient environment, no live package-manager probes.
 
     const DETECT_SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
     /// Heredoc delimiter for fake `--version` executables; never appears in
@@ -954,8 +922,8 @@ mod tests {
             std::fs::create_dir_all(&bin).expect("mkdir bin");
             std::fs::create_dir_all(&home).expect("mkdir home");
             write_fake_version_exe(&bin, &exe_name, &fixture);
-            // Sometimes a mise-shaped shim under the injected home: a
-            // non-executable text file (the broken-shim arm).
+            // Every third iteration also plants a non-executable mise-shaped
+            // shim (the broken-shim arm).
             if iter % 3 == 0 {
                 let shims = home.join(".local/share/mise/shims");
                 std::fs::create_dir_all(&shims).expect("mkdir shims");
@@ -965,9 +933,7 @@ mod tests {
             let before = snapshot_dir(&dir);
 
             let path_dirs = gen_path_shaped(&mut prng, &[bin.clone()]);
-            // Hermetic: only injected PATH/home are consulted; every
-            // live package-manager probe is disabled (the group-F
-            // no-live-network discipline).
+            // Hermetic: every live package-manager probe is disabled.
             let opts = DetectOptions {
                 path_dirs: Some(path_dirs.clone()),
                 home_dir: Some(home.clone()),
@@ -986,8 +952,8 @@ mod tests {
             let result = std::panic::catch_unwind(|| detect_all_for_entry(&entry, &opts));
             assert!(result.is_ok(), "detect_all_for_entry panicked at {iter}");
             let detections = result.expect("catch ok");
-            // Bounded hit count: at most one per PATH dir per executable,
-            // plus the configured/mise arms.
+            // At most one hit per PATH dir per executable, plus the
+            // configured/mise arms.
             let bound = path_dirs.len().saturating_mul(entry.executables.len()) + 2;
             assert!(
                 detections.len() <= bound,
