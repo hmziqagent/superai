@@ -281,11 +281,8 @@ fn quarantine_corrupt_journal(journal_path: &Path, cause: &ConfigError) -> Journ
         .and_then(|s| s.strip_suffix(".journal"))
         .unwrap_or_default()
         .to_owned();
-    let mut aside_name = journal_path.as_os_str().to_os_string();
-    aside_name.push(".corrupt");
-    let aside = PathBuf::from(aside_name);
-    let (recovered, outcome) = match std::fs::rename(journal_path, &aside) {
-        Ok(()) => (
+    let (recovered, outcome) = match quarantine_aside(journal_path) {
+        Ok(aside) => (
             true,
             format!(
                 "corrupt journal ({cause}) quarantined aside as {}",
@@ -312,6 +309,28 @@ fn quarantine_corrupt_journal(journal_path: &Path, cause: &ConfigError) -> Journ
         },
         outcome,
     }
+}
+
+/// Rename the journal aside under a fresh `.corrupt.<millis>.<4hex>` name
+/// (the backup naming idiom), so a repeat corruption of the same journal
+/// name never overwrites prior quarantined evidence. Refuses after
+/// repeated name collisions rather than clobber anything.
+fn quarantine_aside(journal_path: &Path) -> std::io::Result<PathBuf> {
+    for _ in 0..5 {
+        let millis = crate::atomic::timestamp_millis_now();
+        let suffix = crate::atomic::generate_random_suffix(millis);
+        let mut aside_name = journal_path.as_os_str().to_os_string();
+        aside_name.push(format!(".corrupt.{millis}.{suffix}"));
+        let aside = PathBuf::from(aside_name);
+        if std::fs::symlink_metadata(&aside).is_ok() {
+            continue;
+        }
+        return std::fs::rename(journal_path, &aside).map(|()| aside);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no fresh quarantine name after repeated collisions",
+    ))
 }
 
 /// Remove stale staged temps: the recorded ones plus unrecorded siblings
@@ -837,7 +856,9 @@ mod tests {
             !jroot.join("op-bad.journal.json").exists(),
             "the corrupt journal no longer sits in the pending set"
         );
-        let aside = jroot.join("op-bad.journal.json.corrupt");
+        let mut asides = quarantined_files(&jroot, "op-bad.journal.json.corrupt");
+        assert_eq!(asides.len(), 1, "exactly one quarantine evidence file");
+        let aside = asides.swap_remove(0);
         assert_eq!(
             std::fs::read(&aside).unwrap(),
             b"not json at all",
@@ -876,9 +897,63 @@ mod tests {
         assert!(rec.recovered, "{}", rec.outcome);
         assert!(rec.outcome.contains("corrupt"), "{}", rec.outcome);
         assert!(!path.exists(), "it is out of the pending set");
-        let aside = jroot.join("op-denied.journal.json.corrupt");
-        assert!(aside.exists(), "the quarantined file is retained");
+        assert_eq!(
+            quarantined_files(&jroot, "op-denied.journal.json.corrupt").len(),
+            1,
+            "the quarantined file is retained"
+        );
         drop(std::fs::remove_dir_all(&home));
+    }
+
+    /// Corrupting the same journal name twice must keep both evidence
+    /// files: the aside name carries millis and hex, so a repeat quarantine
+    /// never overwrites the earlier copy.
+    #[test]
+    fn repeat_corruption_of_the_same_journal_name_keeps_both_evidence_files() {
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let pending = jroot.join("op-again.journal.json");
+
+        std::fs::write(&pending, b"first corruption").unwrap();
+        let first = recover_pending(&home).unwrap();
+        assert!(first.all_recovered(), "{:?}", first.journals);
+
+        std::fs::write(&pending, b"second corruption").unwrap();
+        let second = recover_pending(&home).unwrap();
+        assert!(second.all_recovered(), "{:?}", second.journals);
+
+        let asides = quarantined_files(&jroot, "op-again.journal.json.corrupt");
+        assert_eq!(
+            asides.len(),
+            2,
+            "both corruption events leave their own evidence file: {asides:?}"
+        );
+        let mut bodies: Vec<Vec<u8>> = asides.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec![b"first corruption".to_vec(), b"second corruption".to_vec()],
+            "each quarantine retains its own bytes"
+        );
+        assert!(!pending.exists(), "nothing stays in the pending set");
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    /// Quarantine evidence files in `dir` whose name starts with `prefix`,
+    /// sorted by name.
+    fn quarantined_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+            })
+            .collect();
+        found.sort();
+        found
     }
 
     /// When the quarantine rename itself fails, the journal stays in place
