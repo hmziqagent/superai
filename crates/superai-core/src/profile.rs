@@ -388,11 +388,12 @@ enum VerifiedRead {
     Unreadable,
 }
 
-/// Read the file at `path` proving it is still the inode `expect` described:
-/// on unix the opened fd's identity must match, so a symlink or replacement
-/// planted after the classify-time refusal is detected instead of read
-/// through. Other platforms keep the plain read (std exposes no file-identity
-/// check there); the window is the documented Windows residual.
+/// Read the file at `path` proving it is still what `expect` described: on
+/// unix the opened fd's dev/ino AND length must match. Length matters because
+/// filesystems recycle inode numbers, so a replacement created after the
+/// classified inode was freed can wear the same ino; a length pin catches it
+/// without resting on allocator behaviour. Other platforms have no std file
+/// identity and pin length only (the documented Windows residual).
 fn read_real_file_verified(path: &Path, expect: &std::fs::Metadata) -> VerifiedRead {
     #[cfg(unix)]
     {
@@ -403,7 +404,10 @@ fn read_real_file_verified(path: &Path, expect: &std::fs::Metadata) -> VerifiedR
         let Ok(opened) = file.metadata() else {
             return VerifiedRead::Unreadable;
         };
-        if opened.dev() != expect.dev() || opened.ino() != expect.ino() {
+        if opened.dev() != expect.dev()
+            || opened.ino() != expect.ino()
+            || opened.len() != expect.len()
+        {
             return VerifiedRead::RaceDetected;
         }
         let mut bytes = Vec::new();
@@ -414,22 +418,25 @@ fn read_real_file_verified(path: &Path, expect: &std::fs::Metadata) -> VerifiedR
     }
     #[cfg(not(unix))]
     {
-        let _ = expect;
         match std::fs::read(path) {
-            Ok(bytes) => VerifiedRead::Bytes(bytes),
+            Ok(bytes) if bytes.len() as u64 == expect.len() => VerifiedRead::Bytes(bytes),
+            Ok(_) => VerifiedRead::RaceDetected,
             Err(_) => VerifiedRead::Unreadable,
         }
     }
 }
 
-/// Whether `path` still names the inode `expect` described (unix only; other
-/// platforms have no std-visible identity and always "match").
+/// Whether `path` still names the inode `expect` described; a length
+/// mismatch also fails, since a recycled inode number with different content
+/// is not the classified object (unix only; other platforms always "match").
 fn still_same_inode(path: &Path, expect: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         match std::fs::symlink_metadata(path) {
-            Ok(now) => now.dev() == expect.dev() && now.ino() == expect.ino(),
+            Ok(now) => {
+                now.dev() == expect.dev() && now.ino() == expect.ino() && now.len() == expect.len()
+            }
             Err(_) => false,
         }
     }
@@ -471,7 +478,8 @@ fn read_restored_bytes(fixed_path: &Path) -> Result<Vec<u8>> {
                 source: e,
             })
         })?;
-        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+        if opened.dev() != named.dev() || opened.ino() != named.ino() || opened.len() != named.len()
+        {
             return Err(CoreError::ConcurrentModification {
                 path: fixed_path.to_path_buf(),
                 expected: "the inode lstat'd after the restore rename".to_owned(),
@@ -1732,18 +1740,20 @@ mod tests {
             VerifiedRead::Bytes(b) if b == b"classified bytes"
         ));
 
-        // A replacement file planted after classification is detected, not
-        // read through.
+        // A same-length replacement renamed over the path is caught by the
+        // dev/ino check: its inode was allocated while the classified inode
+        // was still live, so no allocator order can collide the two.
         let swap = dir.join("intruder");
-        std::fs::write(&swap, b"intruder bytes").unwrap();
+        std::fs::write(&swap, b"replaced bytes!").unwrap();
         std::fs::rename(&swap, &target).unwrap();
         assert!(matches!(
             read_real_file_verified(&target, &meta),
             VerifiedRead::RaceDetected
         ));
 
-        // A symlink planted at the path is detected the same way: the fd
-        // opens the target, whose inode differs from the classified one.
+        // A symlink planted at the path is detected even when the victim
+        // file recycled the freed classified inode number: the replacement
+        // is shorter, so detection never rests on inode allocation alone.
         let victim = dir.join("victim");
         std::fs::write(&victim, b"victim bytes").unwrap();
         std::fs::remove_file(&target).unwrap();

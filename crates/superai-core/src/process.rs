@@ -180,14 +180,29 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     }
 }
 
+/// Fold ASCII a-z up to A-Z across UTF-16 code units; every other unit
+/// (non-ASCII, surrogates) passes through untouched. Pure so the Windows
+/// fold is compiled and tested on every platform.
+#[cfg(any(windows, test))]
+fn fold_wide_ascii_uppercase(units: &[u16]) -> Vec<u16> {
+    units
+        .iter()
+        .map(|&u| match u {
+            // 0x61..=0x7A is ASCII a-z; subtracting 0x20 folds it to A-Z.
+            0x61..=0x7A => u - 0x20,
+            _ => u,
+        })
+        .collect()
+}
+
 /// Canonical key for the composed child env map: Windows env names are
 /// ASCII-case-insensitive, so fold them there (duct's wrappers matched the
 /// same way); other platforms match exactly.
 #[cfg(windows)]
 fn env_map_key(name: &OsStr) -> OsString {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    let folded: Vec<u16> = name.encode_wide().map(u16::to_ascii_uppercase).collect();
-    OsString::from_wide(&folded)
+    let wide: Vec<u16> = name.encode_wide().collect();
+    OsString::from_wide(&fold_wide_ascii_uppercase(&wide))
 }
 
 #[cfg(not(windows))]
@@ -695,17 +710,31 @@ mod tests {
             env_remove: vec!["HOME".to_owned()],
             ..Default::default()
         };
-        // printenv prints one value line per found variable; HOME must not
-        // print, so the child saw exactly the kept variable.
-        let out = run_command(
-            "printenv",
-            &["HOME".to_owned(), "SUPERAI_TEST_KEEP".to_owned()],
-            &opts,
-        )
-        .unwrap();
+        // /bin/sh -c prints one marker per pinned fact; BSD printenv rejects
+        // multiple operands, so env inspection must not lean on it.
+        let script = "if [ -z \"${HOME+x}\" ]; then echo home-dropped; fi; \
+                      if [ -n \"${SUPERAI_TEST_KEEP+x}\" ]; then echo keep=${SUPERAI_TEST_KEEP}; fi";
+        let out = run_command("/bin/sh", &["-c".to_owned(), script.to_owned()], &opts).unwrap();
         assert_eq!(
-            out.stdout, "yes\n",
-            "HOME must be removed from the child environment"
+            out.stdout, "home-dropped\nkeep=yes\n",
+            "HOME must be removed while the other addition reaches the child"
+        );
+    }
+
+    #[test]
+    fn fold_wide_ascii_uppercase_folds_ascii_only() {
+        // Windows env keys match ASCII-case-insensitively: both spellings of
+        // one name must fold to a single key.
+        let lower: Vec<u16> = "path".encode_utf16().collect();
+        let upper: Vec<u16> = "PATH".encode_utf16().collect();
+        assert_eq!(
+            fold_wide_ascii_uppercase(&lower),
+            fold_wide_ascii_uppercase(&upper)
+        );
+        // Non-ASCII units (latin-1, CJK, a lone surrogate) pass through.
+        assert_eq!(
+            fold_wide_ascii_uppercase(&[0xE9, 0x4E2D, 0xD83D, 0x30]),
+            vec![0xE9, 0x4E2D, 0xD83D, 0x30]
         );
     }
 
@@ -735,8 +764,10 @@ mod tests {
     #[cfg(unix)]
     fn run_command_env_additions_survive_clear_env() {
         // End-to-end pin of the composed precedence: additions survive
-        // clear_env, env_remove wins on a same-key addition, and an
-        // inherited var (PATH) stays cleared. printenv omits missing vars.
+        // clear_env and env_remove wins on a same-key addition. A shell
+        // cannot probe PATH (POSIX sh fabricates a default PATH at startup),
+        // so the cleared-base pin uses single-operand printenv, whose
+        // unset-variable behaviour is identical on GNU and BSD.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             env: vec![
@@ -747,19 +778,18 @@ mod tests {
             clear_env: true,
             ..Default::default()
         };
-        let out = run_command(
-            "printenv",
-            &[
-                "SUPERAI_TEST_DUP".to_owned(),
-                "SUPERAI_TEST_ADD".to_owned(),
-                "PATH".to_owned(),
-            ],
-            &opts,
-        )
-        .unwrap();
+        let script = "if [ -n \"${SUPERAI_TEST_ADD+x}\" ]; then echo add=${SUPERAI_TEST_ADD}; fi; \
+                      if [ -z \"${SUPERAI_TEST_DUP+x}\" ]; then echo dup-removed; fi";
+        let out = run_command("/bin/sh", &["-c".to_owned(), script.to_owned()], &opts).unwrap();
         assert_eq!(
-            out.stdout, "reaches-child\n",
-            "addition must survive clear_env; same-key removal must win; PATH must stay cleared"
+            out.stdout, "add=reaches-child\ndup-removed\n",
+            "addition must survive clear_env and same-key removal must win"
+        );
+        let out = run_command("printenv", &["PATH".to_owned()], &opts).unwrap();
+        assert!(
+            out.stdout.is_empty(),
+            "inherited PATH must stay cleared, got {:?}",
+            out.stdout
         );
     }
 
@@ -771,21 +801,22 @@ mod tests {
             env: vec![("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned())],
             ..Default::default()
         };
-        // std resolves the bare name through the parent PATH, so this
-        // asserts the ambient PATH VALUE reached the child env, not that
-        // the spawn needed it.
-        let out = run_command(
-            "printenv",
-            &["PATH".to_owned(), "SUPERAI_TEST_KEEP".to_owned()],
-            &opts,
-        )
-        .unwrap();
+        let script =
+            "if [ -n \"${SUPERAI_TEST_KEEP+x}\" ]; then echo keep=${SUPERAI_TEST_KEEP}; fi";
+        let out = run_command("/bin/sh", &["-c".to_owned(), script.to_owned()], &opts).unwrap();
         assert_eq!(
-            out.stdout.lines().count(),
-            2,
-            "ambient PATH and the addition must both reach the child"
+            out.stdout, "keep=yes\n",
+            "the addition must reach the child"
         );
-        assert_eq!(out.stdout.lines().last(), Some("yes"));
+        // printenv (not a shell probe: sh fabricates PATH) proves the
+        // ambient PATH VALUE reached the child env unchanged.
+        let ambient = std::env::var_os("PATH").expect("the test runner provides PATH");
+        let out = run_command("printenv", &["PATH".to_owned()], &opts).unwrap();
+        assert_eq!(
+            out.stdout.trim(),
+            ambient.to_string_lossy(),
+            "ambient PATH must reach the child unchanged"
+        );
     }
 
     #[test]
