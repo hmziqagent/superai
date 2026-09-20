@@ -247,24 +247,9 @@ fn extract_host(url: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-/// True for hosts a fetch must never reach: loopback, link-local, and
-/// RFC1918 space, including `inet_aton` shorthands (`127.1`, `2130706433`)
-/// and IPv6 literals (`fc00::/7`, `::1`, v4-mapped loopback).
-fn is_private_host(host: &str) -> bool {
-    let h = host.to_ascii_lowercase();
-    if h == "localhost" || h.is_empty() {
-        return true;
-    }
-    if h.contains(':') {
-        // IPv6 literal: loopback, unspecified, v4-mapped loopback, and
-        // unique-local fc00::/7 (first hextet starts fc/fd).
-        let first_group = h.split(':').next().unwrap_or_default();
-        return h == "::1"
-            || h == "::"
-            || h.contains("127.0.0.1")
-            || first_group.starts_with("fc")
-            || first_group.starts_with("fd");
-    }
+/// True for a dotted-IPv4-shaped literal in private/loopback/link-local
+/// space, including `inet_aton` shorthands (`127.1`, `2130706433`).
+fn is_private_v4_literal(h: &str) -> bool {
     // Digits and dots only is an IP literal in some inet_aton spelling,
     // never a real domain; judge it by its leading octet (or u32 form).
     if h.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -289,6 +274,41 @@ fn is_private_host(host: &str) -> bool {
         return second.parse::<u8>().is_ok_and(|v| (16..=31).contains(&v));
     }
     false
+}
+
+/// True for hosts a fetch must never reach: loopback, link-local, and
+/// RFC1918 space, including `inet_aton` shorthands and IPv6 literals
+/// (loopback `::1`, unspecified `::`, link-local `fe80::/10`,
+/// unique-local `fc00::/7`, and v4-mapped forms judged by their embedded
+/// v4 address).
+fn is_private_host(host: &str) -> bool {
+    // A trailing dot is the DNS root label: "localhost." is localhost.
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h == "localhost" || h.is_empty() {
+        return true;
+    }
+    if h.contains(':') {
+        if h == "::1" || h == "::" {
+            return true;
+        }
+        let first_group = h.split(':').next().unwrap_or_default();
+        if first_group.starts_with("fe8")
+            || first_group.starts_with("fe9")
+            || first_group.starts_with("fea")
+            || first_group.starts_with("feb")
+            || first_group.starts_with("fc")
+            || first_group.starts_with("fd")
+        {
+            return true;
+        }
+        // v4-mapped (::ffff:a.b.c.d): judge the embedded address.
+        if let Some(v4) = h.strip_prefix("::ffff:") {
+            return is_private_v4_literal(v4);
+        }
+        return false;
+    }
+    is_private_v4_literal(h)
 }
 
 // Core fetch: bytes with limits
@@ -736,18 +756,28 @@ mod tests {
             "https://127.0.0.2/catalog.json",
             "https://[::1]/catalog.json",
             "https://[fd00::1]/catalog.json",
+            "https://[fe80::1]/catalog.json",
+            "https://[::ffff:10.0.0.5]/catalog.json",
+            "https://[::ffff:192.168.1.1]/catalog.json",
+            "https://[::ffff:172.16.0.1]/catalog.json",
+            "https://[::ffff:169.254.169.254]/catalog.json",
+            "https://[::ffff:127.0.0.1]/catalog.json",
             "https://user@127.0.0.1/catalog.json",
             "https://user:pw@10.0.0.5/catalog.json",
             "https://2130706433/catalog.json",
             "https://127.1/catalog.json",
             "https://0.0.0.1/catalog.json",
+            "https://localhost./catalog.json",
+            "https://10.0.0.5./catalog.json",
         ] {
             let err = validate_fetch_url(url, "catalog").unwrap_err();
             assert!(err.to_string().contains("private"), "{url}: {err}");
         }
-        // Ordinary domains, including fc/fd initials, stay fetchable.
+        // Ordinary domains, including fc/fd initials and a public
+        // v4-mapped literal, stay fetchable.
         validate_fetch_url("https://fdtools.example.com/catalog.json", "catalog").unwrap();
         validate_fetch_url("https://example.com/catalog.json", "catalog").unwrap();
+        validate_fetch_url("https://[::ffff:8.8.8.8]/catalog.json", "catalog").unwrap();
     }
 
     #[test]

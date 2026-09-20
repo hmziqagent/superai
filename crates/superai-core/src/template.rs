@@ -498,9 +498,11 @@ pub struct TemplateRepoConfig {
     /// Optional fully-qualified base URL that overrides `https://{host}/{owner}/{repo}/{ref}`.
     ///
     /// When `Some`, it is used verbatim as the prefix for `catalog_url()` and
-    /// `template_url()`. This is intended for tests (`file://` or local
-    /// `http://`) and for self-hosted mirrors. When `None`, the URL is built
-    /// from `host`/`owner`/`repo`/`git_ref`.
+    /// `template_url()`: `file://` for tests and `https://` for self-hosted
+    /// mirrors. The fetch layer only ever retrieves https (plus `file://`
+    /// for tests), so an `http://` base only builds URLs that fetching
+    /// refuses. When `None`, the URL is built from
+    /// `host`/`owner`/`repo`/`git_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
@@ -868,19 +870,22 @@ impl Template {
                     reason: format!("wrapper_env key must not contain control chars: `{k}`"),
                 });
             }
-            if v.contains('\0') {
+            // Values reach generated wrappers; a line break would escape
+            // `set "KEY=..."` as fresh batch commands, and no dialect can
+            // quote a control character usefully.
+            if v.chars().any(char::is_control) {
                 return Err(CoreError::Validation {
                     field: "wrapper_env".to_owned(),
-                    reason: "wrapper_env value must not contain NUL".to_owned(),
+                    reason: "wrapper_env value must not contain control chars".to_owned(),
                 });
             }
             check_value_forbidden(&Value::String(v.clone()))?;
         }
         for arg in &self.wrapper_args {
-            if arg.contains('\0') {
+            if arg.chars().any(char::is_control) {
                 return Err(CoreError::Validation {
                     field: "wrapper_args".to_owned(),
-                    reason: "wrapper arg must not contain NUL".to_owned(),
+                    reason: "wrapper arg must not contain control chars".to_owned(),
                 });
             }
             // Shell patterns in args are forbidden (no `sh -c` etc).
@@ -2069,6 +2074,23 @@ mod tests {
         tmpl.wrapper_env
             .insert("ANTHROPIC_MODEL".to_owned(), "m".to_owned());
         tmpl.validate().unwrap();
+    }
+
+    /// A `\r\n` in a value would escape `set "KEY=..."` as fresh batch
+    /// lines in the cmd dialect; validation must refuse it before any
+    /// wrapper bytes are ever generated.
+    #[test]
+    fn template_wrapper_env_and_args_reject_control_characters() {
+        let mut tmpl = minimal_template();
+        tmpl.wrapper_env
+            .insert("CLAUDE_CONFIG_DIR".to_owned(), "x\r\n del /q C:".to_owned());
+        let err = tmpl.validate().unwrap_err().to_string();
+        assert!(err.contains("control chars"), "{err}");
+
+        let mut args_only = minimal_template();
+        args_only.wrapper_args.push("--flag\r\nrm -rf /".to_owned());
+        let err = args_only.validate().unwrap_err().to_string();
+        assert!(err.contains("control chars"), "{err}");
     }
 
     #[test]
