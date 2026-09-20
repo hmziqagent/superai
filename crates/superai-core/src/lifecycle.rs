@@ -4,8 +4,25 @@
 //! fresh from disk, and the registry record commits only after target
 //! verification.
 
-#![expect(clippy::all, reason = "INS lifecycle pending polish, tracked")]
-#![expect(clippy::pedantic, reason = "INS lifecycle pending polish")]
+#![expect(
+    clippy::assigning_clones,
+    clippy::cast_possible_truncation,
+    clippy::collapsible_if,
+    clippy::doc_markdown,
+    clippy::excessive_nesting,
+    clippy::format_push_string,
+    clippy::manual_contains,
+    clippy::map_unwrap_or,
+    clippy::needless_borrow,
+    clippy::needless_pass_by_value,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::ref_option,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    reason = "orchestration keeps nested preview/commit branches"
+)]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -6042,6 +6059,10 @@ pub fn adopt_with_wrapper(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::bool_assert_comparison,
+    reason = "outcome asserts read as assert!(x.success) on purpose"
+)]
 mod tests {
     use super::*;
     use crate::adapter::{GenericAdapter, ProductStatus};

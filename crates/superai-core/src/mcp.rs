@@ -9,8 +9,19 @@
 //! typed `LossyWrite` error until a preserving codec exists. Secrets are
 //! ephemeral, written only to adapter-declared sinks, and redacted in diffs.
 
-#![expect(clippy::all, reason = "mcp module reviewed for pedantic lints")]
-#![expect(clippy::pedantic, reason = "mcp comprehensive")]
+#![expect(
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::excessive_nesting,
+    clippy::for_kv_map,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_wraps,
+    reason = "per-format walks keep manual nesting and literal-bounded generics"
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -1930,6 +1941,13 @@ pub fn bulk_apply(targets: &[BulkTarget], plan: &BulkPlan, action: &BulkAction) 
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::redundant_closure_for_method_calls,
+    clippy::redundant_field_names,
+    clippy::semicolon_if_nothing_returned,
+    clippy::unnecessary_literal_bound,
+    reason = "validation fixtures stay literal for review against the spec"
+)]
 mod tests {
     use super::*;
     use crate::adapter::{ConfigScope, RestartBehavior};

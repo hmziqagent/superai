@@ -7,10 +7,24 @@
 //! unbounded allocation, no path escape, and no FS mutation on reject.
 //! No external `cargo-fuzz` binary is required.
 
-#![expect(clippy::all, reason = "fuzz scaffolding uses manual loops")]
-#![expect(clippy::pedantic, reason = "fuzz helpers intentionally verbose")]
-#![expect(clippy::restriction, reason = "fuzz explicit")]
-#![expect(clippy::nursery, reason = "fuzz explicit")]
+#![expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_if,
+    clippy::excessive_nesting,
+    clippy::format_push_string,
+    clippy::manual_assert,
+    clippy::manual_clamp,
+    clippy::manual_let_else,
+    clippy::single_char_add_str,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    clippy::unreadable_literal,
+    clippy::useless_vec,
+    reason = "fuzz loops: manual nesting, PRNG casts, incremental formats"
+)]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

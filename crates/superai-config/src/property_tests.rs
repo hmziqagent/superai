@@ -4,10 +4,20 @@
 //! Covers: no-op byte identity, unrelated survive, restore exact,
 //! preview deterministic, collision-safe normalization.
 
-#![expect(clippy::all, reason = "property tests manual loops")]
-#![expect(clippy::pedantic, reason = "property tests")]
-#![expect(clippy::restriction, reason = "property tests manual loops")]
-#![expect(clippy::nursery, reason = "property tests manual loops")]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::excessive_nesting,
+    clippy::format_push_string,
+    clippy::len_zero,
+    clippy::manual_is_multiple_of,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal,
+    reason = "property loops keep PRNG casts and manual nesting"
+)]
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};

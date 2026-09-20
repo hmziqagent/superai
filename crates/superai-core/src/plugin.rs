@@ -6,8 +6,16 @@
 //! instead of running anything. Removal touches exactly the recorded owned
 //! entries, and a shared dependency is retained until no consumer remains.
 
-#![expect(clippy::all, reason = "plugin module reviewed")]
-#![expect(clippy::pedantic, reason = "plugin comprehensive")]
+#![expect(
+    clippy::assigning_clones,
+    clippy::collapsible_if,
+    clippy::doc_markdown,
+    clippy::excessive_nesting,
+    clippy::manual_let_else,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    reason = "decl validation keeps collapsible guards and let-else chains"
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -1370,6 +1378,11 @@ pub fn remove_config_entry(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_statements,
+    clippy::map_unwrap_or,
+    reason = "fixtures build records step by step"
+)]
 mod tests {
     use super::*;
     use crate::adapter::RestartBehavior;

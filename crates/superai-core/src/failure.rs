@@ -6,15 +6,14 @@
 //! deterministic: no live network, no real daemons.
 
 #![expect(
-    clippy::all,
-    reason = "failure harness has intentional deep branching and test asserts"
+    clippy::collapsible_if,
+    clippy::excessive_nesting,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::redundant_clone,
+    clippy::vec_init_then_push,
+    reason = "failure harness keeps deliberate deep branching"
 )]
-#![expect(clippy::pedantic, reason = "failure harness pedantic lints reviewed")]
-#![expect(
-    clippy::restriction,
-    reason = "harness does not need restriction lints"
-)]
-#![expect(clippy::nursery, reason = "nursery lints not critical for harness")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1143,6 +1142,16 @@ impl FakeNetworkHarness {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    clippy::doc_markdown,
+    clippy::let_underscore_must_use,
+    clippy::manual_assert_eq,
+    clippy::option_map_unit_fn,
+    clippy::uninlined_format_args,
+    clippy::unreachable,
+    reason = "crash-recovery asserts check Result states directly"
+)]
 mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;

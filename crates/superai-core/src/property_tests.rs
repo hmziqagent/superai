@@ -3,10 +3,22 @@
 //! Covers: registry no forbidden fields, preview deterministic,
 //! restore exact, collision-safe normalization, capability complete.
 
-#![expect(clippy::all, reason = "property tests manual loops")]
-#![expect(clippy::pedantic, reason = "property tests")]
-#![expect(clippy::restriction, reason = "property tests")]
-#![expect(clippy::nursery, reason = "property tests")]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::excessive_nesting,
+    clippy::manual_is_multiple_of,
+    clippy::manual_let_else,
+    clippy::redundant_clone,
+    clippy::same_functions_in_if_condition,
+    clippy::single_char_add_str,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_to_owned,
+    clippy::unreadable_literal,
+    reason = "property loops keep PRNG casts and manual nesting"
+)]
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

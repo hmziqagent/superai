@@ -8,10 +8,25 @@
 //! registry so updates can detect and refuse to clobber local edits.
 
 #![expect(
-    clippy::all,
-    reason = "skill registry has been manually reviewed for pedantic lints"
+    clippy::assigning_clones,
+    clippy::cast_possible_truncation,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_if,
+    clippy::doc_markdown,
+    clippy::duration_suboptimal_units,
+    clippy::excessive_nesting,
+    clippy::manual_inspect,
+    clippy::map_unwrap_or,
+    clippy::needless_continue,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::redundant_closure_for_method_calls,
+    clippy::semicolon_if_nothing_returned,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::useless_format,
+    reason = "registry walks keep manual nesting, collapsible guards, incremental formats"
 )]
-#![expect(clippy::pedantic, reason = "skill registry comprehensive")]
 #![expect(unused_qualifications, reason = "explicit paths for clarity")]
 
 use std::collections::{BTreeSet, HashSet};
@@ -3565,6 +3580,13 @@ pub fn update_skill(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::if_not_else,
+    clippy::needless_borrows_for_generic_args,
+    clippy::similar_names,
+    clippy::unnecessary_map_or,
+    reason = "staging fixtures keep short local names and explicit conditionals"
+)]
 mod tests {
     use super::*;
     use crate::adapter::{GenericAdapter, ProductStatus};

@@ -108,9 +108,10 @@ pub enum ReconcileChoice {
 
 /// Launch instruction for the harness app (WRP-06 "launch app if
 /// requested"): derived from the adapter's invocation plan (WRP-01)
-/// (executable, ordered argv, environment set/unset, working-directory
-/// policy). Guidance is surfaced even when the caller launches the app
-/// themselves.
+/// (executable, ordered argv, isolation env, working-directory policy).
+/// The launch starts from a cleared env, so the plan's unset list needs
+/// no counterpart here. Guidance is surfaced even when the caller
+/// launches the app themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchInstruction {
     /// Executable to run (name or absolute path).
@@ -119,8 +120,6 @@ pub struct LaunchInstruction {
     pub args: Vec<String>,
     /// Environment to set (the plan's isolation env).
     pub env_vars: Vec<(String, String)>,
-    /// Environment to unset before launch (no inherited credentials).
-    pub env_unset: Vec<String>,
     /// Working directory, when the plan pins one.
     pub working_dir: Option<String>,
 }
@@ -136,7 +135,6 @@ impl LaunchInstruction {
                 .unwrap_or_else(|| fallback_executable.to_owned()),
             args: plan.args.clone(),
             env_vars: plan.env_vars.clone(),
-            env_unset: plan.env_unset.clone(),
             working_dir: plan.working_dir.clone(),
         }
     }
@@ -155,9 +153,6 @@ impl LaunchInstruction {
                     .join(" ")
             ),
         ];
-        if !self.env_unset.is_empty() {
-            lines.push(format!("launch unset: {}", self.env_unset.join(" ")));
-        }
         if let Some(dir) = &self.working_dir {
             lines.push(format!("launch cwd: {dir}"));
         }
@@ -1389,7 +1384,6 @@ mod tests {
             executable: app.display().to_string(),
             args: Vec::new(),
             env_vars: vec![("SUPERAI_TEST_ISO".to_owned(), "delivered".to_owned())],
-            env_unset: Vec::new(),
             working_dir: None,
         };
         let outcome = launch_app(&instruction, std::time::Duration::from_secs(10)).unwrap();

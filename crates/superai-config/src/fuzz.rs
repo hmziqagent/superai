@@ -16,12 +16,29 @@
 //! (QAL-04 exit gate); these loops are the CI-friendly baseline.
 
 #![expect(
-    clippy::all,
-    reason = "fuzz scaffolding intentionally uses manual loops and test helpers"
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::excessive_nesting,
+    clippy::format_push_string,
+    clippy::items_after_statements,
+    clippy::manual_assert_eq,
+    clippy::manual_clamp,
+    clippy::manual_is_multiple_of,
+    clippy::manual_let_else,
+    clippy::manual_string_new,
+    clippy::needless_raw_string_hashes,
+    clippy::redundant_closure_for_method_calls,
+    clippy::semicolon_if_nothing_returned,
+    clippy::single_char_add_str,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal,
+    clippy::useless_vec,
+    reason = "fuzz loops: manual nesting, PRNG casts, incremental formats"
 )]
-#![expect(clippy::pedantic, reason = "fuzz scaffolding intentionally verbose")]
-#![expect(clippy::restriction, reason = "fuzz explicit")]
-#![expect(clippy::nursery, reason = "fuzz explicit")]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

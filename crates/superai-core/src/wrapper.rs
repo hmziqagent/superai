@@ -1159,20 +1159,23 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
     Ok(())
 }
 
-// WRP-04, bounded diagnostic probe + runtime isolation evidence
+// WRP-04, bounded diagnostic probe + runtime isolation evidence. Test-only
+// until layer 3 consumes them.
 
 /// Outcome of a bounded, no-auth diagnostic launch of a wrapper (WRP-04).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiagnosticProbe {
+struct DiagnosticProbe {
     /// Whether the probe exited zero within the bound.
-    pub exit_ok: bool,
+    exit_ok: bool,
     /// Captured stdout, secret-shaped values redacted, bounded.
-    pub stdout_redacted: String,
+    stdout_redacted: String,
     /// Captured stderr, secret-shaped values redacted, bounded.
-    pub stderr_redacted: String,
+    stderr_redacted: String,
 }
 
 /// Redact secret-shaped tokens (`sk-…` and friends) from probe output.
+#[cfg(test)]
 fn redact_probe_output(text: &str) -> String {
     let mut out = text.to_owned();
     for prefix in ["sk-", "ghp_", "xoxb-"] {
@@ -1213,7 +1216,8 @@ fn redact_probe_output(text: &str) -> String {
 /// argument (e.g. `--version`) under a CLEAN environment (the wrapper
 /// installs its own isolation env) with a hard timeout and output cap.
 /// Never passes credentials; output is redacted before return.
-pub fn diagnostic_probe(
+#[cfg(test)]
+fn diagnostic_probe(
     path: &Path,
     probe_arg: &str,
     timeout: std::time::Duration,
@@ -1238,8 +1242,9 @@ pub fn diagnostic_probe(
 /// `full` is only marked verified when the split surfaces are actually
 /// observable in the generated invocation AND the plan declares no shared
 /// state that remains joined (keychain, subscription, cloud account).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationVerdict {
+enum IsolationVerdict {
     /// Split surfaces verified and no shared state declared.
     Full,
     /// Surfaces split but shared state remains (the honest constrained
@@ -1247,6 +1252,7 @@ pub enum IsolationVerdict {
     Constrained,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for IsolationVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -1258,17 +1264,18 @@ impl std::fmt::Display for IsolationVerdict {
 }
 
 /// Evidence gathered for one isolation claim (WRP-04).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IsolationEvidence {
+struct IsolationEvidence {
     /// Isolation class the instance record claims.
-    pub claimed: crate::state::Isolation,
+    claimed: crate::state::Isolation,
     /// Verified verdict.
-    pub verdict: IsolationVerdict,
+    verdict: IsolationVerdict,
     /// Split surfaces verified against the generated invocation (each line
     /// names the surface, e.g. `env CLAUDE_CONFIG_DIR=/x/.claude-work`).
-    pub verified_surfaces: Vec<String>,
+    verified_surfaces: Vec<String>,
     /// Shared state the plan honestly declares as still joined.
-    pub shared_state: Vec<String>,
+    shared_state: Vec<String>,
 }
 
 /// Collect runtime isolation evidence for an instance from its wrapper plan
@@ -1276,7 +1283,8 @@ pub struct IsolationEvidence {
 /// generated wrapper content, and downgrades the verdict to
 /// [`IsolationVerdict::Constrained`] whenever the plan declares shared
 /// state that no wrapper can split (keychain/subscription/cloud).
-pub fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationEvidence {
+#[cfg(test)]
+fn isolation_evidence(instance: &Instance, plan: &WrapperPlan) -> IsolationEvidence {
     // A plan whose keys cannot generate degrades like an unparseable
     // wrapper: nothing verifies, so the verdict is honestly Constrained.
     let generated = generate_shell_wrapper(instance, plan).ok();
