@@ -393,6 +393,65 @@ pub fn is_owned_wrapper(path: &Path, expected_digest: Option<&str>) -> bool {
     }
 }
 
+/// Remove a superai-owned wrapper without the verify-then-remove window: the
+/// file is verified, renamed aside under a unique sibling name, re-verified
+/// THERE, and only then deleted. If the moved bytes are no longer ours (a
+/// swap raced the rename), the moved file goes back to the original name and
+/// the removal refuses; a foreign file is never deleted. `Ok(false)` means
+/// nothing eligible sat at `path`.
+pub fn remove_owned_wrapper_verified(path: &Path, expected_digest: Option<&str>) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !is_owned_wrapper(path, expected_digest) {
+        return Ok(false);
+    }
+    let file_name =
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| CoreError::InvalidPath {
+                kind: "wrapper".to_owned(),
+                value: path.display().to_string(),
+                reason: "wrapper path has no usable file name".to_owned(),
+            })?;
+    let unique = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        format!("{millis:013}-{}", std::process::id())
+    };
+    let temp = path.with_file_name(format!(".{file_name}.superai-remove-{unique}"));
+    std::fs::rename(path, &temp).map_err(|e| {
+        CoreError::Config(superai_config::ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    })?;
+    if is_owned_wrapper(&temp, expected_digest) {
+        std::fs::remove_file(&temp).map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: temp.clone(),
+                source: e,
+            })
+        })?;
+        return Ok(true);
+    }
+    // The moved bytes are not ours: put them back untouched and refuse.
+    std::fs::rename(&temp, path).map_err(|e| CoreError::Commit {
+        path: path.to_path_buf(),
+        reason: format!(
+            "wrapper changed under the removal; foreign bytes now sit at {} and cannot \
+                 be returned: {e}",
+            temp.display()
+        ),
+    })?;
+    Err(CoreError::ForeignOwnership {
+        path: path.to_path_buf(),
+        owner: "wrapper changed under the removal; left in place".to_owned(),
+    })
+}
+
 /// What a wrapper file on disk appears to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WrapperKind {

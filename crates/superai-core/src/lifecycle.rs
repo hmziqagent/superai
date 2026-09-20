@@ -4134,229 +4134,50 @@ pub fn reconfigure_with_home(
     let mut diagnostics: Vec<String> = Vec::new();
     let mut verification: Vec<VerificationResult> = Vec::new();
 
-    for action in &request.actions {
-        match action {
-            ReconfigureAction::ApplyProvider { .. }
-            | ReconfigureAction::SwitchDefaultModel { .. }
-            | ReconfigureAction::RemoveProvider { .. } => {
-                let (primary, reassign) = resolve_action_providers(action)?;
-                let change = provider_change_with(action, &primary, &reassign)?;
-                let options = crate::provider_render::ProviderChangeOptions {
-                    journal_root: journal_root.clone(),
-                };
-                let outcome = crate::provider_render::commit_provider_change(
-                    &instance, adapter, &change, &options,
-                )?;
-                applied.extend(outcome.applied.iter().cloned());
-                for warning in &outcome.warnings {
-                    diagnostics.push(format!("provider change warning: {warning}"));
-                }
-                verification.push(VerificationResult {
-                    path: AbsolutePath::from_path(&outcome.path)
-                        .unwrap_or_else(|_| instance.config_root.clone()),
-                    kind: VerificationKind::Parse,
-                    passed: true,
-                    message: "provider mutation committed (foreign entries preserved)".to_owned(),
-                });
+    // WriteFile-kind targets per action order: the byte-restorable surfaces
+    // the compensator below reverts. Link farms (skills relink) and bundle
+    // directories are not byte-restorable and stay uncompensated.
+    let write_targets: Vec<(u32, PathBuf)> = preview
+        .actions
+        .iter()
+        .filter(|a| matches!(a.kind, ActionKind::WriteFile))
+        .map(|a| (a.order, a.target.as_path().to_path_buf()))
+        .collect();
+    let mut reverts: Vec<AppliedRevert> = Vec::new();
+
+    for (order, action) in request.actions.iter().enumerate() {
+        for target in write_targets.iter().filter(|(o, _)| *o == order as u32) {
+            capture_revert(&target.1, &mut reverts);
+        }
+        if let Err(failure) = apply_reconfigure_action(
+            &instance,
+            adapter,
+            action,
+            home,
+            journal_root.as_deref(),
+            &mut applied,
+            &mut diagnostics,
+            &mut verification,
+        ) {
+            // First action failed: nothing is applied, the typed error
+            // stands. A mid-list failure rolls the applied actions back
+            // instead of leaving a half-applied request on disk.
+            if order == 0 {
+                return Err(failure);
             }
-            ReconfigureAction::ReapplyTemplate { template } => {
-                let settings_path = instance.config_root.as_path().join("settings.json");
-                let snap_before = snapshot(&settings_path);
-                let current_bytes = std::fs::read(&settings_path).ok();
-                // codec-honesty gate happens inside the mutation helper.
-                let new_bytes = mutate_settings_with_template(
-                    &settings_path,
-                    current_bytes.as_deref(),
-                    template,
-                )?;
-                let op_id_str = generate_operation_id_string();
-                let tx_op_id =
-                    superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
-                        CoreError::Validation {
-                            field: "operation_id".to_owned(),
-                            reason: format!("op id invalid: {e}"),
-                        }
-                    })?;
-                let steps = vec![FileAction::Write {
-                    path: settings_path.clone(),
-                    content: new_bytes.clone(),
-                    kind: superai_config::document::DocumentKind::StrictJson,
-                }];
-                let mut tx = Transaction::new(tx_op_id, steps);
-                if let Some(root) = &journal_root {
-                    tx = tx.with_journal(root.clone());
-                }
-                let outcome = tx.execute().map_err(CoreError::Config)?;
-                if !outcome.success {
-                    return Ok(OperationResult {
-                        id: preview_id,
-                        kind: OperationKind::ReconfigureInstance,
-                        actions_completed: Vec::new(),
-                        backups: Vec::new(),
-                        verification: vec![VerificationResult {
-                            path: AbsolutePath::from_path(&settings_path)
-                                .unwrap_or_else(|_| instance.config_root.clone()),
-                            kind: VerificationKind::Parse,
-                            passed: false,
-                            message: format!(
-                                "template re-apply failed: {:?}",
-                                outcome.diagnostics_redacted
-                            ),
-                        }],
-                        rollback_status: RollbackStatus::Failed,
-                        diagnostics_redacted: outcome.diagnostics_redacted,
-                        success: false,
-                    });
-                }
-                let verify_bytes = std::fs::read(&settings_path).map_err(|e| {
-                    CoreError::Config(ConfigError::Io {
-                        path: settings_path.clone(),
-                        source: e,
-                    })
-                })?;
-                if compute_digest_bytes(&verify_bytes) != compute_digest_bytes(&new_bytes) {
-                    return Err(CoreError::Verification {
-                        path: settings_path,
-                        kind: "digest".to_owned(),
-                        reason: "template re-apply digest mismatch after commit".to_owned(),
-                    });
-                }
-                let changed = snap_before.digest.as_deref()
-                    != Some(compute_digest_bytes(&new_bytes).as_str());
-                applied.push(format!(
-                    "template {} re-applied (changed={changed})",
-                    template.name
-                ));
-                verification.push(VerificationResult {
-                    path: AbsolutePath::from_path(&settings_path)
-                        .unwrap_or_else(|_| instance.config_root.clone()),
-                    kind: VerificationKind::Digest,
-                    passed: true,
-                    message: "template re-apply verified against staged bytes".to_owned(),
-                });
-            }
-            ReconfigureAction::SetMcpEnabled { server, enabled } => {
-                let (path, decl) = mcp_dest_path(&instance, adapter)?;
-                let server_id =
-                    crate::ids::McpServerId::new(server).map_err(|e| CoreError::Validation {
-                        field: "mcp.server".to_owned(),
-                        reason: format!("invalid server id: {e}"),
-                    })?;
-                crate::mcp::set_mcp_enabled(&path, &decl, &server_id, *enabled)?;
-                applied.push(format!(
-                    "mcp server `{server}` {}",
-                    if *enabled { "enabled" } else { "disabled" }
-                ));
-                verification.push(VerificationResult {
-                    path: AbsolutePath::from_path(&path)
-                        .unwrap_or_else(|_| instance.config_root.clone()),
-                    kind: VerificationKind::Parse,
-                    passed: true,
-                    message: "mcp destination re-parses after toggle".to_owned(),
-                });
-            }
-            ReconfigureAction::RelinkSkills => {
-                let skills_dir = adapter_skills_dir(&instance, adapter).ok_or_else(|| {
-                    CoreError::UnsupportedOperation {
-                        harness: adapter.id().to_string(),
-                        operation: "relink_skills".to_owned(),
-                        reason: "harness declares no skills surface".to_owned(),
-                    }
-                })?;
-                let mode = adapter
-                    .supported_skill_modes()
-                    .first()
-                    .copied()
-                    .ok_or_else(|| CoreError::UnsupportedOperation {
-                        harness: adapter.id().to_string(),
-                        operation: "relink_skills".to_owned(),
-                        reason: "harness supports no skill modes".to_owned(),
-                    })?;
-                // Skills root under the caller's home, same placement as
-                // `skills::default_skills_root` (hermetic, replayable).
-                let skills_home = home.ok_or(CoreError::NoHomeDir)?;
-                let root = skills_home.join(".superai").join("skills");
-                let skill_registry = crate::skills::SkillRegistry::load(&root)?;
-                let provenance = crate::skills::apply_skill_mode(
-                    &skill_registry,
-                    &skills_dir,
-                    mode,
-                    &[],
-                    adapter,
-                )?;
-                applied.push(format!(
-                    "skills relinked ({mode}, {} destinations)",
-                    provenance.len()
-                ));
-                verification.push(VerificationResult {
-                    path: AbsolutePath::from_path(&skills_dir)
-                        .unwrap_or_else(|_| instance.config_root.clone()),
-                    kind: VerificationKind::Parse,
-                    passed: true,
-                    message: "skill links re-applied".to_owned(),
-                });
-            }
-            ReconfigureAction::SetPluginEnabled { plugin, enabled } => {
-                // INS-06 plugin kind: registry flag first (reversible), then
-                // the destination mutation with foreign entries preserved.
-                let decl =
-                    adapter
-                        .plugin_decl()
-                        .ok_or_else(|| CoreError::UnsupportedOperation {
-                            harness: adapter.id().to_string(),
-                            operation: "reconfigure_plugin".to_owned(),
-                            reason: "harness declares no plugin destination".to_owned(),
-                        })?;
-                let plugin_home = home.ok_or(CoreError::NoHomeDir)?;
-                let mut plugin_registry =
-                    crate::plugin::PluginRegistry::load(&plugin_registry_root(plugin_home))?;
-                let plugin_id =
-                    crate::ids::PluginId::new(plugin).map_err(|e| CoreError::Validation {
-                        field: "plugin.id".to_owned(),
-                        reason: format!("plugin id `{plugin}` invalid: {e}"),
-                    })?;
-                let record = plugin_registry.get(&plugin_id).cloned().ok_or_else(|| {
-                    CoreError::Validation {
-                        field: "plugin.id".to_owned(),
-                        reason: format!("plugin `{plugin}` is not installed (no registry record)"),
-                    }
-                })?;
-                let source = crate::plugin::PluginSource {
-                    id: plugin_id,
-                    kind: record.kind,
-                    locator: record.source_locator.clone(),
-                    version: record.version.clone(),
-                    digest: record.digest.clone(),
-                };
-                let dest = plugin_dest_path(&instance, &decl);
-                crate::plugin::set_plugin_enabled(
-                    &mut plugin_registry,
-                    &decl,
-                    &dest,
-                    &source,
-                    *enabled,
-                )?;
-                applied.push(format!(
-                    "plugin `{plugin}` {}",
-                    if *enabled { "enabled" } else { "disabled" }
-                ));
-                verification.push(VerificationResult {
-                    path: AbsolutePath::from_path(&dest)
-                        .unwrap_or_else(|_| instance.config_root.clone()),
-                    kind: VerificationKind::Parse,
-                    passed: true,
-                    message: format!(
-                        "plugin `{plugin}` destination consistent after {}",
-                        if *enabled { "enable" } else { "disable" }
-                    ),
-                });
-                if decl.restart != crate::adapter::RestartBehavior::None {
-                    diagnostics.push(format!(
-                        "restart required after plugin toggle: {:?}",
-                        decl.restart
-                    ));
-                }
-            }
+            let (rollback_status, notes) = rollback_applied_reverts(&reverts);
+            diagnostics.push(format!("action {order} failed: {failure}"));
+            diagnostics.extend(notes);
+            return Ok(OperationResult {
+                id: preview_id,
+                kind: OperationKind::ReconfigureInstance,
+                actions_completed: Vec::new(),
+                backups: Vec::new(),
+                verification,
+                rollback_status,
+                diagnostics_redacted: diagnostics,
+                success: false,
+            });
         }
     }
 
@@ -4447,6 +4268,321 @@ pub fn reconfigure_with_home(
         diagnostics_redacted: diagnostics,
         success: true,
     })
+}
+
+/// Apply ONE reconfigure action, appending its applied descriptions,
+/// diagnostics, and verification results. Errors flow to the caller's
+/// compensator in [`reconfigure_with_home`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "one commit pass over every reconfigure action kind"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared output buffers avoid a context struct for one call site"
+)]
+fn apply_reconfigure_action(
+    instance: &Instance,
+    adapter: &dyn Adapter,
+    action: &ReconfigureAction,
+    home: Option<&Path>,
+    journal_root: Option<&Path>,
+    applied: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
+    verification: &mut Vec<VerificationResult>,
+) -> Result<()> {
+    match action {
+        ReconfigureAction::ApplyProvider { .. }
+        | ReconfigureAction::SwitchDefaultModel { .. }
+        | ReconfigureAction::RemoveProvider { .. } => {
+            let (primary, reassign) = resolve_action_providers(action)?;
+            let change = provider_change_with(action, &primary, &reassign)?;
+            let options = crate::provider_render::ProviderChangeOptions {
+                journal_root: journal_root.map(PathBuf::from),
+            };
+            let outcome = crate::provider_render::commit_provider_change(
+                instance, adapter, &change, &options,
+            )?;
+            applied.extend(outcome.applied.iter().cloned());
+            for warning in &outcome.warnings {
+                diagnostics.push(format!("provider change warning: {warning}"));
+            }
+            verification.push(VerificationResult {
+                path: AbsolutePath::from_path(&outcome.path)
+                    .unwrap_or_else(|_| instance.config_root.clone()),
+                kind: VerificationKind::Parse,
+                passed: true,
+                message: "provider mutation committed (foreign entries preserved)".to_owned(),
+            });
+        }
+        ReconfigureAction::ReapplyTemplate { template } => {
+            let settings_path = instance.config_root.as_path().join("settings.json");
+            let snap_before = snapshot(&settings_path);
+            let current_bytes = std::fs::read(&settings_path).ok();
+            // codec-honesty gate happens inside the mutation helper.
+            let new_bytes =
+                mutate_settings_with_template(&settings_path, current_bytes.as_deref(), template)?;
+            let op_id_str = generate_operation_id_string();
+            let tx_op_id =
+                superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
+                    CoreError::Validation {
+                        field: "operation_id".to_owned(),
+                        reason: format!("op id invalid: {e}"),
+                    }
+                })?;
+            let steps = vec![FileAction::Write {
+                path: settings_path.clone(),
+                content: new_bytes.clone(),
+                kind: superai_config::document::DocumentKind::StrictJson,
+            }];
+            let mut tx = Transaction::new(tx_op_id, steps);
+            if let Some(root) = journal_root {
+                tx = tx.with_journal(root.to_path_buf());
+            }
+            let outcome = tx.execute().map_err(CoreError::Config)?;
+            if !outcome.success {
+                return Err(CoreError::Commit {
+                    path: settings_path,
+                    reason: format!(
+                        "template re-apply failed: {}",
+                        outcome.diagnostics_redacted.join("; ")
+                    ),
+                });
+            }
+            let verify_bytes = std::fs::read(&settings_path).map_err(|e| {
+                CoreError::Config(ConfigError::Io {
+                    path: settings_path.clone(),
+                    source: e,
+                })
+            })?;
+            if compute_digest_bytes(&verify_bytes) != compute_digest_bytes(&new_bytes) {
+                return Err(CoreError::Verification {
+                    path: settings_path,
+                    kind: "digest".to_owned(),
+                    reason: "template re-apply digest mismatch after commit".to_owned(),
+                });
+            }
+            let changed =
+                snap_before.digest.as_deref() != Some(compute_digest_bytes(&new_bytes).as_str());
+            applied.push(format!(
+                "template {} re-applied (changed={changed})",
+                template.name
+            ));
+            verification.push(VerificationResult {
+                path: AbsolutePath::from_path(&settings_path)
+                    .unwrap_or_else(|_| instance.config_root.clone()),
+                kind: VerificationKind::Digest,
+                passed: true,
+                message: "template re-apply verified against staged bytes".to_owned(),
+            });
+        }
+        ReconfigureAction::SetMcpEnabled { server, enabled } => {
+            let (path, decl) = mcp_dest_path(instance, adapter)?;
+            let server_id =
+                crate::ids::McpServerId::new(server).map_err(|e| CoreError::Validation {
+                    field: "mcp.server".to_owned(),
+                    reason: format!("invalid server id: {e}"),
+                })?;
+            crate::mcp::set_mcp_enabled(&path, &decl, &server_id, *enabled)?;
+            applied.push(format!(
+                "mcp server `{server}` {}",
+                if *enabled { "enabled" } else { "disabled" }
+            ));
+            verification.push(VerificationResult {
+                path: AbsolutePath::from_path(&path)
+                    .unwrap_or_else(|_| instance.config_root.clone()),
+                kind: VerificationKind::Parse,
+                passed: true,
+                message: "mcp destination re-parses after toggle".to_owned(),
+            });
+        }
+        ReconfigureAction::RelinkSkills => {
+            let skills_dir = adapter_skills_dir(instance, adapter).ok_or_else(|| {
+                CoreError::UnsupportedOperation {
+                    harness: adapter.id().to_string(),
+                    operation: "relink_skills".to_owned(),
+                    reason: "harness declares no skills surface".to_owned(),
+                }
+            })?;
+            let mode = adapter
+                .supported_skill_modes()
+                .first()
+                .copied()
+                .ok_or_else(|| CoreError::UnsupportedOperation {
+                    harness: adapter.id().to_string(),
+                    operation: "relink_skills".to_owned(),
+                    reason: "harness supports no skill modes".to_owned(),
+                })?;
+            // Skills root under the caller's home, same placement as
+            // `skills::default_skills_root` (hermetic, replayable).
+            let skills_home = home.ok_or(CoreError::NoHomeDir)?;
+            let root = skills_home.join(".superai").join("skills");
+            let skill_registry = crate::skills::SkillRegistry::load(&root)?;
+            let provenance =
+                crate::skills::apply_skill_mode(&skill_registry, &skills_dir, mode, &[], adapter)?;
+            applied.push(format!(
+                "skills relinked ({mode}, {} destinations)",
+                provenance.len()
+            ));
+            verification.push(VerificationResult {
+                path: AbsolutePath::from_path(&skills_dir)
+                    .unwrap_or_else(|_| instance.config_root.clone()),
+                kind: VerificationKind::Parse,
+                passed: true,
+                message: "skill links re-applied".to_owned(),
+            });
+        }
+        ReconfigureAction::SetPluginEnabled { plugin, enabled } => {
+            // INS-06 plugin kind: registry flag first (reversible), then
+            // the destination mutation with foreign entries preserved.
+            let decl = adapter
+                .plugin_decl()
+                .ok_or_else(|| CoreError::UnsupportedOperation {
+                    harness: adapter.id().to_string(),
+                    operation: "reconfigure_plugin".to_owned(),
+                    reason: "harness declares no plugin destination".to_owned(),
+                })?;
+            let plugin_home = home.ok_or(CoreError::NoHomeDir)?;
+            let mut plugin_registry =
+                crate::plugin::PluginRegistry::load(&plugin_registry_root(plugin_home))?;
+            let plugin_id =
+                crate::ids::PluginId::new(plugin).map_err(|e| CoreError::Validation {
+                    field: "plugin.id".to_owned(),
+                    reason: format!("plugin id `{plugin}` invalid: {e}"),
+                })?;
+            let record =
+                plugin_registry
+                    .get(&plugin_id)
+                    .cloned()
+                    .ok_or_else(|| CoreError::Validation {
+                        field: "plugin.id".to_owned(),
+                        reason: format!("plugin `{plugin}` is not installed (no registry record)"),
+                    })?;
+            let source = crate::plugin::PluginSource {
+                id: plugin_id,
+                kind: record.kind,
+                locator: record.source_locator,
+                version: record.version,
+                digest: record.digest,
+            };
+            let dest = plugin_dest_path(instance, &decl);
+            crate::plugin::set_plugin_enabled(
+                &mut plugin_registry,
+                &decl,
+                &dest,
+                &source,
+                *enabled,
+            )?;
+            applied.push(format!(
+                "plugin `{plugin}` {}",
+                if *enabled { "enabled" } else { "disabled" }
+            ));
+            verification.push(VerificationResult {
+                path: AbsolutePath::from_path(&dest)
+                    .unwrap_or_else(|_| instance.config_root.clone()),
+                kind: VerificationKind::Parse,
+                passed: true,
+                message: format!(
+                    "plugin `{plugin}` destination consistent after {}",
+                    if *enabled { "enable" } else { "disable" }
+                ),
+            });
+            if decl.restart != crate::adapter::RestartBehavior::None {
+                diagnostics.push(format!(
+                    "restart required after plugin toggle: {:?}",
+                    decl.restart
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One byte-restorable surface captured before the action that mutates it.
+struct AppliedRevert {
+    path: PathBuf,
+    pre: Option<Vec<u8>>,
+    existed: bool,
+}
+
+/// Capture the pre-image of `path` once per request (first writer wins, so
+/// the captured bytes are the request-start state).
+fn capture_revert(path: &Path, reverts: &mut Vec<AppliedRevert>) {
+    if reverts.iter().any(|r| r.path == path) {
+        return;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => reverts.push(AppliedRevert {
+            path: path.to_path_buf(),
+            pre: std::fs::read(path).ok(),
+            existed: true,
+        }),
+        // Directories and symlinks are not byte-restorable surfaces.
+        Ok(_) => {}
+        Err(_) => reverts.push(AppliedRevert {
+            path: path.to_path_buf(),
+            pre: None,
+            existed: false,
+        }),
+    }
+}
+
+/// Restore captured pre-images in reverse order; files the request created
+/// (absent at capture) are quarantined, never deleted.
+fn rollback_applied_reverts(reverts: &[AppliedRevert]) -> (RollbackStatus, Vec<String>) {
+    let op = generate_operation_id_string();
+    let mut notes = Vec::new();
+    let mut failed = 0usize;
+    for revert in reverts.iter().rev() {
+        match &revert.pre {
+            Some(bytes) => {
+                match superai_config::transaction::commit_file(
+                    "reconfigure-rollback",
+                    &revert.path,
+                    bytes,
+                    superai_config::document::DocumentKind::TextFragment,
+                ) {
+                    Ok(_) => notes.push(format!("rolled back {}", revert.path.display())),
+                    Err(e) => {
+                        failed += 1;
+                        notes.push(format!(
+                            "rollback failed for {}: {e}",
+                            revert.path.display()
+                        ));
+                    }
+                }
+            }
+            None if revert.existed => {
+                failed += 1;
+                notes.push(format!(
+                    "rollback failed for {}: unreadable before the failed action, left in place",
+                    revert.path.display()
+                ));
+            }
+            None => {
+                if revert.path.exists()
+                    && let Err(e) =
+                        superai_config::quarantine::move_to_quarantine(&revert.path, &op)
+                {
+                    failed += 1;
+                    notes.push(format!(
+                        "rollback failed for {}: {e}",
+                        revert.path.display()
+                    ));
+                }
+            }
+        }
+    }
+    let status = if reverts.is_empty() {
+        RollbackStatus::NotNeeded
+    } else if failed == 0 {
+        RollbackStatus::Succeeded
+    } else if failed == reverts.len() {
+        RollbackStatus::Failed
+    } else {
+        RollbackStatus::Partial
+    };
+    (status, notes)
 }
 
 /// Choices for detach wrapper handling.
@@ -4560,25 +4696,24 @@ pub fn detach(registry_path: &Path, name: &str, choice: DetachChoice) -> Result<
         reason: format!("instance {name} not found for detach"),
     })?;
 
-    // Remove the wrapper only when the marker digest proves ownership.
+    // Remove the wrapper only when the marker digest proves ownership, and
+    // only through the verified rename-shuffle (never a bare remove).
     let mut wrapper_removed = false;
     if choice == DetachChoice::RemoveWrapperIfOwned
         && let Some(wrapper) = &instance.wrapper
     {
         let wrapper_path = wrapper.path.as_path();
         if wrapper_path.exists() {
-            if wrapper_helper::is_owned_wrapper(wrapper_path, Some(&wrapper.content_digest)) {
-                match std::fs::remove_file(wrapper_path) {
-                    Ok(()) => wrapper_removed = true,
-                    Err(e) => {
-                        let mut fresh = Registry::load(registry_path)?;
-                        fresh.insert(instance.clone())?;
-                        fresh.store(registry_path)?;
-                        return Err(CoreError::Config(ConfigError::Io {
-                            path: wrapper_path.to_path_buf(),
-                            source: e,
-                        }));
-                    }
+            match wrapper_helper::remove_owned_wrapper_verified(
+                wrapper_path,
+                Some(&wrapper.content_digest),
+            ) {
+                Ok(removed) => wrapper_removed = removed,
+                Err(e) => {
+                    let mut fresh = Registry::load(registry_path)?;
+                    fresh.insert(instance.clone())?;
+                    fresh.store(registry_path)?;
+                    return Err(e);
                 }
             }
         }
@@ -4901,18 +5036,13 @@ pub fn remove_instance_with_home(
     ) && let Some(wrapper) = &instance.wrapper
     {
         let wrapper_path = wrapper.path.as_path();
-        if wrapper_path.exists()
-            && wrapper_helper::is_owned_wrapper(wrapper_path, Some(&wrapper.content_digest))
-        {
-            std::fs::remove_file(wrapper_path).map_err(|e| {
-                CoreError::Config(ConfigError::Io {
-                    path: wrapper_path.to_path_buf(),
-                    source: e,
-                })
-            })?;
-            wrapper_removed = true;
-        } else if wrapper_path.exists() {
-            // Exists but not owned: left in place.
+        if wrapper_path.exists() {
+            // Verified rename-shuffle removal: a swap between verify and
+            // delete is refused instead of deleting foreign bytes.
+            wrapper_removed = wrapper_helper::remove_owned_wrapper_verified(
+                wrapper_path,
+                Some(&wrapper.content_digest),
+            )?;
         }
     }
 
@@ -7524,6 +7654,163 @@ mod tests {
             ghost_preview.conflicts
         );
         reconfigure_with_home(&registry_path, "work", &adapter, &ghost, Some(&home)).unwrap_err();
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// A failure after earlier actions already applied rolls the applied
+    /// mutations back to their request-start bytes instead of leaving a
+    /// half-applied request on disk. A corrupt skills registry passes the
+    /// preview (never loaded there) and fails the RelinkSkills commit.
+    #[test]
+    fn reconfigure_mid_list_failure_rolls_back_applied_actions() {
+        let tmp = unique_temp("reconfigure_rollback");
+        let home = tmp.join("home");
+        let skills_root = home.join(".superai").join("skills");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        std::fs::write(skills_root.join("registry.json"), "{ not json").unwrap();
+        let registry_path = tmp.join("registry.json");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        let mcp_path = root.join(".mcp.json");
+        let original_mcp = r#"{
+  "mcpServers": {
+    "owned-server": {"command": "npx", "args": ["-y", "owned-server"]}
+  },
+  "note": "keep me"
+}
+"#;
+        std::fs::write(&mcp_path, original_mcp).unwrap();
+
+        let mut registry = Registry::load(&registry_path).unwrap();
+        registry
+            .insert(Instance {
+                id: InstanceId::new("id-reconf-rollback").unwrap(),
+                name: InstanceName::new("work").unwrap(),
+                harness: HarnessId::new("claude-code").unwrap(),
+                config_root: AbsolutePath::from_path(&root).unwrap(),
+                binary: None,
+                wrapper: None,
+                isolation: Isolation::RelocatedRoot,
+                origin: InstanceOrigin::Created,
+                ownership: Ownership::SuperaiCreated,
+                template: None,
+                created_at: now_iso8601(),
+                adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+            })
+            .unwrap();
+        registry.store(&registry_path).unwrap();
+
+        let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
+        let request = ReconfigureRequest::new(vec![
+            ReconfigureAction::SetMcpEnabled {
+                server: "owned-server".to_owned(),
+                enabled: false,
+            },
+            ReconfigureAction::RelinkSkills,
+        ]);
+        let loaded = Registry::load(&registry_path).unwrap();
+        let preview =
+            preview_reconfigure_with_home(&loaded, "work", &adapter, &request, Some(&home))
+                .unwrap();
+        assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+
+        let result =
+            reconfigure_with_home(&registry_path, "work", &adapter, &request, Some(&home)).unwrap();
+        assert!(
+            !result.success,
+            "the corrupt-registry action must fail: {:?}",
+            result.diagnostics_redacted
+        );
+        assert_eq!(result.rollback_status, RollbackStatus::Succeeded);
+        assert_eq!(
+            std::fs::read_to_string(&mcp_path).unwrap(),
+            original_mcp,
+            "the applied MCP toggle must be rolled back to request-start bytes"
+        );
+        assert!(
+            result
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("action 1 failed")),
+            "{:?}",
+            result.diagnostics_redacted
+        );
+        assert!(
+            result
+                .diagnostics_redacted
+                .iter()
+                .any(|d| d.contains("rolled back")),
+            "{:?}",
+            result.diagnostics_redacted
+        );
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    /// The verified wrapper removal deletes exactly an owned wrapper and
+    /// never a foreign launcher.
+    #[test]
+    fn verified_wrapper_removal_deletes_owned_and_spares_foreign() {
+        let tmp = unique_temp("wrapper-verified-remove");
+        let root = tmp.join(".claude-work");
+        std::fs::create_dir_all(&root).unwrap();
+        let temp_inst = Instance {
+            id: InstanceId::new("id-wrapper-remove").unwrap(),
+            name: InstanceName::new("w").unwrap(),
+            harness: HarnessId::new("claude-code").unwrap(),
+            config_root: AbsolutePath::from_path(&root).unwrap(),
+            binary: None,
+            wrapper: None,
+            isolation: Isolation::RelocatedRoot,
+            origin: InstanceOrigin::Created,
+            ownership: Ownership::SuperaiCreated,
+            template: None,
+            created_at: now_iso8601(),
+            adapter_revision: crate::adapter::ADAPTER_REVISION.to_owned(),
+        };
+        let plan = make_adapter("claude-code")
+            .plan_wrapper(&temp_inst)
+            .unwrap_or_else(|_| {
+                let mut p = WrapperPlan::new("test");
+                p.env_vars.push((
+                    crate::wrapper::env_var_for_harness(&HarnessId::new("claude-code").unwrap()),
+                    root.display().to_string(),
+                ));
+                p
+            });
+        let (content, digest) = crate::wrapper::generate_shell_wrapper(&temp_inst, &plan);
+
+        let owned = tmp.join("owned-cli");
+        std::fs::write(&owned, &content).unwrap();
+        assert_eq!(
+            wrapper_helper::remove_owned_wrapper_verified(&owned, Some(&digest)).unwrap(),
+            true
+        );
+        assert!(!owned.exists(), "owned wrapper must be deleted");
+        let leftovers: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".owned-cli"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no shuffle sibling may linger: {leftovers:?}"
+        );
+
+        let foreign = tmp.join("foreign-cli");
+        std::fs::write(&foreign, "#!/bin/sh\necho not ours\n").unwrap();
+        assert_eq!(
+            wrapper_helper::remove_owned_wrapper_verified(&foreign, Some(&digest)).unwrap(),
+            false
+        );
+        assert!(foreign.exists(), "foreign launcher must be untouched");
+
+        assert_eq!(
+            wrapper_helper::remove_owned_wrapper_verified(&tmp.join("absent-cli"), Some(&digest))
+                .unwrap(),
+            false
+        );
         drop(std::fs::remove_dir_all(&tmp));
     }
 
