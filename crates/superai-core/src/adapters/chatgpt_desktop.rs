@@ -1,20 +1,6 @@
-//! `ChatGPT` Desktop adapter — read-only view of the `~/.codex` store shared
-//! with codex-cli.
-//!
-//! Research source: `docs/harness-configs/chatgpt-desktop.md` (verified
-//! 2026-09-18; evidence at `.z-workflow/evidence/desktop-research/`).
-//! The unified `ChatGPT` desktop app (Chat + Work + Codex; macOS 14+/Windows
-//! since 2026-07-09, Linux PREVIEW since 2026-08-11) has NO local config of
-//! its own that is officially documented: officially it "picks up your
-//! session history and configuration from the Codex CLI and IDE extension" —
-//! the `~/.codex` store (`config.toml` incl. the desktop-only
-//! `desktop.custom_file_handlers` key and `[mcp_servers.<id>]`, `auth.json`,
-//! profiles, sessions). That store BELONGS to the `codex-cli` harness, so
-//! this adapter is `ReadOnly`, declares NO MCP destination of its own (the
-//! Chat surface is remote-MCP-only per the official position), and warns
-//! `shares ~/.codex with codex-cli`. App-level relocation is verified-absent
-//! (whether the GUI honors `CODEX_HOME` is undocumented) — aliasing routes
-//! through codex-cli, so `plan_wrapper` declares no env vars of its own.
+//! `ChatGPT` Desktop adapter: read-only view of the `~/.codex` store shared
+//! with codex-cli. Research source: `docs/harness-configs/chatgpt-desktop.md`
+//! (verified 2026-09-18).
 
 use std::path::PathBuf;
 
@@ -30,10 +16,6 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Harness identifier for the `ChatGPT` desktop app.
 pub const HARNESS_ID_STR: &str = "chatgpt-desktop";
 
@@ -43,7 +25,7 @@ pub const DISPLAY_NAME: &str = "ChatGPT Desktop (Codex)";
 /// The shared Codex store this app reads (owned by the codex-cli harness).
 pub const SHARED_STORE_HINT: &str = "~/.codex";
 
-/// Env var that relocates the shared store for the CLI only — documented for
+/// Env var that relocates the shared store for the CLI only: documented for
 /// codex-cli; whether the GUI app honors it is NOT documented.
 pub const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 
@@ -59,7 +41,7 @@ pub const REMOTE_MCP_POSITION: &str =
 pub const SHARED_STATE_WARNING: &str = "shares ~/.codex with codex-cli";
 
 /// Verified-absent relocation note (chatgpt-desktop.md section 5).
-pub const NO_RELOCATION_NOTE: &str = "no app-level relocation documented; CODEX_HOME is a CLI-documented knob — \
+pub const NO_RELOCATION_NOTE: &str = "no app-level relocation documented; CODEX_HOME is a CLI-documented knob: \
 whether the GUI honors it is undocumented";
 
 /// Research document link.
@@ -70,10 +52,6 @@ pub const LAST_VERIFIED: &str = "2026-09-18";
 
 /// Schema version.
 pub const SCHEMA_VERSION_STR: &str = "1";
-
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
 
 /// Concrete adapter for the `ChatGPT` desktop app (`ReadOnly`).
 #[derive(Debug, Clone)]
@@ -110,10 +88,8 @@ impl ChatGptDesktopAdapter {
         Some(PathBuf::from(home).join(".codex"))
     }
 
-    /// Collect filesystem evidence for detection. The GUI binary name is
-    /// unverified, so evidence keys on the shared store — and must say that
-    /// the same files indicate a codex-cli install (stores are shared and
-    /// not distinguishable at file level).
+    /// The GUI binary name is unverified, so evidence keys on the shared
+    /// store and must say the files may equally be a codex-cli install.
     #[expect(clippy::excessive_nesting, reason = "evidence branches explicit")]
     fn collect_config_evidence(evidence: &mut Vec<String>) {
         evidence.push(format!(
@@ -207,7 +183,7 @@ impl Adapter for ChatGptDesktopAdapter {
             InstallPresence::Absent
         };
         // The store is shared with codex-cli, so file evidence alone is a
-        // low-confidence signal for the APP specifically.
+        // low-confidence signal for this app.
         let confidence = if store_seen {
             DetectionConfidence::Low
         } else {
@@ -231,8 +207,8 @@ impl Adapter for ChatGptDesktopAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Shared user config (owned by codex-cli): the ONE desktop-specific
-        // owned selector is desktop.custom_file_handlers.
+        // Shared with codex-cli; the one desktop-owned selector is
+        // desktop.custom_file_handlers.
         let config_resolver = PathResolver::new(
             Some("$CODEX_HOME/config.toml (shared with codex-cli)"),
             Some("$CODEX_HOME/config.toml (shared with codex-cli)"),
@@ -252,7 +228,6 @@ impl Adapter for ChatGptDesktopAdapter {
         config.restart_behavior = RestartBehavior::Reload;
         surfaces.push(config);
 
-        // Shared profiles: $CODEX_HOME/<name>.config.toml.
         let profile_resolver = PathResolver::new(
             Some("$CODEX_HOME/<name>.config.toml (shared with codex-cli)"),
             Some("$CODEX_HOME/<name>.config.toml (shared with codex-cli)"),
@@ -271,7 +246,6 @@ impl Adapter for ChatGptDesktopAdapter {
         profiles.restart_behavior = RestartBehavior::Reload;
         surfaces.push(profiles);
 
-        // Credentials: secret-bearing, detect-only.
         let auth_resolver = PathResolver::new(
             Some("$CODEX_HOME/auth.json"),
             Some("$CODEX_HOME/auth.json"),
@@ -290,7 +264,6 @@ impl Adapter for ChatGptDesktopAdapter {
         auth.restart_behavior = RestartBehavior::ReLogin;
         surfaces.push(auth);
 
-        // Sessions the app ingests from the CLI store (community-corroborated).
         let sessions_resolver = PathResolver::fallback_only(
             "$CODEX_HOME session store (internal, app ingests CLI sessions)",
         );
@@ -335,10 +308,8 @@ impl Adapter for ChatGptDesktopAdapter {
         ]
     }
 
-    /// Honest no-env plan: setting `CODEX_HOME` here would fabricate GUI-level
-    /// relocation the docs do not support. The empty env set is deliberate —
-    /// the alias core refuses aliasing on exactly this, and the plan text
-    /// redirects to the verified path (alias codex-cli).
+    /// Setting `CODEX_HOME` here would fabricate undocumented GUI relocation;
+    /// the empty env set is what the alias core refuses on (alias codex-cli).
     fn plan_wrapper(&self, instance: &Instance) -> Result<WrapperPlan, CoreError> {
         if instance.harness != self.id {
             return Err(CoreError::Validation {
@@ -355,7 +326,7 @@ impl Adapter for ChatGptDesktopAdapter {
         );
         plan.description = format!(
             " chatgpt-desktop {SHARED_STATE_WARNING} and reads it at its default location; \
-             {NO_RELOCATION_NOTE}; alias codex-cli instead — the CLI demonstrably honors \
+             {NO_RELOCATION_NOTE}; alias codex-cli instead: the CLI demonstrably honors \
              {CODEX_HOME_ENV_VAR} (run-3/4 live evidence); config_root {} is informative only \
              (chatgpt-desktop.md section 6)",
             instance.config_root
@@ -363,7 +334,7 @@ impl Adapter for ChatGptDesktopAdapter {
         plan.shared_state_warnings = vec![
             format!(
                 "{SHARED_STATE_WARNING} (config.toml incl. mcp_servers, auth.json, profiles, \
-                 sessions) — only codex-cli owns writes to it"
+                 sessions): only codex-cli owns writes to it"
             ),
             format!(
                 "{CODEX_HOME_ENV_VAR} relocation is CLI-documented only; the GUI following it \
@@ -398,7 +369,7 @@ impl Adapter for ChatGptDesktopAdapter {
                 field: "isolation".to_owned(),
                 reason: format!(
                     "chatgpt-desktop reads the shared default store with no app-level \
-                     relocation (fixed_path_single); got {other} — alias codex-cli for \
+                     relocation (fixed_path_single); got {other}: alias codex-cli for \
                      {CODEX_HOME_ENV_VAR} isolation"
                 ),
             }),
@@ -406,8 +377,7 @@ impl Adapter for ChatGptDesktopAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // The shared config's TOML table shape plus the one desktop-owned
-        // key; everything else in the file belongs to codex-cli's model.
+        // Everything except the desktop-owned key belongs to codex-cli's model.
         match surface_id {
             "config.toml" => Some(
                 SurfaceSchema::new()
@@ -422,11 +392,8 @@ impl Adapter for ChatGptDesktopAdapter {
         Vec::new()
     }
 
-    /// EXT-09: explicit MCP absence — the app's Chat surface is remote-MCP
-    /// only, and the local `[mcp_servers]` destination inside `~/.codex/
-    /// config.toml` belongs to the codex-cli harness (already modeled there;
-    /// a duplicate decl would double-own one file). The community-grade
-    /// `config/mcp.json` path claim is flagged in the doc, never modeled.
+    /// EXT-09: Chat-surface MCP is remote-only; the local `[mcp_servers]`
+    /// inside `~/.codex/config.toml` belongs to codex-cli (modeled there).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "chat connects to remote MCP servers only (official position); the local \
@@ -435,9 +402,8 @@ impl Adapter for ChatGptDesktopAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded): MCP
-    /// "apps" are server-side and web-managed; no local plugin mechanism is
-    /// documented for the app.
+    /// EXT-06: MCP "apps" are server-side and web-managed; no local
+    /// plugin mechanism.
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "MCP apps are server-side and web-managed (developer mode); no local plugin \
@@ -575,7 +541,7 @@ mod tests {
 
     /// The alias-contract pin: no env vars of its own (setting `CODEX_HOME`
     /// here would fabricate GUI-level relocation), and the plan redirects to
-    /// codex-cli — `alias::create_alias` refuses on the empty env set.
+    /// codex-cli: `alias::create_alias` refuses on the empty env set.
     #[test]
     fn plan_wrapper_sets_no_env_vars_and_redirects_to_codex_cli() {
         let a = adapter();
@@ -652,10 +618,6 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: on-disk fixture corpus (QAL-02)
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_corpus_validity_and_secret_free() {

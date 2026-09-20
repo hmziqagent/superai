@@ -1,15 +1,7 @@
-//! Aider adapter — explicit-config via `--config`/`--env-file` plus HOME relocation.
-//!
+//! Aider adapter: explicit-config via `--config`/`--env-file` plus HOME relocation.
 //! Research source: `docs/harness-configs/aider.md` (last verified 2026-08-25).
-//! Executable `aider`, YAML config `~/.aider.conf.yml` / `.aider.conf.yml`,
-//! env file `~/.env` / `.env` with explicit `--env-file`, JSON metadata
-//! `.aider.model.metadata.json`, isolation `explicit-config` (with HOME trick).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use superai_config::document::ValueType;
 
@@ -22,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Aider.
 pub const HARNESS_ID_STR: &str = "aider";
@@ -45,10 +33,8 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for provider/model mutation inside `.aider.conf.yml` (YAML).
-///
-/// These are kebab-case keys matching long CLI options without `--`.
-/// Everything else round-trips untouched via `superai-config::yaml`.
+/// Kebab-case keys matching long CLI options without `--`; everything else
+/// round-trips untouched via `superai-config::yaml`.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "weak-model",
@@ -59,23 +45,15 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "edit-format",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Aider.
-///
-/// Isolation is `explicit-config` via `--config` / `--env-file` plus the
-/// `HOME` relocation trick. The wrapper sets `HOME` to the instance
-/// `config_root` and passes explicit `--config` and `--env-file` args
-/// pointing inside that root.
+/// Isolation is `explicit-config`: the wrapper relocates `HOME` and passes
+/// explicit `--config` / `--env-file` paths inside the instance root.
 #[derive(Debug, Clone)]
 pub struct AiderAdapter {
     id: HarnessId,
 }
 
 impl AiderAdapter {
-    /// Create a new adapter instance, validating the static harness id.
+    /// Create an adapter, validating the static harness id.
     pub fn new() -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self { id })
@@ -91,106 +69,6 @@ impl AiderAdapter {
         EXECUTABLE
     }
 
-    /// Try to locate the `aider` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `aider --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `aider 0.84.0` or `aider 0.84.0.dev` into version.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve the default HOME for config lookup.
     fn default_home() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("HOME")
@@ -204,15 +82,6 @@ impl AiderAdapter {
             return Some(PathBuf::from(home));
         }
         None
-    }
-
-    /// Check if default config root exists on disk for evidence.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let home = Self::default_home()?;
-        let conf = home.join(".aider.conf.yml");
-        if conf.exists() { Some(home) } else { None }
     }
 
     /// Build detection evidence about aider config and env files.
@@ -250,7 +119,6 @@ impl AiderAdapter {
                 evidence.push(format!("model settings present at {}", settings.display()));
             }
 
-            // Also check cwd/git-root heuristic surfaces if they exist.
             let cwd_yml = Path::new(".aider.conf.yml");
             if cwd_yml.exists() {
                 evidence.push(format!("cwd yaml config found at {}", cwd_yml.display()));
@@ -311,14 +179,14 @@ impl Adapter for AiderAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -383,7 +251,7 @@ impl Adapter for AiderAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Primary writable surface: .aider.conf.yml (YAML) — searched git-root/cwd/home, explicit --config overrides.
+        // Searched git-root/cwd/home; explicit --config overrides.
         let yml_resolver = PathResolver::new(
             Some(
                 "~/.aider.conf.yml / ./.aider.conf.yml / $GIT_ROOT/.aider.conf.yml (or --config <path>)",
@@ -405,7 +273,6 @@ impl Adapter for AiderAdapter {
         yml_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(yml_surface);
 
-        // Env file surface: .env / --env-file (dotenv)
         let env_resolver = PathResolver::new(
             Some("~/.env / ./.env / $GIT_ROOT/.env (or --env-file <path>)"),
             Some("~/.env / ./.env"),
@@ -429,7 +296,6 @@ impl Adapter for AiderAdapter {
         env_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(env_surface);
 
-        // Model settings surface: .aider.model.settings.yml (YAML)
         let settings_resolver = PathResolver::new(
             Some("~/.aider.model.settings.yml / ./.aider.model.settings.yml"),
             Some("~/.aider.model.settings.yml"),
@@ -447,7 +313,6 @@ impl Adapter for AiderAdapter {
         settings_surface.backup_required = true;
         surfaces.push(settings_surface);
 
-        // Model metadata surface: .aider.model.metadata.json (JSON)
         let metadata_resolver = PathResolver::new(
             Some("~/.aider.model.metadata.json / ./.aider.model.metadata.json"),
             Some("~/.aider.model.metadata.json"),
@@ -465,7 +330,6 @@ impl Adapter for AiderAdapter {
         metadata_surface.backup_required = true;
         surfaces.push(metadata_surface);
 
-        // Chat history surface: .aider.chat.history.md — text fragment, project workspace.
         let history_resolver = PathResolver::fallback_only(
             ".aider.chat.history.md (project root or --chat-history-file)",
         );
@@ -527,10 +391,8 @@ impl Adapter for AiderAdapter {
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("explicit-config via --config/--env-file + HOME relocation");
-        // HOME relocation isolates ~/.aider.conf.yml, ~/.env, model settings etc.
         plan.env_vars
             .push(("HOME".to_owned(), instance.config_root.to_string()));
-        // Explicit CLI paths ensure the instance uses its own config and env file.
         let config_path = Path::new(&instance.config_root.to_string()).join(".aider.conf.yml");
         let env_path = Path::new(&instance.config_root.to_string()).join(".env");
         plan.args.push("--config".to_owned());
@@ -580,9 +442,8 @@ impl Adapter for AiderAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: types per the options reference in
-        // docs/harness-configs/aider.md §3 (kebab-case YAML keys typed like
-        // their CLI flags). Deprecated legacy OpenAI switches per §env note.
+        // HAD-03 per docs/harness-configs/aider.md §3: kebab-case keys typed
+        // like their CLI flags; legacy OpenAI switches map to env.
         match surface_id {
             ".aider.conf.yml" | ".aider.model.settings.yml" => Some(
                 SurfaceSchema::new()
@@ -775,7 +636,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = AiderAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -887,7 +748,6 @@ mod tests {
                     let suffix = pat.trim_start_matches('*');
                     file.ends_with(suffix)
                 } else if pat.contains('*') {
-                    // simple glob: check prefix before * and suffix after *
                     let parts: Vec<&str> = pat.split('*').collect();
                     if parts.len() == 2 {
                         file.starts_with(parts[0]) && file.ends_with(parts[1])
@@ -919,7 +779,6 @@ mod tests {
         );
         assert!(plan.args.contains(&"--config".to_owned()));
         assert!(plan.args.contains(&"--env-file".to_owned()));
-        // Check that args contain the config root path
         let config_arg = plan
             .args
             .windows(2)
@@ -1027,10 +886,6 @@ mod tests {
         assert!(env.path_resolver.fallback.contains(".env"));
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/aider")
     }
@@ -1053,7 +908,6 @@ mod tests {
         let path = fixture_path("aider.minimal.yml");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::yaml::load(&path).unwrap();
-        // Minimal may be empty or contain only a model key.
         assert!(map.is_empty() || map.contains_key("model") || map.len() <= 2);
     }
 
@@ -1130,7 +984,6 @@ mod tests {
             path.display()
         );
         let map = superai_config::env_file::load(&path).unwrap();
-        // Minimal env may be empty or contain a key.
         assert!(map.is_empty() || map.contains_key("OPENAI_API_KEY") || !map.is_empty());
     }
 
@@ -1331,10 +1184,6 @@ mod tests {
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
 
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema (mapping root + owned-key semantics)
-    // -------------------------------------------------------------------
-
     #[test]
     fn surface_schema_declares_yaml_env_and_metadata_shapes() {
         let a = adapter();
@@ -1409,10 +1258,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -------------------------------------------------------------------
-    // HAD-05/HAD-06 version-boundary fixtures (model-metadata era)
-    // -------------------------------------------------------------------
-
     #[test]
     fn boundary_fixtures_split_model_metadata_eras() {
         let legacy = fixture_path("model.metadata.boundary_legacy.json");
@@ -1428,7 +1273,6 @@ mod tests {
         // Current era: routed providers (openrouter) present.
         assert!(current_map.contains_key("openrouter/anthropic/claude-sonnet-4"));
 
-        // Both eras satisfy the declared object-root schema on read.
         for path in [&legacy, &current] {
             let content = std::fs::read(path).unwrap();
             let diags = crate::adapter::validate_surface_content(
@@ -1454,7 +1298,7 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned();
-        let parsed = AiderAdapter::parse_version_output(&version_text);
+        let parsed = crate::adapters::parse_version_output(&version_text);
         assert_eq!(parsed.as_deref(), Some("0.84.0"));
         let res = adapter().version_resolution();
         if res.detected_version.as_deref() == parsed.as_deref() {

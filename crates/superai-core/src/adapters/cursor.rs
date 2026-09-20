@@ -1,20 +1,7 @@
-//! Cursor adapter — `CURSOR_CONFIG_DIR` plus IDE `--user-data-dir` isolation.
-//!
-//! Research source: `docs/harness-configs/cursor.md` (last verified 2026-08-25;
-//! MCP read paths live-verified 2026-09-18).
-//! Executables `cursor` (IDE) and `agent`/`cursor-agent` (CLI), CLI config
-//! `~/.cursor/cli-config.json` via `$CURSOR_CONFIG_DIR`, IDE user-data via
-//! `--user-data-dir` + `--extensions-dir`, isolation `ide-user-data`.
-//! NOTE (live probe, agent 2026.09.15-d2fe57e): `mcp.json` is NOT relocated
-//! by `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` — the agent reads it only from
-//! `$HOME/.cursor/mcp.json` and project `.cursor/mcp.json`; only
-//! `cli-config.json` follows `CURSOR_CONFIG_DIR`.
+//! Cursor adapter: `CURSOR_CONFIG_DIR` plus IDE `--user-data-dir` isolation.
+//! Research source: `docs/harness-configs/cursor.md` (last verified 2026-09-18).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -25,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Cursor.
 pub const HARNESS_ID_STR: &str = "cursor";
@@ -60,9 +43,8 @@ pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 /// Default CLI config fallback.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.cursor";
 
-/// Live-read user MCP fallback (agent 2026.09.15-d2fe57e ignores
-/// `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` for `mcp.json` — probe-verified
-/// 2026-09-18, evidence live/cursor/mcp-readpath-r6.log).
+/// The agent ignores `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` for `mcp.json`
+/// (probe-verified 2026-09-18; see mcp-readpath-r6.log).
 pub const MCP_READ_PATH_FALLBACK: &str = "~/.cursor/mcp.json";
 
 /// Research document link.
@@ -87,10 +69,6 @@ pub const OWNED_SELECTORS: &[&str] = &[
 
 /// Owned selectors for MCP.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
-
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
 
 /// Concrete adapter for Cursor.
 #[derive(Debug, Clone)]
@@ -120,105 +98,6 @@ impl CursorAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try locate binary via PATH, checking `cursor`, `agent`, `cursor-agent`.
-    #[expect(clippy::unused_self, reason = "uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_CLI, EXECUTABLE_LEGACY] {
-            for dir in path_var.split(sep) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `--version`.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version token.
-    #[expect(clippy::excessive_nesting, reason = "version parsing explicit")]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve default CLI config root.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -240,9 +119,8 @@ impl CursorAdapter {
         Some(PathBuf::from(home).join(".cursor"))
     }
 
-    /// Live user-MCP read path `$HOME/.cursor/mcp.json` — the agent does not
-    /// relocate `mcp.json` via `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME`
-    /// (probe-verified 2026-09-18, evidence live/cursor/mcp-readpath-r6.log).
+    /// The agent reads user MCP only from `$HOME/.cursor/mcp.json` and
+    /// ignores env relocation (probe-verified 2026-09-18).
     fn mcp_read_path() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -416,7 +294,7 @@ impl Adapter for CursorAdapter {
         let mut evidence = Vec::new();
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_CLI, EXECUTABLE_LEGACY]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
@@ -425,7 +303,7 @@ impl Adapter for CursorAdapter {
                         .unwrap_or("cursor"),
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `--version`"));
                         version = Some(v);
@@ -516,10 +394,8 @@ impl Adapter for CursorAdapter {
         project_cli.backup_required = true;
         surfaces.push(project_cli);
 
-        // Live-read layout (probe 2026-09-18): `agent mcp list` reads only
-        // `$HOME/.cursor/mcp.json` (+ project `.cursor/mcp.json`); a file at
-        // `$CURSOR_CONFIG_DIR/mcp.json` or `$XDG_CONFIG_HOME/cursor/mcp.json`
-        // is ignored — unlike `cli-config.json`, which does follow the env.
+        // `agent mcp list` reads only $HOME/.cursor/mcp.json (plus the
+        // project copy); env-relocated mcp.json copies are ignored.
         let mcp_resolver = PathResolver::new(
             Some(MCP_READ_PATH_FALLBACK),
             Some(MCP_READ_PATH_FALLBACK),
@@ -704,9 +580,8 @@ impl Adapter for CursorAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (cursor.md §1.2: `~/.cursor/mcp.json` global
-    /// and project `.cursor/mcp.json` — live-confirmed read paths; the agent
-    /// does NOT read `$CURSOR_CONFIG_DIR/mcp.json`, probe 2026-09-18).
+    /// EXT-08/09: global `~/.cursor/mcp.json` plus the project copy; the
+    /// agent never reads `$CURSOR_CONFIG_DIR/mcp.json` (probe 2026-09-18).
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp.json",
@@ -789,15 +664,15 @@ mod tests {
     #[test]
     fn parse_version_cases() {
         assert_eq!(
-            CursorAdapter::parse_version_output("cursor 1.2.3").as_deref(),
+            crate::adapters::parse_version_output("cursor 1.2.3").as_deref(),
             Some("1.2.3")
         );
         assert_eq!(
-            CursorAdapter::parse_version_output("agent 0.5.0").as_deref(),
+            crate::adapters::parse_version_output("agent 0.5.0").as_deref(),
             Some("0.5.0")
         );
-        assert_eq!(CursorAdapter::parse_version_output(""), None);
-        assert_eq!(CursorAdapter::parse_version_output("not a version"), None);
+        assert_eq!(crate::adapters::parse_version_output(""), None);
+        assert_eq!(crate::adapters::parse_version_output("not a version"), None);
     }
 
     #[test]
@@ -819,7 +694,7 @@ mod tests {
 
     /// Live-probe regression pin (2026-09-18, agent 2026.09.15-d2fe57e): the
     /// agent reads `mcp.json` only from `$HOME/.cursor/mcp.json` (+ project
-    /// `.cursor/mcp.json`) — never from `$CURSOR_CONFIG_DIR/mcp.json`.
+    /// `.cursor/mcp.json`): never from `$CURSOR_CONFIG_DIR/mcp.json`.
     #[test]
     fn mcp_surface_pins_home_cursor_read_path() {
         let a = adapter();
@@ -960,10 +835,6 @@ mod tests {
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
         assert!(!boxed.config_surfaces().is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: on-disk fixture corpus (writable-state surface)
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_populated_loads_with_documented_keys() {

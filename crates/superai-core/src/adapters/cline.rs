@@ -1,16 +1,7 @@
-//! `Cline` adapter — VS Code `--user-data-dir` plus `CLINE_DATA_DIR` isolation.
-//!
+//! `Cline` adapter: VS Code `--user-data-dir` plus `CLINE_DATA_DIR` isolation.
 //! Research source: `docs/harness-configs/cline.md` (last verified 2026-08-25).
-//! Executable `cline` (CLI) / VS Code extension `saoudrizwan.claude-dev`,
-//! config root `~/.cline` or `$CLINE_DATA_DIR`, plus VS Code globalStorage
-//! `…/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`,
-//! isolation `ide-user-data` via `--user-data-dir` + `CLINE_DATA_DIR`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -23,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Cline.
 pub const HARNESS_ID_STR: &str = "cline";
@@ -61,10 +48,8 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for provider/MCP mutation inside Cline settings (JSON).
-///
-/// These are top-level keys superai owns; everything else round-trips untouched
-/// via `superai-config::json`.
+/// Top-level keys superai owns in providers.json; everything else
+/// round-trips untouched via `superai-config::json`.
 pub const OWNED_SELECTORS: &[&str] = &[
     "apiProvider",
     "openAiBaseUrl",
@@ -79,16 +64,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Owned selectors for MCP servers inside `cline_mcp_settings.json`.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Cline.
-///
-/// Isolation is `ide-user-data` via VS Code `--user-data-dir` + `--extensions-dir`
-/// plus `CLINE_DATA_DIR` for the CLI/SDK side. The wrapper sets
-/// `CLINE_DATA_DIR` to the instance `config_root` and passes
-/// `--user-data-dir <root>/vscode-data` to `code`.
+/// Isolation is `ide-user-data`: `CLINE_DATA_DIR` for the CLI/SDK side,
+/// `--user-data-dir` / `--extensions-dir` for VS Code.
 #[derive(Debug, Clone)]
 pub struct ClineAdapter {
     id: HarnessId,
@@ -116,124 +93,9 @@ impl ClineAdapter {
         DATA_DIR_ENV_VAR
     }
 
-    /// Try to locate the `cline` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-            // Also check for VS Code binary as secondary evidence.
-            let _code_candidate = Path::new(dir).join(VSCODE_EXECUTABLE);
-            // Prefer cline; VS Code binary check is deferred to second pass.
-        }
-        // If cline not found, check for VS Code binary directly for evidence.
-        let path_var2 = std::env::var("PATH").ok()?;
-        for dir in path_var2.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let code_candidate = Path::new(dir).join(VSCODE_EXECUTABLE);
-            if code_candidate.is_file() {
-                return Some(code_candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{VSCODE_EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `cline --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `cline 1.2.3` or `Cline 2.0.0` into `1.2.3`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
+    /// Cline first; a lone VS Code binary still counts as install evidence.
+    fn find_binary_in_path() -> Option<PathBuf> {
+        super::find_in_path(&[EXECUTABLE]).or_else(|| super::find_in_path(&[VSCODE_EXECUTABLE]))
     }
 
     /// Resolve the default config root: `$CLINE_DATA_DIR` or `~/.cline`.
@@ -308,14 +170,6 @@ impl ClineAdapter {
         }
     }
 
-    /// Check if default config root exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
-    }
-
     /// Build detection evidence about Cline config and VS Code storage.
     #[expect(
         clippy::excessive_nesting,
@@ -369,7 +223,6 @@ impl ClineAdapter {
                             data_settings.display()
                         ));
                     }
-                    // Rules directory.
                     let rules = root.join("rules");
                     if rules.exists() {
                         evidence.push(format!("rules dir present at {}", rules.display()));
@@ -383,7 +236,6 @@ impl ClineAdapter {
             }
         }
 
-        // VS Code globalStorage
         if let Some(vs_root) = Self::vscode_global_storage_root() {
             if vs_root.exists() {
                 evidence.push(format!(
@@ -403,14 +255,6 @@ impl ClineAdapter {
                     vs_root.display()
                 ));
             }
-            // VS Code settings.json
-            if let Some(home) = Self::default_config_root()
-                .as_ref()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-            {
-                let _ = home;
-            }
-            // Check VS Code settings.json locations.
             let home_opt = std::env::var("HOME")
                 .ok()
                 .or_else(|| std::env::var("USERPROFILE").ok());
@@ -443,7 +287,6 @@ impl ClineAdapter {
             }
         }
 
-        // CLINE_DATA_DIR env
         if let Ok(dir) = std::env::var(DATA_DIR_ENV_VAR)
             && !dir.trim().is_empty()
         {
@@ -452,7 +295,6 @@ impl ClineAdapter {
             evidence.push(format!("{DATA_DIR_ENV_VAR} not set"));
         }
 
-        // Project .clinerules
         let clinerules = Path::new(".clinerules");
         let cline_dir = Path::new(".cline");
         if clinerules.exists() {
@@ -515,7 +357,7 @@ impl Adapter for ClineAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        if let Some(path) = self.find_binary_in_path() {
+        if let Some(path) = Self::find_binary_in_path() {
             evidence.push(format!(
                 "found binary `{}` at {}",
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("cline"),
@@ -527,7 +369,7 @@ impl Adapter for ClineAdapter {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
             if file_name.contains("cline") {
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `cline --version`"));
                         version = Some(v);
@@ -596,7 +438,6 @@ impl Adapter for ClineAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Primary writable surface: providers.json (JSON, via CLINE_DATA_DIR or ~/.cline/data/settings)
         let providers_resolver = PathResolver::new(
             Some("$CLINE_DATA_DIR/settings/providers.json"),
             Some("$CLINE_DATA_DIR/settings/providers.json"),
@@ -617,7 +458,6 @@ impl Adapter for ClineAdapter {
         providers_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(providers_surface);
 
-        // Global settings: global-settings.json
         let global_resolver = PathResolver::new(
             Some("$CLINE_DATA_DIR/settings/global-settings.json"),
             Some("$CLINE_DATA_DIR/settings/global-settings.json"),
@@ -636,7 +476,6 @@ impl Adapter for ClineAdapter {
         global_surface.backup_required = true;
         surfaces.push(global_surface);
 
-        // MCP settings: cline_mcp_settings.json (CLI/SDK location)
         let mcp_resolver = PathResolver::new(
             Some("$CLINE_DATA_DIR/settings/cline_mcp_settings.json"),
             Some("$CLINE_DATA_DIR/settings/cline_mcp_settings.json"),
@@ -658,7 +497,6 @@ impl Adapter for ClineAdapter {
         mcp_surface.backup_required = true;
         surfaces.push(mcp_surface);
 
-        // VS Code globalStorage MCP settings — harness-managed but we track it.
         let vscode_mcp_resolver = PathResolver::new(
             Some(
                 "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
@@ -687,7 +525,6 @@ impl Adapter for ClineAdapter {
         vscode_mcp.restart_behavior = RestartBehavior::Reload;
         surfaces.push(vscode_mcp);
 
-        // VS Code settings.json with cline.* namespace
         let vscode_settings_resolver = PathResolver::new(
             Some("~/.config/Code/User/settings.json"),
             Some("~/Library/Application Support/Code/User/settings.json"),
@@ -711,7 +548,6 @@ impl Adapter for ClineAdapter {
         vscode_settings.backup_required = true;
         surfaces.push(vscode_settings);
 
-        // Rules surface: .clinerules (text fragments)
         let rules_resolver =
             PathResolver::fallback_only(".clinerules / .cline/rules.md / ~/Documents/Cline/Rules");
         let mut rules_surface = ConfigSurface::new(
@@ -725,7 +561,6 @@ impl Adapter for ClineAdapter {
         rules_surface.backup_required = false;
         surfaces.push(rules_surface);
 
-        // .clineignore (text fragment)
         let ignore_resolver = PathResolver::fallback_only(".clineignore (project root)");
         let mut ignore_surface = ConfigSurface::new(
             ".clineignore",
@@ -738,7 +573,6 @@ impl Adapter for ClineAdapter {
         ignore_surface.backup_required = false;
         surfaces.push(ignore_surface);
 
-        // Workflow/skill/hook surfaces are under ~/.cline or .cline/ — text fragments.
         let workflows_resolver =
             PathResolver::fallback_only("~/.cline/workflows / .cline/workflows");
         let mut workflows = ConfigSurface::new(
@@ -798,12 +632,10 @@ impl Adapter for ClineAdapter {
         }
         instance.validate()?;
         let mut plan = WrapperPlan::new("ide-user-data via --user-data-dir + CLINE_DATA_DIR");
-        // CLI/SDK isolation via CLINE_DATA_DIR.
         plan.env_vars.push((
             DATA_DIR_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // VS Code isolation via --user-data-dir and --extensions-dir.
         let vscode_data = Path::new(&instance.config_root.to_string()).join("vscode-data");
         let extensions = Path::new(&instance.config_root.to_string()).join("extensions");
         plan.args.push(USER_DATA_DIR_FLAG.to_owned());
@@ -818,11 +650,8 @@ impl Adapter for ClineAdapter {
             vscode_data.display(),
             extensions.display()
         );
-        // WRP-01 invocation spec (cline.md / WRP-05): the VS Code `code`
-        // executable with per-profile user-data + extensions dirs; the split
-        // surfaces are the CLI env and the two editor directories; VS Code's
-        // login/keychain/globalStorage stay shared — the honest constrained
-        // channel.
+        // VS Code's login/keychain/globalStorage stay shared across profiles;
+        // only the user-data and extensions dirs are per-profile.
         plan.executable = Some("code".to_owned());
         plan.state_paths = vec![
             format!("{DATA_DIR_ENV_VAR}={}", instance.config_root),
@@ -873,9 +702,8 @@ impl Adapter for ClineAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: provider-profile + MCP shapes per
-        // docs/harness-configs/cline.md §config (providers.json holds
-        // provider config metadata; cline_mcp_settings.json holds mcpServers).
+        // HAD-03 per docs/harness-configs/cline.md: providers.json holds
+        // provider metadata; cline_mcp_settings.json holds mcpServers.
         match surface_id {
             "providers.json" | "global-settings.json" => Some(
                 SurfaceSchema::new()
@@ -1059,7 +887,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = super::ClineAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1320,10 +1148,6 @@ mod tests {
             .unwrap();
         assert!(vscode.path_resolver.fallback.contains("globalStorage"));
     }
-
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cline")
@@ -1628,10 +1452,6 @@ mod tests {
         assert!(!boxed.config_surfaces().is_empty());
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema
-    // -------------------------------------------------------------------
 
     #[test]
     fn surface_schema_declares_provider_and_mcp_shapes() {

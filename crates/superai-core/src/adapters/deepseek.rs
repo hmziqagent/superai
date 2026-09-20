@@ -1,17 +1,7 @@
-//! `DeepSeek` Harness adapter — `dsh`, `DSH_HOME`, relocated-root, `ResearchBlocked` dev preview.
-//!
+//! `DeepSeek` Harness adapter: `dsh`, `DSH_HOME`, relocated-root, `ResearchBlocked` dev preview.
 //! Research source: `docs/harness-configs/deepseek-harness.md` (last verified 2026-08-25).
-//! Executable `dsh` (`npx @deepseek-ai/dsh`), config root `~/.dsh` or `$DSH_HOME`,
-//! provider catalog via `@earendil-works/pi-ai` (`providers` keyed by route, `apiKeyEnv`
-//! as env-var name, `compat` wire-quirk catalog), plugin config incomplete,
-//! isolation `relocated-root` via `DSH_HOME`, product status `preview` (developer
-//! preview 2026-08-13, compatibility-breaking changes warned), support `ResearchBlocked`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -22,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `DeepSeek` Harness.
 pub const HARNESS_ID_STR: &str = "deepseek-harness";
@@ -54,19 +40,11 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version (provider catalog surface).
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Research-blocked reason — provider catalog + plugin incomplete, dev preview.
-pub const BLOCKED_REASON: &str = "DeepSeek Harness developer preview (2026-08-13): provider catalog pi-ai compat switches, plugin contracts, profile boot, AGENTS.md/skills, sandbox runner unverified — relocated-root via DSH_HOME verified but writes blocked";
+/// Research-blocked reason: provider catalog + plugin incomplete, dev preview.
+pub const BLOCKED_REASON: &str = "DeepSeek Harness developer preview (2026-08-13): provider catalog pi-ai compat switches, plugin contracts, profile boot, AGENTS.md/skills, sandbox runner unverified: relocated-root via DSH_HOME verified but writes blocked";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for `DeepSeek` Harness (`ResearchBlocked`).
-///
-/// Isolation is `relocated-root` via `DSH_HOME`. Detection via `dsh --version`
-/// and harness home existence; provider `compat` and plugin system are not
-/// yet stable for mutation. The wrapper would set `DSH_HOME` to the instance
-/// `config_root` and exec `dsh`, but is blocked until research gaps close.
+/// `ResearchBlocked`: detection works (`dsh --version`, harness home), but
+/// the provider `compat` catalog and plugin system are not stable to mutate.
 #[derive(Debug, Clone)]
 pub struct DeepSeekAdapter {
     id: HarnessId,
@@ -99,109 +77,6 @@ impl DeepSeekAdapter {
         BLOCKED_REASON
     }
 
-    /// Try to locate the `dsh` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `dsh --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            // dsh may also support `dsh --version` or `dsh cli --version`; try plain --version
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `0.1.1-rc.2` or `dsh 0.1.1-rc.2` into `0.1.1-rc.2`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve the default harness home: `$DSH_HOME` or `~/.dsh`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -216,14 +91,6 @@ impl DeepSeekAdapter {
             return None;
         }
         Some(PathBuf::from(home).join(".dsh"))
-    }
-
-    /// Check if default harness home exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
     }
 
     /// Build detection evidence about harness home and provider config.
@@ -251,7 +118,7 @@ impl DeepSeekAdapter {
                     } else {
                         evidence.push(format!("AGENTS.md missing at {}", agents_md.display()));
                     }
-                    // Provider catalog config — may be plugin-scoped, unverified exact filename
+                    // May be plugin-scoped; exact filename unverified.
                     let config_candidates =
                         ["config.json", "config.yaml", "dsh.json", "settings.json"];
                     let mut found_config = false;
@@ -295,7 +162,6 @@ impl DeepSeekAdapter {
         } else {
             evidence.push(format!("{CONFIG_ENV_VAR} not set, using ~/.dsh"));
         }
-        // Project AGENTS.md
         if Path::new("AGENTS.md").exists() {
             evidence.push("project AGENTS.md found in cwd".to_owned());
         }
@@ -351,14 +217,14 @@ impl Adapter for DeepSeekAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path_dir_first(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -402,7 +268,7 @@ impl Adapter for DeepSeekAdapter {
         if let Some(v) = detection.version {
             let mut notes = Vec::new();
             notes.push(format!("detected deepseek-harness version {v}"));
-            notes.push(format!("research blocked — {BLOCKED_REASON}"));
+            notes.push(format!("research blocked: {BLOCKED_REASON}"));
             notes.push("dev preview 0.1.1-rc.2, compatibility-breaking changes warned".to_owned());
             let mut res = VersionResolution::new(Some(v), None, false);
             res.notes = notes;
@@ -419,7 +285,6 @@ impl Adapter for DeepSeekAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Harness home config — providers catalog (JSON), user scope
         let home_resolver = PathResolver::new(
             Some("$DSH_HOME/config.json"),
             Some("$DSH_HOME/config.json"),
@@ -446,7 +311,6 @@ impl Adapter for DeepSeekAdapter {
         home_config.restart_behavior = RestartBehavior::Reload;
         surfaces.push(home_config);
 
-        // Global AGENTS.md — text fragment, user scope
         let agents_resolver = PathResolver::new(
             Some("$DSH_HOME/AGENTS.md"),
             Some("$DSH_HOME/AGENTS.md"),
@@ -464,7 +328,6 @@ impl Adapter for DeepSeekAdapter {
         agents_global.backup_required = false;
         surfaces.push(agents_global);
 
-        // Project AGENTS.md — project/workspace scope
         let project_agents = PathResolver::fallback_only("AGENTS.md (project, cwd)");
         let mut project_agents_surface = ConfigSurface::new(
             "AGENTS.md (project)",
@@ -477,7 +340,6 @@ impl Adapter for DeepSeekAdapter {
         project_agents_surface.backup_required = false;
         surfaces.push(project_agents_surface);
 
-        // Plugins — directory bundle, user scope (incomplete)
         let plugins_resolver = PathResolver::new(
             Some("$DSH_HOME/plugins/<name>/"),
             Some("$DSH_HOME/plugins/<name>/"),
@@ -549,7 +411,7 @@ impl Adapter for DeepSeekAdapter {
             harness: self.id.to_string(),
             surface: "wrapper".to_owned(),
             reason: format!(
-                "ResearchBlocked: {BLOCKED_REASON} — wrapper via {CONFIG_ENV_VAR} not yet verified for concurrent plugin/profile isolation"
+                "ResearchBlocked: {BLOCKED_REASON}: wrapper via {CONFIG_ENV_VAR} not yet verified for concurrent plugin/profile isolation"
             ),
         })
     }
@@ -577,7 +439,7 @@ impl Adapter for DeepSeekAdapter {
             harness: self.id.to_string(),
             surface: "validate_instance".to_owned(),
             reason: format!(
-                "ResearchBlocked: {BLOCKED_REASON} — validate blocked until provider/plugin schema stabilized"
+                "ResearchBlocked: {BLOCKED_REASON}: validate blocked until provider/plugin schema stabilized"
             ),
         })
     }
@@ -701,7 +563,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = DeepSeekAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -802,10 +664,6 @@ mod tests {
         assert!(exclusions.iter().any(|p| p.contains("cache")));
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/deepseek_harness")
     }
@@ -819,7 +677,6 @@ mod tests {
         let path = fixture_path("settings.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
-        // Minimal may be empty or contain providers routing stub
         assert!(map.is_empty() || map.contains_key("providers") || map.len() <= 2);
     }
 

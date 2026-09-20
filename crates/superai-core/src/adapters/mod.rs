@@ -1,4 +1,10 @@
-//! Harness adapters — concrete implementations.
+//! Harness adapters: concrete implementations.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 pub mod aider;
 pub mod amazon_q;
@@ -51,6 +57,127 @@ pub mod windsurf;
 pub mod workbuddy;
 pub mod zcode;
 pub mod zed_acp;
+
+/// First PATH hit for `names`, name-major: an earlier name wins over an
+/// earlier directory.
+pub(crate) fn find_in_path(names: &[&str]) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    for name in names {
+        for dir in path_var.split(separator) {
+            if let Some(hit) = probe_path_dir(dir, name) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// First PATH hit for `names`, dir-major: the earliest directory holding any
+/// name wins.
+pub(crate) fn find_in_path_dir_first(names: &[&str]) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    for dir in path_var.split(separator) {
+        for name in names {
+            if let Some(hit) = probe_path_dir(dir, name) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+fn probe_path_dir(dir: &str, name: &str) -> Option<PathBuf> {
+    if dir.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(dir).join(name);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    if cfg!(windows) {
+        let exe_candidate = Path::new(dir).join(format!("{name}.exe"));
+        if exe_candidate.is_file() {
+            return Some(exe_candidate);
+        }
+    }
+    None
+}
+
+/// Parse the first version-shaped token (`1.2.3`, `v1.2`, `1.0.0-rc1`).
+#[expect(clippy::excessive_nesting, reason = "token fallback chain is explicit")]
+pub(crate) fn parse_version_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for token in trimmed.split_whitespace() {
+        let mut candidate = token;
+        if let Some(stripped) = candidate.strip_prefix('v') {
+            candidate = stripped;
+        } else if let Some(stripped) = candidate.strip_prefix('V') {
+            candidate = stripped;
+        }
+        let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+        if cleaned.is_empty() {
+            continue;
+        }
+        let has_dot = cleaned.contains('.');
+        let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if has_dot && starts_digit {
+            let is_version_like = cleaned
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
+            if is_version_like {
+                return Some(cleaned.to_owned());
+            }
+            let mut version_part = String::new();
+            for ch in cleaned.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
+                    version_part.push(ch);
+                } else {
+                    break;
+                }
+            }
+            if version_part.contains('.') && !version_part.is_empty() {
+                return Some(version_part);
+            }
+        }
+    }
+    None
+}
+
+/// Run `<binary> --version` under a 2s budget and parse the version from the
+/// combined output. A hung child outlives the budget; its thread dies with it.
+pub(crate) fn probe_version(binary: &Path) -> Option<String> {
+    let owned = binary.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new(&owned)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        drop(tx.send(output));
+    });
+    let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
+        return None;
+    };
+    if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stdout.trim().is_empty() {
+        stderr.into_owned()
+    } else if stderr.trim().is_empty() {
+        stdout.into_owned()
+    } else {
+        format!("{stdout} {stderr}")
+    };
+    parse_version_output(&combined)
+}
 
 #[cfg(test)]
 mod decl_tests {
@@ -242,12 +369,8 @@ mod decl_tests {
         }
     }
 
-    /// Verified corpus partition of the 51 MCP declarations (round-1 judge
-    /// recount plus workbuddy, corrected round 5 by the live grok-build
-    /// probe and round 6 by the live factory-droid probe; claude-desktop
-    /// added writable round 5, chatgpt-desktop added absent round 5): pins
-    /// the exact writable/read-only/absence split so any drift in either
-    /// direction fails with the real numbers.
+    /// Verified corpus partition of the 51 MCP declarations: any drift in the
+    /// writable/read-only/absence split fails with the real numbers.
     const EXPECTED_MCP_WRITABLE: usize = 19;
     const EXPECTED_MCP_READ_ONLY: usize = 18;
     const EXPECTED_MCP_ABSENT: usize = 14;

@@ -1,17 +1,7 @@
-//! Auggie adapter — `~/.augment/settings.json` with `.augment/rules`, account/workspace.
-//!
+//! Auggie adapter: `~/.augment/settings.json` with `.augment/rules`, account/workspace.
 //! Research source: `docs/harness-configs/auggie.md` (last verified 2026-08-25).
-//! Executable `auggie`, config hierarchy `~/.augment/settings.json` (user) +
-//! `<workspace>/.augment/settings.json` + `<workspace>/.augment/settings.local.json`
-//! + `/etc/augment/settings.json` (managed), isolation `project-scope` with
-//!   account/workspace constrained via `AUGMENT_SESSION_AUTH` and
-//!   `--workspace-root` / `--augment-cache-dir`, constrained.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -22,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Auggie.
 pub const HARNESS_ID_STR: &str = "auggie";
@@ -75,10 +61,6 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// MCP selectors.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Auggie.
 #[derive(Debug, Clone)]
 pub struct AuggieAdapter {
@@ -105,100 +87,6 @@ impl AuggieAdapter {
     /// Session env var.
     pub fn session_env_var(&self) -> &str {
         SESSION_ENV_VAR
-    }
-
-    #[expect(clippy::unused_self, reason = "adapter uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(sep) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    fn probe_version(binary: &Path) -> Option<String> {
-        let owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    #[expect(clippy::excessive_nesting, reason = "version parsing explicit")]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     fn default_config_root() -> Option<PathBuf> {
@@ -251,7 +139,6 @@ impl AuggieAdapter {
             }
             None => evidence.push("could not resolve config root (no HOME)".to_owned()),
         }
-        // workspace .augment
         if Path::new(".augment/settings.json").exists() {
             evidence.push(".augment/settings.json exists (workspace)".to_owned());
         }
@@ -325,14 +212,14 @@ impl Adapter for AuggieAdapter {
         let mut evidence = Vec::new();
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `--version`"));
                         version = Some(v);
@@ -568,7 +455,6 @@ impl Adapter for AuggieAdapter {
         let mut plan = WrapperPlan::new(
             "account/workspace via AUGMENT_SESSION_AUTH + --workspace-root + --augment-cache-dir",
         );
-        // Account isolation via AUGMENT_SESSION_AUTH pointing at per-instance session file
         let session_path = Path::new(&instance.config_root.to_string()).join("session.json");
         plan.env_vars.push((
             SESSION_ENV_VAR.to_owned(),
@@ -576,7 +462,6 @@ impl Adapter for AuggieAdapter {
         ));
         plan.env_vars
             .push(("AUGMENT_DISABLE_AUTO_UPDATE".to_owned(), "1".to_owned()));
-        // Workspace and cache isolation
         let workspace = Path::new(&instance.config_root.to_string()).join("workspace");
         let cache = Path::new(&instance.config_root.to_string()).join("cache");
         plan.args.push(WORKSPACE_FLAG.to_owned());
@@ -719,10 +604,10 @@ mod tests {
     #[test]
     fn parse_version_ok() {
         assert_eq!(
-            AuggieAdapter::parse_version_output("auggie 0.5.0").as_deref(),
+            crate::adapters::parse_version_output("auggie 0.5.0").as_deref(),
             Some("0.5.0")
         );
-        assert_eq!(AuggieAdapter::parse_version_output(""), None);
+        assert_eq!(crate::adapters::parse_version_output(""), None);
     }
 
     #[test]
@@ -800,10 +685,6 @@ mod tests {
         let boxed: Box<dyn Adapter> = Box::new(a);
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: on-disk fixture corpus (writable-state surface)
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_populated_loads_with_documented_keys() {

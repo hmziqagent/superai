@@ -1,20 +1,8 @@
-//! Copilot Coding Agent adapter — `Unsupported`, cloud-owned.
-//!
-//! Research source: `docs/harness-configs/copilot-cli.md` annex (also
-//! `docs/harness-configs/orchestrators.md` context) (last verified 2026-08-25).
-//! The *Copilot coding agent* (distinct from Copilot CLI) is a cloud-owned,
-//! GitHub-hosted agent: repo/org settings `AGENTS.md`/`copilot-instructions.md`,
-//! org policy, Actions workflow `copilot-setup-steps.yml`, no local config dir,
-//! no relocatable root, no MCP local, no skills local, no API key local.
-//! Isolation `unsupported`, support `Unsupported`, product `active` (cloud), no
-//! local mutation — detection only informs, wrapper blocked, every write
-//! `UnsupportedOperation` with cloud-owned reason.
+//! Copilot Coding Agent adapter: `Unsupported`, cloud-owned (distinct from
+//! Copilot CLI). Research source: `docs/harness-configs/copilot-cli.md` annex
+//! (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -25,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Copilot Coding Agent.
 pub const HARNESS_ID_STR: &str = "copilot-coding-agent";
@@ -51,20 +35,11 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version (no local schema).
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Unsupported reason — cloud-owned.
-pub const UNSUPPORTED_REASON: &str = "cloud-owned repo/org settings (github.com settings → Copilot → Coding agent, AGENTS.md/copilot-instructions.md, copilot-setup-steps.yml Actions workflow, org policy), no local mutation, no relocatable root, no MCP/skills local — use Copilot CLI (`copilot-cli`) for local isolation";
+/// Unsupported reason: cloud-owned.
+pub const UNSUPPORTED_REASON: &str = "cloud-owned repo/org settings (github.com settings → Copilot → Coding agent, AGENTS.md/copilot-instructions.md, copilot-setup-steps.yml Actions workflow, org policy), no local mutation, no relocatable root, no MCP/skills local: use Copilot CLI (`copilot-cli`) for local isolation";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Copilot Coding Agent (`Unsupported`, `unsupported`).
-///
-/// All operations except `detect`/`scan_candidates` are `Unsupported`.
-/// `detect` probes for `gh` (GitHub CLI) and for cloud hints
-/// (`AGENTS.md`, `copilot-instructions.md`, `.github/workflows/copilot-setup-steps.yml`);
-/// `version_resolution` is unknown/unsupported; `plan_wrapper` and `write_config`
-/// always return `UnsupportedOperation`.
+/// Cloud-owned: every operation except `detect`/`scan_candidates` returns
+/// `UnsupportedOperation`; detection probes `gh` plus repo cloud hints only.
 #[derive(Debug, Clone)]
 pub struct CopilotCodingAgentAdapter {
     id: HarnessId,
@@ -92,113 +67,10 @@ impl CopilotCodingAgentAdapter {
         UNSUPPORTED_REASON
     }
 
-    /// Try to locate the `gh` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `gh --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `gh version 2.80.0` into `2.80.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Build detection evidence about cloud-owned repo/org settings and local hints.
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         evidence.push(format!("unsupported: {UNSUPPORTED_REASON}"));
-        // Repo-local instructions files (cloud agent reads them, but local file presence is hint)
         if Path::new(".github")
             .join("copilot-instructions.md")
             .exists()
@@ -226,14 +98,12 @@ impl CopilotCodingAgentAdapter {
                 agents_alt.display()
             ));
         }
-        // Actions workflow dir
         if Path::new(".github").join("workflows").exists() {
             evidence.push(".github/workflows/ present (Actions, cloud-owned)".to_owned());
         }
-        // Auth helper hint: gh auth status
         evidence.push("cloud-owned: no local config dir, no relocatable root, settings live on github.com (Copilot → Coding agent)".to_owned());
         evidence.push(
-            "no MCP local, no skills local, no API key local — org policy + repo settings govern"
+            "no MCP local, no skills local, no API key local: org policy + repo settings govern"
                 .to_owned(),
         );
         // GH token env (but don't leak)
@@ -241,13 +111,13 @@ impl CopilotCodingAgentAdapter {
             && !val.trim().is_empty()
         {
             evidence.push(
-                "GH_TOKEN is set (len redacted) — may auth gh helper, not coding agent".to_owned(),
+                "GH_TOKEN is set (len redacted): may auth gh helper, not coding agent".to_owned(),
             );
         } else if let Ok(val) = std::env::var("GITHUB_TOKEN")
             && !val.trim().is_empty()
         {
             evidence.push(
-                "GITHUB_TOKEN is set (len redacted) — Actions token, not local coding agent config"
+                "GITHUB_TOKEN is set (len redacted): Actions token, not local coding agent config"
                     .to_owned(),
             );
         } else {
@@ -303,7 +173,7 @@ impl Adapter for CopilotCodingAgentAdapter {
     fn detection(&self) -> DetectionResult {
         let mut evidence = Vec::new();
         let mut version: Option<String> = None;
-        let binary_path: Option<PathBuf> = self.find_binary_in_path();
+        let binary_path: Option<PathBuf> = super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]);
 
         if let Some(path) = binary_path.as_ref() {
             evidence.push(format!(
@@ -311,8 +181,8 @@ impl Adapter for CopilotCodingAgentAdapter {
                 path.display(),
                 path.display()
             ));
-            // Probe gh version but do NOT claim it's coding-agent version
-            match Self::probe_version(path) {
+            // The gh version is evidence, never claimed as coding-agent version.
+            match super::probe_version(path) {
                 Some(v) => {
                     evidence.push(format!(
                         "helper version `{v}` via `gh --version` (helper, not coding-agent version)"
@@ -335,9 +205,8 @@ impl Adapter for CopilotCodingAgentAdapter {
 
         self.collect_config_evidence(&mut evidence);
 
-        // Coding agent itself is cloud; local presence is always Absent for local mutation.
+        // The agent is cloud-owned, so local presence is always Absent.
         let present = InstallPresence::Absent;
-        // Confidence high because cloud-owned is deterministic
         let confidence = DetectionConfidence::High;
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -345,7 +214,6 @@ impl Adapter for CopilotCodingAgentAdapter {
 
     fn version_resolution(&self) -> VersionResolution {
         let detection = self.detection();
-        // Coding agent has no local versioned schema; always unknown/unsupported
         let mut res = VersionResolution::unknown();
         res.notes = detection.evidence;
         res.notes.push(format!("unsupported: {UNSUPPORTED_REASON}"));
@@ -357,7 +225,7 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
-        // Cloud-owned surfaces are not locally writable; we expose them as Opaque for documentation.
+        // Cloud-owned surfaces are exposed as Opaque for documentation.
         let mut surfaces = Vec::new();
 
         let cloud_instructions_resolver = PathResolver::fallback_only(
@@ -424,7 +292,6 @@ impl Adapter for CopilotCodingAgentAdapter {
     }
 
     fn plan_mirror_exclusions(&self) -> Vec<String> {
-        // No local instance to mirror; exclusions are placeholder to satisfy trait.
         vec![
             ".github/*".to_owned(),
             "*.log".to_owned(),
@@ -446,7 +313,7 @@ impl Adapter for CopilotCodingAgentAdapter {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
             reason: format!(
-                "Unsupported: {UNSUPPORTED_REASON} — coding agent is hosted by GitHub, not on this machine; manage via github.com repo settings and Actions; for local isolation use copilot-cli harness instead"
+                "Unsupported: {UNSUPPORTED_REASON}: coding agent is hosted by GitHub, not on this machine; manage via github.com repo settings and Actions; for local isolation use copilot-cli harness instead"
             ),
         })
     }
@@ -468,7 +335,6 @@ impl Adapter for CopilotCodingAgentAdapter {
                 reason: format!("expected harness `{}`, got `{}`", self.id, instance.harness),
             });
         }
-        // Unsupported: every validate is an UnsupportedOperation
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "validate_instance".to_owned(),
@@ -559,7 +425,6 @@ mod tests {
         assert!(!result.evidence.is_empty());
         assert!(result.evidence.iter().any(|e| e.contains("unsupported")));
         assert!(result.evidence.iter().any(|e| e.contains("cloud-owned")));
-        // Coding agent is cloud; always Absent locally
         assert_eq!(result.present, crate::state::InstallPresence::Absent);
         assert_eq!(result.confidence, crate::adapter::DetectionConfidence::High);
     }
@@ -586,7 +451,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = CopilotCodingAgentAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -706,10 +571,6 @@ mod tests {
         let a = adapter();
         assert!(a.supported_skill_modes().is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: adopt the on-disk fixture corpus into tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_corpus_validates_secret_free() {

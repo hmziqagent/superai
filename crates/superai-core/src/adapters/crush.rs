@@ -1,18 +1,7 @@
-//! Crush adapter — executable `crushrc`, per-project `crush.json` plus XDG, `ResearchBlocked`.
-//!
+//! Crush adapter: executable `crushrc`, per-project `crush.json` plus XDG, `ResearchBlocked`.
 //! Research source: `docs/harness-configs/crush.md` (last verified 2026-08-25).
-//! Executable `crush`, primary config `crushrc` (executable Bash, `provider`/`model`/`mcp`
-//! builtins) with legacy `crush.json` (JSON) deprecated; discovery project overrides
-//! global XDG `$XDG_CONFIG_HOME/crush/crushrc` (`~/.config/crush/crushrc`); override
-//! via `CRUSH_GLOBAL_CONFIG=<dir>`; isolation `project-scope` (project/XDG); support
-//! `ResearchBlocked` for writes until command API (`provider add`, `model add`) is
-//! verified non-interactive; read-only detect with minimal fixture.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -25,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Crush.
 pub const HARNESS_ID_STR: &str = "crush";
@@ -60,21 +45,11 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version (legacy JSON surface).
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Research-blocked reason — writes blocked until command API verified.
-pub const BLOCKED_REASON: &str = "crushrc is executable Bash with command-backed mutation (provider add/model add) — writes ResearchBlocked until non-interactive command API is verified; project/XDG isolation via CRUSH_GLOBAL_CONFIG";
+/// Research-blocked reason: writes blocked until command API verified.
+pub const BLOCKED_REASON: &str = "crushrc is executable Bash with command-backed mutation (provider add/model add): writes ResearchBlocked until non-interactive command API is verified; project/XDG isolation via CRUSH_GLOBAL_CONFIG";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Crush (`ResearchBlocked`).
-///
-/// Only read-only detection and inspection are supported. The executable
-/// `crushrc` (`provider`, `model`, `mcp` builtins) and legacy `crush.json`
-/// are detected but not mutated; `CRUSH_GLOBAL_CONFIG` / `CRUSH_GLOBAL_DATA`
-/// relocation for isolation is documented but not assumed stable for
-/// concurrent wrappers until verified. Project `.crushrc`/`.crush.json` and
-/// global `~/.config/crush/crushrc` are scanned.
+/// Read-only detection and inspection; env relocation is documented but not
+/// trusted for concurrent wrappers until the command API is verified.
 #[derive(Debug, Clone)]
 pub struct CrushAdapter {
     id: HarnessId,
@@ -107,108 +82,6 @@ impl CrushAdapter {
         BLOCKED_REASON
     }
 
-    /// Try to locate the `crush` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `crush --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `crush 0.5.1` or `0.5.1` into `0.5.1`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve the default global config path: `$CRUSH_GLOBAL_CONFIG` or XDG/home.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -228,14 +101,6 @@ impl CrushAdapter {
             return None;
         }
         Some(PathBuf::from(home).join(".config").join("crush"))
-    }
-
-    /// Check if default config root exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
     }
 
     /// Build detection evidence about config presence and surfaces.
@@ -305,7 +170,6 @@ impl CrushAdapter {
         {
             evidence.push(format!("{DATA_ENV_VAR} set to {val}"));
         }
-        // Project discovery
         for proj in [
             Path::new("./.crushrc"),
             Path::new("./crushrc"),
@@ -371,14 +235,14 @@ impl Adapter for CrushAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path_dir_first(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -425,7 +289,7 @@ impl Adapter for CrushAdapter {
         if let Some(v) = detection.version {
             let mut notes = Vec::new();
             notes.push(format!("detected crush version {v}"));
-            notes.push(format!("research blocked — {BLOCKED_REASON}"));
+            notes.push(format!("research blocked: {BLOCKED_REASON}"));
             let mut res = VersionResolution::new(Some(v), None, false);
             res.notes = notes;
             res
@@ -441,7 +305,6 @@ impl Adapter for CrushAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Project crushrc — executable Bash, project scope, user-editable, highest precedence
         let project_rc_resolver = PathResolver::fallback_only("./.crushrc or ./crushrc (project)");
         let mut project_rc = ConfigSurface::new(
             "crushrc (project)",
@@ -456,7 +319,6 @@ impl Adapter for CrushAdapter {
         project_rc.restart_behavior = RestartBehavior::Reload;
         surfaces.push(project_rc);
 
-        // Project crush.json — legacy JSON, project scope
         let project_json_resolver =
             PathResolver::fallback_only("./.crush.json or ./crush.json (project, deprecated)");
         let mut project_json = ConfigSurface::new(
@@ -471,7 +333,6 @@ impl Adapter for CrushAdapter {
         project_json.backup_required = true;
         surfaces.push(project_json);
 
-        // Global crushrc — XDG or CRUSH_GLOBAL_CONFIG
         let global_rc_resolver = PathResolver::new(
             Some("$CRUSH_GLOBAL_CONFIG/crushrc"),
             Some("$CRUSH_GLOBAL_CONFIG/crushrc"),
@@ -491,7 +352,6 @@ impl Adapter for CrushAdapter {
         global_rc.restart_behavior = RestartBehavior::Reload;
         surfaces.push(global_rc);
 
-        // Global crush.json — legacy JSON global
         let global_json_resolver = PathResolver::new(
             Some("$CRUSH_GLOBAL_CONFIG/crush.json"),
             Some("$CRUSH_GLOBAL_CONFIG/crush.json"),
@@ -517,7 +377,6 @@ impl Adapter for CrushAdapter {
         global_json.backup_required = true;
         surfaces.push(global_json);
 
-        // Per-project state dir .crush/ — opaque, not user-editable for wiring
         let state_resolver = PathResolver::fallback_only(".crush/ (project data_directory)");
         let mut state = ConfigSurface::new(
             ".crush/state",
@@ -586,7 +445,7 @@ impl Adapter for CrushAdapter {
             harness: self.id.to_string(),
             surface: "wrapper".to_owned(),
             reason: format!(
-                "ResearchBlocked: {BLOCKED_REASON} — detect only; wrapper via {CONFIG_ENV_VAR} not verified for concurrent instances"
+                "ResearchBlocked: {BLOCKED_REASON}: detect only; wrapper via {CONFIG_ENV_VAR} not verified for concurrent instances"
             ),
         })
     }
@@ -618,7 +477,7 @@ impl Adapter for CrushAdapter {
             harness: self.id.to_string(),
             surface: "validate_instance".to_owned(),
             reason: format!(
-                "ResearchBlocked: {BLOCKED_REASON} — validate blocked until crushrc mutation verified"
+                "ResearchBlocked: {BLOCKED_REASON}: validate blocked until crushrc mutation verified"
             ),
         })
     }
@@ -628,9 +487,8 @@ impl Adapter for CrushAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 (read side; writes are ResearchBlocked): shapes for the
-        // deprecated legacy crush.json per docs/harness-configs/crush.md §1
-        // schema table. The executable crushrc has no value schema.
+        // HAD-03, read side (writes are ResearchBlocked); the executable
+        // crushrc has no value schema.
         match surface_id {
             "crush.json (global)" | "crush.json (project)" => Some(
                 SurfaceSchema::new()
@@ -763,7 +621,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = CrushAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -888,10 +746,6 @@ mod tests {
         assert!(exclusions.iter().any(|p| p.contains("cache")));
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/crush")
     }
@@ -905,7 +759,6 @@ mod tests {
         let path = fixture_path("settings.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
-        // Minimal may be empty object with optional $schema
         assert!(map.is_empty() || map.contains_key("$schema") || map.len() <= 2);
     }
 
@@ -1009,10 +862,6 @@ mod tests {
         assert!(BLOCKED_REASON.contains("ResearchBlocked") || BLOCKED_REASON.contains("command"));
     }
 
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema (read side; writes ResearchBlocked)
-    // -------------------------------------------------------------------
-
     #[test]
     fn surface_schema_declares_legacy_json_shapes() {
         let a = adapter();
@@ -1027,7 +876,6 @@ mod tests {
             );
         }
         assert!(a.surface_schema("crush.json (project)").is_some());
-        // The executable crushrc has no value schema.
         assert!(a.surface_schema("crushrc (global)").is_none());
     }
 

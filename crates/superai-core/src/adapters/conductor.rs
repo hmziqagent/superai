@@ -1,22 +1,7 @@
-//! Conductor adapter — orchestrator, user/repo TOML, macOS worktrees/profiles, `Constrained`.
-//!
+//! Conductor adapter: orchestrator, user/repo TOML, macOS worktrees/profiles, `Constrained`.
 //! Research source: `docs/harness-configs/orchestrators.md` (last verified 2026-08-25).
-//! macOS desktop app `Conductor`, harnesses claude-code/codex/cursor/opencode,
-//! configurable executables `claude_code_executable_path`/`codex_executable_path`,
-//! providers `claude_provider` (anthropic/bedrock/vertex) with `bedrock_region`/
-//! `vertex_project_id`, models `models.default`/`models.review` etc, TOML
-//! `~/.conductor/settings.toml` user + `<repo>/.conductor/settings.toml` repo +
-//! `settings.local.toml` secrets + `settings.managed.toml` org, scripts
-//! `[scripts]` setup/run/archive + `run_mode`, env `[environment_variables]` with
-//! `.local`/`.cloud` scopes, worktrees `~/conductor/workspaces/<name>/` with
-//! `CONDUCTOR_*` env (PORT range, `ROOT_PATH`), `.worktreeinclude` file copy,
-//! isolation `os_bound` (macOS worktrees), support `Constrained`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -27,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Conductor.
 pub const HARNESS_ID_STR: &str = "conductor";
@@ -53,7 +34,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Constrained note — macOS worktrees/profile scoped.
+/// Constrained note: macOS worktrees/profile scoped.
 pub const CONSTRAINED_NOTE: &str = "user/repo TOML `~/.conductor/settings.toml` + `.conductor/settings.toml` + `.local`/`.managed` scopes, macOS worktrees `~/conductor/workspaces/` with CONDUCTOR_PORT..+9 per workspace, OS-bound: macOS desktop app, conductor build only, provider `claude_provider`/`codex_provider` + Bedrock/Vertex routing, profiles not fully isolated without containers";
 
 /// Owned selectors for provider/executor/model mutation.
@@ -75,16 +56,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "scripts.archive",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Conductor (`Constrained`, `os_bound`, macOS).
-///
-/// Isolation is `os_bound` via git worktrees plus macOS app bundle.
-/// Constrained because provider/model is per-profile TOML only, true
-/// multi-account isolation needs OS users/containers, and Cloud workspaces
-/// are separate proprietary infrastructure.
+/// `Constrained` and `os_bound`: provider/model is per-profile TOML; true
+/// multi-account isolation needs OS users or containers.
 #[derive(Debug, Clone)]
 pub struct ConductorAdapter {
     id: HarnessId,
@@ -110,108 +83,6 @@ impl ConductorAdapter {
     /// Constrained note.
     pub fn constrained_note(&self) -> &str {
         CONSTRAINED_NOTE
-    }
-
-    /// Try to locate the `conductor` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `conductor --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `conductor 1.2.3` into `1.2.3`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve the default user settings path `~/.conductor/settings.toml`.
@@ -311,7 +182,6 @@ impl ConductorAdapter {
                 evidence.push(format!("{var} not set"));
             }
         }
-        // Executor paths
         evidence.push("executors: $claude_code_executable_path / $codex_executable_path overrides documented; harness binaries expected on PATH".to_owned());
         if Path::new(".worktreeinclude").exists() {
             evidence.push(".worktreeinclude present (untracked file copy)".to_owned());
@@ -365,13 +235,13 @@ impl Adapter for ConductorAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        if let Some(path) = self.find_binary_in_path() {
+        if let Some(path) = super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             evidence.push(format!(
                 "found binary `{}` at {}",
                 EXECUTABLE,
                 path.display()
             ));
-            match Self::probe_version(&path) {
+            match super::probe_version(&path) {
                 Some(v) => {
                     evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                     version = Some(v);
@@ -661,7 +531,7 @@ impl Adapter for ConductorAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "conductor requires isolation os_bound (macOS worktrees) or project_scope, got {other} — {CONSTRAINED_NOTE}"
+                    "conductor requires isolation os_bound (macOS worktrees) or project_scope, got {other}: {CONSTRAINED_NOTE}"
                 ),
             }),
         }
@@ -795,7 +665,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = ConductorAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -971,10 +841,6 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: adopt the on-disk fixture corpus into tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_corpus_validates_secret_free_and_flags_malformed() {

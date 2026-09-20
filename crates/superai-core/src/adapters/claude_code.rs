@@ -1,14 +1,7 @@
-//! Claude Code adapter — relocated-root via `CLAUDE_CONFIG_DIR`.
-//!
+//! Claude Code adapter: relocated-root via `CLAUDE_CONFIG_DIR`.
 //! Research source: `docs/harness-configs/claude-code.md` (last verified 2026-08-25).
-//! Executable `claude`, config root `~/.claude` or `$CLAUDE_CONFIG_DIR`, primary
-//! writable surface `settings.json` (JSON/JSONC), isolation `relocated-root`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use superai_config::document::ValueType;
 
@@ -21,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Claude Code.
 pub const HARNESS_ID_STR: &str = "claude-code";
@@ -50,10 +39,8 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current settings shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for provider/model mutation — instance-specific fields.
-///
-/// These are the selectors superai owns inside `settings.json`. Everything
-/// else round-trips untouched via `superai-config::json`.
+/// Selectors superai owns inside `settings.json`; everything else
+/// round-trips untouched via `superai-config::json`.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "env.ANTHROPIC_BASE_URL",
@@ -67,14 +54,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "env.CLAUDE_CODE_USE_FOUNDRY",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Claude Code.
-///
-/// Isolation is `relocated-root` via `CLAUDE_CONFIG_DIR`. The wrapper sets
-/// `CLAUDE_CONFIG_DIR` to the instance `config_root` and execs `claude`.
+/// Isolation is `relocated-root`: the wrapper points `CLAUDE_CONFIG_DIR` at
+/// the instance `config_root` and execs `claude`.
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeAdapter {
     id: HarnessId,
@@ -93,12 +74,8 @@ impl ClaudeCodeAdapter {
         })
     }
 
-    /// Create an adapter pinned to an explicit `claude` binary location.
-    ///
-    /// The pinned path is probed before the `PATH` scan, matching the
-    /// `SUPERAI_CONFIGURED_BINARY_CLAUDE_CODE` detection source used by
-    /// [`crate::detect`]. Callers that already know where the harness binary
-    /// lives (install receipts, tests) use this instead of ambient `PATH`.
+    /// Pin an explicit `claude` binary; it wins over the `PATH` scan
+    /// (mirrors the `SUPERAI_CONFIGURED_BINARY_CLAUDE_CODE` detection source).
     pub fn with_configured_binary(path: PathBuf) -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self {
@@ -122,114 +99,14 @@ impl ClaudeCodeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `claude` binary: a pinned configured binary wins,
-    /// otherwise scan `PATH`.
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
+    /// A pinned configured binary wins over the `PATH` scan.
+    fn find_binary(&self) -> Option<PathBuf> {
         if let Some(pinned) = &self.configured_binary
             && pinned.is_file()
         {
             return Some(pinned.clone());
         }
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `claude --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `2.0.12 (Claude Code)` or `claude 1.5.3` into `1.5.3`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        // Split by whitespace and look for token containing '.' and starting with digit or 'v'.
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            // Strip leading 'v' or 'V'.
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            // Remove trailing punctuation like ',' or ')'.
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                // Accept semver-like strings: allow alphanumeric suffix after dash/plus.
-                // Trim trailing junk but keep suffix like "-alpha", "-rc1", "+build".
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
+        super::find_in_path(&[EXECUTABLE])
     }
 
     /// Resolve the default config root: `$CLAUDE_CONFIG_DIR` or `~/.claude`.
@@ -246,14 +123,6 @@ impl ClaudeCodeAdapter {
             return None;
         }
         Some(PathBuf::from(home).join(".claude"))
-    }
-
-    /// Check if default config root exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
     }
 
     /// Build the settings.json path for a given config root.
@@ -275,7 +144,6 @@ impl ClaudeCodeAdapter {
                     let settings = Self::settings_path_for_root(&root);
                     if settings.exists() {
                         evidence.push(format!("settings.json found at {}", settings.display()));
-                        // Check for schema marker.
                         if let Ok(text) = std::fs::read_to_string(&settings)
                             && (text.contains("\"$schema\"") || text.contains("$schema"))
                         {
@@ -301,7 +169,6 @@ impl ClaudeCodeAdapter {
 
 impl Default for ClaudeCodeAdapter {
     fn default() -> Self {
-        // Static id is known valid; use expect with reason for the lint.
         #[expect(clippy::unwrap_used, reason = "claude-code is static valid HarnessId")]
         let id = HarnessId::new(HARNESS_ID_STR).unwrap();
         Self {
@@ -349,15 +216,14 @@ impl Adapter for ClaudeCodeAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match self.find_binary() {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                // Try version probe.
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -393,7 +259,6 @@ impl Adapter for ClaudeCodeAdapter {
             (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
         };
 
-        // If absent, confidence is high (we looked and found nothing).
         let confidence = if present == InstallPresence::Absent {
             DetectionConfidence::High
         } else {
@@ -408,8 +273,6 @@ impl Adapter for ClaudeCodeAdapter {
         if let Some(v) = detection.version {
             let mut notes = Vec::new();
             notes.push(format!("detected claude version {v}"));
-            // For now, any detected version maps to schema 1 and is compatible.
-            // Future versions may branch.
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
             let mut res =
                 VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
@@ -417,7 +280,6 @@ impl Adapter for ClaudeCodeAdapter {
             res
         } else {
             let mut res = VersionResolution::unknown();
-            // Preserve evidence from detection for debugging.
             res.notes = detection.evidence;
             res
         }
@@ -426,7 +288,6 @@ impl Adapter for ClaudeCodeAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Primary writable surface: settings.json under CLAUDE_CONFIG_DIR or ~/.claude.
         let settings_resolver = PathResolver::new(
             Some("$CLAUDE_CONFIG_DIR/settings.json"),
             Some("$CLAUDE_CONFIG_DIR/settings.json"),
@@ -447,7 +308,6 @@ impl Adapter for ClaudeCodeAdapter {
         settings_surface.restart_behavior = RestartBehavior::Reload;
         surfaces.push(settings_surface);
 
-        // Secondary surface: .claude.json (global config, MCP servers, OAuth state) — harness-managed, not directly writable for provider.
         let claude_json_resolver = PathResolver::new(
             Some("$CLAUDE_CONFIG_DIR/.claude.json"),
             Some("$CLAUDE_CONFIG_DIR/.claude.json"),
@@ -466,7 +326,6 @@ impl Adapter for ClaudeCodeAdapter {
         claude_json.restart_behavior = RestartBehavior::Reload;
         surfaces.push(claude_json);
 
-        // Project MCP surface: .mcp.json at project root — writable for MCP management.
         let mcp_resolver = PathResolver::fallback_only(".mcp.json (project root)");
         let mut mcp_surface = ConfigSurface::new(
             ".mcp.json",
@@ -480,7 +339,7 @@ impl Adapter for ClaudeCodeAdapter {
         mcp_surface.backup_required = true;
         surfaces.push(mcp_surface);
 
-        // Credentials surface: .credentials.json — external secret store, not writable.
+        // Credentials surface: .credentials.json: external secret store, not writable.
         let creds_resolver = PathResolver::new(
             Some("$CLAUDE_CONFIG_DIR/.credentials.json"),
             Some("$CLAUDE_CONFIG_DIR/.credentials.json"),
@@ -499,7 +358,6 @@ impl Adapter for ClaudeCodeAdapter {
         creds.restart_behavior = RestartBehavior::ReLogin;
         surfaces.push(creds);
 
-        // Skills surface: SKILL.md files — text fragments.
         let skills_resolver = PathResolver::new(
             Some("$CLAUDE_CONFIG_DIR/skills/<name>/SKILL.md"),
             Some("$CLAUDE_CONFIG_DIR/skills/<name>/SKILL.md"),
@@ -554,10 +412,8 @@ impl Adapter for ClaudeCodeAdapter {
         ]
     }
 
-    /// INS-03/04: claude-code's skills directory is link-safe shared state —
-    /// `$CLAUDE_CONFIG_DIR/skills` is where the harness reads skills and
-    /// superai already manages them by symlinking (`LinkAll`, claude-code.md
-    /// "skills" row), so a mirror links it instead of copying.
+    /// The harness reads skills from `$CLAUDE_CONFIG_DIR/skills`; superai
+    /// manages them by symlinking (`LinkAll`), so a mirror links, not copies.
     fn mirror_link_paths(&self) -> Vec<String> {
         vec!["skills".to_owned()]
     }
@@ -576,16 +432,12 @@ impl Adapter for ClaudeCodeAdapter {
         let mut plan = WrapperPlan::new("relocated-root via CLAUDE_CONFIG_DIR");
         plan.env_vars
             .push((CONFIG_ENV_VAR.to_owned(), instance.config_root.to_string()));
-        // No extra args; the binary is EXECUTABLE and will be resolved via PATH
-        // or instance.binary if set. The wrapper execs `claude` with the env set.
         plan.description = format!(
             " Wrapper sets {}={} and execs `{}`",
             CONFIG_ENV_VAR, instance.config_root, EXECUTABLE
         );
-        // WRP-01 invocation spec (claude-code.md): the `claude` CLI is the
-        // executable; config/state split through CLAUDE_CONFIG_DIR; auth is
-        // OAuth (in-harness `/login`) or an ANTHROPIC_API_KEY env reference —
-        // never embedded; macOS credentials live in the SHARED Keychain.
+        // Auth stays OAuth (`/login`) or an env reference, never embedded;
+        // macOS credentials live in the SHARED Keychain.
         plan.executable = Some(EXECUTABLE.to_owned());
         plan.state_paths = vec![
             format!("{CONFIG_ENV_VAR}={}", instance.config_root),
@@ -601,7 +453,7 @@ impl Adapter for ClaudeCodeAdapter {
                 .to_owned(),
         ];
         plan.auth_prerequisites = vec![crate::adapter::AuthPrerequisite::harness_login(
-            "claude /login (OAuth) — or export ANTHROPIC_API_KEY before launching",
+            "claude /login (OAuth): or export ANTHROPIC_API_KEY before launching",
         )];
         Ok(plan)
     }
@@ -623,7 +475,6 @@ impl Adapter for ClaudeCodeAdapter {
             });
         }
         instance.validate()?;
-        // Enforce relocated-root isolation for Claude Code; allow Unknown for legacy adoption.
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => {
                 // HAD-03: surface content present under the instance root must
@@ -638,9 +489,8 @@ impl Adapter for ClaudeCodeAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 root shape + owned-key semantics per the settings-reference
-        // types in docs/harness-configs/claude-code.md §1.2. Rules fire only
-        // when the key is present; foreign keys are untouched by design.
+        // HAD-03 per docs/harness-configs/claude-code.md §1.2; rules fire
+        // only when the key is present, foreign keys stay untouched.
         match surface_id {
             "settings.json" => Some(
                 SurfaceSchema::new()
@@ -780,9 +630,7 @@ mod tests {
     fn detection_returns_evidence_and_confidence() {
         let a = adapter();
         let result = a.detection();
-        // Detection must always return evidence and a confidence.
         assert!(!result.evidence.is_empty());
-        // Present can be Absent on CI where claude is not installed; just check it's coherent.
         match result.present {
             InstallPresence::Absent => {
                 assert!(result.version.is_none());
@@ -792,14 +640,12 @@ mod tests {
                 assert!(result.version.is_some());
             }
             InstallPresence::UnknownVersion => {
-                // binary found but version unknown
                 assert!(result.evidence.iter().any(|e| e.contains("found binary")));
             }
             InstallPresence::Broken => {
                 assert!(!result.evidence.is_empty());
             }
         }
-        // Confidence must be set.
         assert_ne!(result.confidence.to_string(), "");
     }
 
@@ -807,8 +653,6 @@ mod tests {
     fn version_resolution_maps_detected() {
         let a = adapter();
         let res = a.version_resolution();
-        // If detection found a version, schema is Some("1") and compatible true.
-        // If not, it's unknown and not compatible.
         if res.detected_version.is_some() {
             assert_eq!(
                 res.schema_version.as_deref(),
@@ -835,7 +679,7 @@ mod tests {
             ("claude-code 2.1.13", Some("2.1.13")),
         ];
         for (input, expected) in cases {
-            let got = ClaudeCodeAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -853,23 +697,19 @@ mod tests {
         assert_eq!(settings.ownership, SurfaceOwnership::UserEditable);
         assert_eq!(settings.scope, ConfigScope::User);
         assert!(settings.backup_required);
-        // Owned selectors must include provider/model fields.
         for selector in ["model", "env.ANTHROPIC_BASE_URL", "apiKeyHelper"] {
             assert!(
                 settings.owned_selectors.contains(&selector.to_owned()),
                 "owned_selectors must contain {selector}"
             );
         }
-        // All owned selectors are non-empty.
         for sel in &settings.owned_selectors {
             assert!(!sel.is_empty());
         }
-        // Verify owned selectors constant matches surface.
         for sel in OWNED_SELECTORS {
             assert!(settings.owned_selectors.contains(&(*sel).to_owned()));
         }
 
-        // Credentials surface must be external secret store and not require backup.
         let creds = surfaces
             .iter()
             .find(|s| s.id == ".credentials.json")
@@ -877,14 +717,12 @@ mod tests {
         assert_eq!(creds.ownership, SurfaceOwnership::ExternalSecretStore);
         assert!(!creds.backup_required);
 
-        // Skills surface must be text fragment.
         let skills = surfaces.iter().find(|s| s.id == "skills").expect("skills");
         assert_eq!(skills.kind, DocumentKind::TextFragment);
     }
 
     #[test]
     fn owned_selectors_are_stable() {
-        // Ensure we have at least 5 selectors and they are distinct.
         assert!(OWNED_SELECTORS.len() >= 5);
         let set: HashSet<&str> = OWNED_SELECTORS.iter().copied().collect();
         assert_eq!(set.len(), OWNED_SELECTORS.len(), "selectors must be unique");
@@ -915,7 +753,6 @@ mod tests {
         let a = adapter();
         let exclusions = a.plan_mirror_exclusions();
         assert!(!exclusions.is_empty());
-        // Must exclude sessions/history/logs/caches/locks.
         let must_contain = [
             "projects/*",
             "history.jsonl",
@@ -930,7 +767,6 @@ mod tests {
                 "exclusions must contain {pat}"
             );
         }
-        // Ensure no writable settings are excluded.
         assert!(!exclusions.contains(&"settings.json".to_owned()));
     }
 
@@ -939,7 +775,6 @@ mod tests {
     fn plan_mirror_includes_settings_and_excludes_sessions() {
         let a = adapter();
         let exclusions = a.plan_mirror_exclusions();
-        // Simulate a file list: included are settings.json, skills, mcp; excluded are projects etc.
         let is_excluded = |file: &str| {
             exclusions.iter().any(|pat| {
                 if pat.ends_with("/*") {
@@ -980,7 +815,6 @@ mod tests {
     fn plan_wrapper_quoting_with_spaces() {
         let tmp_root = crate::test_util::tmp_abs_str("my claude work");
         let a = adapter();
-        // Path with spaces must be preserved verbatim in env var value.
         let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         let env_val = plan
@@ -1050,7 +884,6 @@ mod tests {
         let surfaces = a.config_surfaces();
         let settings = surfaces.iter().find(|s| s.id == "settings.json").unwrap();
         assert_eq!(settings.path_resolver.fallback, "~/.claude/settings.json");
-        // Linux/macos/windows hints should contain CLAUDE_CONFIG_DIR
         let resolver = &settings.path_resolver;
         assert!(resolver.linux.as_deref().unwrap().contains(CONFIG_ENV_VAR));
         assert!(resolver.macos.as_deref().unwrap().contains(CONFIG_ENV_VAR));
@@ -1063,10 +896,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude_code")
     }
@@ -1078,7 +907,6 @@ mod tests {
     #[test]
     fn fixture_missing_file_loads_as_empty() {
         let path = fixture_path("nonexistent-settings.json");
-        // Ensure missing file is treated as empty object.
         let map = superai_config::json::load(&path).unwrap();
         assert!(map.is_empty());
         let value = superai_config::json::load_value(&path).unwrap();
@@ -1090,8 +918,6 @@ mod tests {
         let path = fixture_path("settings.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
-        // Minimal may be empty or contain only $schema.
-        // Should not error.
         assert!(map.is_empty() || map.contains_key("$schema"));
     }
 
@@ -1103,7 +929,6 @@ mod tests {
         assert!(
             map.contains_key("env") || map.contains_key("model") || map.contains_key("permissions")
         );
-        // If env exists, check that ANTHROPIC keys are plausible.
         if let Some(env) = map.get("env")
             && let Some(obj) = env.as_object()
         {
@@ -1117,23 +942,17 @@ mod tests {
     fn fixture_foreign_preserves_unknown_keys_on_edit() {
         let path = fixture_path("settings.foreign.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
-        // Load original.
         let original = superai_config::json::load(&path).unwrap();
         assert!(original.contains_key("foreignKey") || original.contains_key("unknownTopLevel"));
-        // Simulate provider mutation: create a temp copy, edit owned selector, verify foreign keys survive.
         let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("settings.foreign.copy.json");
         std::fs::copy(&path, &tmp).unwrap();
-        // Edit via superai-config json edit (preserves unknown keys).
         superai_config::json::edit(&tmp, |map| {
-            // Mutate an owned selector.
             map.insert(
                 "model".to_owned(),
                 serde_json::Value::String("sonnet".to_owned()),
             );
-            // Ensure foreign keys are still there after edit closure runs on the loaded map.
-            // The edit closure receives the map that already contains foreign keys.
             assert!(map.contains_key("foreignKey") || map.contains_key("unknownTopLevel"));
         })
         .unwrap();
@@ -1143,7 +962,6 @@ mod tests {
             after["model"],
             serde_json::Value::String("sonnet".to_owned())
         );
-        // Foreign keys must still be present.
         let foreign_preserved = after.contains_key("foreignKey")
             || after.contains_key("unknownTopLevel")
             || after.contains_key("customField");
@@ -1179,7 +997,6 @@ mod tests {
         let text = serde_json::to_string_pretty(&original_json).unwrap();
         std::fs::write(&path, text).unwrap();
 
-        // Edit only the owned selector; foreign keys must survive.
         superai_config::json::edit(&path, |map| {
             if let Some(env) = map.get_mut("env").and_then(|v| v.as_object_mut()) {
                 env.insert(
@@ -1222,7 +1039,6 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
 
-        // Simulate template applying new provider.
         superai_config::json::edit(&path, |map| {
             map.insert(
                 "model".to_owned(),
@@ -1379,10 +1195,6 @@ mod tests {
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
 
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema (root shape + owned-key semantics)
-    // -------------------------------------------------------------------
-
     #[test]
     fn surface_schema_declares_settings_and_mcp_shapes() {
         let a = adapter();
@@ -1462,10 +1274,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // -------------------------------------------------------------------
-    // HAD-05/HAD-06 version-boundary fixtures (settings-era)
-    // -------------------------------------------------------------------
-
     /// The fixture pair documents the settings-era boundary: the legacy file
     /// carries the pre-2.0 minimal shape (env + permissions only), the
     /// current file carries the 2.x shape (hooks, statusLine, enabledPlugins,
@@ -1518,7 +1326,7 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned();
-        let parsed = ClaudeCodeAdapter::parse_version_output(&version_text);
+        let parsed = crate::adapters::parse_version_output(&version_text);
         assert!(parsed.is_some(), "version.txt must parse: {version_text}");
         let major = parsed
             .as_deref()

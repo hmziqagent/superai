@@ -1,15 +1,7 @@
-//! Amazon Q Developer CLI adapter — sunsetting, `MigrationOnly`.
-//!
-//! Research source: `docs/harness-configs/amazon-q-cli.md` (last verified 2026-08-25).
-//! Executable `q`, config `~/.aws/amazonq/settings.json` plus `cli-agents/*.json`,
-//! `rules/*.md`, `AmazonQ.md`, MCP inside agent JSON, isolation `project_scope`.
-//! Product status `sunset`, successor `kiro` (Kiro CLI).
+//! Amazon Q Developer CLI adapter: sunsetting, `MigrationOnly`.
+//! Research source: `docs/harness-configs/amazon-q-cli.md` (last verified 2026-08-25); successor `kiro`.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -20,10 +12,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Amazon Q Developer CLI.
 pub const HARNESS_ID_STR: &str = "amazon-q-cli";
@@ -53,13 +41,9 @@ pub const SUNSET_NOTE: &str = "sunsetting 2026-05-15, EOS 2027-04-30";
 pub const SUCCESSOR_ID: &str = "kiro";
 
 /// Migration tip.
-pub const MIGRATION_TIP: &str = "Amazon Q Developer CLI is sunsetting (no new signups 2026-05-15, EOS 2027-04-30); migrate to kiro (Kiro CLI) — export settings.json, cli-agents/*.json, rules/*.md, and mcpServers from agent JSON";
+pub const MIGRATION_TIP: &str = "Amazon Q Developer CLI is sunsetting (no new signups 2026-05-15, EOS 2027-04-30); migrate to kiro (Kiro CLI): export settings.json, cli-agents/*.json, rules/*.md, and mcpServers from agent JSON";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Amazon Q Developer CLI (`MigrationOnly`).
+/// Sunset `MigrationOnly`: detection, reads, and migration guidance only.
 #[derive(Debug, Clone)]
 pub struct AmazonQAdapter {
     id: HarnessId,
@@ -85,106 +69,6 @@ impl AmazonQAdapter {
     /// Migration tip.
     pub fn successor_tip(&self) -> &str {
         MIGRATION_TIP
-    }
-
-    /// Try to locate the `q` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `q --version` with a timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve default config root `~/.aws/amazonq`.
@@ -284,14 +168,14 @@ impl Adapter for AmazonQAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -463,9 +347,7 @@ impl Adapter for AmazonQAdapter {
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
-            reason: format!(
-                "MigrationOnly: {MIGRATION_TIP} — no new instances; export/backup only"
-            ),
+            reason: format!("MigrationOnly: {MIGRATION_TIP}: no new instances; export/backup only"),
         })
     }
 
@@ -492,7 +374,7 @@ impl Adapter for AmazonQAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "amazon-q-cli (MigrationOnly) expects isolation project_scope, got {other} — {MIGRATION_TIP}"
+                    "amazon-q-cli (MigrationOnly) expects isolation project_scope, got {other}: {MIGRATION_TIP}"
                 ),
             }),
         }
@@ -626,7 +508,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = AmazonQAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
