@@ -5,6 +5,11 @@
 //! filesystem state and restores each resource from its recorded backup; it
 //! never replays stale staged content. Journals hold paths, backup ids,
 //! phase, and redacted diagnostics only: no contents, no secrets.
+//! Backups and digests are integrity-checked, not authenticated: they are
+//! unkeyed and recomputable, so a writer with access to the journal and
+//! resource directories can forge records that recovery will act on.
+//! Closing that boundary needs a keyed digest and a key store superai
+//! does not have.
 
 use std::path::{Path, PathBuf};
 
@@ -203,22 +208,29 @@ pub fn recover_pending(home: &Path) -> Result<RecoveryReport> {
     Ok(RecoveryReport { journals })
 }
 
-/// Recover one journal file (see [`recover_pending`]).
+/// Recover one journal file (see [`recover_pending`]). A journal that
+/// cannot be read or parsed is quarantined beside itself (renamed
+/// `.corrupt`) and reported as its own outcome, so it never aborts the
+/// recovery of the remaining journals.
 pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
-    let Some(journal) = CrashJournal::load_from(journal_path)? else {
-        // Nothing to recover; treat as done and remove the stray file.
-        CrashJournal::remove(journal_path)?;
-        return Ok(JournalRecovery {
-            journal_path: journal_path.to_path_buf(),
-            operation_id: String::new(),
-            phase: JournalPhase::Done,
-            recovered: true,
-            removed_temps: Vec::new(),
-            restored: Vec::new(),
-            removed_creations: Vec::new(),
-            residuals: Vec::new(),
-            outcome: "no journal to recover".to_owned(),
-        });
+    let journal = match CrashJournal::load_from(journal_path) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => {
+            // Nothing to recover; treat as done and remove the stray file.
+            CrashJournal::remove(journal_path)?;
+            return Ok(JournalRecovery {
+                journal_path: journal_path.to_path_buf(),
+                operation_id: String::new(),
+                phase: JournalPhase::Done,
+                recovered: true,
+                removed_temps: Vec::new(),
+                restored: Vec::new(),
+                removed_creations: Vec::new(),
+                residuals: Vec::new(),
+                outcome: "no journal to recover".to_owned(),
+            });
+        }
+        Err(cause) => return Ok(quarantine_corrupt_journal(journal_path, &cause)),
     };
 
     let (removed_temps, mut residuals) = remove_stale_temps(&journal);
@@ -258,8 +270,55 @@ pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
     })
 }
 
-/// Remove stale staged temps: the recorded ones plus unrecorded `.tmp.`
-/// siblings next to each resource. Returns (removed, residuals).
+/// Set one unreadable or unparseable journal aside beside itself so the
+/// scan can continue without it; the renamed file no longer matches the
+/// `.journal.json` suffix, so later runs leave it for inspection. A rename
+/// failure keeps the journal in place and reports it as a residual.
+fn quarantine_corrupt_journal(journal_path: &Path, cause: &ConfigError) -> JournalRecovery {
+    let operation_id = journal_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_suffix(".journal"))
+        .unwrap_or_default()
+        .to_owned();
+    let mut aside_name = journal_path.as_os_str().to_os_string();
+    aside_name.push(".corrupt");
+    let aside = PathBuf::from(aside_name);
+    let (recovered, outcome) = match std::fs::rename(journal_path, &aside) {
+        Ok(()) => (
+            true,
+            format!(
+                "corrupt journal ({cause}) quarantined aside as {}",
+                aside.display()
+            ),
+        ),
+        Err(e) => (
+            false,
+            format!("corrupt journal ({cause}) could not be quarantined: {e}"),
+        ),
+    };
+    JournalRecovery {
+        journal_path: journal_path.to_path_buf(),
+        operation_id,
+        phase: JournalPhase::Done,
+        recovered,
+        removed_temps: Vec::new(),
+        restored: Vec::new(),
+        removed_creations: Vec::new(),
+        residuals: if recovered {
+            Vec::new()
+        } else {
+            vec![journal_path.to_path_buf()]
+        },
+        outcome,
+    }
+}
+
+/// Remove stale staged temps: the recorded ones plus unrecorded siblings
+/// next to each resource that match superai's own temp naming
+/// (`.tmp.<resource file name>.` from `atomic::generate_temp_path`).
+/// Foreign `.tmp.*` files from other tools are never touched. Returns
+/// (removed, residuals).
 fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -273,7 +332,17 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
         }
     }
     for res in &journal.resources {
-        let dir = match PathBuf::from(res).parent() {
+        let resource = PathBuf::from(res);
+        // No file name to tie the pattern to: sweep nothing rather than
+        // everything (a bare `.tmp.` prefix would match foreign temps too).
+        let Some(file_name) = resource.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if file_name.is_empty() {
+            continue;
+        }
+        let prefix = format!(".tmp.{file_name}.");
+        let dir = match resource.parent() {
             Some(parent) => parent.to_path_buf(),
             None => PathBuf::from("."),
         };
@@ -281,7 +350,11 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
             continue;
         };
         for ent in entries.flatten() {
-            if !ent.file_name().to_string_lossy().starts_with(".tmp.") {
+            if !ent
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix.as_str())
+            {
                 continue;
             }
             let p = ent.path();
@@ -573,14 +646,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_removes_stray_temp_files_next_to_resources() {
+    fn recovery_sweeps_only_own_temp_pattern_next_to_resources() {
         let home = home_dir();
         let resource = home.join("a.json");
         std::fs::write(&resource, b"x").unwrap();
         let stray = home.join(".tmp.a.json.abcd.123");
         std::fs::write(&stray, b"stale").unwrap();
-        let unrelated = home.join(".tmp.untracked");
-        std::fs::write(&unrelated, b"keep").unwrap();
+        let foreign = home.join(".tmp.untracked");
+        std::fs::write(&foreign, b"other tool's file").unwrap();
+        let other_resource = home.join(".tmp.b.json.beef.9");
+        std::fs::write(&other_resource, b"concurrent neighbor").unwrap();
         let jroot = journal_dir(&home);
         std::fs::create_dir_all(&jroot).unwrap();
         let journal = CrashJournal::new(
@@ -594,12 +669,21 @@ mod tests {
         assert!(report.all_recovered());
         assert!(
             !stray.exists(),
-            "stray transaction temp removed ({:?})",
+            "a stale temp of this resource's replace is removed ({:?})",
             report.journals
         );
         assert!(
-            !unrelated.exists(),
-            "the sibling sweep covers untracked `.tmp.` files in the resource directory"
+            foreign.exists(),
+            "a foreign `.tmp.*` file with no tie to the resource survives"
+        );
+        assert!(
+            other_resource.exists(),
+            "a temp named for a different resource survives"
+        );
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"other tool's file",
+            "foreign temps keep their bytes"
         );
         drop(std::fs::remove_dir_all(&home));
     }
@@ -710,6 +794,121 @@ mod tests {
         assert_eq!(rec.outcome, "no journal to recover");
         assert!(!path.exists(), "the stray empty journal is removed");
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// One corrupt journal must not abort the scan: it is set aside with its
+    /// bytes intact while the remaining journals recover normally.
+    #[test]
+    fn one_corrupt_journal_does_not_abort_recovery_of_the_rest() {
+        let home = home_dir();
+        let created = home.join("created.json");
+        std::fs::write(&created, b"committed").unwrap();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+
+        std::fs::write(jroot.join("op-bad.journal.json"), b"not json at all").unwrap();
+        let mut good = CrashJournal::new(
+            "op-good",
+            JournalPhase::Verify,
+            vec![created.to_string_lossy().into_owned()],
+        );
+        good.completed.push(created.to_string_lossy().into_owned());
+        good.write_to(&journal_path(&jroot, "op-good")).unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        assert!(
+            report.all_recovered(),
+            "the quarantined journal leaves no residual: {:?}",
+            report.journals
+        );
+        assert_eq!(report.journals.len(), 2, "both journals get an outcome");
+        let bad = report
+            .journals
+            .iter()
+            .find(|j| j.operation_id == "op-bad")
+            .expect("the corrupt journal has its own reported outcome");
+        assert!(bad.recovered);
+        assert!(
+            bad.outcome.contains("corrupt") && bad.outcome.contains(".corrupt"),
+            "the outcome names the quarantine: {}",
+            bad.outcome
+        );
+        assert!(
+            !jroot.join("op-bad.journal.json").exists(),
+            "the corrupt journal no longer sits in the pending set"
+        );
+        let aside = jroot.join("op-bad.journal.json.corrupt");
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"not json at all",
+            "quarantine preserves the corrupt bytes for inspection"
+        );
+        assert!(
+            !created.exists(),
+            "the healthy journal still recovers its committed creation"
+        );
+        assert!(
+            !journal_path(&jroot, "op-good").exists(),
+            "the healthy journal is consumed as usual"
+        );
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    /// An unreadable journal is quarantined exactly like an unparseable one:
+    /// the bytes are unverifiable either way. The chmod-000 variant needs
+    /// the permissions to actually bind (root reads through them).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_journal_is_quarantined_and_kept_for_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let path = journal_path(&jroot, "op-denied");
+        std::fs::write(&path, b"never parseable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = recover_pending(&home).unwrap();
+        let rec = report
+            .journals
+            .first()
+            .expect("the unreadable journal is reported, not skipped");
+        assert!(rec.recovered, "{}", rec.outcome);
+        assert!(rec.outcome.contains("corrupt"), "{}", rec.outcome);
+        assert!(!path.exists(), "it is out of the pending set");
+        let aside = jroot.join("op-denied.journal.json.corrupt");
+        assert!(aside.exists(), "the quarantined file is retained");
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    /// When the quarantine rename itself fails, the journal stays in place
+    /// and is reported as a residual instead of being silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_corrupt_journal_that_cannot_be_renamed_is_reported_as_a_residual() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        let jroot = journal_dir(&home);
+        std::fs::create_dir_all(&jroot).unwrap();
+        let path = journal_path(&jroot, "op-stuck");
+        std::fs::write(&path, b"corrupt bytes").unwrap();
+        std::fs::set_permissions(&jroot, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = jroot.join("probe-write");
+        let denied = std::fs::File::create(&probe).is_err();
+        let rec = recover_journal_file(&path);
+        std::fs::set_permissions(&jroot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !denied {
+            // Root bypasses the rename denial; the arm is unreachable here.
+            assert!(rec.is_ok());
+            drop(std::fs::remove_dir_all(&home));
+            return;
+        }
+        let rec = rec.expect("a failed quarantine is a report, not an error");
+        assert!(!rec.recovered, "{}", rec.outcome);
+        assert_eq!(rec.residuals, vec![path.clone()]);
+        assert!(path.exists(), "the journal is retained for the operator");
+        drop(std::fs::remove_file(&path));
+        drop(std::fs::remove_dir_all(&home));
     }
 
     #[cfg(unix)]

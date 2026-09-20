@@ -99,7 +99,8 @@ fn generate_backup_path(original: &Path) -> Result<(PathBuf, u128, String)> {
 
 /// Pick a backup name, steering away from names `taken` reports while a
 /// free one appears. The probe is advisory: after 5 collisions the last
-/// candidate is returned and the copy overwrites whatever holds it.
+/// candidate is returned and the caller decides (copy over it off unix,
+/// refuse it on unix).
 fn pick_backup_path(
     original: &Path,
     mut taken: impl FnMut(&Path) -> bool,
@@ -113,6 +114,60 @@ fn pick_backup_path(
         attempts += 1;
         if attempts >= 5 {
             return Ok(candidate);
+        }
+    }
+}
+
+/// Write `bytes` to `target` iff nothing holds the name (unix):
+/// `create_new` fails with `AlreadyExists` on any occupied name, a planted
+/// symlink included, so the write can never be redirected through a link.
+#[cfg(unix)]
+fn write_backup_exclusive(target: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    // Create with at most the recorded permission bits (umask may narrow
+    // them); the chmod after landing makes them exact.
+    options
+        .write(true)
+        .create_new(true)
+        .mode(mode.unwrap_or(0o600) & 0o777);
+    let mut file = options
+        .open(target)
+        .map_err(|e| ConfigError::io(target, e))?;
+    file.write_all(bytes)
+        .map_err(|e| ConfigError::io(target, e))
+}
+
+/// Land the backup bytes (unix): exclusive-create a fresh name, retrying a
+/// bounded number of times if a name is taken between pick and create.
+/// Refuses to overwrite after repeated collisions.
+#[cfg(unix)]
+fn write_backup_bytes(
+    original: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(PathBuf, u128, String)> {
+    let mut collisions = 0u32;
+    loop {
+        let (target, millis, suffix) = pick_backup_path(original, Path::exists)?;
+        match write_backup_exclusive(&target, bytes, mode) {
+            Ok(()) => return Ok((target, millis, suffix)),
+            Err(ConfigError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                collisions += 1;
+                if collisions >= 5 {
+                    return Err(ConfigError::io(
+                        &target,
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "no free backup name after repeated collisions",
+                        ),
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -178,8 +233,8 @@ pub struct BackupEntry {
     pub reason: String,
 }
 
-/// Copy `path` beside itself as `<name>.bak.<millis>.<rand4>` before it is
-/// overwritten; `Ok(None)` for a not-yet-existing file. Flushes and
+/// Back up `path` beside itself as `<name>.bak.<millis>.<rand4>` before it
+/// is overwritten; `Ok(None)` for a not-yet-existing file. Flushes and
 /// digest-verifies before returning.
 pub fn backup(path: &Path) -> Result<Option<BackupEntry>> {
     backup_with_reason(path, "pre-write backup")
@@ -248,15 +303,26 @@ fn backup_inner(
         ));
     }
 
-    let (target, millis, suffix) = pick_backup_path(path, Path::exists)?;
-
     let original_bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let digest = compute_digest(&original_bytes);
     let size = original_bytes.len() as u64;
     let permissions = get_permissions_u32(&meta);
 
     inject(injector, Point::BackupWrite)?;
-    std::fs::copy(path, &target).map_err(|e| ConfigError::io(path, e))?;
+    // Unix lands the already-read bytes through exclusive create: a symlink
+    // planted at the backup name between pick and create is refused, never
+    // followed, and the source is read exactly once. Windows keeps fs::copy
+    // because it propagates the readonly attribute (its test-asserted
+    // contract), which costs a second source read and keeps the
+    // probe-to-copy race in the local-writer threat model.
+    #[cfg(unix)]
+    let (target, millis, suffix) = write_backup_bytes(path, &original_bytes, permissions)?;
+    #[cfg(not(unix))]
+    let (target, millis, suffix) = {
+        let picked = pick_backup_path(path, Path::exists)?;
+        std::fs::copy(path, &picked.0).map_err(|e| ConfigError::io(path, e))?;
+        picked
+    };
 
     // Off unix `permissions` is always None, so this is a no-op there.
     if let Some(mode) = permissions {
@@ -2064,5 +2130,49 @@ mod tests {
         );
         drop(std::fs::remove_dir(&path));
         drop(std::fs::remove_file(&entry.backup_path));
+    }
+
+    /// A name already held by a symlink is refused with `AlreadyExists`:
+    /// exclusive create must never follow a link planted at the backup
+    /// name, so the link's referent keeps its bytes and stays a link.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_backup_refuses_a_held_backup_name_instead_of_following_it() {
+        let dir = crate::test_util::temp_dir_unique("config-backup-excl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.dat");
+        std::fs::write(&victim, b"precious bytes that must survive").unwrap();
+        let planted = dir.join("cfg.json.bak.1.abcd");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let res = write_backup_exclusive(&planted, b"backup payload", Some(0o600));
+        match &res {
+            Err(ConfigError::Io { source, .. }) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "a held backup name must be refused, never written through"
+            ),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(&planted).is_ok_and(|m| m.file_type().is_symlink()),
+            "the planted link itself must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious bytes that must survive",
+            "following the link would have truncated the referent"
+        );
+
+        // A genuinely free name lands the bytes as a fresh regular file.
+        let fresh = dir.join("cfg.json.bak.2.abcd");
+        write_backup_exclusive(&fresh, b"backup payload", Some(0o600)).unwrap();
+        let meta = std::fs::symlink_metadata(&fresh).unwrap();
+        assert!(meta.is_file(), "the landed backup is its own regular file");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"backup payload");
+        drop(std::fs::remove_file(&planted));
+        drop(std::fs::remove_file(&fresh));
+        drop(std::fs::remove_file(&victim));
+        drop(std::fs::remove_dir(&dir));
     }
 }
