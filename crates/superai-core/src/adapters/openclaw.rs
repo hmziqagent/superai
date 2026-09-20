@@ -1,17 +1,10 @@
-//! `OpenClaw` adapter — `OPENCLAW_HOME` daemon, `ResearchBlocked`.
-//!
+//! `OpenClaw` adapter: long-running `daemon_service` (Node service,
+//! ports/gateway), config `~/.openclaw/openclaw.json` (JSON5) + `.env`,
+//! relocation via `OPENCLAW_HOME`/`OPENCLAW_STATE_DIR`/`OPENCLAW_CONFIG_PATH`;
+//! `ResearchBlocked` until gateway and schema gaps close.
 //! Research source: `docs/harness-configs/openclaw.md` (last verified 2026-08-25).
-//! Executable `openclaw`, config `~/.openclaw/openclaw.json` (JSON5), env file
-//! `~/.openclaw/.env`, default state dir `~/.openclaw`, relocation via
-//! `OPENCLAW_HOME` / `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH`, isolation
-//! `daemon_service` (long-running Node service, ports/gateway), support
-//! `ResearchBlocked` until gateway and full schema gaps close.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -23,10 +16,6 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence};
 use superai_config::document::ValueType;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `OpenClaw`.
 pub const HARNESS_ID_STR: &str = "openclaw";
@@ -62,7 +51,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// Research-blocked reason.
-pub const BLOCKED_REASON: &str = "daemon state, gateway/schema incomplete — ports, gateway security, multi-agent, plugin/skill paths unverified; long-running service not per-invocation CLI";
+pub const BLOCKED_REASON: &str = "daemon state, gateway/schema incomplete: ports, gateway security, multi-agent, plugin/skill paths unverified; long-running service not per-invocation CLI";
 
 /// Daemon-class facts the current research state allows to be wired (WRP-07).
 ///
@@ -92,10 +81,6 @@ pub fn daemon_constraints() -> DaemonConstraints {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for `OpenClaw` (`ResearchBlocked`).
 #[derive(Debug, Clone)]
 pub struct OpenClawAdapter {
@@ -122,106 +107,6 @@ impl OpenClawAdapter {
     /// Blocked reason.
     pub fn blocked_reason(&self) -> &str {
         BLOCKED_REASON
-    }
-
-    /// Try to locate `openclaw` binary via PATH.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `openclaw --version` with timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve default state dir.
@@ -332,14 +217,14 @@ impl Adapter for OpenClawAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -383,7 +268,7 @@ impl Adapter for OpenClawAdapter {
         if let Some(v) = detection.version {
             let mut notes = Vec::new();
             notes.push(format!("detected openclaw version {v}"));
-            notes.push(format!("research blocked — {BLOCKED_REASON}"));
+            notes.push(format!("research blocked: {BLOCKED_REASON}"));
             let mut res = VersionResolution::new(Some(v), None, false);
             res.notes = notes;
             res
@@ -511,7 +396,7 @@ impl Adapter for OpenClawAdapter {
             harness: self.id.to_string(),
             surface: "wrapper".to_owned(),
             reason: format!(
-                "ResearchBlocked: {BLOCKED_REASON} — two instances means two daemons, ports/gateway not verified"
+                "ResearchBlocked: {BLOCKED_REASON}: two instances means two daemons, ports/gateway not verified"
             ),
         })
     }
@@ -539,7 +424,7 @@ impl Adapter for OpenClawAdapter {
             harness: self.id.to_string(),
             surface: "validate_instance".to_owned(),
             reason: format!(
-                "ResearchBlocked: {BLOCKED_REASON} — validate blocked until gateway/schema complete"
+                "ResearchBlocked: {BLOCKED_REASON}: validate blocked until gateway/schema complete"
             ),
         })
     }
@@ -627,9 +512,8 @@ mod tests {
 
     #[test]
     fn daemon_constraints_report_unverified_ports_and_blocked_lifecycle() {
-        // WRP-07 declaration honesty: the generic daemon machinery exists,
-        // but openclaw's research state does not yet verify ports or permit
-        // lifecycle control — nothing is invented here.
+        // WRP-07 declaration honesty: the daemon machinery exists, but the
+        // research state does not verify ports or permit lifecycle control.
         let c = super::daemon_constraints();
         assert!(!c.ports_verified);
         assert!(
@@ -689,7 +573,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = OpenClawAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -760,10 +644,6 @@ mod tests {
         let a = adapter();
         assert!(a.supported_skill_modes().is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema (read side; writes ResearchBlocked)
-    // -------------------------------------------------------------------
 
     #[test]
     fn surface_schema_declares_config_and_env_shapes() {

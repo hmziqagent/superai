@@ -1,15 +1,9 @@
-//! Legacy Kimi CLI adapter — TOML/MCP legacy root, `MigrationOnly`.
-//!
+//! Legacy Kimi CLI adapter: legacy root `~/.kimi` (`config.toml` + `mcp.json`),
+//! `MigrationOnly` (detect/inspect/backup/export); retired in favour of
+//! kimi-code-cli.
 //! Research source: `docs/harness-configs/kimi-cli.md` (last verified 2026-08-25).
-//! Executable `kimi`, legacy config root `~/.kimi` with `config.toml` TOML and
-//! `mcp.json`, isolation `relocated-root` (legacy), product status `retired`,
-//! successor `kimi-code-cli` (`kimi` Node).
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -20,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Legacy Kimi CLI (canonical ledger id).
 pub const HARNESS_ID_STR: &str = "legacy-kimi-cli";
@@ -56,11 +46,7 @@ pub const SUCCESSOR_ID: &str = "kimi-code-cli";
 pub const SUCCESSOR_EXECUTABLE: &str = "kimi";
 
 /// Migration tip.
-pub const MIGRATION_TIP: &str = "Legacy Kimi CLI (Python, ~/.kimi/config.toml) is wound down; migrate via `kimi migrate` to kimi-code-cli (Kimi Code CLI ~/.kimi-code) — carries config.toml, MCP servers, history; OAuth and MCP authorizations not migrated";
-
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
+pub const MIGRATION_TIP: &str = "Legacy Kimi CLI (Python, ~/.kimi/config.toml) is wound down; migrate via `kimi migrate` to kimi-code-cli (Kimi Code CLI ~/.kimi-code): carries config.toml, MCP servers, history; OAuth and MCP authorizations not migrated";
 
 /// Concrete adapter for Legacy Kimi CLI (`MigrationOnly`).
 #[derive(Debug, Clone)]
@@ -94,106 +80,6 @@ impl LegacyKimiAdapter {
     /// Migration tip.
     pub fn successor_tip(&self) -> &str {
         MIGRATION_TIP
-    }
-
-    /// Try to locate `kimi` binary via PATH.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `kimi --version` with timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve default legacy root `~/.kimi`.
@@ -292,14 +178,14 @@ impl Adapter for LegacyKimiAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -461,9 +347,7 @@ impl Adapter for LegacyKimiAdapter {
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
-            reason: format!(
-                "MigrationOnly: {MIGRATION_TIP} — no new instances; export/backup only"
-            ),
+            reason: format!("MigrationOnly: {MIGRATION_TIP}; no new instances, export/backup only"),
         })
     }
 
@@ -489,7 +373,7 @@ impl Adapter for LegacyKimiAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "legacy-kimi (MigrationOnly) expects isolation relocated_root, got {other} — {MIGRATION_TIP}"
+                    "legacy-kimi (MigrationOnly) expects isolation relocated_root, got {other}; {MIGRATION_TIP}"
                 ),
             }),
         }
@@ -619,7 +503,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = LegacyKimiAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }

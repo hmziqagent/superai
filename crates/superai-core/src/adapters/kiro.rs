@@ -1,20 +1,10 @@
-//! Kiro adapter — `KIRO_HOME`, `ReadOnly` until research gaps closed.
-//!
+//! Kiro adapter: `relocated-root` via `KIRO_HOME`, surfaces
+//! `settings/cli.json`, `settings/mcp.json`, `settings/permissions.yaml`,
+//! `agents/`/`skills/` dirs; `ReadOnly` until BYO and schema gaps close.
 //! Research source: `docs/harness-configs/kiro.md` (last verified 2026-08-25;
 //! executable name live-verified 2026-09-18).
-//! Executable `kiro-cli` (the only name the vendor installer ships —
-//! cli.kiro.dev/install, kiro-cli 2.22.0; `kiro` exists only where a wrapper
-//! or bridge aliases it), config root `~/.kiro` or `$KIRO_HOME`, surfaces
-//! `settings/cli.json` (JSON), `settings/mcp.json` (JSON),
-//! `settings/permissions.yaml` (YAML), `agents/` / `skills/` / `steering/` /
-//! `hooks/` dirs, isolation `relocated-root` via `KIRO_HOME`, product status
-//! `active`, support `ReadOnly` until BYO and full schema gaps close.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -26,25 +16,18 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Harness identifier for Kiro.
 pub const HARNESS_ID_STR: &str = "kiro";
 
 /// Human display name.
 pub const DISPLAY_NAME: &str = "Kiro CLI/IDE";
 
-/// Primary executable name — the only binary the vendor installer ships
-/// (`kiro-cli`; probe 2026-09-18: cli.kiro.dev/install materializes
-/// kiro-cli/kiro-cli-chat/kiro-cli-term and no `kiro`, evidence
-/// live/kiro/executable-r6.log).
+/// Primary executable name: the only binary the vendor installer ships
+/// (live-verified 2026-09-18; the installer materializes no bare `kiro`).
 pub const EXECUTABLE: &str = "kiro-cli";
 
-/// Alternative executable name — `kiro` exists only where a wrapper or
-/// bridge aliases it (kept for alias-style installs, workbuddy
-/// cbc/codebuddy precedent).
+/// Alternative executable name: `kiro` exists only where a wrapper or
+/// bridge aliases it.
 pub const EXECUTABLE_ALT: &str = "kiro";
 
 /// Environment variable that relocates the config root.
@@ -63,11 +46,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// `ReadOnly` reason.
-pub const READONLY_REASON: &str = "read-only until research gaps close — BYO endpoint not supported, full cli.json schema unverified, AWS credential isolation via AWS_PROFILE/AWS_CONFIG_FILE";
-
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
+pub const READONLY_REASON: &str = "read-only until research gaps close: BYO endpoint not supported, full cli.json schema unverified, AWS credential isolation via AWS_PROFILE/AWS_CONFIG_FILE";
 
 /// Concrete adapter for Kiro (`ReadOnly`).
 #[derive(Debug, Clone)]
@@ -100,108 +79,6 @@ impl KiroAdapter {
     /// `ReadOnly` reason.
     pub fn readonly_reason(&self) -> &str {
         READONLY_REASON
-    }
-
-    /// Try to locate `kiro-cli` (then the `kiro` alias) via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `kiro --version` with timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve default config root `$KIRO_HOME` or `~/.kiro`.
@@ -307,7 +184,7 @@ impl Adapter for KiroAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
@@ -316,7 +193,7 @@ impl Adapter for KiroAdapter {
                         .unwrap_or(EXECUTABLE),
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -542,7 +419,7 @@ impl Adapter for KiroAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "kiro expects isolation relocated_root via KIRO_HOME, got {other} — {READONLY_REASON}"
+                    "kiro expects isolation relocated_root via KIRO_HOME, got {other}; {READONLY_REASON}"
                 ),
             }),
         }
@@ -657,7 +534,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = KiroAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }

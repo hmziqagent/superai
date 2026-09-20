@@ -1,15 +1,8 @@
-//! Goose adapter — relocated-root via `GOOSE_PATH_ROOT` with YAML config/recipes.
-//!
+//! Goose adapter: relocated-root via `GOOSE_PATH_ROOT` (goose nests a
+//! `config/` dir inside the relocation root), `config.yaml` (YAML) surface.
 //! Research source: `docs/harness-configs/goose.md` (last verified 2026-08-25).
-//! Executable `goose`, config root `~/.config/goose` or `$GOOSE_PATH_ROOT/config`
-//! (goose nests a `config/` dir inside `GOOSE_PATH_ROOT`), primary writable
-//! surface `config.yaml` (YAML), isolation `relocated-root`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -20,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Goose.
 pub const HARNESS_ID_STR: &str = "goose";
@@ -38,13 +27,8 @@ pub const EXECUTABLE: &str = "goose";
 pub const CONFIG_ENV_VAR: &str = "GOOSE_PATH_ROOT";
 
 /// Config root when `GOOSE_PATH_ROOT` is set: goose nests a `config/` dir
-/// inside the relocation root (goose.md §1: goose creates `config/`, `data/`,
-/// `state/` subdirectories under `GOOSE_PATH_ROOT`). Live-verified against
-/// goose 1.51.0: `goose info` reports Config dir `$GOOSE_PATH_ROOT/config` and
-/// Config yaml `$GOOSE_PATH_ROOT/config/config.yaml`, while a provider config
-/// seeded at the flat `$GOOSE_PATH_ROOT/config.yaml` is ignored
-/// (`goose doctor`: "No provider configured") — see
-/// `.z-workflow/evidence/live/goose/` (area-5 round 5, fixed round 6).
+/// inside the relocation root (goose.md §1; live-verified 1.51.0 via
+/// `goose info`, which ignores a flat `$GOOSE_PATH_ROOT/config.yaml`).
 pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GOOSE_PATH_ROOT/config";
 
 /// Default config root when `GOOSE_PATH_ROOT` is unset.
@@ -72,14 +56,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "GOOSE_LEAD_MODEL",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Goose.
-///
-/// Isolation is `relocated-root` via `GOOSE_PATH_ROOT`. The wrapper sets
-/// `GOOSE_PATH_ROOT` to the instance `config_root` and execs `goose`.
 #[derive(Debug, Clone)]
 pub struct GooseAdapter {
     id: HarnessId,
@@ -107,115 +84,13 @@ impl GooseAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `goose` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `goose --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `goose 1.2.3` into `1.2.3`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve the default config root: `$GOOSE_PATH_ROOT/config` or `~/.config/goose`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
         {
-            // goose nests a `config/` dir inside $GOOSE_PATH_ROOT (goose.md §1:
-            // "creates config/, data/, state/ subdirectories under it"); live
-            // goose 1.51.0 `goose info` reports Config dir
-            // $GOOSE_PATH_ROOT/config, Config yaml …/config/config.yaml.
+            // goose nests `config/` inside $GOOSE_PATH_ROOT; a flat
+            // $GOOSE_PATH_ROOT/config.yaml is ignored by the live binary.
             return Some(PathBuf::from(dir).join("config"));
         }
         let home = std::env::var("HOME")
@@ -225,14 +100,6 @@ impl GooseAdapter {
             return None;
         }
         Some(PathBuf::from(home).join(".config").join("goose"))
-    }
-
-    /// Check if default config root exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
     }
 
     /// Build the config.yaml path for a given config root.
@@ -335,14 +202,14 @@ impl Adapter for GooseAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -368,20 +235,11 @@ impl Adapter for GooseAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "config root exists" arm can never
+        // survive; it is not computed.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -480,10 +338,8 @@ impl Adapter for GooseAdapter {
         extensions.backup_required = true;
         surfaces.push(extensions);
 
-        // Live goose 1.51.0 stores sessions in a sqlite DB, not per-session
-        // jsonl: `goose info` reports "Sessions DB (sqlite):
-        // $GOOSE_PATH_ROOT/data/sessions/sessions.db" (relocated) and
-        // ~/.local/share/goose/sessions/sessions.db (default home layout).
+        // Live goose 1.51.0 stores sessions in a sqlite DB under data/, not
+        // per-session jsonl (`goose info`, relocated and default layouts).
         let session_resolver = PathResolver::new(
             Some("$GOOSE_PATH_ROOT/data/sessions/sessions.db"),
             Some("$GOOSE_PATH_ROOT/data/sessions/sessions.db"),
@@ -742,7 +598,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = GooseAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -903,12 +759,9 @@ mod tests {
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
     }
 
-    /// Real goose nests a `config/` dir inside `$GOOSE_PATH_ROOT` (goose.md §1;
-    /// live goose 1.51.0 `goose info`: Config dir `$GOOSE_PATH_ROOT/config`,
-    /// Config yaml `…/config/config.yaml`; a provider config seeded at the
-    /// flat root is ignored — area-5 evidence, `.z-workflow/evidence/live/
-    /// goose/`). Every config-file surface hint must carry the segment; the
-    /// sessions DB lives under `data/`, not `config/`.
+    /// Real goose nests `config/` inside `$GOOSE_PATH_ROOT` (live 1.51.0:
+    /// a flat `$GOOSE_PATH_ROOT/config.yaml` is ignored); every config-file
+    /// hint must carry the segment, and the sessions DB lives under `data/`.
     #[test]
     fn env_relocated_surface_hints_nest_config_segment() {
         let a = adapter();
@@ -965,10 +818,8 @@ mod tests {
         );
     }
 
-    /// The sessions surface models the live sqlite DB, not per-session jsonl
-    /// (live goose 1.51.0 `goose info`: "Sessions DB (sqlite): …
-    /// data/sessions/sessions.db"; default home layout keeps it under
-    /// ~/.local/share/goose/, NOT ~/.config/goose/).
+    /// The sessions surface models the live sqlite DB under `data/` (default
+    /// home layout keeps it under ~/.local/share/goose/, not ~/.config/goose/).
     #[test]
     fn sessions_surface_models_sqlite_db_under_data() {
         let a = adapter();
@@ -1030,10 +881,6 @@ mod tests {
                 .contains(CONFIG_ENV_VAR)
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/goose")

@@ -1,16 +1,10 @@
-//! Kilo Code adapter — layered JSONC with IDE `--user-data-dir` plus HOME inline.
-//!
+//! Kilo Code adapter: layered JSONC (`~/.config/kilo/kilo.jsonc` global,
+//! `./kilo.jsonc`, `./.kilo/kilo.jsonc`), isolation `ide-user-data` via
+//! `HOME`/`XDG_CONFIG_HOME` plus VS Code `--user-data-dir`, constrained until
+//! relocated-root is verified.
 //! Research source: `docs/harness-configs/kilo-code.md` (last verified 2026-08-25).
-//! Executable `kilo` (CLI) / VS Code extension `kilocode.kilo-code`, config
-//! `~/.config/kilo/kilo.jsonc` global + `./kilo.jsonc` + `./.kilo/kilo.jsonc`
-//! layered, isolation `ide-user-data` via `HOME`/`XDG_CONFIG_HOME` inline plus
-//! VS Code `--user-data-dir`, constrained until relocated-root verified.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -21,10 +15,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Kilo Code.
 pub const HARNESS_ID_STR: &str = "kilo-code";
@@ -77,10 +67,6 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// MCP selectors.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcp"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Kilo Code.
 #[derive(Debug, Clone)]
 pub struct KiloAdapter {
@@ -110,41 +96,16 @@ impl KiloAdapter {
     }
 
     #[expect(clippy::unused_self, reason = "adapter uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
     fn find_binary_in_path(&self) -> Option<PathBuf> {
+        if let Some(kilo) =
+            super::find_in_path(&[EXECUTABLE]).or_else(|| super::find_in_path(&[EXECUTABLE_ALT]))
+        {
+            return Some(kilo);
+        }
+        // The VS Code `code` binary is fallback evidence; no .exe spelling,
+        // matching the historical scan.
         let path_var = std::env::var("PATH").ok()?;
         let sep = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(sep) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        for dir in path_var.split(sep) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE_ALT);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE_ALT}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        // also check for code binary as secondary evidence
         for dir in path_var.split(sep) {
             if dir.is_empty() {
                 continue;
@@ -152,77 +113,6 @@ impl KiloAdapter {
             let code = Path::new(dir).join("code");
             if code.is_file() {
                 return Some(code);
-            }
-        }
-        None
-    }
-
-    fn probe_version(binary: &Path) -> Option<String> {
-        let owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    #[expect(clippy::excessive_nesting, reason = "version parsing explicit")]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
             }
         }
         None
@@ -283,7 +173,6 @@ impl KiloAdapter {
             }
             None => evidence.push("could not resolve config root (no HOME)".to_owned()),
         }
-        // Project layered
         for p in [
             Path::new("./kilo.jsonc"),
             Path::new("./kilo.json"),
@@ -372,7 +261,7 @@ impl Adapter for KiloAdapter {
                     .unwrap_or_default()
                     .to_owned();
                 if file_name.contains("kilo") {
-                    match Self::probe_version(&path) {
+                    match super::probe_version(&path) {
                         Some(v) => {
                             evidence.push(format!("version `{v}` via `--version`"));
                             version = Some(v);
@@ -393,19 +282,11 @@ impl Adapter for KiloAdapter {
             (Some(_), None) => InstallPresence::UnknownVersion,
             (None, _) => InstallPresence::Absent,
         };
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "config root exists" arm can never
+        // survive; it is not computed.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -603,7 +484,6 @@ impl Adapter for KiloAdapter {
         let mut plan = WrapperPlan::new(
             "ide-user-data via HOME/XDG_CONFIG_HOME + --user-data-dir (inline until verified)",
         );
-        // HOME relocation isolates ~/.config/kilo via HOME override, plus XDG_CONFIG_HOME
         plan.env_vars
             .push(("HOME".to_owned(), instance.config_root.to_string()));
         plan.env_vars.push((
@@ -613,7 +493,6 @@ impl Adapter for KiloAdapter {
                 .display()
                 .to_string(),
         ));
-        // Inline config can also be injected whole (optional)
         plan.env_vars.push((
             INLINE_CONFIG_ENV_VAR.to_owned(),
             "{{\"remote_control\": true}}".to_owned(),
@@ -757,10 +636,10 @@ mod tests {
     #[test]
     fn parse_version_ok() {
         assert_eq!(
-            KiloAdapter::parse_version_output("kilo 1.2.3").as_deref(),
+            crate::adapters::parse_version_output("kilo 1.2.3").as_deref(),
             Some("1.2.3")
         );
-        assert_eq!(KiloAdapter::parse_version_output(""), None);
+        assert_eq!(crate::adapters::parse_version_output(""), None);
     }
 
     #[test]
@@ -845,10 +724,6 @@ mod tests {
         let boxed: Box<dyn Adapter> = Box::new(a);
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: on-disk fixture corpus (writable-state surface)
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_populated_loads_with_documented_keys() {

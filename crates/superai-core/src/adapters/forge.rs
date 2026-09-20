@@ -1,14 +1,8 @@
-//! Forge adapter — relocated config via `FORGE_CONFIG` with TOML/YAML/JSON.
-//!
+//! Forge adapter: `forge` binary, config root `~/.forge` or `$FORGE_CONFIG`,
+//! primary writable surface `.forge.toml` (TOML), isolation `relocated-root`.
 //! Research source: `docs/harness-configs/forge.md` (last verified 2026-08-25).
-//! Executable `forge`, config root `~/.forge` or `$FORGE_CONFIG`, primary
-//! writable surface `.forge.toml` (TOML), isolation `relocated-root`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -19,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Forge.
 pub const HARNESS_ID_STR: &str = "forge";
@@ -61,14 +51,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "restricted",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Forge.
-///
-/// Isolation is `relocated-root` via `FORGE_CONFIG`. The wrapper sets
-/// `FORGE_CONFIG` to the instance `config_root` and execs `forge`.
 #[derive(Debug, Clone)]
 pub struct ForgeAdapter {
     id: HarnessId,
@@ -96,106 +79,6 @@ impl ForgeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Try to locate the `forge` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `forge --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `forge 0.3.0` into `0.3.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve the default config root: `$FORGE_CONFIG` or `~/.forge`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -210,14 +93,6 @@ impl ForgeAdapter {
             return None;
         }
         Some(PathBuf::from(home).join(".forge"))
-    }
-
-    /// Check if default config root exists on disk.
-    #[expect(dead_code, reason = "helper for future use")]
-    #[expect(clippy::unused_self, reason = "adapter helper")]
-    fn default_config_root_exists(&self) -> Option<PathBuf> {
-        let root = Self::default_config_root()?;
-        if root.exists() { Some(root) } else { None }
     }
 
     /// Build the `.forge.toml` path for a given config root.
@@ -270,7 +145,6 @@ impl ForgeAdapter {
         } else {
             evidence.push(format!("{CONFIG_ENV_VAR} not set, using ~/.forge"));
         }
-        // Project forge.yaml
         let project_cfg = Path::new("forge.yaml");
         if project_cfg.exists() {
             evidence.push(format!(
@@ -330,14 +204,14 @@ impl Adapter for ForgeAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -363,20 +237,11 @@ impl Adapter for ForgeAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "config root exists" arm can never
+        // survive; it is not computed.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -753,7 +618,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = ForgeAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -962,10 +827,6 @@ mod tests {
                 .contains(CONFIG_ENV_VAR)
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/forge")

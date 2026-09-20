@@ -1,17 +1,9 @@
-//! Gemini CLI adapter — relocated-root via `GEMINI_CLI_HOME`, retired 2026-06-18.
-//!
+//! Gemini CLI adapter: relocated-root via `GEMINI_CLI_HOME`, retired
+//! 2026-06-18, successor `antigravity-cli` (`agy`); `MigrationOnly` support
+//! (detect/inspect/backup/export, no new defaults, no deletion).
 //! Research source: `docs/harness-configs/gemini-cli.md` (last verified 2026-08-25).
-//! Executable `gemini`, config root `~/.gemini` or `$GEMINI_CLI_HOME/.gemini`
-//! (the CLI nests a `.gemini/` dir inside `GEMINI_CLI_HOME`),
-//! primary writable surface `settings.json` (JSON), isolation `relocated-root`.
-//! Product status `retired`, successor `antigravity-cli` (`agy`).
-//! Support `MigrationOnly`: detect/inspect/backup/export with tip, no new defaults, no deletion.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -22,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Gemini CLI.
 pub const HARNESS_ID_STR: &str = "gemini-cli";
@@ -43,10 +31,7 @@ pub const CONFIG_ENV_VAR: &str = "GEMINI_CLI_HOME";
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.gemini";
 
 /// Config root when `GEMINI_CLI_HOME` is set: the CLI creates a `.gemini/`
-/// directory *inside* the env-var dir (gemini-cli.md:18 "User settings file —
-/// `$GEMINI_CLI_HOME/.gemini/settings.json`" and :78 "CLI creates `.gemini/`
-/// inside it"; live gemini 0.60.0 materialized `$GEMINI_CLI_HOME/.gemini/` on
-/// 2026-09-18, see `.z-workflow/evidence/live/gemini-cli/`).
+/// dir inside the env-var dir (gemini-cli.md:18/:78; live-verified 0.60.0).
 pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GEMINI_CLI_HOME/.gemini";
 
 /// Research document link.
@@ -68,18 +53,10 @@ pub const SUCCESSOR_ID: &str = "antigravity-cli";
 pub const SUCCESSOR_EXECUTABLE: &str = "agy";
 
 /// Tip shown for migration.
-pub const MIGRATION_TIP: &str = "Gemini CLI consumer tiers retired 2026-06-18; migrate to Antigravity CLI (agy) via `agy plugin import gemini` — skills .gemini/skills/ -> .gemini/antigravity-cli/skills/, mcpServers url/httpUrl -> serverUrl in mcp_config.json";
+pub const MIGRATION_TIP: &str = "Gemini CLI consumer tiers retired 2026-06-18; migrate to Antigravity CLI (agy) via `agy plugin import gemini`: skills .gemini/skills/ -> .gemini/antigravity-cli/skills/, mcpServers url/httpUrl -> serverUrl in mcp_config.json";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Gemini CLI (`MigrationOnly`).
-///
-/// Isolation is `relocated-root` via `GEMINI_CLI_HOME`. `MigrationOnly` means
-/// only detect/inspect/backup/export are supported; new instance creation and
-/// deletion are not provided. Every mutating attempt returns a tip to the
-/// successor `antigravity-cli`.
+/// Concrete adapter for Gemini CLI (`MigrationOnly`): detect/inspect/backup/
+/// export only; every mutating attempt returns the successor tip.
 #[derive(Debug, Clone)]
 pub struct GeminiCliAdapter {
     id: HarnessId,
@@ -112,114 +89,13 @@ impl GeminiCliAdapter {
         MIGRATION_TIP
     }
 
-    /// Try to locate the `gemini` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `gemini --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `0.84.0` or `gemini 2.1.0` into version.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
     /// Resolve the default config root: `$GEMINI_CLI_HOME/.gemini` or `~/.gemini`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
         {
-            // The CLI nests a `.gemini/` dir inside $GEMINI_CLI_HOME
-            // (gemini-cli.md:18/:78); user settings live one level deeper
-            // than the env-var dir itself.
+            // The CLI nests a `.gemini/` dir inside $GEMINI_CLI_HOME; user
+            // settings live one level deeper than the env-var dir itself.
             return Some(PathBuf::from(dir).join(".gemini"));
         }
         let home = std::env::var("HOME")
@@ -316,14 +192,14 @@ impl Adapter for GeminiCliAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -487,9 +363,7 @@ impl Adapter for GeminiCliAdapter {
         Err(CoreError::UnsupportedOperation {
             harness: self.id.to_string(),
             operation: "plan_wrapper".to_owned(),
-            reason: format!(
-                "MigrationOnly: {MIGRATION_TIP} — no new instances; export/backup only"
-            ),
+            reason: format!("MigrationOnly: {MIGRATION_TIP}; no new instances, export/backup only"),
         })
     }
 
@@ -515,7 +389,7 @@ impl Adapter for GeminiCliAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "gemini-cli (MigrationOnly) expects isolation relocated_root, got {other} — {MIGRATION_TIP}"
+                    "gemini-cli (MigrationOnly) expects isolation relocated_root, got {other}; {MIGRATION_TIP}"
                 ),
             }),
         }
@@ -655,7 +529,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = GeminiCliAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -715,9 +589,9 @@ mod tests {
 
     #[test]
     fn env_relocated_surface_hints_nest_gemini_segment() {
-        // Real gemini nests `.gemini/` inside $GEMINI_CLI_HOME (gemini-cli.md:18/:78;
-        // live 0.60.0 materialized `$GEMINI_CLI_HOME/.gemini/`). An env-based hint
-        // without that segment targets a file the real CLI never reads.
+        // Real gemini nests `.gemini/` inside $GEMINI_CLI_HOME
+        // (live-verified 0.60.0); a hint without that segment targets a file
+        // the CLI never reads.
         let a = adapter();
         let env_prefix = format!("{ISOLATED_CONFIG_ROOT_HINT}/");
         let win_prefix = "%GEMINI_CLI_HOME%\\.gemini\\";

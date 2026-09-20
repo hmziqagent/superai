@@ -1,18 +1,11 @@
-//! iFlow CLI adapter — Gemini-fork, `MigrationOnly` shutdown 2026-04-17.
-//!
-//! Research source: `docs/harness-configs/iflow-cli.md` (last verified 2026-08-25).
-//! Executable `iflow`, config `~/.iflow/settings.json` (user), `.iflow/settings.json`
+//! iFlow CLI adapter: Gemini-fork, `MigrationOnly` (detect/inspect/backup/
+//! export, no new defaults, no deletion); sunset 2026-04-17, successor
+//! gemini-cli. Config: `~/.iflow/settings.json` (user), `.iflow/settings.json`
 //! (project), `/etc/iflow-cli/settings.json` or `$IFLOW_CLI_SYSTEM_SETTINGS_PATH`
-//! (system) plus env `IFLOW_*` overrides, isolation `env_only` / system-file;
-//! product status `sunset` (shutdown 2026-04-17), successor guidance at
-//! `vibex.iflow.cn/t/topic/4819`; support `MigrationOnly` — detect/inspect/backup/export
-//! with tip, no new defaults, no deletion.
+//! (system), plus env `IFLOW_*` overrides.
+//! Research source: `docs/harness-configs/iflow-cli.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -23,10 +16,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for iFlow CLI.
 pub const HARNESS_ID_STR: &str = "iflow-cli";
@@ -65,17 +54,12 @@ pub const SUCCESSOR_ID: &str = "gemini-cli";
 pub const SUCCESSOR_EXECUTABLE: &str = "gemini";
 
 /// Migration tip shown for migration-only support.
-pub const MIGRATION_TIP: &str = "iFlow CLI shutting down 2026-04-17 (UTC+8); migrate via gemini-cli (Gemini CLI lineage) — IFLOW_* env vars map to GEMINI_* (apiKey/baseUrl/modelName), system settings IFLOW_CLI_SYSTEM_SETTINGS_PATH -> GEMINI system path, auth selectedAuthType iflow/openai-compatible; guide https://vibex.iflow.cn/t/topic/4819";
+pub const MIGRATION_TIP: &str = "iFlow CLI shutting down 2026-04-17 (UTC+8); migrate via gemini-cli (Gemini CLI lineage): IFLOW_* env vars map to GEMINI_* (apiKey/baseUrl/modelName), system settings IFLOW_CLI_SYSTEM_SETTINGS_PATH -> GEMINI system path, auth selectedAuthType iflow/openai-compatible; guide https://vibex.iflow.cn/t/topic/4819";
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for iFlow CLI (`MigrationOnly`).
-///
-/// Isolation is `env_only` (pure `IFLOW_*` env vars outrank all files) with
-/// optional `IFLOW_CLI_SYSTEM_SETTINGS_PATH` for file-based isolation.
-/// `MigrationOnly` means only detect/inspect/backup/export are supported.
+/// Concrete adapter for iFlow CLI (`MigrationOnly`): `env_only` isolation
+/// (pure `IFLOW_*` env vars outrank all files) with optional
+/// `IFLOW_CLI_SYSTEM_SETTINGS_PATH` for file-based isolation; only
+/// detect/inspect/backup/export are supported.
 #[derive(Debug, Clone)]
 pub struct IflowAdapter {
     id: HarnessId,
@@ -106,108 +90,6 @@ impl IflowAdapter {
     /// Successor tip.
     pub fn successor_tip(&self) -> &str {
         MIGRATION_TIP
-    }
-
-    /// Try to locate the `iflow` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `iflow --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `iflow 0.9.0` into `0.9.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve the default user config root: `~/.iflow`.
@@ -271,7 +153,6 @@ impl IflowAdapter {
                 evidence.push("could not resolve user config root (no HOME)".to_owned());
             }
         }
-        // Project tier
         let project_settings = Path::new(".iflow").join("settings.json");
         if project_settings.exists() {
             evidence.push(format!(
@@ -279,7 +160,6 @@ impl IflowAdapter {
                 project_settings.display()
             ));
         }
-        // System tier env var
         if let Ok(val) = std::env::var(SYSTEM_SETTINGS_ENV_VAR)
             && !val.trim().is_empty()
         {
@@ -294,7 +174,6 @@ impl IflowAdapter {
         } else {
             evidence.push(format!("{SYSTEM_SETTINGS_ENV_VAR} not set"));
         }
-        // IFLOW_* env vars
         let mut env_count = 0;
         for (key, _) in std::env::vars() {
             if key.starts_with("IFLOW_") || key.starts_with("iflow_") {
@@ -356,14 +235,14 @@ impl Adapter for IflowAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -422,7 +301,6 @@ impl Adapter for IflowAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // User settings.json — ~/.iflow/settings.json
         let user_resolver = PathResolver::new(
             Some("~/.iflow/settings.json"),
             Some("~/.iflow/settings.json"),
@@ -451,7 +329,6 @@ impl Adapter for IflowAdapter {
         user_settings.restart_behavior = RestartBehavior::Reload;
         surfaces.push(user_settings);
 
-        // Project settings — .iflow/settings.json
         let project_resolver = PathResolver::fallback_only(".iflow/settings.json (project)");
         let mut project_settings = ConfigSurface::new(
             "settings.json (project)",
@@ -472,7 +349,6 @@ impl Adapter for IflowAdapter {
         project_settings.restart_behavior = RestartBehavior::Reload;
         surfaces.push(project_settings);
 
-        // System settings — /etc/iflow-cli/settings.json or IFLOW_CLI_SYSTEM_SETTINGS_PATH
         let system_resolver = PathResolver::new(
             Some("$IFLOW_CLI_SYSTEM_SETTINGS_PATH or /etc/iflow-cli/settings.json"),
             Some(
@@ -498,7 +374,6 @@ impl Adapter for IflowAdapter {
         system_settings.backup_required = true;
         surfaces.push(system_settings);
 
-        // IFLOW.md — project context file
         let iflow_md_resolver = PathResolver::fallback_only("IFLOW.md (project context)");
         let mut iflow_md = ConfigSurface::new(
             "IFLOW.md",
@@ -511,7 +386,6 @@ impl Adapter for IflowAdapter {
         iflow_md.backup_required = false;
         surfaces.push(iflow_md);
 
-        // Subagents — .iflow/agents/*.md / ~/.iflow/agents/*.md
         let agents_resolver = PathResolver::new(
             Some("~/.iflow/agents/*.md or .iflow/agents/*.md"),
             Some("~/.iflow/agents/*.md or .iflow/agents/*.md"),
@@ -741,7 +615,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = IflowAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -876,10 +750,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Fixture-backed conformance tests
-    // -----------------------------------------------------------------------
-
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/iflow_cli")
     }
@@ -900,7 +770,6 @@ mod tests {
         let path = fixture_path("settings.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
-        // Minimal may be empty or contain selectedAuthType
         assert!(map.is_empty() || map.contains_key("selectedAuthType") || map.len() <= 3);
     }
 

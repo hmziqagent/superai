@@ -1,15 +1,9 @@
-//! gptme adapter — workspace plus explicit via `--workspace` and env.
-//!
+//! gptme adapter: workspace plus explicit via `--workspace` and env
+//! (`GPTME_WORKSPACE`), global TOML `~/.config/gptme/config.toml` plus
+//! project `gptme.toml`; cloud managed service excluded.
 //! Research source: `docs/harness-configs/gptme.md` (last verified 2026-08-25).
-//! Executable `gptme`, global TOML `~/.config/gptme/config.toml` plus project
-//! `gptme.toml`, workspaces and logs, isolation `project-scope` with explicit
-//! `--workspace`. Cloud managed service excluded.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -20,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for gptme.
 pub const HARNESS_ID_STR: &str = "gptme";
@@ -72,15 +62,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Selectors for YAML project context (gptme.toml may be TOML but also YAML env overlay).
 pub const ENV_OWNED_SELECTORS: &[&str] = &["env", "OPENAI_API_KEY", "MODEL"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for gptme.
-///
-/// Isolation is `project-scope` (workspace) plus explicit `--workspace` flag.
-/// The wrapper sets `GPTME_WORKSPACE` to the instance workspace dir and may
-/// set `GPTME_LOGS_HOME` for log isolation.
 #[derive(Debug, Clone)]
 pub struct GptmeAdapter {
     id: HarnessId,
@@ -106,106 +88,6 @@ impl GptmeAdapter {
     /// Workspace env var.
     pub fn workspace_env_var(&self) -> &str {
         WORKSPACE_ENV_VAR
-    }
-
-    /// Try to locate the `gptme` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `gptme --version` with a timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `gptme 0.12.0` into `0.12.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve the default global config root: `~/.config/gptme`.
@@ -354,14 +236,14 @@ impl Adapter for GptmeAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -387,20 +269,11 @@ impl Adapter for GptmeAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "config root exists" arm can never
+        // survive; it is not computed.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -579,9 +452,8 @@ impl Adapter for GptmeAdapter {
         ]
     }
 
-    /// INS-03: gptme's `config.toml` embeds absolute config paths in content
-    /// — the documented plugin search path `paths = ["./plugins",
-    /// "~/.config/gptme/plugins"]` (gptme.md §1.1) — so a mirrored copy has
+    /// INS-03: `config.toml` embeds absolute config paths in content (the
+    /// documented plugin `paths` list, gptme.md §1.1), so a mirrored copy has
     /// its config-root references rewritten to the target root.
     fn mirror_content_rewrite_files(&self) -> Vec<String> {
         vec!["config.toml".to_owned()]
@@ -762,7 +634,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = GptmeAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }

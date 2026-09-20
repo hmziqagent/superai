@@ -1,24 +1,9 @@
-//! Factory Droid adapter — project/HOME via `~/.factory/settings.json`.
-//!
+//! Factory Droid adapter: `droid` binary, layered `~/.factory/settings.json`
+//! with project overlay, `project-scope` isolation via HOME relocation.
 //! Research source: `docs/harness-configs/factory-droid.md` (last verified
 //! 2026-08-25; MCP destination live-verified 2026-09-18).
-//! Executable `droid` (`factory` alias), layered JSON `~/.factory/settings.json`
-//! with project `.factory/settings.json` overlay, MCP servers in
-//! `~/.factory/mcp.json` under top-level `mcpServers` (`droid mcp add` own
-//! writer, live-verified), isolation `project-scope` with HOME relocation
-//! hack. Hosted Factory account features use `FACTORY_API_KEY`.
-//!
-//! Isolation contract (self-consistent): the wrapper sets `HOME` to the
-//! instance/alias root, so the binary's `$HOME/.factory/...` tree resolves to
-//! `<root>/.factory/...`. Every dest modeled relative to the root (the MCP
-//! `dest_file`) therefore nests under `.factory/` — a flat dest would write a
-//! file the live binary never reads (run-4 round-3 alias bug 1).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -29,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Factory Droid.
 pub const HARNESS_ID_STR: &str = "factory-droid";
@@ -61,10 +42,8 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for Factory Droid inside `settings.json`.
-///
-/// Hosted/enterprise policy keys and org-managed custom model policy are
-/// excluded — we own only local customModels and tool gating.
+/// Owned selectors for Factory Droid inside `settings.json`: local
+/// customModels and tool gating only; hosted/org policy keys stay foreign.
 pub const OWNED_SELECTORS: &[&str] = &[
     "customModels",
     "model",
@@ -77,16 +56,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "modelFallbacks",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Factory Droid.
-///
-/// Isolation is `project-scope` with HOME relocation for full instance
-/// isolation (sessions/skills/MCP). The wrapper sets `HOME` to the instance
-/// root when isolation requires it, otherwise relies on project `.factory/`
-/// overlay.
 #[derive(Debug, Clone)]
 pub struct FactoryDroidAdapter {
     id: HarnessId,
@@ -107,113 +77,6 @@ impl FactoryDroidAdapter {
     /// Executable name for this harness.
     pub fn executable_name(&self) -> &str {
         EXECUTABLE
-    }
-
-    /// API key env var.
-    pub fn api_key_env_var(&self) -> &str {
-        API_KEY_ENV_VAR
-    }
-
-    /// Try to locate the `droid` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `droid --version` with a timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `droid 0.3.0` into `0.3.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve the default config root: `~/.factory`.
@@ -336,14 +199,14 @@ impl Adapter for FactoryDroidAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -369,20 +232,11 @@ impl Adapter for FactoryDroidAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("config root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High: the Low "config root exists" arm below can
+        // never survive that override, so it is not computed at all.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -604,18 +458,11 @@ impl Adapter for FactoryDroidAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination — `droid mcp add` (own writer) writes
-    /// top-level `mcpServers` into `~/.factory/mcp.json` and `droid mcp list`
-    /// reads it back (live-verified droid 0.222.0, 2026-09-18, evidence
-    /// live/factory-droid/mcp-dest-r6.log; factory-droid.md §6a).
-    ///
-    /// The dest is nested under `.factory/` because the wrapper relocates
-    /// `HOME` to the instance/alias root (see [`FactoryDroidAdapter::plan_wrapper`]
-    /// env): every caller resolves `dest_file` relative to that root, so a
-    /// flat `mcp.json` would land beside the fake home where the binary never
-    /// looks. `droid` demonstrably reads `<root>/.factory/mcp.json` and never
-    /// `<root>/mcp.json` under `HOME=<root>` (re-probed live 2026-09-18,
-    /// run-4 evidence aliases/factory-droid/round4-live-probe.txt).
+    /// EXT-08/09: `droid mcp add` (own writer) puts top-level `mcpServers`
+    /// into `~/.factory/mcp.json` (live-verified droid 0.222.0, 2026-09-18).
+    /// The dest nests under `.factory/` because the wrapper relocates HOME to
+    /// the instance root and the binary reads `$HOME/.factory/mcp.json` only;
+    /// a flat dest would never be read.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".factory/mcp.json",
@@ -725,7 +572,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = FactoryDroidAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -927,10 +774,8 @@ mod tests {
         assert!(map.is_empty() || map.contains_key("mcpServers") || !map.is_empty());
     }
 
-    /// Live-probe regression pin (2026-09-18, droid 0.222.0): `droid mcp add`
-    /// (own writer) writes top-level `mcpServers` into `~/.factory/mcp.json`.
-    /// Under the wrapper's `HOME=<root>` relocation the same file is
-    /// `<root>/.factory/mcp.json`, so the dest must nest under `.factory/`.
+    /// Live-probe pin (droid 0.222.0): the own writer puts `mcpServers` into
+    /// `<root>/.factory/mcp.json` under HOME relocation.
     #[test]
     fn mcp_decl_pins_live_writer_destination() {
         let a = adapter();
@@ -939,15 +784,13 @@ mod tests {
         assert_eq!(decl.dest_key, "mcpServers");
         assert!(
             decl.read_only.is_none(),
-            "dest is writable — the binary's own writer verified it"
+            "dest is writable: the binary's own writer verified it"
         );
         assert!(a.mcp_absence_reason().is_none());
     }
 
-    /// Plan env and MCP dest must agree with the live binary: the wrapper
-    /// relocates `HOME` to the instance root and `droid` reads
-    /// `$HOME/.factory/mcp.json` (never a flat `$HOME/mcp.json`), so
-    /// `root.join(dest_file)` must land inside `root/.factory/`.
+    /// Wrapper HOME and the MCP dest must agree: droid reads
+    /// `$HOME/.factory/mcp.json`, never a flat `$HOME/mcp.json`.
     #[test]
     fn plan_env_and_mcp_dest_agree_under_relocated_home() {
         let tmp_root = crate::test_util::tmp_abs_str(".factory-live");

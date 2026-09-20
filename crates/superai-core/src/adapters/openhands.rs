@@ -1,16 +1,9 @@
-//! `OpenHands` adapter — V0 TOML vs V1 env/Docker persistence.
-//!
+//! `OpenHands` adapter: V0 `config.toml` (TOML) vs V1 `agent_settings.json`
+//! (JSON) + env `LLM_*`/`OH_PERSISTENCE_DIR` with Docker sandbox isolation
+//! (`os_bound`); `Constrained`, both schemas must be owned for writes.
 //! Research source: `docs/harness-configs/openhands.md` (last verified 2026-08-25).
-//! Executable `openhands`, V0 `config.toml` TOML (core/llm/agent/sandbox/security),
-//! V1 `~/.openhands/agent_settings.json` JSON + env `LLM_*`/`OH_PERSISTENCE_DIR`/
-//! Docker sandbox isolation `os_bound`, support `Constrained` version split requiring
-//! both schemas, product status `active`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -21,10 +14,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `OpenHands`.
 pub const HARNESS_ID_STR: &str = "openhands";
@@ -61,9 +50,9 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 pub const SCHEMA_VERSION_STR: &str = "1";
 
 /// V1 schema marker version split note.
-pub const VERSION_SPLIT_NOTE: &str = "OpenHands V0 config.toml (TOML, ./config.toml or ~/.openhands/config.toml, sections [core]/[llm]/[agent]/[sandbox]) vs V1 agent_settings.json + env (OH_PERSISTENCE_DIR, LLM_MODEL/API_KEY/BASE_URL, SANDBOX_VOLUMES) with Docker isolation — both schemas must be owned for constrained writes";
+pub const VERSION_SPLIT_NOTE: &str = "OpenHands V0 config.toml (TOML, ./config.toml or ~/.openhands/config.toml, sections [core]/[llm]/[agent]/[sandbox]) vs V1 agent_settings.json + env (OH_PERSISTENCE_DIR, LLM_MODEL/API_KEY/BASE_URL, SANDBOX_VOLUMES) with Docker isolation: both schemas must be owned for constrained writes";
 
-/// Owned selectors for provider/model mutation — V0 TOML keys and V1 JSON paths.
+/// Owned selectors: V0 TOML keys and V1 JSON paths.
 ///
 /// V0: `llm.model`, `llm.api_key`, `llm.base_url`, `core.runtime`, `core.max_iterations`, `sandbox.*`
 /// V1: `llm.model`, `llm.api_key`, `llm.base_url` inside `agent_settings.json`
@@ -83,17 +72,9 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "agent.enable_browsing",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for `OpenHands` (`Constrained`, `os_bound`).
-///
-/// Isolation is `os_bound` via Docker (`runtime = docker`) plus V1
-/// `OH_PERSISTENCE_DIR` relocation and V0 per-directory `config.toml`.
-/// Constrained because version split requires owning both TOML and JSON
-/// schemas, and Docker mounts plus GUI session state make full isolation
-/// container-scoped.
+/// Concrete adapter for `OpenHands` (`Constrained`, `os_bound`): Docker
+/// runtime plus V1 `OH_PERSISTENCE_DIR` and V0 per-directory `config.toml`;
+/// constrained because writes must own both schemas.
 #[derive(Debug, Clone)]
 pub struct OpenHandsAdapter {
     id: HarnessId,
@@ -124,108 +105,6 @@ impl OpenHandsAdapter {
     /// Version split note.
     pub fn version_split_note(&self) -> &str {
         VERSION_SPLIT_NOTE
-    }
-
-    /// Try to locate the `openhands` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `openhands --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `openhands 1.8.0` or `0.44.0` into `0.44.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve the default persistence root: `$OH_PERSISTENCE_DIR` or `~/.openhands`.
@@ -307,7 +186,6 @@ impl OpenHandsAdapter {
                 evidence.push("could not resolve persistence root (no HOME)".to_owned());
             }
         }
-        // V0 per-directory config.toml
         let cwd_v0 = Path::new("config.toml");
         if cwd_v0.exists() {
             evidence.push(format!("cwd V0 config.toml found at {}", cwd_v0.display()));
@@ -344,7 +222,6 @@ impl OpenHandsAdapter {
                 evidence.push(format!("{var} not set"));
             }
         }
-        // Docker socket heuristic
         if Path::new("/var/run/docker.sock").exists() {
             evidence
                 .push("docker socket present at /var/run/docker.sock (sandbox docker)".to_owned());
@@ -398,14 +275,14 @@ impl Adapter for OpenHandsAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -431,22 +308,11 @@ impl Adapter for OpenHandsAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence
-                .iter()
-                .any(|e| e.contains("persistence root exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "persistence root exists" arm can
+        // never survive; it is not computed.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -684,8 +550,8 @@ impl Adapter for OpenHandsAdapter {
             PERSISTENCE_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // V1 env overrides are session-inline and require --override-with-envs; we expose them as wrapper env hints.
-        // The actual values are provider/template driven; wrapper sets persistence deterministically.
+        // V1 env overrides are session-inline and need --override-with-envs;
+        // values are provider/template driven, persistence is set here.
         plan.env_vars
             .push(("RUNTIME".to_owned(), "docker".to_owned()));
         let runtime_image = "ghcr.io/openhands/agent-server:1.26.0-python";
@@ -734,7 +600,7 @@ impl Adapter for OpenHandsAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "openhands requires isolation os_bound (Docker + OH_PERSISTENCE_DIR), got {other} — {VERSION_SPLIT_NOTE}"
+                    "openhands requires isolation os_bound (Docker + OH_PERSISTENCE_DIR), got {other}; {VERSION_SPLIT_NOTE}"
                 ),
             }),
         }
@@ -887,7 +753,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = OpenHandsAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1066,10 +932,6 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: adopt the on-disk fixture corpus into tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_corpus_validates_secret_free_and_flags_malformed() {
