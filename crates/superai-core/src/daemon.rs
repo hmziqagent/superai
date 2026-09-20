@@ -172,6 +172,106 @@ pub fn identity_path(root: &Path, harness: &str, instance: &str) -> PathBuf {
     root.join(format!("{harness}-{instance}.identity.json"))
 }
 
+/// Start-lock body: the holder identity, for staleness recovery and conflict
+/// diagnostics.
+#[derive(Serialize, Deserialize)]
+struct StartLockFile {
+    pid: u32,
+    harness: String,
+    acquired_at: String,
+}
+
+/// Exclusive start lock serializing daemon starts per harness/instance, so
+/// the exists-check, spawn, and identity write act as one step: two
+/// concurrent starts cannot both pass the check and both spawn.
+///
+/// Create-new semantics with the `activation::ActivationLock` stale-recovery
+/// idiom: a lockfile whose recorded pid is provably dead (or unparsable) is
+/// recovered exactly once; elsewhere a live holder is a typed conflict and a
+/// stale lock is never guessed away.
+struct DaemonStartLock {
+    path: PathBuf,
+}
+
+impl DaemonStartLock {
+    fn acquire(root: &Path, harness: &str, instance: &str) -> Result<Self> {
+        let path = root.join(format!("{harness}-{instance}.start.lock"));
+        if Self::try_create(&path, harness)? {
+            return Ok(Self { path });
+        }
+        if lock_is_stale(&path) {
+            drop(std::fs::remove_file(&path));
+            if Self::try_create(&path, harness)? {
+                return Ok(Self { path });
+            }
+        }
+        let holder_pid = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<StartLockFile>(&b).ok())
+            .map(|l| l.pid);
+        Err(CoreError::Validation {
+            field: "daemon".to_owned(),
+            reason: format!(
+                "daemon start already in progress for {harness}/{instance} (start lock held by \
+                 pid {})",
+                holder_pid.map_or_else(|| "unknown".to_owned(), |p| p.to_string())
+            ),
+        })
+    }
+
+    /// `Ok(true)` = created (acquired); `Ok(false)` = held; `Err` = I/O.
+    fn try_create(path: &Path, harness: &str) -> Result<bool> {
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => {
+                return Err(CoreError::Validation {
+                    field: "daemon_start_lock".to_owned(),
+                    reason: format!("cannot open start lock {}: {e}", path.display()),
+                });
+            }
+        };
+        let body = serde_json::to_vec(&StartLockFile {
+            pid: std::process::id(),
+            harness: harness.to_owned(),
+            acquired_at: now_iso8601(),
+        })
+        .map_err(|e| CoreError::Validation {
+            field: "daemon_start_lock".to_owned(),
+            reason: format!("cannot serialize start lock: {e}"),
+        })?;
+        file.write_all(&body).map_err(|e| CoreError::Validation {
+            field: "daemon_start_lock".to_owned(),
+            reason: format!("cannot write start lock {}: {e}", path.display()),
+        })?;
+        Ok(true)
+    }
+}
+
+impl Drop for DaemonStartLock {
+    fn drop(&mut self) {
+        drop(std::fs::remove_file(&self.path));
+    }
+}
+
+/// Whether the start lock at `path` is provably stale (dead holder or
+/// unparsable body sitting in the superai-owned root).
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    match serde_json::from_slice::<StartLockFile>(&bytes) {
+        Ok(lock) => lock.pid != std::process::id() && !pid_is_alive(lock.pid),
+        Err(_) => true,
+    }
+}
+
 /// Recorded service identity of a daemon superai started (WRP-07).
 ///
 /// Carries only safe facts: no argv and no environment are recorded, so a
@@ -555,7 +655,9 @@ fn identity_token(pid: u32) -> String {
 
 /// Start a daemon: resolve the port (conflict-checked), spawn via duct with
 /// the port in env/args, record the superai-owned identity, and wait bounded
-/// for readiness.
+/// for readiness. Concurrent starts of the same harness/instance serialize
+/// through an exclusive start lock spanning the check, spawn, and identity
+/// write.
 ///
 /// Background launch (the default) spawns detached with nulled stdio and
 /// returns a [`DaemonLaunch::Background`] handle once ready. Foreground
@@ -565,6 +667,10 @@ fn identity_token(pid: u32) -> String {
 /// On readiness timeout the just-spawned process is killed (it is our own
 /// child, killed by handle, never by pid), the identity file is removed, and
 /// the typed [`CoreError::DaemonNotReady`] is returned.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the locked start window reads as one sequential protocol"
+)]
 pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Result<DaemonLaunch> {
     if config.executable.is_empty() || config.executable.contains('\0') {
         return Err(CoreError::Validation {
@@ -588,65 +694,78 @@ pub fn start_daemon(config: &DaemonStartConfig, probe: &dyn ProcessProbe) -> Res
         ),
     })?;
 
-    // One live daemon per harness/instance.
+    // One live daemon per harness/instance. The start lock spans the
+    // exists-check, spawn, and identity write so a concurrent start cannot
+    // slip between them; the identity file is the durable record, the lock
+    // only the start-race guard.
     let id_path = identity_path(
         &config.identity_root,
         config.harness.as_str(),
         config.instance.as_str(),
     );
-    if id_path.exists()
-        && let Ok(existing) = load_identity(&id_path)
-        && probe.is_alive(existing.pid)
+    let (handle, pid, port);
     {
-        return Err(CoreError::Validation {
-            field: "daemon".to_owned(),
-            reason: format!(
-                "daemon {}/{} already running as pid {} on port {}",
-                config.harness, config.instance, existing.pid, existing.port
-            ),
-        });
-    }
-
-    let port = match config.port {
-        Some(explicit) => {
-            check_port_free(config.bind_addr, explicit, &config.identity_root, probe)?;
-            explicit
-        }
-        None => allocate_port(
-            config.bind_addr,
-            &config.port_range,
+        let _start_lock = DaemonStartLock::acquire(
             &config.identity_root,
-            probe,
-        )?,
-    };
+            config.harness.as_str(),
+            config.instance.as_str(),
+        )?;
+        if id_path.exists()
+            && let Ok(existing) = load_identity(&id_path)
+            && probe.is_alive(existing.pid)
+        {
+            return Err(CoreError::Validation {
+                field: "daemon".to_owned(),
+                reason: format!(
+                    "daemon {}/{} already running as pid {} on port {}",
+                    config.harness, config.instance, existing.pid, existing.port
+                ),
+            });
+        }
 
-    let (handle, pid) = spawn_daemon_process(config, port)?;
-    let identity = DaemonIdentity {
-        harness: config.harness.to_string(),
-        instance: config.instance.to_string(),
-        pid,
-        port,
-        bind_addr: config.bind_addr.to_string(),
-        executable: probe
-            .executable(pid)
-            .unwrap_or_else(|| config.executable.clone()),
-        start_time: probe.start_time(pid),
-        started_at: now_iso8601(),
-        identity_token: identity_token(pid),
-    };
-    let id_bytes = serde_json::to_vec_pretty(&identity).map_err(|e| CoreError::Validation {
-        field: "daemon_identity".to_owned(),
-        reason: format!("cannot serialize daemon identity: {e}"),
-    })?;
-    // Plan-02 fold: the identity record persists through the config crate's
-    // ONE mutation boundary (pretty JSON, staged parse-validation included).
-    commit_file(
-        "daemon-identity",
-        &id_path,
-        &id_bytes,
-        DocumentKind::StrictJson,
-    )
-    .map_err(CoreError::Config)?;
+        port = match config.port {
+            Some(explicit) => {
+                check_port_free(config.bind_addr, explicit, &config.identity_root, probe)?;
+                explicit
+            }
+            None => allocate_port(
+                config.bind_addr,
+                &config.port_range,
+                &config.identity_root,
+                probe,
+            )?,
+        };
+
+        let (spawned_handle, spawned_pid) = spawn_daemon_process(config, port)?;
+        handle = spawned_handle;
+        pid = spawned_pid;
+        let identity = DaemonIdentity {
+            harness: config.harness.to_string(),
+            instance: config.instance.to_string(),
+            pid,
+            port,
+            bind_addr: config.bind_addr.to_string(),
+            executable: probe
+                .executable(pid)
+                .unwrap_or_else(|| config.executable.clone()),
+            start_time: probe.start_time(pid),
+            started_at: now_iso8601(),
+            identity_token: identity_token(pid),
+        };
+        let id_bytes = serde_json::to_vec_pretty(&identity).map_err(|e| CoreError::Validation {
+            field: "daemon_identity".to_owned(),
+            reason: format!("cannot serialize daemon identity: {e}"),
+        })?;
+        // Plan-02 fold: the identity record persists through the config crate's
+        // ONE mutation boundary (pretty JSON, staged parse-validation included).
+        commit_file(
+            "daemon-identity",
+            &id_path,
+            &id_bytes,
+            DocumentKind::StrictJson,
+        )
+        .map_err(CoreError::Config)?;
+    }
 
     if let Err(e) = wait_for_ready(config.harness.as_str(), &config.readiness, port) {
         // Our own child: kill by handle, never by pid; wait reaps it so the
@@ -1322,6 +1441,106 @@ mod tests {
         }
         assert!(!handle.identity_path.exists(), "identity cleaned up");
         assert!(!probe.is_alive(handle.pid), "daemon is dead");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A held start lock refuses the start before anything is spawned: no
+    /// port allocation, no daemon, no identity record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_start_lock_refuses_a_live_holder_before_spawning() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-lock-held");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let config = default_start_config(&dir, &ready_file, &pid_file);
+
+        let lock_path = config.identity_root.join("daemon-test-t1.start.lock");
+        std::fs::create_dir_all(&config.identity_root).unwrap();
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&StartLockFile {
+                pid: std::process::id(),
+                harness: "daemon-test".to_owned(),
+                acquired_at: now_iso8601(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = start_daemon(&config, &SystemProcessProbe).unwrap_err();
+        let reason = format!("{err}");
+        assert!(
+            reason.contains("already in progress"),
+            "expected the start-lock conflict, got: {reason}"
+        );
+        assert!(
+            !ready_file.exists(),
+            "nothing may be spawned while the lock is held"
+        );
+        let id_path = identity_path(
+            &config.identity_root,
+            config.harness.as_str(),
+            config.instance.as_str(),
+        );
+        assert!(!id_path.exists(), "no identity may be recorded");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A start lock whose holder is provably dead is recovered exactly once:
+    /// the next start proceeds normally.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_start_lock_recovers_when_the_holder_is_dead() {
+        if !sh_available() {
+            return;
+        }
+        let dir = tmp_dir("daemon-lock-stale");
+        let ready_file = dir.join("ready.flag");
+        let pid_file = dir.join("daemon.pid");
+        let config = default_start_config(&dir, &ready_file, &pid_file);
+
+        // A genuinely dead pid: a reaped child's own pid, printed by sh.
+        let dead_pid = {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("echo $$; exit 0")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+        };
+        assert!(!pid_is_alive(dead_pid), "fixture pid must be dead");
+
+        std::fs::create_dir_all(&config.identity_root).unwrap();
+        std::fs::write(
+            config.identity_root.join("daemon-test-t1.start.lock"),
+            serde_json::to_vec(&StartLockFile {
+                pid: dead_pid,
+                harness: "daemon-test".to_owned(),
+                acquired_at: now_iso8601(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let probe = SystemProcessProbe;
+        let handle = match start_daemon(&config, &probe).unwrap() {
+            DaemonLaunch::Background(handle) => handle,
+            other @ DaemonLaunch::Foreground { .. } => {
+                panic!("background launch must return a handle, got {other:?}")
+            }
+        };
+        assert!(ready_file.exists(), "recovered start must reach readiness");
+        drop(stop_daemon(
+            &handle.identity_path,
+            &probe,
+            &StopOptions::default(),
+        ));
         drop(std::fs::remove_dir_all(&dir));
     }
 
