@@ -355,13 +355,14 @@ fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
 }
 
 /// Resolve what `path` currently is: a symlink (payload = resolved target),
-/// real content, or absent.
+/// real content (carrying the lstat, so later steps can re-verify they act on
+/// the same inode), or absent.
 enum FixedPathState {
     /// Symlink; the caller decides managed vs foreign against the recorded
     /// profile roots.
     Symlink(PathBuf),
-    /// Real file/directory content (not a symlink).
-    RealContent,
+    /// Real file/directory content (not a symlink), with its own metadata.
+    RealContent(std::fs::Metadata),
     /// Nothing at the path.
     Absent,
 }
@@ -384,7 +385,7 @@ fn classify_fixed_path(path: &Path) -> Result<FixedPathState> {
                 };
                 Ok(FixedPathState::Symlink(resolved))
             } else {
-                Ok(FixedPathState::RealContent)
+                Ok(FixedPathState::RealContent(meta))
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FixedPathState::Absent),
@@ -405,6 +406,127 @@ fn is_managed_target(target: &Path, base_dir: &Path, harness: &HarnessId) -> Res
     Ok(load_manifest(base_dir)?
         .iter()
         .any(|record| record.harness == *harness && record.root.as_path() == target))
+}
+
+/// Outcome of reading a real file whose identity must match `expect`.
+enum VerifiedRead {
+    /// Bytes of the very inode `expect` described.
+    Bytes(Vec<u8>),
+    /// The path no longer names the classified inode: a local writer swapped
+    /// it between classification and read.
+    RaceDetected,
+    /// The file exists but cannot be read (e.g. permissions).
+    Unreadable,
+}
+
+/// Read the file at `path` proving it is still the inode `expect` described:
+/// on unix the opened fd's identity must match, so a symlink or replacement
+/// planted after the classify-time refusal is detected instead of read
+/// through. Other platforms keep the plain read (std exposes no file-identity
+/// check there); the window is the documented Windows residual.
+fn read_real_file_verified(path: &Path, expect: &std::fs::Metadata) -> VerifiedRead {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return VerifiedRead::Unreadable;
+        };
+        let Ok(opened) = file.metadata() else {
+            return VerifiedRead::Unreadable;
+        };
+        if opened.dev() != expect.dev() || opened.ino() != expect.ino() {
+            return VerifiedRead::RaceDetected;
+        }
+        let mut bytes = Vec::new();
+        match std::io::Read::read_to_end(&mut file, &mut bytes) {
+            Ok(_) => VerifiedRead::Bytes(bytes),
+            Err(_) => VerifiedRead::Unreadable,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expect;
+        match std::fs::read(path) {
+            Ok(bytes) => VerifiedRead::Bytes(bytes),
+            Err(_) => VerifiedRead::Unreadable,
+        }
+    }
+}
+
+/// Whether `path` still names the inode `expect` described (unix only; other
+/// platforms have no std-visible identity and always "match").
+fn still_same_inode(path: &Path, expect: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(now) => now.dev() == expect.dev() && now.ino() == expect.ino(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expect);
+        true
+    }
+}
+
+/// Read the restored content at `fixed_path` without following a swap-in:
+/// on unix the lstat'd inode must be the inode opened, so verification reads
+/// the file that was restored, never a symlink planted after the rename.
+fn read_restored_bytes(fixed_path: &Path) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let named = std::fs::symlink_metadata(fixed_path).map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: fixed_path.to_path_buf(),
+                source: e,
+            })
+        })?;
+        if named.file_type().is_symlink() {
+            return Err(CoreError::ForeignOwnership {
+                path: fixed_path.to_path_buf(),
+                owner: "restored fixed path became a symlink before verification".to_owned(),
+            });
+        }
+        let mut file = std::fs::File::open(fixed_path).map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: fixed_path.to_path_buf(),
+                source: e,
+            })
+        })?;
+        let opened = file.metadata().map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: fixed_path.to_path_buf(),
+                source: e,
+            })
+        })?;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(CoreError::ConcurrentModification {
+                path: fixed_path.to_path_buf(),
+                expected: "the inode lstat'd after the restore rename".to_owned(),
+                actual: "a different inode was opened".to_owned(),
+            });
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: fixed_path.to_path_buf(),
+                source: e,
+            })
+        })?;
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read(fixed_path).map_err(|e| {
+            CoreError::Config(superai_config::ConfigError::Io {
+                path: fixed_path.to_path_buf(),
+                source: e,
+            })
+        })
+    }
 }
 
 /// Create a profile: a fresh managed tree under the base, marked with the
@@ -534,7 +656,7 @@ fn prepare_fixed_path_for_swap(
             }
             Ok(carried_backup_slot(prior))
         }
-        FixedPathState::RealContent => {
+        FixedPathState::RealContent(meta) => {
             if let Some(swap) = prior {
                 return Err(CoreError::ForeignOwnership {
                     path: fixed_path.to_path_buf(),
@@ -547,15 +669,47 @@ fn prepare_fixed_path_for_swap(
                 });
             }
             let mut digest = None;
-            if fixed_path.is_file()
-                && let Ok(bytes) = std::fs::read(fixed_path)
-            {
-                digest = Some(compute_digest(&bytes));
+            if meta.is_file() {
+                match read_real_file_verified(fixed_path, &meta) {
+                    VerifiedRead::Bytes(bytes) => digest = Some(compute_digest(&bytes)),
+                    VerifiedRead::RaceDetected => {
+                        return Err(CoreError::ForeignOwnership {
+                            path: fixed_path.to_path_buf(),
+                            owner: "fixed path was replaced between classification and \
+                                    backup; the classified content is gone"
+                                .to_owned(),
+                        });
+                    }
+                    VerifiedRead::Unreadable => {}
+                }
             }
             let op = unique_operation_string("profile-swap");
             let entry = superai_config::quarantine::move_to_quarantine_under(base, fixed_path, &op)
                 .map_err(CoreError::Config)?;
-            Ok((Some(entry.quarantine_path), digest))
+            let quarantine_path = entry.quarantine_path;
+            if !entry.recoverable {
+                return Err(CoreError::Verification {
+                    path: quarantine_path,
+                    kind: "backup".to_owned(),
+                    reason: "backup move could not be verified; refusing to swap over it"
+                        .to_owned(),
+                });
+            }
+            // Same-filesystem moves preserve the inode: if the quarantined
+            // entry is not the classified inode, a writer swapped the path
+            // mid-move and the quarantine holds the wrong object.
+            if entry.same_filesystem && !still_same_inode(&quarantine_path, &meta) {
+                let owner = format!(
+                    "fixed path was swapped during the backup move; {} holds the \
+                     replacement, not the classified content",
+                    quarantine_path.display()
+                );
+                return Err(CoreError::ForeignOwnership {
+                    path: quarantine_path,
+                    owner,
+                });
+            }
+            Ok((Some(quarantine_path), digest))
         }
         FixedPathState::Absent => Ok(carried_backup_slot(prior)),
     }
@@ -699,6 +853,10 @@ pub fn activate_profile(
 /// content is foreign and must not be touched), or when the recorded backup
 /// entry has been replaced by a symlink (restoring through it would hand
 /// the fixed path to whatever the link points at).
+#[expect(
+    clippy::too_many_lines,
+    reason = "restore refuses inline, one path per check"
+)]
 pub fn deactivate_profile(
     base_dir: &Path,
     harness: &HarnessId,
@@ -737,7 +895,7 @@ pub fn deactivate_profile(
                 });
             }
         }
-        FixedPathState::RealContent | FixedPathState::Absent => {
+        FixedPathState::RealContent(_) | FixedPathState::Absent => {
             return Err(CoreError::ForeignOwnership {
                 path: fixed_path.to_path_buf(),
                 owner: "fixed path is no longer a superai-managed symlink".to_owned(),
@@ -746,7 +904,10 @@ pub fn deactivate_profile(
     }
     // The quarantine entry is the moved pre-existing content (file or
     // directory tree). Validate it before touching the live link: a symlink
-    // planted at the entry path must refuse the restore outright.
+    // planted at the entry path must refuse the restore outright. The lstat
+    // is kept: after the restore rename the fixed path must still name this
+    // inode (unix), or a writer swapped the entry mid-restore.
+    let mut backup_meta: Option<std::fs::Metadata> = None;
     if let Some(backup) = swap.backup_path.as_deref() {
         let entry = PathBuf::from(backup);
         match std::fs::symlink_metadata(&entry) {
@@ -756,7 +917,7 @@ pub fn deactivate_profile(
                     owner: "recorded backup entry is a symlink; restore refused".to_owned(),
                 });
             }
-            Ok(_) => {}
+            Ok(meta) => backup_meta = Some(meta),
             Err(_) => {
                 return Err(CoreError::Verification {
                     path: entry,
@@ -777,13 +938,17 @@ pub fn deactivate_profile(
             path: fixed_path.to_path_buf(),
             reason: format!("cannot restore backup {}: {e}", entry.display()),
         })?;
+        if let Some(expected) = backup_meta.as_ref()
+            && !still_same_inode(fixed_path, expected)
+        {
+            return Err(CoreError::ConcurrentModification {
+                path: fixed_path.to_path_buf(),
+                expected: "the verified backup inode".to_owned(),
+                actual: "a different inode now sits at the fixed path".to_owned(),
+            });
+        }
         if let Some(expected) = swap.preexisting_digest.as_deref() {
-            let restored_bytes = std::fs::read(fixed_path).map_err(|e| {
-                CoreError::Config(superai_config::ConfigError::Io {
-                    path: fixed_path.to_path_buf(),
-                    source: e,
-                })
-            })?;
+            let restored_bytes = read_restored_bytes(fixed_path)?;
             let actual = compute_digest(&restored_bytes);
             if actual != expected {
                 return Err(CoreError::Verification {
@@ -1432,5 +1597,61 @@ mod tests {
             Some(&serde_json::Value::String("keep-me".to_owned()))
         );
         assert_eq!(list_profiles(&b).unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backup_digest_read_detects_a_swapped_fixed_path() {
+        let dir = crate::test_util::temp_dir_unique("profile-race");
+        let target = dir.join("config");
+        std::fs::write(&target, b"classified bytes").unwrap();
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+
+        // Untouched path: the classified bytes come back.
+        assert!(matches!(
+            read_real_file_verified(&target, &meta),
+            VerifiedRead::Bytes(b) if b == b"classified bytes"
+        ));
+
+        // A replacement file planted after classification is detected, not
+        // read through.
+        let swap = dir.join("intruder");
+        std::fs::write(&swap, b"intruder bytes").unwrap();
+        std::fs::rename(&swap, &target).unwrap();
+        assert!(matches!(
+            read_real_file_verified(&target, &meta),
+            VerifiedRead::RaceDetected
+        ));
+
+        // A symlink planted at the path is detected the same way: the fd
+        // opens the target, whose inode differs from the classified one.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"victim bytes").unwrap();
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+        assert!(matches!(
+            read_real_file_verified(&target, &meta),
+            VerifiedRead::RaceDetected
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_verification_refuses_a_symlink_at_the_restored_path() {
+        let dir = crate::test_util::temp_dir_unique("profile-restore-race");
+        let real = dir.join("real");
+        std::fs::write(&real, b"restored bytes").unwrap();
+        let bytes = read_restored_bytes(&real).unwrap();
+        assert_eq!(bytes, b"restored bytes".to_vec());
+
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = read_restored_bytes(&link).unwrap_err();
+        assert!(
+            format!("{err}").contains("symlink"),
+            "a swap-in at the restored path must refuse verification: {err}"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }
