@@ -706,7 +706,7 @@ mod tests {
         for t in traversals {
             drop(Selector::parse(t));
         }
-        assert!(validate_quarantine_target(std::path::Path::new("/tmp/../etc")).is_err());
+        assert!(validate_quarantine_target(&std::env::temp_dir().join("../etc")).is_err());
         assert!(validate_quarantine_target(std::path::Path::new("relative")).is_err());
     }
 }

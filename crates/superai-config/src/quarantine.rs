@@ -748,10 +748,10 @@ mod tests {
     fn validate_quarantine_rejects_broad_roots_and_globs() {
         validate_quarantine_target(Path::new("/")).unwrap_err();
         validate_quarantine_target(Path::new("/home")).unwrap_err();
-        validate_quarantine_target(Path::new("/tmp/*.json")).unwrap_err();
-        validate_quarantine_target(Path::new("/tmp/$HOME/foo")).unwrap_err();
+        validate_quarantine_target(&std::env::temp_dir().join("*.json")).unwrap_err();
+        validate_quarantine_target(&std::env::temp_dir().join("$HOME/foo")).unwrap_err();
         validate_quarantine_target(Path::new("relative/path")).unwrap_err();
-        validate_quarantine_target(Path::new("/tmp/../etc")).unwrap_err();
+        validate_quarantine_target(&std::env::temp_dir().join("../etc")).unwrap_err();
     }
 
     #[test]

@@ -1634,7 +1634,7 @@ mod tests {
             "HAS-DASH",
             "SP ACE",
         ] {
-            let inst = sample_instance_with_root("/tmp/wrapper-keys");
+            let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("wrapper-keys"));
             let mut set_plan = WrapperPlan::new("test");
             set_plan
                 .env_vars
@@ -1658,7 +1658,7 @@ mod tests {
     /// cmd `"`/`%` doubling inside `set "VAR=..."`.
     #[test]
     fn env_values_are_escaped_per_dialect() {
-        let inst = sample_instance_with_root("/tmp/wrapper-values");
+        let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str("wrapper-values"));
         let tricky = "it's 100% \"quoted\"";
         let mut plan = WrapperPlan::new("test");
         plan.env_vars.push(("NOTE".to_owned(), tricky.to_owned()));

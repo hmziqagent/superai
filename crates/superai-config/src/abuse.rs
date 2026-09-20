@@ -300,17 +300,28 @@ mod tests {
         assert!(err.is_err(), "C:\\Windows should be rejected for removal");
 
         // Globs
-        for p in ["/tmp/*.json", "/var/*.log", "/home/user/[abc]"] {
-            let err = validate_quarantine_target(Path::new(p));
-            assert!(err.is_err(), "glob {p} should be rejected");
+        for p in [
+            std::env::temp_dir().join("*.json"),
+            PathBuf::from("/var/*.log"),
+            PathBuf::from("/home/user/[abc]"),
+        ] {
+            let err = validate_quarantine_target(&p);
+            assert!(err.is_err(), "glob {} should be rejected", p.display());
         }
         // Unresolved variables
-        for p in ["/tmp/$HOME/foo", "/tmp/%USERPROFILE%/bar"] {
-            let err = validate_quarantine_target(Path::new(p));
-            assert!(err.is_err(), "unresolved var {p} should be rejected");
+        for p in [
+            std::env::temp_dir().join("$HOME/foo"),
+            std::env::temp_dir().join("%USERPROFILE%/bar"),
+        ] {
+            let err = validate_quarantine_target(&p);
+            assert!(
+                err.is_err(),
+                "unresolved var {} should be rejected",
+                p.display()
+            );
         }
         // Traversal
-        let err = validate_quarantine_target(Path::new("/tmp/../etc/passwd"));
+        let err = validate_quarantine_target(&std::env::temp_dir().join("../etc/passwd"));
         assert!(err.is_err(), "traversal should be rejected");
 
         // Relative should be rejected
@@ -326,8 +337,8 @@ mod tests {
 
         // A path that itself contains the sentinel is rejected without panic;
         // the error echoes the caller's path, which is unavoidable.
-        let sentinel_path = Path::new("/tmp/sk-superai-test-sentinel-12345-fake");
-        drop(validate_quarantine_target(sentinel_path));
+        let sentinel_path = std::env::temp_dir().join(SENTINEL);
+        drop(validate_quarantine_target(&sentinel_path));
     }
 
     #[test]
@@ -377,8 +388,8 @@ mod tests {
         }
 
         // Also test via quarantine validation which checks shell-like globs? Not shell but similar.
-        let shell_path = Path::new("/tmp/$(rm -rf)/file.json");
-        let err = validate_quarantine_target(shell_path);
+        let shell_path = std::env::temp_dir().join("$(rm -rf)/file.json");
+        let err = validate_quarantine_target(&shell_path);
         assert!(
             err.is_err(),
             "shell metachars path should be rejected via quarantine or path safety"

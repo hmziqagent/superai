@@ -469,11 +469,15 @@ mod tests {
         let dir = home_dir();
         let path = dir.join("j.json");
         let mut journal = CrashJournal::new("op-x", JournalPhase::Commit, vec![]);
+        let resource = std::env::temp_dir()
+            .join("a.json")
+            .to_string_lossy()
+            .into_owned();
         journal.backups.push(JournalBackup {
-            resource: "/tmp/a.json".to_owned(),
+            resource: resource.clone(),
             backup_id: "1-0001".to_owned(),
         });
-        journal.completed.push("/tmp/a.json".to_owned());
+        journal.completed.push(resource);
         journal
             .diagnostics
             .push("sk-REDACTED-marker only".to_owned());

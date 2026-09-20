@@ -1007,12 +1007,20 @@ mod tests {
         SourceDocument::from_bytes(Path::new(path), bytes.to_vec())
     }
 
+    /// Absolute on every platform; `"/tmp/..."` is drive-relative on Windows.
+    fn tmp_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     // DocumentKind detection
 
     #[test]
     fn kind_from_path_json() {
         assert_eq!(
-            DocumentKind::from_path(Path::new("/tmp/settings.json")),
+            DocumentKind::from_path(&std::env::temp_dir().join("settings.json")),
             DocumentKind::StrictJson
         );
     }
@@ -1106,7 +1114,7 @@ mod tests {
 
     #[test]
     fn envelope_empty_file_has_lf_and_no_diagnostics() {
-        let d = doc("/tmp/empty.json", b"");
+        let d = doc(&tmp_path("empty.json"), b"");
         assert!(d.is_empty());
         assert_eq!(d.newline_style, NewlineStyle::Lf);
         assert!(!d.bom);
@@ -1120,7 +1128,7 @@ mod tests {
     fn envelope_detects_bom() {
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(b"{\"a\":1}");
-        let d = doc("/tmp/with_bom.json", &bytes);
+        let d = doc(&tmp_path("with_bom.json"), &bytes);
         assert!(d.bom);
         assert_eq!(d.text(), Some("{\"a\":1}"));
         assert!(d.diagnostics.is_empty());
@@ -1128,13 +1136,13 @@ mod tests {
 
     #[test]
     fn envelope_detects_crlf() {
-        let d = doc("/tmp/a.toml", b"a = 1\r\nb = 2\r\n");
+        let d = doc(&tmp_path("a.toml"), b"a = 1\r\nb = 2\r\n");
         assert_eq!(d.newline_style, NewlineStyle::Crlf);
     }
 
     #[test]
     fn envelope_detects_lf() {
-        let d = doc("/tmp/a.toml", b"a = 1\nb = 2\n");
+        let d = doc(&tmp_path("a.toml"), b"a = 1\nb = 2\n");
         assert_eq!(d.newline_style, NewlineStyle::Lf);
     }
 
@@ -1142,7 +1150,7 @@ mod tests {
     fn envelope_invalid_utf8_is_diagnostic_not_replacement() {
         // 0xFF is never valid UTF-8.
         let bytes = vec![0xFF, 0xFE, b'{'];
-        let d = doc("/tmp/bad.json", &bytes);
+        let d = doc(&tmp_path("bad.json"), &bytes);
         assert!(!d.diagnostics.is_empty());
         assert!(d.text().is_none());
         // Bytes are preserved verbatim.
@@ -1154,9 +1162,10 @@ mod tests {
 
     #[test]
     fn envelope_digest_is_stable_and_changes_with_bytes() {
-        let a = doc("/tmp/a.json", b"{}");
-        let b = doc("/tmp/a.json", b"{}");
-        let c = doc("/tmp/a.json", b"{\"a\":1}");
+        let same_path = tmp_path("a.json");
+        let a = doc(&same_path, b"{}");
+        let b = doc(&same_path, b"{}");
+        let c = doc(&same_path, b"{\"a\":1}");
         assert_eq!(a.digest, b.digest);
         assert_ne!(a.digest, c.digest);
         assert_eq!(a.digest.len(), 16);
@@ -1164,10 +1173,8 @@ mod tests {
 
     #[test]
     fn envelope_load_distinguishes_missing_vs_empty() {
-        let missing = PathBuf::from(format!(
-            "/tmp/superai-doc-test-missing-{}",
-            std::process::id()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("superai-doc-test-missing-{}", std::process::id()));
         drop(std::fs::remove_file(&missing));
         let err = SourceDocument::load(&missing).unwrap_err();
         match err {
@@ -1186,7 +1193,7 @@ mod tests {
     #[test]
     fn envelope_root_shape_is_not_validated_by_envelope() {
         // StrictJson with an array root is allowed at envelope level; adapter decides.
-        let d = doc("/tmp/a.json", b"[1,2,3]");
+        let d = doc(&tmp_path("a.json"), b"[1,2,3]");
         assert_eq!(d.kind, DocumentKind::StrictJson);
         assert!(d.diagnostics.is_empty());
     }
@@ -1194,7 +1201,7 @@ mod tests {
     #[test]
     fn envelope_from_bytes_with_explicit_kind() {
         let d = SourceDocument::from_bytes_with_kind(
-            Path::new("/tmp/unknown.bin"),
+            &std::env::temp_dir().join("unknown.bin"),
             b"hello".to_vec(),
             DocumentKind::Env,
         );
@@ -1358,7 +1365,7 @@ mod tests {
         });
         let _ = Operation::new(EditOperation::EnsureDirEntry {
             selector: Selector::Key("plugins".to_owned()),
-            path: "/tmp/foo".to_owned(),
+            path: tmp_path("foo"),
         });
     }
 

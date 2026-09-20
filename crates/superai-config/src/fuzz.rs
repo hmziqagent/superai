@@ -1182,7 +1182,7 @@ mod tests {
                 _ => gen_random_text_with_bom_and_control(&mut prng),
             };
             assert!(input.len() <= MAX_INPUT_BYTES);
-            let path = PathBuf::from(format!("/tmp/fuzz-doc-{iter}.json"));
+            let path = std::env::temp_dir().join(format!("fuzz-doc-{iter}.json"));
             let _kind = DocumentKind::from_path(&path);
 
             // Envelope creation must not panic
@@ -1222,11 +1222,11 @@ mod tests {
 
             // Ensure doc kind detection doesn't panic on weird extensions
             let weird_paths = [
-                PathBuf::from(format!("/tmp/weird-{iter}.JSON")),
-                PathBuf::from(format!("/tmp/weird-{iter}.Toml")),
-                PathBuf::from(format!("/tmp/weird-{iter}.YaML")),
-                PathBuf::from(format!("/tmp/weird-{iter}")),
-                PathBuf::from(format!("/tmp/.env.{iter}")),
+                std::env::temp_dir().join(format!("weird-{iter}.JSON")),
+                std::env::temp_dir().join(format!("weird-{iter}.Toml")),
+                std::env::temp_dir().join(format!("weird-{iter}.YaML")),
+                std::env::temp_dir().join(format!("weird-{iter}")),
+                std::env::temp_dir().join(format!(".env.{iter}")),
             ];
             for wp in weird_paths {
                 let k = std::panic::catch_unwind(|| DocumentKind::from_path(&wp));
@@ -1485,7 +1485,7 @@ mod tests {
                 DocumentKind::Yaml,
                 DocumentKind::Env,
             ] {
-                let path = PathBuf::from(format!("/tmp/combined-{iter}-{}", kind.as_str()));
+                let path = std::env::temp_dir().join(format!("combined-{iter}-{}", kind.as_str()));
                 let doc = crate::document::SourceDocument::from_bytes_with_kind(
                     &path,
                     input.clone(),

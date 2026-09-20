@@ -2415,19 +2415,20 @@ mod tests {
     #[test]
     fn file_action_sort_is_deterministic() {
         let id = OperationId::new("op-1").unwrap();
+        let base = std::env::temp_dir();
         let mut txn = Transaction::new(
             id,
             vec![
                 FileAction::Write {
-                    path: PathBuf::from("/tmp/b.json"),
+                    path: base.join("b.json"),
                     content: b"{}".to_vec(),
                     kind: DocumentKind::StrictJson,
                 },
                 FileAction::CreateDir {
-                    path: PathBuf::from("/tmp/a"),
+                    path: base.join("a"),
                 },
                 FileAction::Write {
-                    path: PathBuf::from("/tmp/a.json"),
+                    path: base.join("a.json"),
                     content: b"{}".to_vec(),
                     kind: DocumentKind::StrictJson,
                 },
@@ -2437,7 +2438,7 @@ mod tests {
         // CreateDir should come first, then Writes sorted by path
         assert!(matches!(txn.steps[0], FileAction::CreateDir { .. }));
         if let FileAction::Write { path, .. } = &txn.steps[1] {
-            assert_eq!(path, &PathBuf::from("/tmp/a.json"));
+            assert_eq!(path, &base.join("a.json"));
         } else {
             panic!("expected write");
         }
@@ -2446,16 +2447,17 @@ mod tests {
     #[test]
     fn validate_plan_rejects_duplicate_and_traversal() {
         let id = OperationId::new("op-2").unwrap();
+        let dup = std::env::temp_dir().join("dup.json");
         let txn = Transaction::new(
             id.clone(),
             vec![
                 FileAction::Write {
-                    path: PathBuf::from("/tmp/a.json"),
+                    path: dup.clone(),
                     content: b"{}".to_vec(),
                     kind: DocumentKind::StrictJson,
                 },
                 FileAction::Write {
-                    path: PathBuf::from("/tmp/a.json"),
+                    path: dup,
                     content: b"{}".to_vec(),
                     kind: DocumentKind::StrictJson,
                 },
@@ -2466,7 +2468,7 @@ mod tests {
         let txn2 = Transaction::new(
             id,
             vec![FileAction::Write {
-                path: PathBuf::from("/tmp/../etc/passwd"),
+                path: std::env::temp_dir().join("../etc/passwd"),
                 content: b"{}".to_vec(),
                 kind: DocumentKind::StrictJson,
             }],
@@ -2483,7 +2485,10 @@ mod tests {
         let bad2 = RemovePlan::new(RemoveKind::InstanceRoot, Path::new("/"));
         assert!(bad2.is_err());
 
-        let bad3 = RemovePlan::new(RemoveKind::InstanceRoot, Path::new("/tmp/*.json"));
+        let bad3 = RemovePlan::new(
+            RemoveKind::InstanceRoot,
+            &std::env::temp_dir().join("*.json"),
+        );
         assert!(bad3.is_err());
 
         // Absolute paths that are valid on every platform (windows rejects
@@ -2565,6 +2570,8 @@ mod tests {
             Path::new("/tmp/a")
         ));
         // Unix paths stay case-sensitive: differing case is NOT equal.
+        // The drive-less literals are deliberate: a real temp path is
+        // windows-shaped on Windows and would fold this pair to equal.
         assert!(!paths_equal_platform_folded(
             Path::new("/tmp/A"),
             Path::new("/tmp/a")
@@ -4428,14 +4435,15 @@ mod tests {
         // Each forbidden character must trip the guard on its own: a path
         // containing only `?` (no `*`), only `[`, only `$`, only `%`.
         for path in [
-            "/tmp/never?here",
-            "/tmp/never[here]",
-            "/tmp/$VAR",
-            "/tmp/%VAR%",
+            std::env::temp_dir().join("never?here"),
+            std::env::temp_dir().join("never[here]"),
+            std::env::temp_dir().join("$VAR"),
+            std::env::temp_dir().join("%VAR%"),
         ] {
             assert!(
-                validate_remove_target(Path::new(path), RemoveKind::WrapperFile).is_err(),
-                "{path} must be refused"
+                validate_remove_target(&path, RemoveKind::WrapperFile).is_err(),
+                "{} must be refused",
+                path.display()
             );
         }
     }
@@ -5037,19 +5045,23 @@ mod tests {
     /// Plan validation rejects each glob character on its own.
     #[test]
     fn validate_plan_rejects_each_glob_character_alone() {
-        for path in ["/tmp/never?path", "/tmp/never[path]"] {
+        for path in [
+            std::env::temp_dir().join("never?path"),
+            std::env::temp_dir().join("never[path]"),
+        ] {
             let id = OperationId::new("op-glob").unwrap();
             let txn = Transaction::new(
                 id,
                 vec![FileAction::Write {
-                    path: PathBuf::from(path),
+                    path: path.clone(),
                     content: b"x".to_vec(),
                     kind: DocumentKind::TextFragment,
                 }],
             );
             assert!(
                 txn.validate_plan().is_err(),
-                "a plan path containing a glob character must be refused: {path}"
+                "a plan path containing a glob character must be refused: {}",
+                path.display()
             );
         }
     }

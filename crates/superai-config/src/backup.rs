@@ -981,8 +981,8 @@ mod tests {
         let entry = BackupEntry {
             id: BackupId::new("0-0000"),
             operation_id: None,
-            original_path: PathBuf::from("/tmp/fake"),
-            backup_path: PathBuf::from("/tmp/does-not-exist-xyz-123"),
+            original_path: std::env::temp_dir().join("fake"),
+            backup_path: std::env::temp_dir().join("does-not-exist-xyz-123"),
             timestamp_millis: 0,
             suffix: "0000".to_owned(),
             digest: "deadbeefdeadbeef".to_owned(),
