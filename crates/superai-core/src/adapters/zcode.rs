@@ -1,16 +1,8 @@
-//! `ZCode` adapter — fixed path `~/.zcode/v2/config.json`, `SingleInstance`.
-//!
+//! `ZCode` adapter: fixed path `~/.zcode/v2/config.json`, `SingleInstance`
+//! (no relocation env var; one instance; writes back up then mutate in place).
 //! Research source: `docs/harness-configs/zcode.md` (last verified 2026-08-25).
-//! Proprietary Electron app, config fixed at `~/.zcode/v2/config.json` (JSON,
-//! versioned path `v2`), no documented relocation env var, isolation
-//! `fixed_path_single` (single instance, GUI), product status `active`,
-//! support `SingleInstance` read/single.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -21,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `ZCode`.
 pub const HARNESS_ID_STR: &str = "zcode";
@@ -69,11 +57,9 @@ pub struct FixedPathLayout {
     pub harness_root: PathBuf,
 }
 
-/// Resolve the fixed-path activation layout for `home`.
-///
-/// Declaration only: drives [`crate::activation::FixedPathProfileStore`]
-/// generically — the fixed path is the activation target and the harness
-/// root bounds where a profile store may never be placed.
+/// Resolve the fixed-path activation layout for `home`: the fixed path is
+/// the activation target; the harness root bounds where a profile store may
+/// never be placed (drives [`crate::activation::FixedPathProfileStore`]).
 #[must_use]
 pub fn fixed_path_layout(home: &Path) -> FixedPathLayout {
     FixedPathLayout {
@@ -82,16 +68,8 @@ pub fn fixed_path_layout(home: &Path) -> FixedPathLayout {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for `ZCode` (`SingleInstance`).
-///
-/// Config is at fixed `~/.zcode/v2/config.json`. No isolation env var; only
-/// one instance can exist. Reads are single-instance; writes must mutate the
-/// fixed path in place (backed up before every write). Wrappers cannot create
-/// isolated copies.
+/// Concrete adapter for `ZCode` (`SingleInstance`): fixed config, no
+/// isolation env, writes mutate the fixed path in place after backup.
 #[derive(Debug, Clone)]
 pub struct ZcodeAdapter {
     id: HarnessId,
@@ -117,106 +95,6 @@ impl ZcodeAdapter {
     /// Fixed path.
     pub fn fixed_path(&self) -> &str {
         FIXED_CONFIG_PATH
-    }
-
-    /// Try to locate `zcode` binary via PATH.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `zcode --version` with timeout.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve fixed config path `~/.zcode/v2/config.json`.
@@ -256,7 +134,6 @@ impl ZcodeAdapter {
                     }
                 } else {
                     evidence.push(format!("config missing at {}", path.display()));
-                    // Check parent dir exists
                     if let Some(parent) = path.parent()
                         && parent.exists()
                     {
@@ -268,7 +145,6 @@ impl ZcodeAdapter {
                 evidence.push("could not resolve home for fixed path".to_owned());
             }
         }
-        // Check bundle hint on macOS
         if cfg!(target_os = "macos") {
             evidence.push(format!("bundle id hint {BUNDLE_ID}"));
         }
@@ -321,14 +197,14 @@ impl Adapter for ZcodeAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -350,7 +226,6 @@ impl Adapter for ZcodeAdapter {
             (Some(_), Some(_)) => InstallPresence::Present,
             (Some(_), None) => InstallPresence::UnknownVersion,
             (None, _) => {
-                // For fixed-path GUI, config existence alone counts as low confidence present
                 if evidence.iter().any(|e| e.contains("config exists")) {
                     InstallPresence::Present
                 } else {
@@ -359,7 +234,6 @@ impl Adapter for ZcodeAdapter {
             }
         };
 
-        // Version for GUI app may be unknown; treat config existence as low confidence.
         let confidence = match (
             &binary_path,
             evidence.iter().any(|e| e.contains("config exists")),
@@ -369,10 +243,7 @@ impl Adapter for ZcodeAdapter {
             (Some(_), true) | (None, false) => DetectionConfidence::High,
         };
 
-        // If absent (no binary and no config), confidence high.
-        let version_for_result = version;
-
-        DetectionResult::new(present, version_for_result, evidence, confidence)
+        DetectionResult::new(present, version, evidence, confidence)
     }
 
     fn version_resolution(&self) -> VersionResolution {
@@ -388,7 +259,7 @@ impl Adapter for ZcodeAdapter {
             res.notes = notes;
             res
         } else if detection.present == InstallPresence::Present {
-            // Config exists but version unknown — still compatible via fixed-path schema
+            // Config exists with version unknown: still compatible via fixed-path schema.
             let mut res = VersionResolution::new(None, Some(SCHEMA_VERSION_STR.to_owned()), true);
             res.notes = detection.evidence;
             res.notes.push(format!(
@@ -475,7 +346,7 @@ impl Adapter for ZcodeAdapter {
         instance.validate()?;
         // Fixed path: no relocation; wrapper is identity (single instance).
         let mut plan = WrapperPlan::new(
-            "fixed path single instance — no isolation, writes to ~/.zcode/v2/config.json in place",
+            "fixed path single instance: no isolation, writes to ~/.zcode/v2/config.json in place",
         );
         // No env vars; the harness always reads the fixed path.
         plan.description = format!(
@@ -513,9 +384,8 @@ impl Adapter for ZcodeAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: only the object root is verified today — the research doc
-        // marks the full config.json schema Unverified (schema research gate
-        // for the SingleInstance ledger row).
+        // HAD-03: only the object root is verified; the research doc marks
+        // the full schema Unverified (SingleInstance research gate).
         match surface_id {
             "config.json" => Some(SurfaceSchema::new().with_root_shape(RootShape::Object)),
             _ => None,
@@ -611,7 +481,6 @@ mod tests {
         let a = adapter();
         let res = a.version_resolution();
         assert!(!res.notes.is_empty());
-        // Should have schema version if present or unknown otherwise, but notes non-empty.
         if res.detected_version.is_some() {
             assert_eq!(
                 res.schema_version.as_deref(),
@@ -631,7 +500,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = ZcodeAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -740,10 +609,6 @@ mod tests {
         let modes = a.supported_skill_modes();
         assert_eq!(modes, vec![SkillMode::CopySelected]);
     }
-
-    // -------------------------------------------------------------------
-    // HAD-03 surface schema (object root; full schema research-gated)
-    // -------------------------------------------------------------------
 
     #[test]
     fn surface_schema_declares_object_root_only() {

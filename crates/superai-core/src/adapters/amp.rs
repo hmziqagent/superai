@@ -80,11 +80,6 @@ impl AmpAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// API key env var.
-    pub fn api_key_env_var(&self) -> &str {
-        API_KEY_ENV_VAR
-    }
-
     /// Resolve the default config root.
     #[expect(clippy::excessive_nesting, reason = "explicit settings path handling")]
     fn default_config_root() -> Option<PathBuf> {
@@ -503,8 +498,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        API_KEY_ENV_VAR, AmpAdapter, CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR,
-        OWNED_SELECTORS, RESEARCH_DOC,
+        AmpAdapter, CONFIG_ENV_VAR, DISPLAY_NAME, EXECUTABLE, HARNESS_ID_STR, OWNED_SELECTORS,
+        RESEARCH_DOC,
     };
     use crate::adapter::{Adapter, ConfigScope, DocumentKind, ProductStatus, SurfaceOwnership};
     use crate::error::CoreError;
@@ -541,7 +536,6 @@ mod tests {
         assert_eq!(a.display_name(), DISPLAY_NAME);
         assert_eq!(a.executable_name(), EXECUTABLE);
         assert_eq!(a.config_env_var(), CONFIG_ENV_VAR);
-        assert_eq!(a.api_key_env_var(), API_KEY_ENV_VAR);
         assert_eq!(a.product_status(), ProductStatus::Active);
         assert_eq!(a.research_doc_link(), RESEARCH_DOC);
         assert!(!a.last_verified_date().is_empty());

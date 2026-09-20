@@ -1,9 +1,6 @@
-//! SWE-agent adapter — composed YAML via `--config` batch.
-//!
+//! SWE-agent adapter: composed YAML via repeatable `--config`, isolation
+//! `explicit-config`; full for config-run instances, batch orchestration aside.
 //! Research source: `docs/harness-configs/swe-agent.md` (last verified 2026-08-25).
-//! Executable `sweagent`, composed YAML `config/*.yaml` with repeatable `--config`,
-//! plus `SWE_AGENT_CONFIG_ROOT` and `SWE_AGENT_TRAJECTORY_DIR`, isolation `explicit-config`.
-//! Full for config-run instances; batch/Docker orchestration handled separately.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,10 +17,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for SWE-agent.
 pub const HARNESS_ID_STR: &str = "swe-agent";
@@ -70,16 +63,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "environment.deployment",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for SWE-agent.
-///
-/// Isolation is `explicit-config` via composed `--config` flags. The wrapper
-/// sets `--config <instance>/config.yaml` (and may set env vars for
-/// config/trajectory isolation). Batch sharding is a separate orchestration
-/// concern but uses the same config composition.
+/// Concrete adapter for SWE-agent (`explicit-config` via composed `--config`
+/// flags; batch sharding reuses the same composition).
 #[derive(Debug, Clone)]
 pub struct SweAgentAdapter {
     id: HarnessId,
@@ -105,32 +90,6 @@ impl SweAgentAdapter {
     /// Config dir env var.
     pub fn config_dir_env_var(&self) -> &str {
         CONFIG_DIR_ENV_VAR
-    }
-
-    /// Try to locate the `sweagent` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Probe `sweagent --help` / `--version` with a timeout.
@@ -172,53 +131,7 @@ impl SweAgentAdapter {
         } else {
             format!("{stdout} {stderr}")
         };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `sweagent 1.0.0` into `1.0.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
+        super::parse_version_output(&combined)
     }
 
     /// Resolve the default config root (package config dir).
@@ -343,7 +256,7 @@ impl Adapter for SweAgentAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
@@ -522,8 +435,8 @@ impl Adapter for SweAgentAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        // Full for config-run instances (the HAD-09 wave scope). Batch orchestration
-        // itself is out of scope but uses the same composed config mechanism.
+        // Full for config-run instances; batch orchestration is out of scope
+        // but reuses this composed-config mechanism.
         vec![
             ("detect".to_owned(), AdapterSupport::Full),
             ("read_config".to_owned(), AdapterSupport::Full),
@@ -728,7 +641,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = SweAgentAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }

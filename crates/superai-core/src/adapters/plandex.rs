@@ -1,21 +1,8 @@
-//! Plandex adapter — env and server/model-pack config, `Constrained` provider/server scoped.
-//!
+//! Plandex adapter: env-driven providers plus the v2 custom-models JSON
+//! (`~/.plandex-home-v2`), `Constrained` provider/server scoped.
 //! Research source: `docs/harness-configs/plandex.md` (last verified 2026-08-25).
-//! Executable `plandex`, env-driven providers
-//! (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
-//!  `PLANDEX_API_HOST`/`PLANDEX_ENV` plus `PLANDEX_BASE_DIR`/`DATABASE_URL` for
-//!  self-host), custom models JSON `~/.plandex-home-v2/custom-models.json` via
-//!  `plandex models custom`
-//!  (`https://plandex.ai/schemas/models-input.schema.json`, `providers`/`models`/
-//!  `modelPacks`), per-plan roles (`planner`/`coder`/… with temperature/strongModel
-//!  fallbacks), provider precedence + `OpenRouter` failover, isolation `env_only`,
-//!  support `Constrained` (provider/server scoped), product `active`.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -26,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Plandex.
 pub const HARNESS_ID_STR: &str = "plandex";
@@ -61,13 +44,9 @@ pub const SERVER_BASE_DIR_ENV_VAR: &str = "PLANDEX_BASE_DIR";
 /// Database URL (self-host).
 pub const DATABASE_URL_ENV_VAR: &str = "DATABASE_URL";
 
-/// Per-user home directory the v2 CLI keeps its state in. Live-verified
-/// against plandex cli/v2.2.1: the binary materializes `~/.plandex-home-v2/`
-/// (cache/, plandex.log) and its strings carry `.plandex-home-v2` joined with
-/// `projects-v2.json`/`settings-v2.json`/`custom-models.json` — there is NO
-/// relocation env (`PLANDEX_HOME`/`PLANDEX_MODELS_FILE` absent from the
-/// binary) and NO `.config/plandex` or `~/.plandex/models.json` path
-/// (area-5 evidence, `.z-workflow/evidence/live/plandex/`).
+/// Per-user home the v2 CLI keeps its state in. Live cli/v2.2.1 has no
+/// relocation env and no `.config/plandex` or `~/.plandex` path (area-5
+/// live evidence).
 pub const V2_HOME_DIR_HINT: &str = "~/.plandex-home-v2";
 
 /// Custom models JSON file inside the v2 home (created/edited by
@@ -83,12 +62,10 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Constrained note — provider/server scoped.
+/// Constrained note: provider/server scoped.
 pub const CONSTRAINED_NOTE: &str = "env + server/model-pack, provider/server scoped: all-provider state is env-driven (per-instance env switching trivial), custom models JSON per-user-file (provider baseUrl/apiKeyEnvVar/skipAuth), self-hosted servers per-deploy (PLANDEX_API_HOST points CLI at any server), per-plan roles planner/coder/architect/… with modelPacks, direct-provider precedence + OpenRouter failover, self-hosted = everything / Cloud+BYO = custom models on built-in / Cloud integrated = packs of built-in only";
 
-/// Owned selectors for provider/model-pack mutation.
-/// Covers custom JSON top-level `providers`/`models`/`modelPacks` plus role keys
-/// and provider env var names that superai owns.
+/// Owned selectors: custom JSON top-level keys, role keys, provider env names.
 pub const OWNED_SELECTORS: &[&str] = &[
     "providers",
     "models",
@@ -106,15 +83,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "PLANDEX_API_HOST",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Plandex (`Constrained`, `env_only`).
-///
-/// Isolation is `env_only` (provider keys + `PLANDEX_API_HOST` per wrapper).
-/// Custom models JSON is per-user-file via `plandex models custom`; self-hosted
-/// servers are per-deploy with `PLANDEX_BASE_DIR`/`DATABASE_URL`/`PORT`.
 #[derive(Debug, Clone)]
 pub struct PlandexAdapter {
     id: HarnessId,
@@ -147,110 +116,8 @@ impl PlandexAdapter {
         CONSTRAINED_NOTE
     }
 
-    /// Try to locate the `plandex` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `plandex --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `plandex v2.1.0` into `2.1.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the custom models JSON path: `~/.plandex-home-v2/custom-models.json`
-    /// (the real v2 home materialized by plandex cli/v2.2.1; the binary contains
-    /// no `.config/plandex` or `~/.plandex/models.json` path — those legacy
-    /// heuristics matched no live layout).
+    /// Resolve `~/.plandex-home-v2/custom-models.json` (live v2 layout; the
+    /// binary carries no `.config/plandex` or `~/.plandex/models.json` path).
     fn custom_models_path() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -273,7 +140,6 @@ impl PlandexAdapter {
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         evidence.push(format!("constrained: {CONSTRAINED_NOTE}"));
-        // Provider envs
         for var in [
             OPENROUTER_API_KEY_ENV_VAR,
             OPENAI_API_KEY_ENV_VAR,
@@ -326,7 +192,6 @@ impl PlandexAdapter {
             }
             None => evidence.push("could not resolve custom models path (no HOME)".to_owned()),
         }
-        // Provider precedence hint
         evidence.push("direct-provider keys take precedence over OpenRouter; OpenRouter failover when both set".to_owned());
         evidence.push("custom models: self-hosted=everything, Cloud+BYO=custom models on built-in, Cloud integrated=packs of built-in only".to_owned());
     }
@@ -378,14 +243,14 @@ impl Adapter for PlandexAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -411,22 +276,10 @@ impl Adapter for PlandexAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence
-                .iter()
-                .any(|e| e.contains("custom models JSON found")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "custom models JSON found" arm can never fire.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -604,8 +457,7 @@ impl Adapter for PlandexAdapter {
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("env_only via PLANDEX_API_HOST + provider keys, server per-deploy");
-        // Per-instance API host — points CLI at isolated server (self-host per-deploy) or cloud default.
-        // Use a derived localhost URL based on instance name hash for test determinism, or leave to template provider.
+        // A name-derived localhost port keeps wrapper plans deterministic.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "name len < 100, truncation intentional for deterministic port"
@@ -621,11 +473,8 @@ impl Adapter for PlandexAdapter {
             " Wrapper sets {API_HOST_ENV_VAR}=http://localhost:{derived_port} {ENV_ENV_VAR}=production and HOME={} (provider keys via template, custom models JSON at <home>/.plandex-home-v2/custom-models.json, server PLANDEX_BASE_DIR/DATABASE_URL per-deploy, {CONSTRAINED_NOTE})",
             instance.config_root
         );
-        // Isolation: plandex v2 has NO relocation env (live cli/v2.2.1 carries no
-        // PLANDEX_HOME/PLANDEX_MODELS_FILE); its home is HOME-relative
-        // (~/.plandex-home-v2), so per-instance isolation relocates HOME itself
-        // (aider precedent) — custom models land at
-        // <config_root>/.plandex-home-v2/custom-models.json.
+        // v2 has no relocation env (live cli/v2.2.1); isolation relocates HOME
+        // itself, so custom models land under <config_root>/.plandex-home-v2/.
         plan.env_vars
             .push(("HOME".to_owned(), instance.config_root.to_string()));
         Ok(plan)
@@ -655,7 +504,7 @@ impl Adapter for PlandexAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "plandex requires isolation env_only (provider/server scoped), got {other} — {CONSTRAINED_NOTE}"
+                    "plandex requires isolation env_only (provider/server scoped), got {other}: {CONSTRAINED_NOTE}"
                 ),
             }),
         }
@@ -789,7 +638,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = PlandexAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -798,9 +647,8 @@ mod tests {
     fn config_surfaces_include_env_and_custom_models() {
         let a = adapter();
         let surfaces = a.config_surfaces();
-        // env + custom-models + server env + per-plan roles (the legacy
-        // `~/.plandex/models.json` alt surface was removed: the live v2
-        // binary contains no such path).
+        // Four surfaces; the legacy `~/.plandex/models.json` surface is gone
+        // (the live v2 binary contains no such path).
         assert_eq!(surfaces.len(), 4);
         let env = surfaces
             .iter()
@@ -834,11 +682,8 @@ mod tests {
         assert_eq!(server.scope, ConfigScope::SystemManaged);
     }
 
-    /// Custom models live in the REAL v2 home `~/.plandex-home-v2/` (live
-    /// plandex cli/v2.2.1 materialized it; binary strings carry
-    /// `.plandex-home-v2` + `custom-models.json` and no `.config/plandex` /
-    /// `~/.plandex/models.json` path — area-5 evidence,
-    /// `.z-workflow/evidence/live/plandex/`).
+    /// Custom models live in the real v2 home `~/.plandex-home-v2/` (live
+    /// cli/v2.2.1; area-5 evidence); no surface may reference legacy paths.
     #[test]
     fn custom_models_surface_pins_v2_home_layout() {
         let a = adapter();
@@ -866,7 +711,6 @@ mod tests {
             resolver.fallback,
             "~/.plandex-home-v2/custom-models.json (`plandex models custom`, providers/models/modelPacks)"
         );
-        // no surface may reference the legacy heuristic paths
         for surface in a.config_surfaces() {
             for hint in [
                 surface.path_resolver.linux.clone(),
@@ -1024,10 +868,6 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: adopt the on-disk fixture corpus into tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_corpus_validates_secret_free_and_flags_malformed() {

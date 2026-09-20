@@ -1,17 +1,8 @@
-//! Zed ACP adapter — JSON settings with ACP wrapper registrations and MCP.
-//!
+//! Zed ACP adapter: JSON settings.json with ACP wrapper registrations
+//! (`agent_servers.*`) and MCP (`context_servers`); `Constrained`.
 //! Research source: `docs/harness-configs/zed-acp.md` (last verified 2026-08-25).
-//! Executable `zed` (editor) hosting external agents via Agent Client Protocol,
-//! config `~/.config/zed/settings.json` (JSON), keys `agent_servers.*` with
-//! `command`/`args`/`env` for ACP wrappers, `context_servers` / `language_models`
-//! for MCP and models, isolation `ide-user-data` via `--user-data-dir` (wrapped),
-//! constrained with wrapper registrations.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -22,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Zed ACP.
 pub const HARNESS_ID_STR: &str = "zed-acp";
@@ -69,10 +56,6 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// MCP owned selectors.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["context_servers", "agent_servers"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Concrete adapter for Zed ACP.
 #[derive(Debug, Clone)]
 pub struct ZedAcpAdapter {
@@ -94,115 +77,6 @@ impl ZedAcpAdapter {
     /// Executable name.
     pub fn executable_name(&self) -> &str {
         EXECUTABLE
-    }
-
-    #[expect(clippy::unused_self, reason = "adapter uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(sep) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        for dir in path_var.split(sep) {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join(EXECUTABLE_ALT);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if cfg!(windows) {
-                let exe_candidate = Path::new(dir).join(format!("{EXECUTABLE_ALT}.exe"));
-                if exe_candidate.is_file() {
-                    return Some(exe_candidate);
-                }
-            }
-        }
-        None
-    }
-
-    fn probe_version(binary: &Path) -> Option<String> {
-        let owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    #[expect(clippy::excessive_nesting, reason = "version parsing explicit")]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     fn default_settings_path() -> Option<PathBuf> {
@@ -316,14 +190,14 @@ impl Adapter for ZedAcpAdapter {
         let mut evidence = Vec::new();
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("zed"),
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `--version`"));
                         version = Some(v);
@@ -344,19 +218,10 @@ impl Adapter for ZedAcpAdapter {
             (Some(_), None) => InstallPresence::UnknownVersion,
             (None, _) => InstallPresence::Absent,
         };
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence.iter().any(|e| e.contains("settings.json exists")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "settings.json exists" arm can never fire.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
         DetectionResult::new(present, version, evidence, confidence)
     }
@@ -518,7 +383,7 @@ impl Adapter for ZedAcpAdapter {
         instance.validate()?;
         let mut plan =
             WrapperPlan::new("ide-user-data via --user-data-dir with ACP wrapper registrations");
-        // Zed config is under ~/.config/zed; relocate via XDG_CONFIG_HOME style, plus IDE user-data
+        // Config lives under XDG_CONFIG_HOME/zed; IDE data isolates separately.
         plan.env_vars.push((
             "XDG_CONFIG_HOME".to_owned(),
             instance.config_root.to_string(),
@@ -529,7 +394,6 @@ impl Adapter for ZedAcpAdapter {
         plan.args.push(user_data.display().to_string());
         plan.args.push(EXTENSIONS_DIR_FLAG.to_owned());
         plan.args.push(extensions.display().to_string());
-        // Record wrapper registration path for evidence
         let wrapper_marker = Path::new(&instance.config_root.to_string())
             .join("zed")
             .join("settings.json");
@@ -658,10 +522,10 @@ mod tests {
     #[test]
     fn parse_version_ok() {
         assert_eq!(
-            ZedAcpAdapter::parse_version_output("zed 0.192.0").as_deref(),
+            crate::adapters::parse_version_output("zed 0.192.0").as_deref(),
             Some("0.192.0")
         );
-        assert_eq!(ZedAcpAdapter::parse_version_output(""), None);
+        assert_eq!(crate::adapters::parse_version_output(""), None);
     }
 
     #[test]
@@ -745,10 +609,6 @@ mod tests {
         let boxed: Box<dyn Adapter> = Box::new(a);
         assert_eq!(boxed.id().as_str(), HARNESS_ID_STR);
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: on-disk fixture corpus (writable-state surface)
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_populated_loads_with_documented_keys() {

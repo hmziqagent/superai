@@ -1,19 +1,8 @@
-//! Warp adapter — CLI TOML MCP JSON workflows YAML, Linux XDG/profile Constrained.
-//!
+//! Warp adapter: CLI TOML settings, MCP JSON, workflows YAML; Linux XDG
+//! relocation only, `Constrained`.
 //! Research source: `docs/harness-configs/warp.md` (last verified 2026-08-25).
-//! Executable `warp`, Agent CLI `~/.warp_cli/settings.toml` TOML (macOS) and
-//! `~/.config/warp-terminal/cli/settings.toml` XDG on Linux (`$XDG_CONFIG_HOME`),
-//! global `~/.warp/.mcp.json` JSON plus CLI `~/.warp_cli/.mcp.json`, workflows
-//! `~/.warp/workflows/*.yaml` YAML (local) and `${XDG_DATA_HOME:-~/.local/share}/warp-terminal/workflows/`, custom routers
-//! `~/.warp/custom_model_routers/`, themes, `WARP_API_KEY`/`WARP_TUI_DISABLE_AUTOUPDATE`
-//! env, platform-mediated inference (no arbitrary `base_url`), isolation `os_bound`,
-//! support `Constrained` (Linux XDG/profile constrained).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, Arch, ConfigScope, ConfigSurface, DetectionConfidence,
@@ -24,10 +13,6 @@ use crate::error::CoreError;
 use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for Warp.
 pub const HARNESS_ID_STR: &str = "warp";
@@ -59,11 +44,10 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Constrained note — Linux XDG/profile constrained.
+/// Constrained note: Linux XDG/profile constrained.
 pub const CONSTRAINED_NOTE: &str = "CLI TOML `~/.warp_cli/settings.toml` (macOS) vs `~/.config/warp-terminal/cli/settings.toml` (Linux XDG `$XDG_CONFIG_HOME`) plus MCP JSON `~/.warp/.mcp.json` vs `~/.warp_cli/.mcp.json`, workflows YAML `~/.warp/workflows/` vs XDG_DATA_HOME, Linux XDG/profile constrained: no documented WARP_HOME, only CLI XDG isolation documented, app settings/GUI not relocatable, inference platform-mediated (no arbitrary base_url, BYOK billing-only)";
 
-/// Owned selectors for provider/model/mcp mutation inside CLI TOML and MCP JSON.
-/// CLI settings are dotted-section TOML; we own appearance, general, agents, and mcpServers.
+/// Owned selectors inside the CLI TOML (dotted sections) and MCP JSON.
 pub const OWNED_SELECTORS: &[&str] = &[
     "appearance.theme",
     "general.autoupdate_enabled",
@@ -74,17 +58,9 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "custom_model_routers",
 ];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for Warp (`Constrained`, `os_bound`).
-///
-/// Isolation is `os_bound`: Linux CLI honors `$XDG_CONFIG_HOME` for
-/// `~/.config/warp-terminal/cli/settings.toml` and `$XDG_DATA_HOME` for
-/// workflows; macOS `~/.warp_cli/` not XDG-relocatable, and app/GUI
-/// settings/Drive are not portable. `WARP_API_KEY` provides per-instance
-/// credential isolation; no `WARP_HOME` exists.
+/// Concrete adapter for Warp (`Constrained`, `os_bound`): Linux CLI relocates
+/// via XDG env; macOS/app stores are fixed; `WARP_API_KEY` is the per-instance
+/// credential (no `WARP_HOME` exists).
 #[derive(Debug, Clone)]
 pub struct WarpAdapter {
     id: HarnessId,
@@ -107,116 +83,9 @@ impl WarpAdapter {
         EXECUTABLE
     }
 
-    /// API key env var.
-    pub fn api_key_env_var(&self) -> &str {
-        API_KEY_ENV_VAR
-    }
-
     /// Constrained note.
     pub fn constrained_note(&self) -> &str {
         CONSTRAINED_NOTE
-    }
-
-    /// Try to locate the `warp` binary via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for exec in [EXECUTABLE, EXECUTABLE_ALT] {
-            for dir in path_var.split(separator) {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = Path::new(dir).join(exec);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{exec}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe `warp --version` with a timeout, returning the parsed version string if successful.
-    fn probe_version(binary: &Path) -> Option<String> {
-        let binary_owned = binary.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let output = Command::new(&binary_owned)
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            drop(tx.send(output));
-        });
-        let Ok(Ok(output)) = rx.recv_timeout(Duration::from_secs(2)) else {
-            return None;
-        };
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stdout.trim().is_empty() {
-            stderr.into_owned()
-        } else if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("{stdout} {stderr}")
-        };
-        Self::parse_version_output(&combined)
-    }
-
-    /// Parse version output like `warp 1.2.3` into `1.2.3`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Resolve the CLI settings path candidate (macOS `~/.warp_cli/settings.toml` or Linux XDG).
@@ -246,7 +115,6 @@ impl WarpAdapter {
                     .join("settings.toml"),
             )
         } else if cfg!(windows) {
-            // Windows: %LOCALAPPDATA%\warp\Warp\config\cli\settings.toml
             if let Ok(local) = std::env::var("LOCALAPPDATA")
                 && !local.trim().is_empty()
             {
@@ -301,7 +169,6 @@ impl WarpAdapter {
             }
             None => evidence.push("could not resolve CLI settings path (no HOME)".to_owned()),
         }
-        // Global MCP
         let home_opt = std::env::var("HOME")
             .ok()
             .or_else(|| std::env::var("USERPROFILE").ok());
@@ -337,12 +204,10 @@ impl WarpAdapter {
                     evidence.push(format!("CLI .mcp.json missing at {}", p.display()));
                 }
             }
-            // Workflows
             let workflows = PathBuf::from(&home).join(".warp").join("workflows");
             if workflows.exists() {
                 evidence.push(format!("workflows dir present at {}", workflows.display()));
             }
-            // XDG workflows Linux
             let xdg_data = std::env::var(XDG_DATA_HOME_ENV_VAR).ok();
             if let Some(xdg) = xdg_data
                 && !xdg.trim().is_empty()
@@ -376,7 +241,6 @@ impl WarpAdapter {
                     custom_routers.display()
                 ));
             }
-            // Project AGENTS.md / WARP.md
             if Path::new("AGENTS.md").exists() {
                 evidence.push("project AGENTS.md found in cwd".to_owned());
             }
@@ -460,14 +324,14 @@ impl Adapter for WarpAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path(&[EXECUTABLE, EXECUTABLE_ALT]) {
             Some(path) => {
                 evidence.push(format!(
                     "found binary `{}` at {}",
                     EXECUTABLE,
                     path.display()
                 ));
-                match Self::probe_version(&path) {
+                match super::probe_version(&path) {
                     Some(v) => {
                         evidence.push(format!("version `{v}` via `{EXECUTABLE} --version`"));
                         version = Some(v);
@@ -493,22 +357,10 @@ impl Adapter for WarpAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        let confidence = match (
-            &binary_path,
-            &version,
-            evidence
-                .iter()
-                .any(|e| e.contains("CLI settings.toml found")),
-        ) {
-            (Some(_), None, _) => DetectionConfidence::Medium,
-            (None, _, true) => DetectionConfidence::Low,
-            (Some(_), Some(_), _) | (None, _, false) => DetectionConfidence::High,
-        };
-
-        let confidence = if present == InstallPresence::Absent {
-            DetectionConfidence::High
-        } else {
-            confidence
+        // Absent forces High, so the Low "CLI settings.toml found" arm can never fire.
+        let confidence = match (&binary_path, &version) {
+            (Some(_), None) => DetectionConfidence::Medium,
+            (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
         };
 
         DetectionResult::new(present, version, evidence, confidence)
@@ -539,7 +391,7 @@ impl Adapter for WarpAdapter {
             Some("~/.warp_cli/settings.toml (macOS, fixed)"),
             Some("~/.warp_cli/settings.toml (macOS, not XDG)"),
             Some("%LOCALAPPDATA%\\warp\\Warp\\config\\cli\\settings.toml (Windows)"),
-            "~/.warp_cli/settings.toml (macOS) — not XDG relocatable, CLI-only",
+            "~/.warp_cli/settings.toml (macOS): not XDG relocatable, CLI-only",
         );
         let mut cli_mac = ConfigSurface::new(
             "settings.toml (CLI, macOS)",
@@ -613,7 +465,7 @@ impl Adapter for WarpAdapter {
             Some("${XDG_DATA_HOME:-~/.local/share}/warp-terminal/workflows/*.yaml (Linux)"),
             Some("~/.warp/workflows/*.yaml (macOS local workflows)"),
             Some("%APPDATA%\\warp\\Warp\\data\\workflows\\*.yaml (Windows)"),
-            "~/.warp/workflows/*.yaml (local, portable) — also {{repo}}/.warp/workflows/ (repo-scoped)",
+            "~/.warp/workflows/*.yaml (local, portable); also {{repo}}/.warp/workflows/ (repo-scoped)",
         );
         let mut workflows = ConfigSurface::new(
             "workflows (local)",
@@ -667,7 +519,7 @@ impl Adapter for WarpAdapter {
         surfaces.push(themes);
 
         let rules_resolver = PathResolver::fallback_only(
-            "AGENTS.md/WARP.md (project rules, ALL CAPS) — Global Rules are cloud-synced, not files",
+            "AGENTS.md/WARP.md (project rules, ALL CAPS); Global Rules are cloud-synced, not files",
         );
         let mut rules = ConfigSurface::new(
             "AGENTS.md/WARP.md (project rules)",
@@ -754,20 +606,19 @@ impl Adapter for WarpAdapter {
         let mut plan = WrapperPlan::new(
             "os_bound via XDG_CONFIG_HOME/XDG_DATA_HOME + WARP_API_KEY (Linux CLI constrained, app/GUI not relocatable)",
         );
-        // Linux CLI isolation via XDG_CONFIG_HOME — moves settings.toml and CLI .mcp.json
+        // XDG_CONFIG_HOME moves settings.toml and the CLI .mcp.json together.
         let xdg_config = format!("{}/config", instance.config_root);
         let xdg_data = format!("{}/data", instance.config_root);
         plan.env_vars
             .push((XDG_CONFIG_HOME_ENV_VAR.to_owned(), xdg_config.clone()));
         plan.env_vars
             .push((XDG_DATA_HOME_ENV_VAR.to_owned(), xdg_data.clone()));
-        // Per-instance credential
         plan.env_vars.push((
             API_KEY_ENV_VAR.to_owned(),
             format!("{}/api_key", instance.config_root),
         ));
         plan.description = format!(
-            " Wrapper sets {XDG_CONFIG_HOME_ENV_VAR}={xdg_config} {XDG_DATA_HOME_ENV_VAR}={xdg_data} {API_KEY_ENV_VAR}=<per-instance> and execs `{EXECUTABLE}` — Linux CLI XDG relocatable per docs ({CONSTRAINED_NOTE}); macOS ~/Library paths and app settings/Drive not relocatable, project AGENTS.md/WARP.md via cwd"
+            " Wrapper sets {XDG_CONFIG_HOME_ENV_VAR}={xdg_config} {XDG_DATA_HOME_ENV_VAR}={xdg_data} {API_KEY_ENV_VAR}=<per-instance> and execs `{EXECUTABLE}`: Linux CLI XDG relocatable per docs ({CONSTRAINED_NOTE}); macOS ~/Library paths and app settings/Drive not relocatable, project AGENTS.md/WARP.md via cwd"
         );
         Ok(plan)
     }
@@ -799,7 +650,7 @@ impl Adapter for WarpAdapter {
             other => Err(CoreError::Validation {
                 field: "isolation".to_owned(),
                 reason: format!(
-                    "warp requires isolation os_bound (Linux XDG/profile constrained), got {other} — {CONSTRAINED_NOTE}"
+                    "warp requires isolation os_bound (Linux XDG/profile constrained), got {other}: {CONSTRAINED_NOTE}"
                 ),
             }),
         }
@@ -872,7 +723,6 @@ mod tests {
         assert_eq!(a.id().as_str(), HARNESS_ID_STR);
         assert_eq!(a.display_name(), DISPLAY_NAME);
         assert_eq!(a.executable_name(), EXECUTABLE);
-        assert_eq!(a.api_key_env_var(), API_KEY_ENV_VAR);
         assert_eq!(a.product_status(), ProductStatus::Active);
         assert_eq!(a.research_doc_link(), RESEARCH_DOC);
         assert!(!a.last_verified_date().is_empty());
@@ -939,7 +789,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = WarpAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1122,10 +972,6 @@ mod tests {
         assert!(s.contains("link_selected"));
         assert!(s.contains("copy_selected"));
     }
-
-    // -------------------------------------------------------------------
-    // HAD-06: adopt the on-disk fixture corpus into tests
-    // -------------------------------------------------------------------
 
     #[test]
     fn fixture_corpus_validates_secret_free_and_flags_malformed() {

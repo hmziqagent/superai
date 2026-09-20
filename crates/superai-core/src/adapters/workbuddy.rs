@@ -1,13 +1,8 @@
-//! `WorkBuddy` / `CodeBuddy` CLI (cbc) adapter — relocated-root via
-//! `CODEBUDDY_CONFIG_DIR` over the shared `~/.codebuddy` JSON tree.
-//!
+//! `WorkBuddy` / `CodeBuddy` CLI (cbc) adapter: relocated-root via
+//! `CODEBUDDY_CONFIG_DIR` over the shared `~/.codebuddy` JSON tree. The
+//! desktop app is GUI-only: documented, never mutated.
 //! Research source: `docs/harness-configs/workbuddy.md` (verified 2026-09-08;
-//! catalog freshness recorded as of 2026-09-01). `WorkBuddy` is Tencent's
-//! desktop AI agent; the only documented programmatic surface is the shared
-//! `CodeBuddy` CLI (`cbc`, npm `@tencent-ai/codebuddy-code`). Primary writable
-//! surfaces: `models.json`, `settings.json`, `.mcp.json` under the config
-//! root. The desktop app itself is GUI-only and is documented, never
-//! mutated. Isolation is `relocated-root`.
+//! catalog freshness recorded as of 2026-09-01).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,10 +22,6 @@ use crate::ids::HarnessId;
 use crate::instance::Instance;
 use crate::state::{AdapterSupport, InstallPresence, Isolation};
 use superai_config::document::ValueType;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// Harness identifier for `WorkBuddy` / `CodeBuddy` CLI.
 pub const HARNESS_ID_STR: &str = "workbuddy";
@@ -110,15 +101,8 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
 /// individual API key; the settings `apiKeyHelper` sits between them).
 pub const AUTH_ENV_VARS: &[&str] = &["CODEBUDDY_AUTH_TOKEN", "CODEBUDDY_API_KEY"];
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
-/// Concrete adapter for `WorkBuddy` / `CodeBuddy` CLI (cbc).
-///
-/// Isolation is `relocated-root` via `CODEBUDDY_CONFIG_DIR`: the wrapper
-/// points the whole `~/.codebuddy` tree at the instance `config_root` and
-/// execs `cbc`.
+/// Concrete adapter for `WorkBuddy` / `CodeBuddy` CLI (cbc): the wrapper
+/// points the whole `~/.codebuddy` tree at the instance `config_root`.
 #[derive(Debug, Clone)]
 pub struct WorkBuddyAdapter {
     id: HarnessId,
@@ -144,32 +128,6 @@ impl WorkBuddyAdapter {
     /// Config relocation env var.
     pub fn config_env_var(&self) -> &str {
         CONFIG_ENV_VAR
-    }
-
-    /// Try to locate `cbc` (then `codebuddy`) via `PATH`.
-    #[expect(clippy::unused_self, reason = "adapter method uses instance constants")]
-    #[expect(clippy::excessive_nesting, reason = "PATH scan branches are explicit")]
-    fn find_binary_in_path(&self) -> Option<PathBuf> {
-        let path_var = std::env::var("PATH").ok()?;
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
-            if dir.is_empty() {
-                continue;
-            }
-            for executable in [EXECUTABLE, ALT_EXECUTABLE] {
-                let candidate = Path::new(dir).join(executable);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if cfg!(windows) {
-                    let exe_candidate = Path::new(dir).join(format!("{executable}.exe"));
-                    if exe_candidate.is_file() {
-                        return Some(exe_candidate);
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Run `binary` with `args` and a timeout, returning combined
@@ -210,7 +168,7 @@ impl WorkBuddyAdapter {
     /// output format is UNVERIFIED (workbuddy.md §7), so this is best-effort
     /// and detection falls back to npm package metadata.
     fn probe_binary_version(binary: &Path) -> Option<String> {
-        Self::parse_version_output(&Self::run_with_timeout(binary, &["--version"])?)
+        super::parse_version_output(&Self::run_with_timeout(binary, &["--version"])?)
     }
 
     /// Probe npm global metadata for the installed package version (the
@@ -238,53 +196,6 @@ impl WorkBuddyAdapter {
         } else {
             None
         }
-    }
-
-    /// Parse version output like `cbc 2.147.0` or
-    /// `@tencent-ai/codebuddy-code 2.147.0` into `2.147.0`.
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "version parsing branches are explicit"
-    )]
-    fn parse_version_output(output: &str) -> Option<String> {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for token in trimmed.split_whitespace() {
-            let mut candidate = token;
-            if let Some(stripped) = candidate.strip_prefix('v') {
-                candidate = stripped;
-            } else if let Some(stripped) = candidate.strip_prefix('V') {
-                candidate = stripped;
-            }
-            let cleaned = candidate.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if cleaned.is_empty() {
-                continue;
-            }
-            let has_dot = cleaned.contains('.');
-            let starts_digit = cleaned.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if has_dot && starts_digit {
-                let is_version_like = cleaned
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-                if is_version_like {
-                    return Some(cleaned.to_owned());
-                }
-                let mut version_part = String::new();
-                for ch in cleaned.chars() {
-                    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+' {
-                        version_part.push(ch);
-                    } else {
-                        break;
-                    }
-                }
-                if version_part.contains('.') && !version_part.is_empty() {
-                    return Some(version_part);
-                }
-            }
-        }
-        None
     }
 
     /// Parse a `major.minor.patch` triple from a version string.
@@ -453,7 +364,7 @@ impl Adapter for WorkBuddyAdapter {
         let mut version: Option<String> = None;
         let mut binary_path: Option<PathBuf> = None;
 
-        match self.find_binary_in_path() {
+        match super::find_in_path_dir_first(&[EXECUTABLE, ALT_EXECUTABLE]) {
             Some(path) => {
                 let name = path.file_name().map_or_else(
                     || EXECUTABLE.to_owned(),
@@ -571,8 +482,8 @@ impl Adapter for WorkBuddyAdapter {
         models.restart_behavior = RestartBehavior::Restart;
         surfaces.push(models);
 
-        // User-scope settings (strict JSON; schema only partially published —
-        // unmodelled keys must be preserved verbatim on write-back).
+        // User-scope settings: schema only partially published, so
+        // unmodelled keys must survive write-back verbatim.
         let settings_resolver = PathResolver::new(
             Some("$CODEBUDDY_CONFIG_DIR/settings.json"),
             Some("$CODEBUDDY_CONFIG_DIR/settings.json"),
@@ -595,10 +506,8 @@ impl Adapter for WorkBuddyAdapter {
         settings.restart_behavior = RestartBehavior::Restart;
         surfaces.push(settings);
 
-        // User-scope MCP config. The document format is JSONC-tolerant
-        // (comments + trailing commas allowed); canonical writes are strict
-        // JSON, which is a valid JSONC subset — same treatment as
-        // claude-code's `.mcp.json`.
+        // User-scope MCP config: the on-disk format is JSONC-tolerant;
+        // canonical writes are strict JSON, a valid JSONC subset.
         let mcp_resolver = PathResolver::new(
             Some("$CODEBUDDY_CONFIG_DIR/.mcp.json"),
             Some("$CODEBUDDY_CONFIG_DIR/.mcp.json"),
@@ -665,10 +574,9 @@ impl Adapter for WorkBuddyAdapter {
         project_mcp.backup_required = false;
         surfaces.push(project_mcp);
 
-        // Deprecated MCP locations (first-existing wins per scope; kept
-        // modelled so scans and mirrors see them, never preferred). The
-        // `~/.codebuddy/*` pair is user scope; the bare project `mcp.json`
-        // is project scope (workbuddy.md §1.1).
+        // Deprecated MCP locations: kept modelled so scans/mirrors see them,
+        // never preferred; the `~/.codebuddy/*` pair is user scope, the bare
+        // project `mcp.json` project scope (workbuddy.md §1.1).
         for (id, name, precedence, scope) in [
             (
                 "deprecated.user.mcp.json",
@@ -840,12 +748,9 @@ impl Adapter for WorkBuddyAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 root shape + owned-key semantics per workbuddy.md §1.
-        // Rules fire only when the key is present; unmodelled keys are
-        // preserved untouched by design (the settings schema is only
-        // partially published). Note: models.json token caps are documented
-        // as numbers but Tencent's bench preset writes `${ENV}` strings, so
-        // no type rule is declared for them — both eras are legal.
+        // HAD-03 per workbuddy.md §1: rules fire only on present keys;
+        // token caps carry no type rule (Tencent bench presets write `${ENV}`
+        // strings, the docs say numbers, both legal).
         match surface_id {
             "models.json" => Some(
                 SurfaceSchema::new()
@@ -919,7 +824,7 @@ impl Adapter for WorkBuddyAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination — WRITABLE `.mcp.json` under the config
+    /// EXT-08/09: MCP destination: WRITABLE `.mcp.json` under the config
     /// root (also manageable via `cbc mcp add/add-json/remove`); canonical
     /// writes are strict JSON, a valid JSONC subset.
     fn mcp_decl(&self) -> Option<McpAdapterDecl> {
@@ -1051,7 +956,7 @@ mod tests {
             ("not a version", None),
         ];
         for (input, expected) in cases {
-            let got = WorkBuddyAdapter::parse_version_output(input);
+            let got = crate::adapters::parse_version_output(input);
             assert_eq!(got.as_deref(), expected, "input: {input:?}");
         }
     }
@@ -1109,9 +1014,7 @@ mod tests {
         assert_eq!(mcp.kind, DocumentKind::Json);
         assert_eq!(mcp.owned_selectors, vec!["mcpServers".to_owned()]);
 
-        // Deprecated locations and the keychain stay modelled but secondary;
-        // the bare project `mcp.json` is project scope, the `~/.codebuddy/*`
-        // pair user scope (workbuddy.md §1.1).
+        // Deprecated locations and the keychain stay modelled but secondary.
         let deprecated_project = surfaces
             .iter()
             .find(|s| s.id == "deprecated.project.mcp.json")
@@ -1462,9 +1365,8 @@ mod tests {
             );
             seen.push(decl.capability);
         }
-        // Every catalog capability is claimed exactly once, including the
-        // deny-list-named tools (WebSearch, ComputerUse) and the
-        // supportsImages-driven image path (Vision).
+        // Every capability is claimed exactly once, deny-list-named tools
+        // included.
         for capability in [
             Capability::Mcp,
             Capability::WebSearch,
@@ -1762,7 +1664,7 @@ mod tests {
     #[test]
     fn fixture_version_txt_parses_via_npm_metadata_shape() {
         let text = std::fs::read_to_string(fixture_path("version.txt")).unwrap();
-        let version = WorkBuddyAdapter::parse_version_output(&text);
+        let version = crate::adapters::parse_version_output(&text);
         assert_eq!(version.as_deref(), Some("2.147.0"));
         assert!(WorkBuddyAdapter::is_auto_compact_window_era(
             &version.unwrap()
