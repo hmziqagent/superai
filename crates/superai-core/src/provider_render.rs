@@ -901,16 +901,40 @@ fn target_surface(adapter: &dyn Adapter) -> Result<(ConfigSurface, RenderStrateg
         })
 }
 
-fn describe_value(value: Option<&Value>) -> String {
+/// Selector names that carry provider secrets. Field semantics decide
+/// redaction; the `sk-` value shape is only a backstop.
+fn is_secret_selector(selector: &str) -> bool {
+    let lower = selector.to_ascii_lowercase();
+    [
+        "api_key", "apikey", "api-key", "secret", "token", "password", "passwd", "auth", "bearer",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
+}
+
+/// Secret-bearing fields display set-ness and length only, never the value.
+fn secret_display(value: &Value) -> String {
     match value {
-        Some(Value::String(s)) => {
-            if s.contains("sk-") {
-                crate::error::RedactedString::placeholder().to_owned()
+        Value::String(s) => format!("[REDACTED len={}]", s.chars().count()),
+        _ => "[REDACTED]".to_owned(),
+    }
+}
+
+fn describe_field(selector: &str, value: Option<&Value>) -> String {
+    match value {
+        Some(v) => {
+            if is_secret_selector(selector) {
+                secret_display(v)
+            } else if let Value::String(s) = v {
+                if s.contains("sk-") {
+                    crate::error::RedactedString::placeholder().to_owned()
+                } else {
+                    s.clone()
+                }
             } else {
-                s.clone()
+                format!("{v}")
             }
         }
-        Some(other) => format!("{other}"),
         None => "(absent)".to_owned(),
     }
 }
@@ -962,8 +986,8 @@ fn plan_change(
         let before = read_selector(selector);
         edits.push(format!(
             "{selector}: {} -> {}",
-            describe_value(before.as_ref()),
-            describe_value(Some(&value))
+            describe_field(selector, before.as_ref()),
+            describe_field(selector, Some(&value))
         ));
         ops.push(set_op(selector, value, owned_keys.to_vec()));
     };
@@ -1083,7 +1107,7 @@ fn plan_change(
                     if lower.contains("base_url") {
                         edits.push(format!(
                             "{sel}: {} -> (removed)",
-                            describe_value(read_selector(sel).as_ref())
+                            describe_field(sel, read_selector(sel).as_ref())
                         ));
                         ops.push(remove_op(sel, owned_keys.clone()));
                     }
@@ -1091,13 +1115,13 @@ fn plan_change(
             } else if strategy == RenderStrategy::ProviderOptions {
                 edits.push(format!(
                     "provider: {} -> (removed)",
-                    describe_value(read_selector("provider").as_ref())
+                    describe_field("provider", read_selector("provider").as_ref())
                 ));
                 ops.push(remove_op("provider", owned_keys.clone()));
                 if owned("options") {
                     edits.push(format!(
                         "options: {} -> (removed)",
-                        describe_value(read_selector("options").as_ref())
+                        describe_field("options", read_selector("options").as_ref())
                     ));
                     ops.push(remove_op("options", owned_keys));
                 }
@@ -1137,14 +1161,16 @@ fn plan_change(
                                 };
                                 edits.push(format!(
                                     "{selector}: {} -> {}",
-                                    describe_value(value.as_ref()),
-                                    describe_value(Some(&new_value))
+                                    describe_field(selector, value.as_ref()),
+                                    describe_field(selector, Some(&new_value))
                                 ));
                                 ops.push(set_op(selector, new_value, owned_keys.clone()));
                             }
                             None => {
-                                dangling
-                                    .push(format!("{selector}={}", describe_value(value.as_ref())));
+                                dangling.push(format!(
+                                    "{selector}={}",
+                                    describe_field(selector, value.as_ref())
+                                ));
                             }
                         }
                     }
@@ -1958,6 +1984,35 @@ mod tests {
             Some("glm")
         );
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Redaction is decided by field semantics: a secret-typed selector
+    /// shows set-ness and length only, in any key format (ghp_, xoxb-,
+    /// raw tokens), not just the `sk-` shape.
+    #[test]
+    fn previews_redact_secret_typed_fields_by_selector() {
+        assert!(is_secret_selector("env.ANTHROPIC_AUTH_TOKEN"));
+        assert!(is_secret_selector("api_key"));
+        assert!(is_secret_selector("providers.glm.api_key"));
+        assert!(!is_secret_selector("model"));
+        assert!(!is_secret_selector("base_url"));
+
+        let ghp = Value::String("ghp_16charssecretvalue".to_owned());
+        let shown = describe_field("env.GITHUB_TOKEN", Some(&ghp));
+        assert!(shown.contains("[REDACTED len="), "shown: {shown}");
+        assert!(!shown.contains("ghp_"), "token leaked: {shown}");
+        let xoxb = Value::String("xoxb-secret-slack-token".to_owned());
+        assert!(!describe_field("api_key", Some(&xoxb)).contains("xoxb-"));
+        // Non-secret fields keep showing their values.
+        assert_eq!(
+            describe_field("model", Some(&Value::String("glm-4".to_owned()))),
+            "glm-4"
+        );
+        // Absent stays "(absent)" even for secret fields.
+        assert_eq!(describe_field("api_key", None), "(absent)");
+        // The sk- shape stays redacted even under an innocent selector.
+        let sk = Value::String("sk-live-abc123".to_owned());
+        assert!(!describe_field("model", Some(&sk)).contains("sk-live-abc123"));
     }
 
     #[test]

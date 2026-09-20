@@ -332,6 +332,38 @@ fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
+/// Move a tree into quarantine (recoverable). A cross-device quarantine
+/// target cannot be renamed into, so the tree is deleted there instead.
+fn move_tree_to_quarantine(dir: &Path, op_id: &str) -> Result<()> {
+    let quarantine_dest =
+        superai_config::quarantine::quarantine_dir(op_id).map_err(|e| CoreError::InvalidPath {
+            kind: "quarantine".to_owned(),
+            value: op_id.to_owned(),
+            reason: format!("quarantine path failed: {e}"),
+        })?;
+    drop(std::fs::create_dir_all(
+        superai_config::quarantine::quarantine_base().map_err(|e| CoreError::InvalidPath {
+            kind: "quarantine".to_owned(),
+            value: "quarantine_base".to_owned(),
+            reason: format!("{e}"),
+        })?,
+    ));
+    match std::fs::rename(dir, &quarantine_dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => std::fs::remove_dir_all(dir)
+            .map_err(|err| CoreError::InvalidPath {
+                kind: "quarantine".to_owned(),
+                value: dir.display().to_string(),
+                reason: format!("cannot quarantine ({e}) or remove dir: {err}"),
+            }),
+        Err(e) => Err(CoreError::InvalidPath {
+            kind: "quarantine".to_owned(),
+            value: dir.display().to_string(),
+            reason: format!("cannot move dir to quarantine: {e}"),
+        }),
+    }
+}
+
 /// Validate a fetch URL: HTTPS only, no shell metachars, no traversal, no control chars.
 pub fn validate_fetch_url(url: &str) -> Result<()> {
     if url.trim().is_empty() {
@@ -1889,41 +1921,7 @@ impl SkillRegistry {
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis())
             );
-            let quarantine_dest =
-                superai_config::quarantine::quarantine_dir(&op_id_str).map_err(|e| {
-                    CoreError::InvalidPath {
-                        kind: "quarantine".to_owned(),
-                        value: op_id_str.clone(),
-                        reason: format!("quarantine path failed: {e}"),
-                    }
-                })?;
-            drop(std::fs::create_dir_all(
-                superai_config::quarantine::quarantine_base().map_err(|e| {
-                    CoreError::InvalidPath {
-                        kind: "quarantine".to_owned(),
-                        value: "quarantine_base".to_owned(),
-                        reason: format!("{e}"),
-                    }
-                })?,
-            ));
-            match std::fs::rename(&skill_dir, &quarantine_dest) {
-                Ok(()) => {}
-                // Cross-device quarantine targets cannot be renamed into.
-                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                    std::fs::remove_dir_all(&skill_dir).map_err(|err| CoreError::InvalidPath {
-                        kind: "skill_remove".to_owned(),
-                        value: skill_dir.display().to_string(),
-                        reason: format!("cannot quarantine ({e}) or remove skill dir: {err}"),
-                    })?;
-                }
-                Err(e) => {
-                    return Err(CoreError::InvalidPath {
-                        kind: "skill_remove".to_owned(),
-                        value: skill_dir.display().to_string(),
-                        reason: format!("cannot move skill dir to quarantine: {e}"),
-                    });
-                }
-            }
+            move_tree_to_quarantine(&skill_dir, &op_id_str)?;
             let prov_dir = self.root.join(PROVENANCE_DIR_NAME).join(skill_id.as_str());
             if prov_dir.exists() {
                 drop(std::fs::remove_dir_all(&prov_dir));
@@ -2245,6 +2243,7 @@ pub fn apply_skill_mode(
                     });
                 }
                 let src_digest = compute_skill_digest(&src_dir)?;
+                let mut owned_dest = false;
                 if dest_dir.exists() {
                     let meta = std::fs::symlink_metadata(&dest_dir).map_err(|e| {
                         CoreError::InvalidPath {
@@ -2271,15 +2270,32 @@ pub fn apply_skill_mode(
                     if let Some(provenance) =
                         load_provenance(&registry.root, skill_id, instance_skills_dir)
                         && meta.is_dir()
-                        && check_drift(&provenance, registry, &dest_dir)?
-                            == DriftStatus::LocallyModified
                     {
-                        return Err(CoreError::ConcurrentModification {
-                            path: dest_dir.clone(),
-                            expected: provenance.dest_digest_at_copy,
-                            actual: compute_skill_digest(&dest_dir)?,
-                        });
+                        if check_drift(&provenance, registry, &dest_dir)?
+                            == DriftStatus::LocallyModified
+                        {
+                            return Err(CoreError::ConcurrentModification {
+                                path: dest_dir.clone(),
+                                expected: provenance.dest_digest_at_copy,
+                                actual: compute_skill_digest(&dest_dir)?,
+                            });
+                        }
+                        // The provenance proves every file under the
+                        // destination is our own copy; clearing it wholesale
+                        // is what keeps files dropped by the new source
+                        // version from lingering as stale skill content.
+                        owned_dest = true;
                     }
+                }
+                if owned_dest {
+                    let quarantine_op = format!(
+                        "skill-recopy-{}-{}",
+                        skill_id.as_str(),
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis())
+                    );
+                    move_tree_to_quarantine(&dest_dir, &quarantine_op)?;
                 }
                 let mut all_src: Vec<PathBuf> = Vec::new();
                 collect_files_recursive(&src_dir, &mut all_src)?;
@@ -4290,6 +4306,68 @@ mod tests {
         drop(std::fs::remove_dir_all(&src_parent));
         drop(std::fs::remove_dir_all(&instance_dir));
         drop(std::fs::remove_dir_all(&instance_dir2));
+    }
+
+    /// Re-copying an owned destination clears files the new source version
+    /// dropped; foreign siblings outside the skill directory stay put.
+    #[test]
+    fn copy_selected_recopy_removes_stale_files_from_owned_dest() {
+        let root = unique_root("recopy_root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let src_parent = unique_root("recopy_src");
+        std::fs::create_dir_all(&src_parent).unwrap();
+        let src = make_skill_dir(&src_parent, "recopy-skill");
+        // v1 carries a helper file that v2 will drop.
+        std::fs::write(src.join("helper.js"), "// old helper").unwrap();
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let rec = reg
+            .install_skill(&SkillSource::local_dir(src.to_str().unwrap()), true)
+            .unwrap();
+        let instance_dir = unique_root("recopy_instance");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        std::fs::write(instance_dir.join("foreign.txt"), "keep").unwrap();
+        let adapter = adapter_full();
+        let id = rec.id;
+        apply_skill_mode(
+            &reg,
+            &instance_dir,
+            SkillMode::CopySelected,
+            &[id.clone()],
+            &adapter,
+        )
+        .unwrap();
+        let dest = instance_dir.join("recopy-skill");
+        assert!(dest.join("SKILL.md").exists());
+        assert!(dest.join("helper.js").exists(), "v1 helper must land first");
+
+        // v2: the source drops the helper and edits the manifest.
+        drop(std::fs::remove_file(
+            root.join("recopy-skill").join("helper.js"),
+        ));
+        write_skill_md(&root.join("recopy-skill"), "recopy-skill", "v2 description");
+        let reg2 = SkillRegistry::load(&root).unwrap();
+        apply_skill_mode(
+            &reg2,
+            &instance_dir,
+            SkillMode::CopySelected,
+            &[id],
+            &adapter,
+        )
+        .unwrap();
+        assert!(
+            !dest.join("helper.js").exists(),
+            "stale file from the previous version must be cleared"
+        );
+        assert!(dest.join("SKILL.md").exists());
+        assert!(
+            instance_dir.join("foreign.txt").exists(),
+            "foreign sibling must survive the owned-set clearing"
+        );
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&src_parent));
+        drop(std::fs::remove_dir_all(&instance_dir));
     }
 
     #[test]
