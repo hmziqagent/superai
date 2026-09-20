@@ -208,8 +208,8 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
         });
     }
     // QAL-11: the URL host itself must not be private or loopback.
-    if let Some(host) = extract_host(url)
-        && is_private_host(&host)
+    if let Some(host) = crate::registry::extract_host(url)
+        && crate::registry::is_private_host(&host)
     {
         return Err(TemplateFetchError::InvalidUrl {
             template: context.to_owned(),
@@ -229,88 +229,6 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
 fn has_parent_component(path: &Path) -> bool {
     path.components()
         .any(|comp| matches!(comp, std::path::Component::ParentDir))
-}
-
-/// Host of an https URL, lowercased. Strips userinfo (`user@`) and unwraps
-/// bracketed IPv6 literals (`[::1]:8443` -> `::1`), both of which otherwise
-/// hide the real host from the private-range check. The authority ends at
-/// the first '/', '?', '#', or '\' (WHATWG special schemes treat '\' like
-/// '/'); anything before that is host, not decoy.
-fn extract_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
-    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let host_port = rest.get(0..end)?;
-    let host_port = host_port.rsplit('@').next().unwrap_or_default();
-    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or_default()
-    } else {
-        host_port.split(':').next().unwrap_or_default()
-    };
-    Some(host.to_ascii_lowercase())
-}
-
-/// True for a dotted-IPv4-shaped literal in private/loopback/link-local
-/// space, including `inet_aton` shorthands (`127.1`, `2130706433`).
-fn is_private_v4_literal(h: &str) -> bool {
-    // Digits and dots only is an IP literal in some inet_aton spelling,
-    // never a real domain; judge it by its leading octet (or u32 form).
-    if h.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        let lead = if h.contains('.') {
-            h.split('.')
-                .find(|s| !s.is_empty())
-                .unwrap_or_default()
-                .parse::<u32>()
-                .unwrap_or(u32::MAX)
-        } else {
-            h.parse::<u32>().map_or(u32::MAX, |v| v >> 24)
-        };
-        if matches!(lead, 0 | 10 | 127) {
-            return true;
-        }
-    }
-    if h.starts_with("10.") || h.starts_with("192.168.") || h.starts_with("169.254.") {
-        return true;
-    }
-    if h.starts_with("172.") {
-        let second = h.split('.').nth(1).unwrap_or_default();
-        return second.parse::<u8>().is_ok_and(|v| (16..=31).contains(&v));
-    }
-    false
-}
-
-/// True for hosts a fetch must never reach: loopback, link-local, and
-/// RFC1918 space, including `inet_aton` shorthands and IPv6 literals
-/// (loopback `::1`, unspecified `::`, link-local `fe80::/10`,
-/// unique-local `fc00::/7`, and v4-mapped forms judged by their embedded
-/// v4 address).
-fn is_private_host(host: &str) -> bool {
-    // A trailing dot is the DNS root label: "localhost." is localhost.
-    let h = host.to_ascii_lowercase();
-    let h = h.trim_end_matches('.');
-    if h == "localhost" || h.is_empty() {
-        return true;
-    }
-    if h.contains(':') {
-        if h == "::1" || h == "::" {
-            return true;
-        }
-        let first_group = h.split(':').next().unwrap_or_default();
-        if first_group.starts_with("fe8")
-            || first_group.starts_with("fe9")
-            || first_group.starts_with("fea")
-            || first_group.starts_with("feb")
-            || first_group.starts_with("fc")
-            || first_group.starts_with("fd")
-        {
-            return true;
-        }
-        // v4-mapped (::ffff:a.b.c.d): judge the embedded address.
-        if let Some(v4) = h.strip_prefix("::ffff:") {
-            return is_private_v4_literal(v4);
-        }
-        return false;
-    }
-    is_private_v4_literal(h)
 }
 
 // Core fetch: bytes with limits
@@ -777,15 +695,15 @@ mod tests {
             "https://169.254.169.254#@api.example.com/catalog.json",
             "https://127.0.0.1\\@x.example.com/catalog.json",
             "https://169.254.169.254\\@api.example.com/catalog.json",
-            // Extra scheme slashes are skipped by the url crate; the empty
-            // host here is private, so the gate refuses.
+            // Extra scheme slashes leave an empty host, which the gate
+            // counts as private and refuses.
             "https:///127.0.0.1/catalog.json",
             "https://\\127.0.0.1/catalog.json",
         ] {
             let err = validate_fetch_url(url, "catalog").unwrap_err();
             assert!(err.to_string().contains("private"), "{url}: {err}");
         }
-        // The url crate strips tabs before parsing; the gate rejects
+        // Real parsers strip tabs before host parsing; the gate rejects
         // control chars before extraction instead.
         let tab_err =
             validate_fetch_url("https://127.0.0.1\t?@x.example.com/catalog.json", "catalog")
@@ -913,13 +831,7 @@ mod tests {
         let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
         std::fs::write(dir.join("catalog.json"), &catalog_bytes).unwrap();
 
-        let config = TemplateRepoConfig {
-            host: "example.com".to_owned(),
-            owner: "owner".to_owned(),
-            repo: "repo".to_owned(),
-            git_ref: "main".to_owned(),
-            base_url: Some(format!("file://{}", dir.display())),
-        };
+        let config = TemplateRepoConfig::for_local_tests(&dir);
         let fetched_catalog = fetch_catalog(&config).unwrap();
         assert_eq!(fetched_catalog, catalog);
 

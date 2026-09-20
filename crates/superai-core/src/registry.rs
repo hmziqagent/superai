@@ -82,6 +82,217 @@ pub(crate) fn now_iso8601() -> String {
     unix_secs_to_rfc3339(secs)
 }
 
+// SSRF gate, shared by template_fetch, health, and skills fetch. One home so
+// a new bypass spelling is fixed once, not per copy.
+
+/// Host of an http(s) URL, lowercased. Strips userinfo (`user:pass@`) and
+/// unwraps bracketed IPv6 literals (`[::1]:8443` -> `::1`), the forms that
+/// otherwise hide the real host from the private-range check. The authority
+/// ends at the first '/', '?', '#', or '\' (WHATWG special schemes treat '\'
+/// like '/'); anything before that is host, not decoy.
+pub(crate) fn extract_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let host_port = rest.get(0..end)?;
+    let host_port = host_port.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// True for hosts a fetch must never reach: `localhost`, empty, loopback,
+/// link-local, and RFC1918 space in every `inet_aton` spelling (dotted,
+/// hex, octal, and bare-u32 forms), and IPv6 literals judged numerically
+/// (unspecified, loopback, link-local, unique-local, and v4-mapped or
+/// v4-compatible tails judged by the embedded v4 address).
+pub(crate) fn is_private_host(host: &str) -> bool {
+    // A trailing dot is the DNS root label: "localhost." is localhost.
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h == "localhost" || h.is_empty() {
+        return true;
+    }
+    if h.contains(':') {
+        // A colon host is an IPv6 literal; anything unparseable is refused
+        // rather than guessed at (no real parser would dial it).
+        return parse_ipv6(h).is_none_or(is_private_v6);
+    }
+    is_private_v4_literal(h)
+}
+
+/// Dotted-IPv4-shaped literal in private/loopback/link-local space. Parses
+/// `inet_aton` forms numerically; unparseable dotted shapes fall back to
+/// the textual prefixes so coverage never widens.
+fn is_private_v4_literal(h: &str) -> bool {
+    if let Some(v) = parse_inet_aton(h) {
+        return is_private_v4_u32(v);
+    }
+    if h.starts_with("0.")
+        || h.starts_with("10.")
+        || h.starts_with("127.")
+        || h.starts_with("192.168.")
+        || h.starts_with("169.254.")
+    {
+        return true;
+    }
+    if h.starts_with("172.") {
+        let second = h.split('.').nth(1).unwrap_or_default();
+        return second.parse::<u8>().is_ok_and(|v| (16..=31).contains(&v));
+    }
+    false
+}
+
+fn is_private_v4_u32(v: u32) -> bool {
+    let first = v >> 24;
+    let second = (v >> 16) & 0xff;
+    matches!(first, 0 | 10 | 127)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+        || (first == 169 && second == 254)
+}
+
+/// `inet_aton` parse: 1-4 dot-separated parts, each decimal, octal (leading
+/// `0`), or hex (`0x`); the last part fills the remaining bytes. Digits-only
+/// and `0x` parts mean "address", never domain, so `beef` stays a domain.
+fn parse_inet_aton(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty()
+        || parts.len() > 4
+        || !parts.iter().all(|p| {
+            if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+                !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+            } else {
+                !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
+            }
+        })
+    {
+        return None;
+    }
+    let mut value: u32 = 0;
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        let num = if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else if let Some(octal) = part.strip_prefix('0') {
+            if octal.is_empty() {
+                0
+            } else {
+                u32::from_str_radix(octal, 8).ok()?
+            }
+        } else {
+            part.parse::<u32>().ok()?
+        };
+        if i < last {
+            if num > 0xff {
+                return None;
+            }
+            value = (value << 8) | num;
+        } else {
+            // The final part spans every byte the earlier parts did not fill.
+            let bits = 32 - 8 * last;
+            if u64::from(num) >= 1u64 << bits {
+                return None;
+            }
+            let combined = (u64::from(value) << bits) | u64::from(num);
+            value = u32::try_from(combined).ok()?;
+        }
+    }
+    Some(value)
+}
+
+fn is_private_v6(v: u128) -> bool {
+    // fe80::/10 link-local, fc00::/7 unique-local.
+    if v >> 118 == 0x3fa || v >> 121 == 0x7e {
+        return true;
+    }
+    // v4-mapped (::ffff:0:0/96) and v4-compatible (::/96) tails are judged
+    // by their embedded v4 address, compressed or full-form alike.
+    if v >> 32 == 0xffff || v >> 32 == 0 {
+        return is_private_v4_u32((v & 0xffff_ffff) as u32);
+    }
+    false
+}
+
+/// Numeric value of an IPv6 literal, accepting `::` compression (once) and
+/// a dotted-quad tail. `None` when `h` is not a valid literal.
+fn parse_ipv6(h: &str) -> Option<u128> {
+    let (head, compressed_tail) = match h.split_once("::") {
+        Some((a, b)) => (a, Some(b)),
+        None => (h, None),
+    };
+    let mut head_words: Vec<u16> = Vec::new();
+    let mut head_v4: Option<u32> = None;
+    if !parse_v6_side(head, &mut head_words, &mut head_v4) {
+        return None;
+    }
+    // A dotted tail is only valid as the literal's last bytes.
+    if head_v4.is_some() && compressed_tail.is_some() {
+        return None;
+    }
+    let mut tail_words: Vec<u16> = Vec::new();
+    let mut tail_v4: Option<u32> = None;
+    if let Some(tail) = compressed_tail
+        && !parse_v6_side(tail, &mut tail_words, &mut tail_v4)
+    {
+        return None;
+    }
+    let head_len = head_words.len() + 2 * usize::from(head_v4.is_some());
+    let tail_len = tail_words.len() + 2 * usize::from(tail_v4.is_some());
+    let mut words: Vec<u16> = head_words;
+    if let Some(v4) = head_v4 {
+        words.push((v4 >> 16) as u16);
+        words.push((v4 & 0xffff) as u16);
+    }
+    if compressed_tail.is_some() {
+        if head_len + tail_len > 8 {
+            return None;
+        }
+        words.resize(head_len + (8 - head_len - tail_len), 0);
+        words.extend(tail_words);
+        if let Some(v4) = tail_v4 {
+            words.push((v4 >> 16) as u16);
+            words.push((v4 & 0xffff) as u16);
+        }
+    } else if words.len() != 8 {
+        return None;
+    }
+    Some(
+        words
+            .iter()
+            .fold(0u128, |acc, w| (acc << 16) | u128::from(*w)),
+    )
+}
+
+/// Parse one `::`-free side into 16-bit groups; a final dotted-quad segment
+/// (the v4 tail) lands in `v4` instead. Empty sides are fine (`::` edges).
+fn parse_v6_side(side: &str, groups: &mut Vec<u16>, v4: &mut Option<u32>) -> bool {
+    if side.is_empty() {
+        return true;
+    }
+    let segments: Vec<&str> = side.split(':').collect();
+    let last = segments.len() - 1;
+    for (i, seg) in segments.iter().enumerate() {
+        if i == last && seg.contains('.') {
+            match parse_inet_aton(seg) {
+                Some(v) => *v4 = Some(v),
+                None => return false,
+            }
+        } else if seg.is_empty() || seg.len() > 4 || !seg.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        } else if let Ok(g) = u16::from_str_radix(seg, 16) {
+            groups.push(g);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 fn stable_id_for_legacy(name: &str, config_root: &str) -> Result<InstanceId> {
     use std::collections::hash_map::DefaultHasher;
     let mut hasher = DefaultHasher::new();
@@ -1281,5 +1492,144 @@ mod tests {
         let known = unix_secs_to_rfc3339(1_728_000_000);
         // 1728000000 secs is 2024-10-02 something; just check format not exact
         assert!(known.starts_with("2024-"), "known ts: {known}");
+    }
+
+    #[test]
+    fn private_host_detection() {
+        assert!(is_private_host("localhost"));
+        assert!(is_private_host("127.0.0.1"));
+        assert!(is_private_host("10.0.0.1"));
+        assert!(is_private_host("192.168.1.1"));
+        assert!(is_private_host("172.16.5.4"));
+        assert!(is_private_host("172.31.255.1"));
+        assert!(!is_private_host("172.32.0.1"));
+        assert!(!is_private_host("8.8.8.8"));
+        assert!(!is_private_host("api.example.com"));
+        // Domain-shaped words that parse as hex are still domains.
+        assert!(!is_private_host("beef"));
+        assert!(!is_private_host("deadbeef.example"));
+    }
+
+    /// SSRF shorthands that bypass prefix-only checks: `inet_aton` digit
+    /// forms, trailing-dot root labels, cloud metadata space, and IPv6
+    /// loopback/link-local/ULA/v4-mapped literals.
+    #[test]
+    fn private_host_detection_covers_ssrf_shorthands() {
+        for host in [
+            "127.1",
+            "127.1.2.3",
+            "2130706433",
+            "localhost.",
+            "LOCALHOST.",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd12:3456::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+        ] {
+            assert!(is_private_host(host), "{host} must count as private");
+        }
+        assert!(!is_private_host("8.8.4.4"));
+        assert!(!is_private_host("2001:db8::1"));
+    }
+
+    /// The `inet_aton` hex/octal spellings and full-form IPv6 literals that
+    /// the old textual checks missed.
+    #[test]
+    fn private_host_rejects_hex_octal_and_full_form_v6() {
+        for host in [
+            "0x7f.0.0.1",
+            "0x7f000001",
+            "0177.0.0.1",
+            "017700000001",
+            "0x7f.1",
+            "0177.1",
+            "0x7f.0.0.001",
+            // v4-mapped in full form and v4-compatible tails, dotted or hex.
+            "::ffff:a00:1",
+            "0:0:0:0:0:ffff:a00:1",
+            "::ffff:10.0.0.5",
+            "::10.0.0.5",
+            "::a00:1",
+            "0:0:0:0:0:0:10.0.0.5",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_private_host(host), "{host} must count as private");
+        }
+        // Public controls: hex that lands outside private ranges, public
+        // v4-mapped and documentation-space literals, and full public v6.
+        assert!(!is_private_host("0x08080808"));
+        assert!(!is_private_host("::ffff:8.8.8.8"));
+        assert!(!is_private_host("::8.8.8.8"));
+        assert!(!is_private_host("1:2:3:4:5:6:7:8"));
+        assert!(!is_private_host("2001:db8:0:0:0:0:0:1"));
+    }
+
+    /// `extract_host` defeats the decoy spellings: userinfo, brackets,
+    /// delimiters that end the authority early, and extra scheme slashes.
+    #[test]
+    fn extract_host_cuts_the_real_authority() {
+        assert_eq!(
+            extract_host("https://example.com/a"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            extract_host("http://example.com"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            extract_host("https://user:pass@10.0.0.5/x"),
+            Some("10.0.0.5".to_owned())
+        );
+        assert_eq!(extract_host("https://[::1]:8443/x"), Some("::1".to_owned()));
+        assert_eq!(
+            extract_host("https://127.0.0.1?@x.example.com/"),
+            Some("127.0.0.1".to_owned())
+        );
+        assert_eq!(
+            extract_host("https://169.254.169.254#@api.example.com/"),
+            Some("169.254.169.254".to_owned())
+        );
+        assert_eq!(
+            extract_host("https://127.0.0.1\\@x.example.com/"),
+            Some("127.0.0.1".to_owned())
+        );
+        // The mirror spelling keeps its public host: the '@' is in the query.
+        assert_eq!(
+            extract_host("https://x.example.com?@127.0.0.1/"),
+            Some("x.example.com".to_owned())
+        );
+        assert_eq!(extract_host("https:///127.0.0.1/"), Some(String::new()));
+        assert_eq!(extract_host("ftp://example.com/"), None);
+    }
+
+    #[test]
+    fn ipv6_parser_accepts_and_rejects_literals() {
+        assert_eq!(parse_ipv6("::"), Some(0));
+        assert_eq!(parse_ipv6("::1"), Some(1));
+        assert_eq!(
+            parse_ipv6("2001:db8::1"),
+            Some(0x2001_0db8_0000_0000_0000_0000_0000_0001)
+        );
+        // Dotted tail without compression, and one compression too many.
+        assert_eq!(parse_ipv6("::ffff:1.2.3.4"), parse_ipv6("::ffff:102:304"));
+        assert_eq!(
+            parse_ipv6("1:2:3:4:5:6:1.2.3.4"),
+            Some(0x0001_0002_0003_0004_0005_0006_0102_0304)
+        );
+        for bad in [
+            "1::2::3",
+            ":::",
+            "12345::",
+            "1:2:3:4:5:6:7:8:9",
+            "gg::1",
+            "1.2.3.4::",
+        ] {
+            assert_eq!(parse_ipv6(bad), None, "{bad} must not parse");
+        }
     }
 }

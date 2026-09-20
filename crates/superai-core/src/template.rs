@@ -497,14 +497,42 @@ pub struct TemplateRepoConfig {
     pub git_ref: String,
     /// Optional fully-qualified base URL that overrides `https://{host}/{owner}/{repo}/{ref}`.
     ///
-    /// When `Some`, it is used verbatim as the prefix for `catalog_url()` and
-    /// `template_url()`: `file://` for tests and `https://` for self-hosted
-    /// mirrors. The fetch layer only ever retrieves https (plus `file://`
-    /// for tests), so an `http://` base only builds URLs that fetching
-    /// refuses. When `None`, the URL is built from
-    /// `host`/`owner`/`repo`/`git_ref`.
+    /// When `Some`, it must be `http://` or `https://` (the fetch layer only
+    /// retrieves https) and is used verbatim as the prefix for
+    /// `catalog_url()` and `template_url()`. When `None`, the URL is built
+    /// from `host`/`owner`/`repo`/`git_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Test builds may point `base_url` at `file://` to stage a local
+    /// repository; the field does not exist in production builds, so no
+    /// runtime input can ever turn the scheme gate back on.
+    #[cfg(test)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    test_file_base: bool,
+}
+
+/// `skip_serializing_if` helper for the test-only `file://` escape.
+#[cfg(test)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Whether this config may use the test-only `file://` base. The flag it
+/// reads does not exist in production builds, so the answer there is an
+/// unconditional no.
+#[cfg(test)]
+fn file_base_allowed(cfg: &TemplateRepoConfig) -> bool {
+    cfg.test_file_base
+}
+
+/// Production arm: no test-only escape exists, the scheme gate is absolute.
+#[cfg(not(test))]
+fn file_base_allowed(_cfg: &TemplateRepoConfig) -> bool {
+    false
 }
 
 impl TemplateRepoConfig {
@@ -516,6 +544,8 @@ impl TemplateRepoConfig {
             repo: repo.to_owned(),
             git_ref: git_ref.to_owned(),
             base_url: None,
+            #[cfg(test)]
+            test_file_base: false,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -529,6 +559,22 @@ impl TemplateRepoConfig {
             repo: "superai-templates".to_owned(),
             git_ref: "main".to_owned(),
             base_url: None,
+            #[cfg(test)]
+            test_file_base: false,
+        }
+    }
+
+    /// Test-only config whose base URL is a local `file://` root; the
+    /// scheme gate refuses this shape for every other constructor.
+    #[cfg(test)]
+    pub(crate) fn for_local_tests(dir: &Path) -> Self {
+        Self {
+            host: "example.com".to_owned(),
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            git_ref: "main".to_owned(),
+            base_url: Some(format!("file://{}", dir.display())),
+            test_file_base: true,
         }
     }
 
@@ -576,12 +622,23 @@ impl TemplateRepoConfig {
                     reason: "base_url must not be empty if provided".to_owned(),
                 });
             }
-            // base_url may be file:// for tests or https:// for real. Validate not
-            // containing NUL/control and that it parses as having a scheme.
-            if base.contains('\0') {
+            if base.contains('\0') || base.chars().any(char::is_control) {
                 return Err(CoreError::Validation {
                     field: "base_url".to_owned(),
-                    reason: "base_url must not contain NUL".to_owned(),
+                    reason: "base_url must not contain NUL or control chars".to_owned(),
+                });
+            }
+            // Template fetching follows http(s) only: any other scheme would
+            // turn a configured repo into a local-file (or other-scheme)
+            // reader, so it is refused here with the scheme named.
+            let trimmed = base.trim_end_matches('/');
+            if !trimmed.starts_with("https://")
+                && !trimmed.starts_with("http://")
+                && !file_base_allowed(self)
+            {
+                return Err(CoreError::Validation {
+                    field: "base_url".to_owned(),
+                    reason: format!("base_url scheme must be https:// or http://, got `{trimmed}`"),
                 });
             }
         }
@@ -598,18 +655,6 @@ impl TemplateRepoConfig {
         self.validate()?;
         if let Some(base) = self.base_url.as_deref() {
             let trimmed = base.trim_end_matches('/');
-            if trimmed.starts_with("file://") {
-                // For file URLs, validation is filesystem path safety; still return as-is.
-                return Ok(format!("{trimmed}/catalog.json"));
-            }
-            if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
-                return Err(CoreError::Validation {
-                    field: "base_url".to_owned(),
-                    reason: format!(
-                        "base_url must start with https:// or file://, got `{trimmed}`"
-                    ),
-                });
-            }
             return Ok(format!("{trimmed}/catalog.json"));
         }
         // Canonical construction. For raw.githubusercontent.com the raw path is
@@ -626,10 +671,7 @@ impl TemplateRepoConfig {
         validate_template_path(relative_path)?;
         if let Some(base) = self.base_url.as_deref() {
             let trimmed = base.trim_end_matches('/');
-            if trimmed.starts_with("file://") {
-                return Ok(format!("{trimmed}/{relative_path}"));
-            }
-            if !trimmed.starts_with("https://") {
+            if !trimmed.starts_with("https://") && !file_base_allowed(self) {
                 return Err(CoreError::Validation {
                     field: "base_url".to_owned(),
                     reason: "base_url must be https:// when fetching remote templates".to_owned(),
@@ -1993,18 +2035,55 @@ mod tests {
         TemplateRepoConfig::new("", "owner", "repo", "main").unwrap_err();
     }
 
+    /// `file://` (and every other non-http(s) scheme) is refused as a
+    /// template base URL: a configured repo must not become a local-file
+    /// reader. http/https are accepted by the config layer; the fetch layer
+    /// keeps refusing plain http.
     #[test]
-    fn repo_config_base_url_file_scheme() {
-        let mut cfg = TemplateRepoConfig::example();
-        let base = format!(
-            "file://{}",
-            crate::test_util::tmp_abs("templates").display()
+    fn repo_config_base_url_refuses_non_http_schemes() {
+        for base in [
+            format!(
+                "file://{}",
+                crate::test_util::tmp_abs("templates").display()
+            ),
+            "ftp://example.com/templates".to_owned(),
+            "gopher://example.com".to_owned(),
+            "example.com/templates".to_owned(),
+        ] {
+            let mut cfg = TemplateRepoConfig::example();
+            cfg.base_url = Some(base.clone());
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("https:// or http://"),
+                "base `{base}` must be refused with the scheme rule: {err}"
+            );
+            cfg.catalog_url().unwrap_err();
+        }
+        let mut http = TemplateRepoConfig::example();
+        http.base_url = Some("http://insecure.example.com/templates".to_owned());
+        http.validate().unwrap();
+        assert_eq!(
+            http.catalog_url().unwrap(),
+            "http://insecure.example.com/templates/catalog.json"
         );
-        cfg.base_url = Some(base.clone());
-        let url = cfg.catalog_url().unwrap();
-        assert_eq!(url, format!("{base}/catalog.json"));
-        let turl = cfg.template_url("claude-glm/1.2.0.json").unwrap();
-        assert_eq!(turl, format!("{base}/claude-glm/1.2.0.json"));
+        let mut https = TemplateRepoConfig::example();
+        https.base_url = Some("https://mirror.example.com/t".to_owned());
+        https.validate().unwrap();
+        assert_eq!(
+            https.catalog_url().unwrap(),
+            "https://mirror.example.com/t/catalog.json"
+        );
+        // The test-only constructor still reaches local fixtures.
+        let dir = crate::test_util::tmp_abs("templates");
+        let local = TemplateRepoConfig::for_local_tests(&dir);
+        assert_eq!(
+            local.catalog_url().unwrap(),
+            format!("file://{}/catalog.json", dir.display())
+        );
+        assert_eq!(
+            local.template_url("claude-glm/1.2.0.json").unwrap(),
+            format!("file://{}/claude-glm/1.2.0.json", dir.display())
+        );
     }
 
     #[test]
@@ -2227,7 +2306,8 @@ mod tests {
 
     #[test]
     fn check_update_offline_via_repo() {
-        // Use a file:// repo that points to a non-existent directory to trigger Offline
+        // A file:// repo is refused by the scheme gate before any fetch;
+        // check_update reports an unusable repo as Offline.
         let catalog = minimal_catalog();
         let instance = sample_instance_with_template("claude-code", "claude-glm", "1.1.0", "0.1.0");
         let mut repo = TemplateRepoConfig::example();
@@ -2236,6 +2316,11 @@ mod tests {
         repo.base_url = Some(format!("file://{}", missing.display()));
         let status = check_update(&instance, &catalog, &repo);
         assert_eq!(status, UpdateStatus::Offline);
+        // An unreachable local root behind the test-only constructor also
+        // reports Offline (the fetch itself fails).
+        let repo2 = TemplateRepoConfig::for_local_tests(&missing);
+        let status2 = check_update(&instance, &catalog, &repo2);
+        assert_eq!(status2, UpdateStatus::Offline);
     }
 
     #[test]
@@ -2296,13 +2381,7 @@ mod tests {
         let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
         std::fs::write(dir.join("catalog.json"), &catalog_bytes).unwrap();
 
-        let repo = TemplateRepoConfig {
-            host: "example.com".to_owned(),
-            owner: "owner".to_owned(),
-            repo: "repo".to_owned(),
-            git_ref: "main".to_owned(),
-            base_url: Some(format!("file://{}", dir.display())),
-        };
+        let repo = TemplateRepoConfig::for_local_tests(&dir);
 
         // check_update should detect incompatible due to harness_version_req
         let status = check_update(&instance, &catalog, &repo);
@@ -2372,13 +2451,7 @@ mod tests {
         )
         .unwrap();
 
-        let repo = TemplateRepoConfig {
-            host: "example.com".to_owned(),
-            owner: "owner".to_owned(),
-            repo: "repo".to_owned(),
-            git_ref: "main".to_owned(),
-            base_url: Some(format!("file://{}", dir.display())),
-        };
+        let repo = TemplateRepoConfig::for_local_tests(&dir);
 
         let status = check_update(&instance, &catalog, &repo);
         match status {

@@ -378,6 +378,16 @@ pub fn validate_fetch_url(url: &str) -> Result<()> {
             reason: format!("url must be https://, got `{url}`"),
         });
     }
+    // Same private-host rule as template fetch and health probes (QAL-11):
+    // a skill source must never aim a fetch at loopback or RFC1918 space.
+    if let Some(host) = crate::registry::extract_host(url)
+        && crate::registry::is_private_host(&host)
+    {
+        return Err(CoreError::Validation {
+            field: "url".to_owned(),
+            reason: format!("url host `{host}` is private or loopback, rejected: `{url}`"),
+        });
+    }
     if url.contains("/../") || url.contains("/./") || url.ends_with("/..") {
         return Err(CoreError::Validation {
             field: "url".to_owned(),
@@ -2778,37 +2788,77 @@ fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a redirect `Location` against the current URL: absolute https
+/// or same-origin absolute-path only; relative paths are refused fail-closed
+/// (no URL library in this workspace). Mirrors `template_fetch`.
+fn resolve_redirect(base: &str, location: &str) -> std::result::Result<String, String> {
+    if location.starts_with("https://") {
+        return Ok(location.to_owned());
+    }
+    if !location.starts_with('/') {
+        return Err(format!(
+            "redirect location must be absolute, got `{location}`"
+        ));
+    }
+    let rest = base
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("redirect base is not https: `{base}`"))?;
+    let origin = rest.split('/').next().unwrap_or_default();
+    Ok(format!("https://{origin}{location}"))
+}
+
 fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
-    // https_only also covers redirect hops: no hop may downgrade to http.
+    // Redirects are followed manually so EVERY hop re-passes validation;
+    // https_only alone stops downgrades, not bounces onto private hosts.
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(10)))
         .https_only(true)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(config);
-    let mut resp = agent
-        .get(url)
-        .header("User-Agent", concat!("superai/", env!("CARGO_PKG_VERSION")))
-        .call()
-        .map_err(|e| e.to_string())?;
-    if resp.status() == 404 {
-        return Err(format!("404 not found for `{url}`"));
+    let mut current = url.to_owned();
+    for _ in 0..=crate::template_fetch::MAX_REDIRECTS {
+        let mut resp = agent
+            .get(&current)
+            .header("User-Agent", concat!("superai/", env!("CARGO_PKG_VERSION")))
+            .call()
+            .map_err(|e| e.to_string())?;
+        if (300..400).contains(&resp.status().as_u16()) {
+            let location = resp
+                .headers()
+                .get("Location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| format!("redirect without a valid Location header"))?
+                .to_owned();
+            current = resolve_redirect(&current, &location)?;
+            validate_fetch_url(&current).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if resp.status() == 404 {
+            return Err(format!("404 not found for `{url}`"));
+        }
+        if resp.status() == 429 {
+            return Err(format!("rate limited for `{url}`"));
+        }
+        if resp.status().as_u16() >= 400 {
+            return Err(format!("http {} for `{url}`", resp.status()));
+        }
+        // Cap the read itself so a hostile body cannot balloon memory before
+        // the limit check runs.
+        let mut bytes = Vec::new();
+        let mut reader = resp.body_mut().as_reader();
+        let mut limited = (&mut reader).take(MAX_TOTAL_BYTES.saturating_add(1));
+        limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_TOTAL_BYTES as usize {
+            return Err(format!("size limit exceeded for `{url}`"));
+        }
+        return Ok(bytes);
     }
-    if resp.status() == 429 {
-        return Err(format!("rate limited for `{url}`"));
-    }
-    if resp.status().as_u16() >= 400 {
-        return Err(format!("http {} for `{url}`", resp.status()));
-    }
-    // Cap the read itself so a hostile body cannot balloon memory before
-    // the limit check runs.
-    let mut bytes = Vec::new();
-    let mut reader = resp.body_mut().as_reader();
-    let mut limited = (&mut reader).take(MAX_TOTAL_BYTES.saturating_add(1));
-    limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_TOTAL_BYTES as usize {
-        return Err(format!("size limit exceeded for `{url}`"));
-    }
-    Ok(bytes)
+    Err(format!(
+        "more than {} redirects for `{url}`",
+        crate::template_fetch::MAX_REDIRECTS
+    ))
 }
 
 /// Enable a skill for an instance: ensures the destination contains the
@@ -4390,12 +4440,14 @@ mod tests {
 
     #[test]
     fn install_https_fetch_failure_returns_typed_error_and_writes_nothing() {
-        // An unreachable HTTPS source must fail with the typed fetch error;
-        // nothing is written to the registry or disk (no invented skill).
+        // A source the transport itself refuses must fail with the typed
+        // fetch error; nothing is written to the registry or disk (no
+        // invented skill). The space makes the URI unparseable, so the
+        // failure is instant and never touches the network.
         let root = unique_root("install_https_fail_root");
         drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(&root).unwrap();
-        let unreachable = "https://127.0.0.1:1/skills/demo/SKILL.md";
+        let unreachable = "https://exa mple.com/skills/demo/SKILL.md";
         let source = SkillSource::github(unreachable, None);
         let mut reg = SkillRegistry::load(&root).unwrap();
         let err = reg.install_skill(&source, true).unwrap_err();
@@ -4416,6 +4468,34 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
+    /// A private-host source is refused before any fetch attempt: loopback
+    /// (in any `inet_aton` spelling) is not a skill source superai will
+    /// retrieve from, and nothing is written anywhere.
+    #[test]
+    fn install_private_host_source_is_refused_and_writes_nothing() {
+        let root = unique_root("install_private_host_root");
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = SkillSource::github("https://127.0.0.1:1/skills/demo/SKILL.md", None);
+        let mut reg = SkillRegistry::load(&root).unwrap();
+        let err = reg.install_skill(&source, true).unwrap_err();
+        match &err {
+            CoreError::Validation { reason, .. } => {
+                assert!(reason.contains("private"), "reason: {reason}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The octal shorthand is refused by the same gate.
+        let octal = SkillSource::github("https://0177.0.0.1/skills/demo/SKILL.md", None);
+        let err2 = reg.install_skill(&octal, true).unwrap_err();
+        assert!(err2.to_string().contains("private"), "err2: {err2}");
+
+        let reloaded = SkillRegistry::load(&root).unwrap();
+        assert!(reloaded.records.is_empty());
+        assert!(!root.join("demo").exists());
+        drop(std::fs::remove_dir_all(&root));
+    }
+
     #[test]
     fn preview_update_https_fetch_failure_returns_typed_error_and_changes_nothing() {
         let root = unique_root("preview_https_fail_root");
@@ -4431,7 +4511,7 @@ mod tests {
         let before = snapshot_tree(&root);
         assert!(!before.is_empty());
 
-        let unreachable = "https://127.0.0.1:1/skills/demo/SKILL.md";
+        let unreachable = "https://exa mple.com/skills/demo/SKILL.md";
         let new_source = SkillSource::github(unreachable, None);
         let err = reg.preview_update(&rec.id, Some(&new_source)).unwrap_err();
         assert!(
@@ -4461,7 +4541,7 @@ mod tests {
         let before = snapshot_tree(&root);
         assert!(!before.is_empty());
 
-        let unreachable = "https://127.0.0.1:1/skills/demo/SKILL.md";
+        let unreachable = "https://exa mple.com/skills/demo/SKILL.md";
         let new_source = SkillSource::github(unreachable, None);
         let preview = SkillUpdatePreview {
             skill_id: rec.id.clone(),

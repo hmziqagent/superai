@@ -181,90 +181,6 @@ pub fn validate_timeout(timeout: Duration) -> Result<Duration> {
 
 // URL validation: scheme, host, private policy, secrecy
 
-/// Host of an http(s) URL, lowercased. Strips userinfo (`user:pass@`) and
-/// unwraps bracketed IPv6 literals (`[::1]:8443` -> `::1`), the two forms
-/// that otherwise hide the real host from the private-range check. The
-/// authority ends at the first '/', '?', '#', or '\' (WHATWG special
-/// schemes treat '\' like '/'); anything before that is host, not decoy.
-fn extract_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let host_port = rest.get(0..end)?;
-    let host_port = host_port.rsplit('@').next().unwrap_or_default();
-    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or_default()
-    } else {
-        host_port.split(':').next().unwrap_or_default()
-    };
-    Some(host.to_ascii_lowercase())
-}
-
-/// Whether `host` is loopback, private, or link-local.
-///
-/// Covers `inet_aton` digit shorthands (`127.1`, `2130706433`), the
-/// trailing-dot root label (`localhost.`), cloud metadata space
-/// (`169.254.*`), and IPv6 loopback/link-local/ULA/v4-mapped literals.
-/// Mirrors the hardened `template_fetch` check (private there); sharing
-/// one helper needs a home outside both files.
-pub fn is_private_host(host: &str) -> bool {
-    // A trailing dot is the DNS root label: "localhost." is localhost.
-    let h = host.to_ascii_lowercase();
-    let h = h.trim_end_matches('.');
-    if h == "localhost" || h.is_empty() {
-        return true;
-    }
-    if h.contains(':') {
-        if h == "::1" || h == "::" {
-            return true;
-        }
-        let first_group = h.split(':').next().unwrap_or_default();
-        if first_group.starts_with("fe8")
-            || first_group.starts_with("fe9")
-            || first_group.starts_with("fea")
-            || first_group.starts_with("feb")
-            || first_group.starts_with("fc")
-            || first_group.starts_with("fd")
-        {
-            return true;
-        }
-        // v4-mapped (::ffff:a.b.c.d): judge the embedded address.
-        if let Some(v4) = h.strip_prefix("::ffff:") {
-            return is_private_v4_literal(v4);
-        }
-        return false;
-    }
-    is_private_v4_literal(h)
-}
-
-/// Dotted-IPv4-shaped literal in private/loopback/link-local space,
-/// including `inet_aton` shorthands judged by leading octet or u32 form.
-fn is_private_v4_literal(h: &str) -> bool {
-    if h.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        let lead = if h.contains('.') {
-            h.split('.')
-                .find(|s| !s.is_empty())
-                .unwrap_or_default()
-                .parse::<u32>()
-                .unwrap_or(u32::MAX)
-        } else {
-            h.parse::<u32>().map_or(u32::MAX, |v| v >> 24)
-        };
-        if matches!(lead, 0 | 10 | 127) {
-            return true;
-        }
-    }
-    if h.starts_with("10.") || h.starts_with("192.168.") || h.starts_with("169.254.") {
-        return true;
-    }
-    if h.starts_with("172.") {
-        let second = h.split('.').nth(1).unwrap_or_default();
-        return second.parse::<u8>().is_ok_and(|v| (16..=31).contains(&v));
-    }
-    false
-}
-
 fn is_valid_base_url_inner(url: &str) -> (bool, String) {
     if url.trim().is_empty() {
         return (false, "must not be empty".to_owned());
@@ -285,7 +201,7 @@ fn is_valid_base_url_inner(url: &str) -> (bool, String) {
     if scheme_rest.is_empty() {
         return (false, "missing host".to_owned());
     }
-    let Some(host) = extract_host(url) else {
+    let Some(host) = crate::registry::extract_host(url) else {
         return (false, "missing host".to_owned());
     };
     if host.is_empty() {
@@ -310,13 +226,13 @@ pub fn validate_base_url_for_probe(url: &str, allow_private: bool) -> Result<()>
         });
     }
     if !allow_private {
-        let Some(host) = extract_host(url) else {
+        let Some(host) = crate::registry::extract_host(url) else {
             return Err(CoreError::Validation {
                 field: "base_url".to_owned(),
                 reason: "invalid url scheme extraction".to_owned(),
             });
         };
-        if is_private_host(&host) {
+        if crate::registry::is_private_host(&host) {
             return Err(CoreError::Validation {
                 field: "base_url".to_owned(),
                 reason: format!("private host `{host}` requires allow_private_network=true"),
@@ -1414,46 +1330,13 @@ mod tests {
         assert!(res_remote.valid);
     }
 
-    #[test]
-    fn private_host_detection() {
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("10.0.0.1"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(is_private_host("172.16.5.4"));
-        assert!(is_private_host("172.31.255.1"));
-        assert!(!is_private_host("172.32.0.1"));
-        assert!(!is_private_host("8.8.8.8"));
-        assert!(!is_private_host("api.example.com"));
-    }
-
-    /// SSRF shorthands that bypassed the old prefix-only check: `inet_aton`
-    /// digit forms, trailing-dot root labels, cloud metadata space, and IPv6
-    /// loopback/link-local/ULA/v4-mapped literals.
+    /// The probe URL gate refuses SSRF shorthands without local intent:
+    /// `inet_aton` digit forms, trailing-dot root labels, cloud metadata
+    /// space, userinfo-prefixed and bracketed IPv6 spellings, and decoy
+    /// tails behind a query or fragment delimiter. Host-level spellings
+    /// live in `registry::tests`.
     #[test]
     fn private_host_detection_covers_ssrf_shorthands() {
-        for host in [
-            "127.1",
-            "127.1.2.3",
-            "2130706433",
-            "localhost.",
-            "LOCALHOST.",
-            "169.254.169.254",
-            "0.0.0.0",
-            "::1",
-            "::",
-            "fe80::1",
-            "fd12:3456::1",
-            "fc00::1",
-            "::ffff:127.0.0.1",
-            "::ffff:10.0.0.5",
-        ] {
-            assert!(is_private_host(host), "{host} must count as private");
-        }
-        assert!(!is_private_host("8.8.4.4"));
-        assert!(!is_private_host("2001:db8::1"));
-        // End to end: the probe URL gate rejects them without local intent,
-        // including userinfo-prefixed and bracketed spellings.
         for url in [
             "https://127.1:8443",
             "https://localhost./v1",
@@ -1472,12 +1355,12 @@ mod tests {
             "https://127.0.0.1\\@x.example.com/",
             "https://169.254.169.254\\@api.example.com/",
             "https://127.1\\@api.example.com/",
-            // Extra slashes after the scheme are skipped by the url crate;
-            // the empty host here is private, so the gate refuses.
+            // Extra slashes after the scheme leave an empty host, which
+            // the gate counts as private and refuses.
             "https:///127.0.0.1/",
             "https://\\127.0.0.1/",
-            // The url crate strips tabs before parsing; control chars are
-            // rejected before extraction instead.
+            // Real parsers strip tabs before host parsing; the gate
+            // rejects control chars before extraction instead.
             "https://127.0.0.1\t?@x.example.com/",
         ] {
             assert!(
