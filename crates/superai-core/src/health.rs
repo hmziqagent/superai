@@ -183,12 +183,14 @@ pub fn validate_timeout(timeout: Duration) -> Result<Duration> {
 
 /// Host of an http(s) URL, lowercased. Strips userinfo (`user:pass@`) and
 /// unwraps bracketed IPv6 literals (`[::1]:8443` -> `::1`), the two forms
-/// that otherwise hide the real host from the private-range check.
+/// that otherwise hide the real host from the private-range check. The
+/// authority ends at the first '/', '?', or '#' (WHATWG); a '?'/'#' before
+/// any '@' means the '@' sits in the query or fragment and is not userinfo.
 fn extract_host(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let end = rest.find('/').unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host_port = rest.get(0..end)?;
     let host_port = host_port.rsplit('@').next().unwrap_or_default();
     let host = if let Some(bracketed) = host_port.strip_prefix('[') {
@@ -1462,6 +1464,11 @@ mod tests {
             "https://[::ffff:127.0.0.1]/",
             "https://[::ffff:10.0.0.5]:8443/",
             "https://[::1]/",
+            // The authority ends at '?' or '#': the public-looking tail
+            // after the delimiter is query/fragment, not the host.
+            "https://127.0.0.1?@x.example.com/",
+            "https://169.254.169.254#@api.example.com/",
+            "https://127.1?@api.example.com/",
         ] {
             assert!(
                 validate_base_url_for_probe(url, false).is_err(),
@@ -1469,6 +1476,9 @@ mod tests {
             );
         }
         assert!(validate_base_url_for_probe("https://api.example.com", false).is_ok());
+        // Mirror spelling: the '@' is inside the query, so the host really
+        // is the public one; the fix un-refuses this decoy tail.
+        assert!(validate_base_url_for_probe("https://x.example.com?@127.0.0.1/", false).is_ok());
     }
 
     /// Every redirect hop re-validates its Location through
@@ -1484,6 +1494,8 @@ mod tests {
             "https://x@169.254.169.254/latest/meta-data",
             "https://attacker@127.0.0.1:8080/",
             "https://[::ffff:10.0.0.5]/",
+            "https://127.0.0.1?@x.example.com/",
+            "https://169.254.169.254#@api.example.com/",
         ] {
             let err = validate_execution_url(hop, &provider, &probe, &cfg)
                 .expect_err("{hop} must be refused at the redirect hop");

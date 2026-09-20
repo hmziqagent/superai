@@ -233,10 +233,12 @@ fn has_parent_component(path: &Path) -> bool {
 
 /// Host of an https URL, lowercased. Strips userinfo (`user@`) and unwraps
 /// bracketed IPv6 literals (`[::1]:8443` -> `::1`), both of which otherwise
-/// hide the real host from the private-range check.
+/// hide the real host from the private-range check. The authority ends at
+/// the first '/', '?', or '#' (WHATWG); a '?'/'#' before any '@' means the
+/// '@' sits in the query or fragment and is not userinfo.
 fn extract_host(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
-    let end = rest.find('/').unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host_port = rest.get(0..end)?;
     let host_port = host_port.rsplit('@').next().unwrap_or_default();
     let host = if let Some(bracketed) = host_port.strip_prefix('[') {
@@ -769,15 +771,21 @@ mod tests {
             "https://0.0.0.1/catalog.json",
             "https://localhost./catalog.json",
             "https://10.0.0.5./catalog.json",
+            // The authority ends at '?' or '#'; the public-looking tail is
+            // query/fragment, not the host.
+            "https://127.0.0.1?@x.example.com/catalog.json",
+            "https://169.254.169.254#@api.example.com/catalog.json",
         ] {
             let err = validate_fetch_url(url, "catalog").unwrap_err();
             assert!(err.to_string().contains("private"), "{url}: {err}");
         }
         // Ordinary domains, including fc/fd initials and a public
-        // v4-mapped literal, stay fetchable.
+        // v4-mapped literal, stay fetchable; the mirror spelling has its
+        // '@' inside the query, so the host really is the public one.
         validate_fetch_url("https://fdtools.example.com/catalog.json", "catalog").unwrap();
         validate_fetch_url("https://example.com/catalog.json", "catalog").unwrap();
         validate_fetch_url("https://[::ffff:8.8.8.8]/catalog.json", "catalog").unwrap();
+        validate_fetch_url("https://x.example.com?@127.0.0.1/catalog.json", "catalog").unwrap();
     }
 
     #[test]
