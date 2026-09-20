@@ -61,7 +61,14 @@ pub mod zed_acp;
 /// First PATH hit for `names`, name-major: an earlier name wins over an
 /// earlier directory.
 pub(crate) fn find_in_path(names: &[&str]) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").ok()?;
+    let path_var = std::env::var_os("PATH")?;
+    find_in_path_within(&path_var, names)
+}
+
+/// [`find_in_path`] against an explicit PATH value, for callers that must
+/// pin exactly what gets resolved before spawning.
+pub(crate) fn find_in_path_within(path_var: &std::ffi::OsStr, names: &[&str]) -> Option<PathBuf> {
+    let path_var = path_var.to_string_lossy();
     let separator = if cfg!(windows) { ';' } else { ':' };
     for name in names {
         for dir in path_var.split(separator) {

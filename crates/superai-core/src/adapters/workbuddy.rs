@@ -174,9 +174,18 @@ impl WorkBuddyAdapter {
     /// Probe npm global metadata for the installed package version (the
     /// preferred version source per HAD-02 because the CLI flag format is
     /// unverified). The package is installed with `npm i -g`, so only the
-    /// global tree can see it.
+    /// global tree can see it. `npm` is resolved to an absolute first-PATH-
+    /// match before spawning (never the working directory); PATH itself is
+    /// user-controlled, so a hostile earlier entry still shadows it.
     fn probe_npm_version() -> Option<String> {
-        let output = Self::run_with_timeout(Path::new("npm"), &["ls", "-g"])?;
+        let path_var = std::env::var_os("PATH")?;
+        Self::probe_npm_version_from(&path_var)
+    }
+
+    /// [`probe_npm_version`] against an explicit PATH value (hermetic seam).
+    fn probe_npm_version_from(path_var: &std::ffi::OsStr) -> Option<String> {
+        let npm = super::find_in_path_within(path_var, &["npm"])?;
+        let output = Self::run_with_timeout(&npm, &["ls", "-g"])?;
         Self::harvest_npm_version(&output)
     }
 
@@ -1400,6 +1409,39 @@ mod tests {
             WorkBuddyAdapter::harvest_npm_version(decorated).as_deref(),
             Some("2.147.4-beta.1")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn npm_probe_resolves_the_first_path_entry_and_never_the_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "superai-wb-npm-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        ));
+        for (sub, version) in [("a", "1.0.1"), ("b", "2.0.2")] {
+            let bin_dir = dir.join(sub);
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let npm = bin_dir.join("npm");
+            std::fs::write(
+                &npm,
+                format!("#!/bin/sh\necho \"@tencent-ai/codebuddy-code@{version}\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var = format!("{}:{}", dir.join("a").display(), dir.join("b").display());
+        assert_eq!(
+            WorkBuddyAdapter::probe_npm_version_from(path_var.as_ref()).as_deref(),
+            Some("1.0.1"),
+            "the FIRST PATH entry must win the npm resolution"
+        );
+        // Only the given PATH is consulted: no ambient fallback, no cwd.
+        assert_eq!(WorkBuddyAdapter::probe_npm_version_from("".as_ref()), None);
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     // -----------------------------------------------------------------------

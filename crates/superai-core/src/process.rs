@@ -12,7 +12,7 @@
 )]
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::CoreError;
@@ -214,11 +214,99 @@ fn compose_child_env(opts: &ExecuteOpts) -> BTreeMap<OsString, OsString> {
     env
 }
 
+/// Whether `path` names a file this process could execute (unix also
+/// demands an execute bit; Windows tests existence only, matching the
+/// adapter PATH helpers).
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
+}
+
+/// First PATH entry holding an executable file named `name` (`.exe` is also
+/// probed on Windows). Empty entries are skipped: POSIX treats them as the
+/// working directory, and this lookup must never resolve from there.
+fn first_path_match(path_var: &OsStr, name: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{name}.exe"));
+            if is_executable_file(&exe) {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `executable` to what will actually be spawned.
+///
+/// Bare names resolve to the first matching executable on the child's PATH
+/// (ambient PATH when inherited, mirroring std's parent-PATH fallback), so
+/// the first-match winner is fixed before spawn instead of being decided by
+/// the platform lookup. Separator-bearing names are used as given (the
+/// caller's explicit choice), except `.`/`..` components, which resolve
+/// relative to the working directory and are refused. Residual risk: PATH
+/// itself is user-controlled, and first match still wins.
+fn resolve_executable(
+    executable: &str,
+    child_env: &BTreeMap<OsString, OsString>,
+) -> Result<PathBuf, CoreError> {
+    let path = Path::new(executable);
+    if path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return Err(CoreError::Validation {
+            field: "executable".to_owned(),
+            reason: format!(
+                "executable `{executable}` must not resolve relative to the working directory"
+            ),
+        });
+    }
+    if path.is_absolute() || executable.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if executable.contains('/') {
+        return Ok(path.to_path_buf());
+    }
+    let path_var = child_env
+        .get(&env_map_key(OsStr::new("PATH")))
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))
+        .ok_or_else(|| CoreError::BinaryDetection {
+            binary: executable.to_owned(),
+            reason: "PATH is not set; refusing to guess a search path for a bare name".to_owned(),
+        })?;
+    first_path_match(&path_var, executable).ok_or_else(|| CoreError::BinaryDetection {
+        binary: executable.to_owned(),
+        reason: format!(
+            "`{executable}` not found on PATH (first match; the working directory is never searched)"
+        ),
+    })
+}
+
 /// Run a command with explicit argv (no shell interpolation), bounded capture,
 /// timeout, and optional redaction.
 ///
 /// - No shell is ever invoked; `executable` and `args` are passed as argv
-///   tokens directly.
+///   tokens directly. Bare names are resolved to an absolute first-PATH-match
+///   before spawn (see [`resolve_executable`]); the working directory is never
+///   searched.
 /// - stdout/stderr are captured up to `output_limit` bytes combined; breach
 ///   returns `CoreError::Verification` with output-limit context and the child
 ///   is killed.
@@ -261,8 +349,12 @@ pub fn run_command(
         }
     }
 
+    // Compose the env first: bare names resolve against the child's PATH.
+    let child_env = compose_child_env(opts);
+    let resolved = resolve_executable(executable, &child_env)?;
+
     // Build duct expression with explicit argv, env, cwd, stdin = none.
-    let mut cmd = duct::cmd(executable, args);
+    let mut cmd = duct::cmd(resolved.as_os_str(), args);
 
     if let Some(cwd) = opts.cwd.as_ref() {
         cmd = cmd.dir(cwd);
@@ -271,7 +363,7 @@ pub fn run_command(
     // One composed map is duct's only env input: its wraps apply in reverse
     // build order, so mixing env/env_remove wraps here would let build order,
     // not compose_child_env, decide precedence.
-    cmd = cmd.full_env(compose_child_env(opts));
+    cmd = cmd.full_env(child_env);
 
     cmd = cmd.stdout_capture().stderr_capture();
 
@@ -675,8 +767,9 @@ mod tests {
             env: vec![("SUPERAI_TEST_KEEP".to_owned(), "yes".to_owned())],
             ..Default::default()
         };
-        // printenv itself resolves through ambient PATH, so an unset PATH
-        // fails the spawn rather than letting this pass vacuously.
+        // std resolves the bare name through the parent PATH, so this
+        // asserts the ambient PATH VALUE reached the child env, not that
+        // the spawn needed it.
         let out = run_command(
             "printenv",
             &["PATH".to_owned(), "SUPERAI_TEST_KEEP".to_owned()],
@@ -689,5 +782,80 @@ mod tests {
             "ambient PATH and the addition must both reach the child"
         );
         assert_eq!(out.stdout.lines().last(), Some("yes"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_resolves_bare_name_to_first_path_match() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("path-order");
+        for (sub, marker) in [("a", "from-a"), ("b", "from-b")] {
+            let bin_dir = dir.join(sub);
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let probe = bin_dir.join("superai-path-order-probe");
+            std::fs::write(&probe, format!("#!/bin/sh\necho {marker}\n")).unwrap();
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The env addition PATH (not the ambient PATH) governs resolution,
+        // and the FIRST directory wins.
+        let joined = format!("{}:{}", dir.join("a").display(), dir.join("b").display());
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            env: vec![("PATH".to_owned(), joined)],
+            ..Default::default()
+        };
+        let out = run_command("superai-path-order-probe", &[], &opts).unwrap();
+        assert_eq!(out.stdout_trimmed(), "from-a");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_never_resolves_a_bare_name_from_the_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir_unique("path-cwd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("superai-path-cwd-probe");
+        std::fs::write(&probe, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // POSIX reads an empty PATH entry as the working directory; the
+        // explicit lookup must skip it even with the probe sitting in cwd.
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            cwd: Some(dir),
+            env: vec![("PATH".to_owned(), String::from(":"))],
+            ..Default::default()
+        };
+        let err = run_command("superai-path-cwd-probe", &[], &opts).unwrap_err();
+        assert!(
+            format!("{err}").contains("not found on PATH"),
+            "expected a PATH-resolution refusal, got: {err}"
+        );
+        assert!(probe.exists());
+    }
+
+    #[test]
+    fn run_command_refuses_dot_relative_executable() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let err = run_command("./probe", &[], &opts).unwrap_err();
+        assert!(
+            format!("{err}").contains("working directory"),
+            "expected a relative-path refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_command_bare_name_absent_from_path_is_a_typed_error() {
+        let opts = ExecuteOpts {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let err = run_command("superai-no-such-tool-xyz", &[], &opts).unwrap_err();
+        assert!(
+            format!("{err}").contains("not found on PATH"),
+            "expected the PATH-resolution error, got: {err}"
+        );
     }
 }
