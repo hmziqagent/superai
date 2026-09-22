@@ -6,10 +6,8 @@ use crate::ids::{HarnessId, InstanceId, InstanceName, TemplateId, TemplateVersio
 use crate::paths::{AbsolutePath, ExecutableRef, WrapperPath};
 use crate::state::{InstanceOrigin, Isolation, Ownership};
 
-/// The template an instance came from, and the version it was built at.
-///
-/// The template name alone cannot answer "is this instance behind?" because
-/// that needs the version, tracked separately from the harness's own version.
+/// The template an instance came from, and the version it was built at;
+/// version is tracked separately from the harness's own version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateRef {
     /// Template identifier, e.g. `claude-code-glm`.
@@ -37,15 +35,8 @@ pub struct WrapperRef {
     pub content_digest: String,
 }
 
-/// A named, isolated setup of a harness: its own config dir, wrapper, and provenance.
-///
-/// This record is superai's own data. The harness has never heard of it, so
-/// there is nothing here to conflict with what the harness writes. Anything
-/// the harness owns (model, base URL, key) is read fresh from its config file
-/// instead of mirrored here.
-///
-/// Forbidden fields (never serialized): `model`, `endpoint`, `api_key`, `key`,
-/// `skill`, `plugin`, `mcp`, capability results, or copied harness config.
+/// A named, isolated setup of a harness: its own config dir, wrapper, provenance.
+/// Superai's own record; harness-owned values (model, base URL, key) are never mirrored here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instance {
     /// Immutable generated identity for the instance; rename does not change it.
@@ -79,10 +70,7 @@ pub struct Instance {
 
 impl Instance {
     /// Validate that required string fields are non-empty and well-formed.
-    ///
-    /// Newtype construction already validates most fields; this checks the free-form
-    /// strings that have no newtype: `generator_version`, `content_digest`,
-    /// `created_at`, and `adapter_revision`.
+    /// Covers the free-form strings with no newtype: `created_at` and friends.
     pub fn validate(&self) -> Result<(), crate::error::CoreError> {
         if self.created_at.is_empty() {
             return Err(crate::error::CoreError::Validation {
@@ -178,15 +166,12 @@ mod tests {
         ];
         let text = json.to_lowercase();
         for field in forbidden {
-            // Check as JSON key, not substring of other values.
-            // Parse as object and check keys explicitly for strictness.
             if let serde_json::Value::Object(map) = &v {
                 assert!(
                     !map.contains_key(field),
                     "forbidden field `{field}` must not be emitted, json: {json}"
                 );
             }
-            // Also ensure no nested forbidden key appears weirdly (template etc.)
             assert!(
                 !text.contains(&format!("\"{field}\"")),
                 "forbidden field `{field}` appears in serialized json: {json}"

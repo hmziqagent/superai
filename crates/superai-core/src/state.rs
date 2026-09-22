@@ -1,7 +1,5 @@
-//! Lifecycle and ownership states.
-//!
-//! Explicit enums model every distinct state without collapsing into booleans.
-//! No `isolated` or `supported` boolean may stand in for these enums.
+//! Lifecycle and ownership states: explicit enums, never booleans; no
+//! `isolated` or `supported` boolean may stand in for these enums.
 
 use std::fmt;
 
@@ -386,7 +384,6 @@ mod tests {
             assert_eq!(v, back);
             assert_eq!(json, format!("\"{v}\""));
         }
-        // Unknown value fails.
         let err: Result<InstallPresence, _> = serde_json::from_str("\"unknown\"");
         err.unwrap_err();
     }
@@ -545,7 +542,6 @@ mod tests {
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(original, back);
 
-        // Verify snake_case wire format, no PascalCase leakage.
         assert!(json.contains("\"unknown_version\""));
         assert!(json.contains("\"adopted_legacy\""));
         assert!(json.contains("\"explicitly_adopted\""));

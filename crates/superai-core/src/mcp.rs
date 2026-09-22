@@ -1,13 +1,5 @@
-//! MCP canonical definition and lifecycle (EXT-08..10).
-//!
-//! `McpServerDef` is the canonical server shape; the adapter declares the
-//! destination (file, key, container shape, read-only honesty) via
-//! [`crate::adapter::McpAdapterDecl`]. Writes are per-entry merges through a
-//! compensated transaction: foreign servers, unmodelled keys, and (for TOML)
-//! comments and decor outside the mutated entry survive byte-for-byte.
-//! JSONC/YAML destinations parse for inspection but refuse writes with the
-//! typed `LossyWrite` error until a preserving codec exists. Secrets are
-//! ephemeral, written only to adapter-declared sinks, and redacted in diffs.
+//! MCP canonical definition and lifecycle (EXT-08..10): per-entry merges
+//! keep foreign servers and unmodelled keys; JSONC/YAML refuse writes.
 
 #![expect(
     clippy::collapsible_if,
@@ -173,7 +165,6 @@ fn validate_env_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Is a key likely to hold a secret? Used for redaction in diffs/logs.
 fn is_secret_key(key: &str) -> bool {
     let lower = key.to_lowercase();
     lower.contains("key")
@@ -613,9 +604,8 @@ pub fn from_native_value(id: &str, value: &Value) -> Result<McpServerDef> {
     Ok(def)
 }
 
-/// Keys the canonical renderer manages on a server entry (EXT-09: unknown
-/// fields of an OWNED server survive rewrites; managed keys the new
-/// rendering no longer emits are dropped so toggles stick).
+/// Keys the canonical renderer manages; a managed key the new rendering
+/// stops emitting is dropped so toggles stick, unknown fields survive.
 const MANAGED_SERVER_KEYS: &[&str] = &[
     "command",
     "args",
@@ -655,7 +645,6 @@ fn merge_server_native(existing: Option<&Value>, new: &Value) -> Value {
     Value::Object(merged)
 }
 
-/// Convert a `toml_edit` document to its semantic JSON value.
 fn toml_document_to_value(doc: &toml_edit::DocumentMut) -> Value {
     fn table_to_value(table: &toml_edit::Table) -> Value {
         let mut map = Map::new();
@@ -700,9 +689,8 @@ fn toml_document_to_value(doc: &toml_edit::DocumentMut) -> Value {
     table_to_value(doc.as_table())
 }
 
-/// Load the outer semantic value of an MCP destination file, fresh from
-/// disk, through the codec for the declared kind. Missing and empty files
-/// read as an empty object; no file is created.
+/// Missing and empty destination files read as an empty object; no file
+/// is created.
 fn read_outer_value(path: &Path, kind: DocumentKind) -> Result<Value> {
     let value = match kind {
         DocumentKind::Json => superai_config::json::load_value(path)?,
@@ -726,11 +714,8 @@ fn read_outer_value(path: &Path, kind: DocumentKind) -> Result<Value> {
     Ok(value)
 }
 
-/// Read the outer semantic value and the inner server entries for `decl`.
-///
-/// The container under `dest_key` (dotted paths address nested containers,
-/// e.g. `amp.mcpServers`) is extracted per the declared shape: name-keyed
-/// maps directly, identity lists keyed by their per-entry identity field.
+/// Read the outer value plus the inner server entries for `decl`;
+/// `dest_key` may be dotted (e.g. `amp.mcpServers`).
 fn read_outer_and_inner(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -753,7 +738,6 @@ fn navigate_dotted<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
     }
 }
 
-/// Extract the server entries under the decl's `dest_key` per its shape.
 fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     let Some(container) = navigate_dotted(outer, &decl.dest_key) else {
@@ -784,15 +768,12 @@ fn inner_entries(outer: &Value, decl: &McpAdapterDecl) -> Result<BTreeMap<String
 /// foreign servers and their lexical presentation untouched).
 #[derive(Debug, Clone, PartialEq)]
 enum ServerWrite {
-    /// Insert or update the entry for `id` with the merged native value.
     Upsert(Value),
-    /// Remove the entry for `id` only.
     Remove,
 }
 
-/// Commit prepared document `bytes` to `path` through a compensated
-/// transaction: backup of foreign content, atomic write, read-back parse
-/// verification (EXT-07/EXT-10 lifecycle discipline).
+/// Commit `bytes` through the compensated transaction: backup, atomic
+/// write, read-back parse verification (EXT-07/EXT-10).
 fn commit_document(path: &Path, kind: DocumentKind, bytes: Vec<u8>) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut steps: Vec<superai_config::transaction::FileAction> = Vec::new();
@@ -925,7 +906,6 @@ fn apply_json_server_write(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    // Walk to the container's parent, creating objects as needed.
     let mut current = outer;
     for segment in &segments {
         if !current.is_object() {
@@ -1029,7 +1009,6 @@ fn write_json_server(
     commit_document(path, decl.kind, bytes)
 }
 
-/// Convert a semantic JSON value into a `toml_edit` item.
 fn json_to_toml_item(value: &Value) -> std::result::Result<toml_edit::Item, String> {
     use toml_edit::value as toml_value;
     match value {
@@ -1066,8 +1045,8 @@ fn json_to_toml_item(value: &Value) -> std::result::Result<toml_edit::Item, Stri
     }
 }
 
-/// Convert a server entry to a TOML table (sub-tables serialize as
-/// `[mcp_servers.<id>.<key>]` sections).
+/// Convert a server entry to a TOML table; sub-tables become
+/// `[mcp_servers.<id>.<key>]` sections.
 fn json_server_to_toml_table(value: &Value) -> std::result::Result<toml_edit::Table, String> {
     let Some(map) = value.as_object() else {
         return Err("mcp server entry must be an object".to_owned());
@@ -1090,7 +1069,6 @@ fn json_server_to_toml_table(value: &Value) -> std::result::Result<toml_edit::Ta
     Ok(table)
 }
 
-/// Walk to the container table at a dotted path, creating parent tables.
 fn toml_container_table<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     dotted: &str,
@@ -1118,8 +1096,7 @@ fn toml_container_table<'a>(
 }
 
 /// Write one server entry into a TOML destination through `toml_edit`, so
-/// comments, formatting, foreign keys, and foreign servers survive the write
-/// byte-for-byte outside the mutated entry.
+/// comments, formatting, and foreign servers survive byte-for-byte.
 fn write_toml_server(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -1202,13 +1179,8 @@ fn write_toml_server(
     commit_document(path, decl.kind, doc.to_string().into_bytes())
 }
 
-/// Inspect effective MCP servers from `path` using `decl` (read fresh, no
-/// mutation). Works across destination kinds and container shapes; read-only
-/// declarations inspect the same as writable ones.
-/// One destination scan: every parseable server plus, per foreign entry
-/// that failed validation, its id and the reason it was excluded. The
-/// invalid list is surfaced, never silently dropped: one bad entry must
-/// not blind the report on the rest.
+/// One destination scan: parseable servers keyed by id, plus `(key, reason)`
+/// for each skipped entry. Invalid entries are surfaced, never dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InspectedServers {
     /// Servers that parsed and validated, keyed by id.
@@ -1224,9 +1196,8 @@ impl InspectedServers {
     }
 }
 
-/// Read and parse every server entry at `path`: valid ones keyed by id,
-/// invalid ones named in [`InspectedServers::invalid`] so a single foreign
-/// entry with e.g. hostile command bytes cannot blind the whole report.
+/// Read and parse every server entry at `path`; entries that fail
+/// validation land in [`InspectedServers::invalid`] instead of failing the scan.
 pub fn inspect_servers(path: &Path, decl: &McpAdapterDecl) -> Result<InspectedServers> {
     let (_outer, inner) = read_outer_and_inner(path, decl)?;
     let mut out = InspectedServers::default();
@@ -1329,9 +1300,7 @@ pub fn preview_install(
 }
 
 /// Install or update a single MCP server, preserving foreign entries.
-///
-/// Validate, preview collisions, merge per-entry, commit through the
-/// compensated transaction. Returns the installed definition on success.
+/// Validates, previews collisions, merges per-entry, commits atomically.
 pub fn install_mcp_server(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -1383,9 +1352,7 @@ pub fn set_mcp_enabled(
 }
 
 /// Remove an owned MCP server, leaving foreign entries untouched.
-///
-/// Only the entry under `dest_key` for `id` is removed; other servers and
-/// top-level keys are preserved. If the server does not exist, returns `Ok(None)`.
+/// Returns `Ok(None)` when the server does not exist.
 pub fn remove_mcp_server(
     path: &Path,
     decl: &McpAdapterDecl,
@@ -1401,7 +1368,7 @@ pub fn remove_mcp_server(
     Ok(Some(def))
 }
 
-/// Helper to compute redacted diff for logging/preview without leaking secrets.
+/// Redacted diff for logging/preview; never carries secret values.
 pub fn redacted_diff(server: &McpServerDef) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("id={}", server.id));
@@ -1463,10 +1430,8 @@ pub struct McpScopeTransferPreview {
     pub diff_redacted: String,
 }
 
-/// Preview moving/copying server `id` between two declared destinations
-/// (EXT-10). Both files are read fresh; scopes and conflicts surface before
-/// any write. Same-semantic destination entry is a no-op/adopt (no conflict);
-/// a different definition under the same id is an explicit conflict.
+/// Preview a scope transfer (EXT-10); both files are read fresh, and a
+/// same-semantic destination entry is a no-op while a differing one conflicts.
 pub fn preview_scope_transfer(
     source_path: &Path,
     source_decl: &McpAdapterDecl,
@@ -1522,11 +1487,8 @@ pub fn preview_scope_transfer(
     })
 }
 
-/// Move or copy server `id` between two declared destinations (EXT-10).
-///
-/// The destination is written first (additive); the source entry is removed
-/// only for [`ScopeTransfer::Move`] after the destination write verified, so
-/// a mid-transfer failure never loses the server.
+/// Move or copy server `id` between destinations (EXT-10); the destination
+/// is written and verified first, so a failure loses nothing.
 pub fn transfer_between_scopes(
     source_path: &Path,
     source_decl: &McpAdapterDecl,
@@ -1547,7 +1509,6 @@ pub fn transfer_between_scopes(
     if let Some(dest) = &preview.dest_existing
         && *dest == preview.source_existing
     {
-        // The destination already carries the same definition.
         if action == ScopeTransfer::Move {
             write_server_entry(source_path, source_decl, id.as_str(), ServerWrite::Remove)?;
         }
@@ -1663,13 +1624,8 @@ impl BulkPlan {
     }
 }
 
-/// Build every per-instance plan fresh (EXT-11).
-///
-/// Each destination is read from disk at plan time; unsupported targets
-/// (verified MCP absence, no destination declared, read-only destinations)
-/// and per-target conflicts (name collisions, missing servers) are visible on
-/// the plan BEFORE anything is committed. Plan-time snapshots are captured so
-/// apply can detect external edits in the plan→apply window.
+/// Build every per-instance plan fresh (EXT-11); unsupported targets and
+/// conflicts surface before commit, snapshots guard the plan→apply window.
 pub fn bulk_plan(targets: &[BulkTarget], action: &BulkAction) -> BulkPlan {
     let mut plans = Vec::new();
     for target in targets {
@@ -1811,8 +1767,7 @@ pub struct BulkTargetResult {
     pub outcome: BulkOutcome,
 }
 
-/// Bulk apply result: per-target outcomes identifying completed vs
-/// rolled-back vs refused targets (EXT-11).
+/// Per-target outcomes: completed vs rolled-back vs refused (EXT-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkResult {
     /// One entry per planned target.
@@ -1867,13 +1822,8 @@ fn ensure_plan_token_unchanged(
     Ok(())
 }
 
-/// Apply a bulk action per the fresh plans (EXT-11).
-///
-/// Every target is applied through the compensated per-write MCP transaction
-/// (backup + atomic replace + read-back verify, area-2 machinery), so a
-/// failure on one target rolls back that target only; other targets proceed
-/// and are reported independently. Refusals never touch disk. External edits
-/// between plan and apply surface as `RolledBack` with the digest evidence.
+/// Apply a bulk action per the fresh plans (EXT-11): each target runs its
+/// own transaction; refusals never touch disk, failures roll back alone.
 pub fn bulk_apply(targets: &[BulkTarget], plan: &BulkPlan, action: &BulkAction) -> BulkResult {
     let mut results = Vec::new();
     for (target, target_plan) in targets.iter().zip(plan.targets.iter()) {
@@ -1900,7 +1850,6 @@ pub fn bulk_apply(targets: &[BulkTarget], plan: &BulkPlan, action: &BulkAction) 
             });
             continue;
         };
-        // Fresh per-target application with the plan-time token enforced.
         let applied = (|| -> Result<String> {
             if let Some(expected) = &target_plan.expected {
                 ensure_plan_token_unchanged(&target_plan.dest_path, expected)?;
@@ -1984,7 +1933,6 @@ mod tests {
         assert_eq!(server.timeout_ms, back.timeout_ms);
         assert_eq!(server.disabled, back.disabled);
 
-        // remote round-trip
         let id2 = McpServerId::new("remote-sse").unwrap();
         let mut remote =
             McpServerDef::remote(id2, McpTransport::Sse, "https://example.com/sse").unwrap();
@@ -1999,7 +1947,6 @@ mod tests {
         assert_eq!(remote.headers, back2.headers);
         assert_eq!(remote.transport, back2.transport);
 
-        // serialization round-trip via serde_json
         let json = serde_json::to_string(&server).unwrap();
         let de: McpServerDef = serde_json::from_str(&json).unwrap();
         assert_eq!(server, de);
@@ -2012,7 +1959,6 @@ mod tests {
     #[test]
     fn foreign_entry_preservation() {
         let path = tmp_file("foreign");
-        // Create file with foreign top-level key and foreign server
         let mut outer = Map::new();
         outer.insert("model".to_owned(), Value::String("sonnet".to_owned()));
         outer.insert("otherKey".to_owned(), Value::String("foreign".to_owned()));
@@ -2030,7 +1976,6 @@ mod tests {
         let server = McpServerDef::stdio(id, "node", vec!["server.js".to_owned()]).unwrap();
         install_mcp_server(&path, &d, &server).unwrap();
 
-        // Read back fresh
         let content = std::fs::read(&path).unwrap();
         let val: Value = serde_json::from_slice(&content).unwrap();
         let obj = val.as_object().unwrap();
@@ -2066,7 +2011,6 @@ mod tests {
             McpServerDef::stdio(id_owned.clone(), "node", vec!["a.js".to_owned()]).unwrap();
         install_mcp_server(&path, &d, &server_owned).unwrap();
 
-        // Manually inject foreign server via direct outer manipulation (simulate foreign)
         let content = std::fs::read(&path).unwrap();
         let mut outer: Map<String, Value> = serde_json::from_slice::<Value>(&content)
             .unwrap()
@@ -2090,18 +2034,15 @@ mod tests {
         )
         .unwrap();
 
-        // Add another owned server
         let id_owned2 = McpServerId::new("owned2").unwrap();
         let server_owned2 =
             McpServerDef::stdio(id_owned2, "node", vec!["b.js".to_owned()]).unwrap();
         install_mcp_server(&path, &d, &server_owned2).unwrap();
 
-        // Remove first owned
         let removed = remove_mcp_server(&path, &d, &id_owned).unwrap();
         assert!(removed.is_some());
         assert_eq!(removed.unwrap().id, id_owned);
 
-        // Verify foreign preserved, owned2 still there, owned removed
         let content2 = std::fs::read(&path).unwrap();
         let val2: Value = serde_json::from_slice(&content2).unwrap();
         let obj2 = val2.as_object().unwrap();
@@ -2232,24 +2173,20 @@ mod tests {
         let id = McpServerId::new("srv").unwrap();
         let server = McpServerDef::stdio(id, "node", vec!["a.js".to_owned()]).unwrap();
         install_mcp_server(&path, &d, &server).unwrap();
-        // Same definition should be no-op (not error)
         let res = install_mcp_server(&path, &d, &server).unwrap();
         assert_eq!(res, server);
-        // Different transport with same id should conflict
         let conflict = McpServerDef::remote(
             McpServerId::new("srv").unwrap(),
             McpTransport::Sse,
             "https://example.com/sse",
         )
         .unwrap();
-        // Need to bypass transport change conflict? Our preview should report conflict
         let preview = preview_install(&path, &d, &conflict).unwrap();
         assert!(
             !preview.can_auto_apply,
             "transport change should be conflict"
         );
         assert!(preview.conflicts.iter().any(|c| c.contains("transport")));
-        // Force install should error via NameCollision
         let err = install_mcp_server(&path, &d, &conflict).unwrap_err();
         match err {
             CoreError::NameCollision { .. } => {}
@@ -2265,15 +2202,12 @@ mod tests {
         let id = McpServerId::new("toggle").unwrap();
         let server = McpServerDef::stdio(id.clone(), "node", vec!["a.js".to_owned()]).unwrap();
         install_mcp_server(&path, &d, &server).unwrap();
-        // disable
         let disabled = set_mcp_enabled(&path, &d, &id, false).unwrap();
         assert!(disabled.disabled);
         let inspected = inspect_servers(&path, &d).unwrap();
         assert!(inspected.servers.get(&id).is_some_and(|v| v.disabled));
-        // enable
         let enabled = set_mcp_enabled(&path, &d, &id, true).unwrap();
         assert!(!enabled.disabled);
-        // remove is different from disable: remove actually deletes entry
         remove_mcp_server(&path, &d, &id).unwrap();
         let after_remove = inspect_servers(&path, &d).unwrap();
         assert!(
@@ -2302,9 +2236,8 @@ mod tests {
 
     #[test]
     fn lossy_surfaces_refuse_install_and_leave_file_untouched() {
-        // codec-honesty (DOC-05/DOC-06): JSONC/YAML MCP surfaces must fail
-        // with the typed lossy-write error instead of receiving normalized
-        // JSON bytes.
+        // JSONC/YAML surfaces must fail with the typed lossy-write error
+        // (DOC-05/DOC-06), not receive normalized JSON bytes.
         for (kind, file_name, format) in [
             (DocumentKind::Jsonc, "settings.jsonc", "jsonc"),
             (DocumentKind::Yaml, "settings.yaml", "yaml"),
@@ -2385,12 +2318,10 @@ mod tests {
         assert!(after.contains("[mcp_servers.context7]"));
         assert!(after.contains("[mcp_servers.owned-server]"));
 
-        // Inspection reads through toml_edit.
         let inspected = inspect_servers(&path, &d).unwrap();
         assert!(inspected.contains_key(&McpServerId::new("context7").unwrap()));
         assert!(inspected.contains_key(&McpServerId::new("owned-server").unwrap()));
 
-        // Remove leaves the foreign server and comments intact.
         remove_mcp_server(&path, &d, &McpServerId::new("owned-server").unwrap()).unwrap();
         let final_text = std::fs::read_to_string(&path).unwrap();
         assert!(final_text.contains("[mcp_servers.context7]"));
@@ -2434,7 +2365,6 @@ mod tests {
         assert!(inspected.contains_key(&McpServerId::new("fetch_server").unwrap()));
         assert!(inspected.contains_key(&McpServerId::new("owned-http").unwrap()));
 
-        // Remove drops only the owned entry.
         remove_mcp_server(&path, &d, &McpServerId::new("owned-http").unwrap()).unwrap();
         let final_text = std::fs::read_to_string(&path).unwrap();
         assert!(final_text.contains("name = \"fetch_server\""));
@@ -2459,13 +2389,11 @@ mod tests {
             ConfigScope::User,
             RestartBehavior::None,
         );
-        // Inspection parses the YAML and the goose cmd/args spelling.
         let inspected = inspect_servers(&path, &d).unwrap();
         assert!(inspected.contains_key(&McpServerId::new("developer-tools").unwrap()));
         let key = McpServerId::new("developer-tools").unwrap();
         let def = &inspected.servers[&key];
         assert_eq!(def.command.as_deref(), Some("npx"));
-        // Writes refuse with the typed lossy error and leave bytes intact.
         let before = std::fs::read(&path).unwrap();
         let server = McpServerDef::stdio(
             McpServerId::new("owned").unwrap(),
@@ -2535,7 +2463,6 @@ mod tests {
             RestartBehavior::None,
         )
         .with_read_only("harness-managed store; superai must not write (corpus: openhands.md)");
-        // Inspection still works.
         assert!(
             inspect_servers(&path, &d)
                 .unwrap()
@@ -2555,7 +2482,6 @@ mod tests {
             }
             other => panic!("expected UnsupportedOperation, got {other:?}"),
         }
-        // Disable/remove of an existing entry refuse the same honest way.
         assert!(matches!(
             set_mcp_enabled(&path, &d, &McpServerId::new("existing").unwrap(), false),
             Err(CoreError::UnsupportedOperation { .. })
@@ -2593,14 +2519,12 @@ mod tests {
             .and_then(|m| m.get("owned"))
             .cloned()
             .unwrap();
-        // Unknown/unmodelled fields survive.
         assert_eq!(entry.get("cwd").and_then(Value::as_str), Some("/x"));
         assert_eq!(
             entry.get("bearer_token_env_var").and_then(Value::as_str),
             Some("TOK")
         );
         assert_eq!(entry.get("trust").and_then(Value::as_bool), Some(true));
-        // Managed fields reflect the new rendering exactly.
         assert_eq!(
             entry.get("args").and_then(|a| a.as_array()).map(Vec::len),
             Some(1)
@@ -2612,7 +2536,6 @@ mod tests {
                 .and_then(Value::as_str),
             Some("2")
         );
-        // A managed field the new rendering no longer emits is dropped.
         assert!(entry.get("timeout").is_none());
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -2842,8 +2765,6 @@ mod tests {
         let project_path = project_root.join(".mcp.json");
         let id = McpServerId::new("shared").unwrap();
 
-        // COPY: source keeps the server, destination gains it; foreign keys
-        // survive on both sides.
         let copied = transfer_between_scopes(
             &user_path,
             &user_decl,
@@ -2867,8 +2788,8 @@ mod tests {
         );
         assert!(project_doc.get("note").is_some());
 
-        // MOVE: destination (already carrying the same definition) adopts and
-        // the source entry is removed.
+        // MOVE: the destination already carries the same definition, so the
+        // source entry is removed.
         let moved = transfer_between_scopes(
             &project_path,
             &project_decl,
@@ -2886,8 +2807,6 @@ mod tests {
             "move must remove the source entry: {project_after}"
         );
 
-        // Conflict preview: a different definition under the same id blocks
-        // the transfer.
         let conflicting_root = root_with_mcp(
             "scope-conflict",
             &serde_json::json!({
@@ -2954,7 +2873,6 @@ mod tests {
             enabled: false,
         };
         let plan = bulk_plan(&targets, &action);
-        // Unsupported target visible BEFORE commit with its absence reason.
         let refusing = plan.refusing_targets();
         assert_eq!(refusing.len(), 1, "{:?}", refusing);
         assert_eq!(refusing[0].instance, "pi-box");
@@ -2966,7 +2884,6 @@ mod tests {
             "{:?}",
             refusing[0].unsupported_reason
         );
-        // Supported targets carry fresh existing definitions + plan tokens.
         for target_plan in &plan.targets[..2] {
             assert!(target_plan.supported);
             assert!(target_plan.existing.is_some());
@@ -2979,8 +2896,6 @@ mod tests {
         assert_eq!(completed, vec!["lab", "work"]);
         assert_eq!(result.refused(), vec!["pi-box"]);
         assert!(result.rolled_back().is_empty());
-        // Both writable destinations now disable the server in place,
-        // preserving foreign entries.
         for root in [&root_a, &root_b] {
             let doc: Value =
                 serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
@@ -3080,7 +2995,6 @@ mod tests {
             },
         ];
         let plan = bulk_plan(&targets, &action);
-        // Read-only destination is surfaced as unsupported with its reason.
         let ro_plan = plan
             .targets
             .iter()
@@ -3093,7 +3007,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|r| r.contains("read-only"))
         );
-        // Missing destination is a constrained note, not a conflict, for installs.
         let fresh_plan = plan.targets.iter().find(|t| t.instance == "fresh").unwrap();
         assert!(fresh_plan.supported);
         assert!(
@@ -3113,7 +3026,6 @@ mod tests {
             created["mcpServers"]["brand-new"]["command"], "uvx",
             "{created}"
         );
-        // Read-only destination bytes untouched.
         let ro_after = std::fs::read_to_string(ro_root.join(".mcp.json")).unwrap();
         assert!(ro_after.contains("server-one"));
 

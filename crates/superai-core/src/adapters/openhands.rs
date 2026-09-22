@@ -1,7 +1,5 @@
-//! `OpenHands` adapter: V0 `config.toml` (TOML) vs V1 `agent_settings.json`
-//! (JSON) + env `LLM_*`/`OH_PERSISTENCE_DIR` with Docker sandbox isolation
-//! (`os_bound`); `Constrained`, both schemas must be owned for writes.
-//! Research source: `docs/harness-configs/openhands.md` (last verified 2026-08-25).
+//! `OpenHands` adapter: V0 `config.toml` vs V1 `agent_settings.json` + env
+//! `LLM_*`/`OH_PERSISTENCE_DIR` with Docker isolation; writes own both schemas.
 
 use std::path::{Path, PathBuf};
 
@@ -52,10 +50,7 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// V1 schema marker version split note.
 pub const VERSION_SPLIT_NOTE: &str = "OpenHands V0 config.toml (TOML, ./config.toml or ~/.openhands/config.toml, sections [core]/[llm]/[agent]/[sandbox]) vs V1 agent_settings.json + env (OH_PERSISTENCE_DIR, LLM_MODEL/API_KEY/BASE_URL, SANDBOX_VOLUMES) with Docker isolation: both schemas must be owned for constrained writes";
 
-/// Owned selectors: V0 TOML keys and V1 JSON paths.
-///
-/// V0: `llm.model`, `llm.api_key`, `llm.base_url`, `core.runtime`, `core.max_iterations`, `sandbox.*`
-/// V1: `llm.model`, `llm.api_key`, `llm.base_url` inside `agent_settings.json`
+/// Owned selectors: V0 TOML keys and V1 JSON paths (same dotted form).
 pub const OWNED_SELECTORS: &[&str] = &[
     "llm.model",
     "llm.api_key",
@@ -72,9 +67,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "agent.enable_browsing",
 ];
 
-/// Concrete adapter for `OpenHands` (`Constrained`, `os_bound`): Docker
-/// runtime plus V1 `OH_PERSISTENCE_DIR` and V0 per-directory `config.toml`;
-/// constrained because writes must own both schemas.
+/// `OpenHands` adapter (`Constrained`): Docker runtime, V1
+/// `OH_PERSISTENCE_DIR`, V0 per-directory `config.toml`; writes own both schemas.
 #[derive(Debug, Clone)]
 pub struct OpenHandsAdapter {
     id: HarnessId,
@@ -107,7 +101,6 @@ impl OpenHandsAdapter {
         VERSION_SPLIT_NOTE
     }
 
-    /// Resolve the default persistence root: `$OH_PERSISTENCE_DIR` or `~/.openhands`.
     fn default_persistence_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(PERSISTENCE_ENV_VAR)
             && !dir.trim().is_empty()
@@ -123,7 +116,6 @@ impl OpenHandsAdapter {
         Some(PathBuf::from(home).join(".openhands"))
     }
 
-    /// Build detection evidence about V0/V1 surfaces and Docker persistence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -325,7 +317,6 @@ impl Adapter for OpenHandsAdapter {
             notes.push(format!("detected openhands version {v}"));
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
             notes.push(format!("split: {VERSION_SPLIT_NOTE}"));
-            // Heuristic: versions < 1.0 are V0 TOML era, >=1.0 V1 env/JSON
             if v.starts_with("0.") {
                 notes.push("version 0.x suggests V0 config.toml era".to_owned());
             } else {
@@ -550,8 +541,8 @@ impl Adapter for OpenHandsAdapter {
             PERSISTENCE_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // V1 env overrides are session-inline and need --override-with-envs;
-        // values are provider/template driven, persistence is set here.
+        // V1 env overrides are session-inline and only apply behind
+        // --override-with-envs; persistence is what the wrapper pins.
         plan.env_vars
             .push(("RUNTIME".to_owned(), "docker".to_owned()));
         let runtime_image = "ghcr.io/openhands/agent-server:1.26.0-python";
@@ -614,7 +605,6 @@ impl Adapter for OpenHandsAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (openhands.md: `mcp.json` listed under server-managed config files)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -630,7 +620,6 @@ impl Adapter for OpenHandsAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (openhands.md)")
     }

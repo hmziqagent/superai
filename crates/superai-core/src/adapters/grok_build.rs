@@ -1,6 +1,5 @@
-//! Grok Build adapter: relocated-root via `GROK_HOME`, primary writable
-//! surface `config.toml` (TOML), `GROK_CONFIG`/`GROK_CONFIG_PATH` overlays.
-//! Research source: `docs/harness-configs/grok-build.md` (last verified 2026-08-25).
+//! Grok Build adapter: relocated root via `GROK_HOME`, writable `config.toml`,
+//! with `GROK_CONFIG`/`GROK_CONFIG_PATH` overlays merged over it.
 
 use std::path::{Path, PathBuf};
 
@@ -55,9 +54,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "custom_models",
 ];
 
-/// Concrete adapter for Grok Build: `relocated-root` via `GROK_HOME`;
-/// `GROK_CONFIG` (inline JSON) and `GROK_CONFIG_PATH` (file) are documented
-/// overlays that win over the file but are not required for isolation.
+/// Grok Build adapter: relocated root via `GROK_HOME`; the `GROK_CONFIG` and
+/// `GROK_CONFIG_PATH` overlays win over the file but are not required.
 #[derive(Debug, Clone)]
 pub struct GrokBuildAdapter {
     id: HarnessId,
@@ -85,7 +83,6 @@ impl GrokBuildAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$GROK_HOME` or `~/.grok`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -101,12 +98,10 @@ impl GrokBuildAdapter {
         Some(PathBuf::from(home).join(".grok"))
     }
 
-    /// Build the config.toml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.toml")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -507,10 +502,8 @@ impl Adapter for GrokBuildAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (live-verified 2026-09-18, grok 1.0.34:
-    /// `grok mcp add` writes `[mcp_servers.<name>]` tables into
-    /// `$GROK_HOME/config.toml`; shipped user-guide 07-mcp-servers.md,
-    /// evidence live/grok-build/mcp-probe.txt).
+    /// `grok mcp add` writes `[mcp_servers.<name>]` into `$GROK_HOME/config.toml`
+    /// (live-verified grok 1.0.34, evidence live/grok-build/mcp-probe.txt).
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.toml",
@@ -521,7 +514,7 @@ impl Adapter for GrokBuildAdapter {
         ))
     }
 
-    /// EXT-06/07: plugin mechanism (grok-build.md: `~/.grok/plugins/` user scope and `.grok/plugins/` project scope)
+    /// Plugins install as directories: `~/.grok/plugins/` (user) or `.grok/plugins/` (project).
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",

@@ -1,8 +1,5 @@
-//! Letta Code adapter: client config (local state via
-//! `$LETTA_LOCAL_BACKEND_DIR`, server connection via `LETTA_API_KEY`/
-//! `LETTA_BASE_URL`) plus separate per-provider server state; `Constrained`
-//! support (client mutation only, server state not mutated per instance).
-//! Research source: `docs/harness-configs/letta-code.md` (last verified 2026-08-25).
+//! Letta Code adapter: client config via `$LETTA_LOCAL_BACKEND_DIR`, server
+//! connection via `LETTA_BASE_URL`/`LETTA_API_KEY`; client-only mutation.
 
 use std::path::{Path, PathBuf};
 
@@ -73,13 +70,8 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Constrained note: the server is separate, one per provider.
 pub const CONSTRAINED_NOTE: &str = "client config isolated via LETTA_LOCAL_BACKEND_DIR; separate server per provider state (LETTA_BASE_URL, LETTA_API_KEY, Ollama/vLLM) is separate server and not per-instance mutated: run one server per provider (different ports/volumes at /root/.letta)";
 
-/// Concrete adapter for Letta Code (`Constrained`).
-///
-/// Isolation is `daemon_service`: each instance gets an isolated local
-/// backend dir via `LETTA_LOCAL_BACKEND_DIR`; server-side provider
-/// connections (`LETTA_BASE_URL` with keys for Anthropic/Ollama/etc.)
-/// are separate and require distinct server processes/volumes. The wrapper
-/// sets `LETTA_LOCAL_BACKEND_DIR` and `LETTA_BASE_URL` for the client.
+/// Letta Code adapter (`Constrained`): each instance gets its own
+/// `LETTA_LOCAL_BACKEND_DIR`; provider servers stay external to the instance.
 #[derive(Debug, Clone)]
 pub struct LettaAdapter {
     id: HarnessId,
@@ -112,7 +104,6 @@ impl LettaAdapter {
         BASE_URL_ENV_VAR
     }
 
-    /// Resolve the default local backend dir: `$LETTA_LOCAL_BACKEND_DIR` or `~/.letta/lc-local-backend`.
     fn default_local_backend_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(LOCAL_BACKEND_ENV_VAR)
             && !dir.trim().is_empty()
@@ -128,7 +119,6 @@ impl LettaAdapter {
         Some(PathBuf::from(home).join(".letta").join("lc-local-backend"))
     }
 
-    /// Resolve the default state dir `~/.letta`.
     fn default_state_dir() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -139,7 +129,6 @@ impl LettaAdapter {
         Some(PathBuf::from(home).join(".letta"))
     }
 
-    /// Build detection evidence about local backend, state, and server config.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -215,7 +204,6 @@ impl LettaAdapter {
                 evidence.push(format!("{var} not set"));
             }
         }
-        // Project skills
         if Path::new(".agents/skills").exists() {
             evidence.push(".agents/skills present in cwd (project)".to_owned());
         }
@@ -339,7 +327,6 @@ impl Adapter for LettaAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Per-agent JSON-ish state, user/instance scope
         let backend_resolver = PathResolver::new(
             Some("$LETTA_LOCAL_BACKEND_DIR"),
             Some("$LETTA_LOCAL_BACKEND_DIR"),
@@ -358,7 +345,6 @@ impl Adapter for LettaAdapter {
         backend.restart_behavior = RestartBehavior::Reload;
         surfaces.push(backend);
 
-        // Git-backed per-agent memory filesystem, instance scope
         let memfs_resolver = PathResolver::new(
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/memory"),
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/memory"),
@@ -376,7 +362,6 @@ impl Adapter for LettaAdapter {
         memfs.backup_required = false;
         surfaces.push(memfs);
 
-        // Computer-scope skills
         let global_skills_resolver = PathResolver::new(
             Some("~/.letta/skills/<name>/"),
             Some("~/.letta/skills/<name>/"),
@@ -394,7 +379,6 @@ impl Adapter for LettaAdapter {
         global_skills.backup_required = false;
         surfaces.push(global_skills);
 
-        // Committed with the repo
         let project_skills_resolver =
             PathResolver::fallback_only(".agents/skills/<name>/ (project)");
         let mut project_skills = ConfigSurface::new(
@@ -408,7 +392,6 @@ impl Adapter for LettaAdapter {
         project_skills.backup_required = false;
         surfaces.push(project_skills);
 
-        // Inside memfs, per agent
         let agent_skills_resolver = PathResolver::new(
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/skills/<name>/"),
             Some("$LETTA_LOCAL_BACKEND_DIR/memfs/<agent-id>/skills/<name>/"),
@@ -426,7 +409,6 @@ impl Adapter for LettaAdapter {
         agent_skills.backup_required = false;
         surfaces.push(agent_skills);
 
-        // Session-inline env config, not a file
         let env_resolver = PathResolver::new(
             Some("$LETTA_BASE_URL / $LETTA_API_KEY (env, session)"),
             Some("$LETTA_BASE_URL / $LETTA_API_KEY (env, session)"),
@@ -452,7 +434,6 @@ impl Adapter for LettaAdapter {
         env_surface.restart_behavior = RestartBehavior::ReLogin;
         surfaces.push(env_surface);
 
-        // Separate server process; constrained, not per-instance
         let server_resolver = PathResolver::fallback_only(
             "server provider state (separate process per provider, /root/.letta, LETTA_APP_SERVER_TOKEN)",
         );
@@ -517,9 +498,8 @@ impl Adapter for LettaAdapter {
             LOCAL_BACKEND_ENV_VAR.to_owned(),
             instance.config_root.to_string(),
         ));
-        // Add a deterministic base-url hint based on instance root for isolation; real server url remains external
-        // For constrained isolation we set LOCAL_BACKEND_DIR deterministically and leave BASE_URL to caller env.
-        // To make wrapper deterministic and testable, we also set a derived BASE_URL if not externally set.
+        // Deterministic per-instance port hint derived from the name; the
+        // real server url stays external to the instance.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "name len < 100 truncation intentional"
@@ -578,14 +558,12 @@ impl Adapter for LettaAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "no dedicated MCP config page in corpus (404); MCP access is mediated through skills + permissions (letta-code.md 5)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (letta-code.md)")
     }

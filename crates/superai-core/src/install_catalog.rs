@@ -1,10 +1,5 @@
 //! Installation catalog: data-driven harness package registry (PKG-02).
-//!
-//! Per harness/platform the catalog records install methods with official
-//! package names, platform constraints, detect/update/uninstall command
-//! tokens (executable + argv, never a shell pipeline), and docs. All data
-//! lives in `assets/install_catalog.json` and is validated on load; no
-//! package identity or command is hard-coded in Rust.
+//! All data lives in assets/install_catalog.json; commands are argv tokens, never shell pipelines.
 
 #![expect(
     clippy::excessive_nesting,
@@ -64,9 +59,7 @@ impl std::fmt::Display for InstallMethodKind {
 }
 
 /// A structured command: executable plus argv tokens, never a shell pipeline.
-///
-/// Tokens carrying shell metacharacters (`|`, `&&`, `;`, `` ` ``, `$(`, `>`)
-/// are rejected on validation so no catalog entry can smuggle a pipeline.
+/// Tokens carrying shell metacharacters are rejected on validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandTokens {
     /// Program to execute (looked up via `PATH` unless absolute).
@@ -177,7 +170,6 @@ impl InstallMethod {
                 reason: "package_name must not contain shell metacharacters".to_owned(),
             });
         }
-        // Forbid shell metachars in tap/repo/registry
         for (field, val) in [
             ("install_method.tap", self.tap.as_ref()),
             ("install_method.repo", self.repo.as_ref()),
@@ -303,11 +295,8 @@ pub struct InstallCatalogEntry {
     /// Whether installation requires admin/elevated privileges.
     #[serde(default)]
     pub requires_admin: bool,
-    /// Optional checksum or signature guard (hex digest or URL). Verified
-    /// for well-formedness on load: a 64-hex SHA-256 or an `https://` URL.
-    /// No direct-download path exists today (PKG-10 refuses Direct and
-    /// External methods), so nothing downloads an artifact to check it
-    /// against yet; when one does, this field is the digest it must match.
+    /// Optional checksum or signature guard: 64-hex SHA-256 or `https://` URL.
+    /// No download path exists yet; when one does, this is the digest it must match.
     #[serde(default)]
     pub checksum: Option<String>,
     /// Harness IDs that conflict or are replaced by this harness.
@@ -436,8 +425,6 @@ fn validate_last_verified(value: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-// Catalog load and lookup
-
 /// Loaded install catalog: harness id -> entry mapping plus ordered list.
 #[derive(Debug, Clone)]
 pub struct InstallCatalog {
@@ -480,10 +467,8 @@ impl InstallCatalog {
         Ok(Self { entries, index })
     }
 
-    /// Load from the embedded asset (`assets/install_catalog.json`).
-    ///
-    /// The asset is a compile-time constant, so the parse is memoized; disk
-    /// catalogs via `from_file` are always read fresh.
+    /// Load from the embedded asset. The parse is memoized (a compile-time
+    /// constant); disk catalogs via `from_file` are always read fresh.
     pub fn embedded() -> Result<Self, CoreError> {
         static CACHED: std::sync::OnceLock<InstallCatalog> = std::sync::OnceLock::new();
         if let Some(cached) = CACHED.get() {
@@ -584,13 +569,11 @@ mod tests {
     fn embedded_catalog_loads_and_validates() {
         let catalog = InstallCatalog::embedded().unwrap();
         assert!(catalog.len() >= 5, "expected at least 5 entries");
-        // Every entry must have validated harness id
         for entry in &catalog.entries {
             entry.harness_id().unwrap();
             assert!(!entry.docs.is_empty());
             validate_last_verified(&entry.last_verified).unwrap();
         }
-        // Lookup by HarnessId
         let id = HarnessId::new("claude-code").unwrap();
         let e = catalog.get(&id).unwrap();
         assert_eq!(e.harness, "claude-code");
@@ -599,8 +582,7 @@ mod tests {
     }
 
     /// A carried checksum is verified for well-formedness on load: 64-hex
-    /// sha256 or an https URL. Absent checksums stay legitimate until a
-    /// direct-download path exists to verify an artifact against them.
+    /// sha256 or an https URL; absent checksums stay legitimate for now.
     #[test]
     fn catalog_checksum_field_is_verified_on_load() {
         let mut good_hex = minimal_entry("checksum-hex");
@@ -657,7 +639,6 @@ mod tests {
 
     #[test]
     fn catalog_validation_catches_missing_commands_structure() {
-        // CommandTokens with shell pipeline must be rejected
         let bad = CommandTokens {
             executable: "npm".to_owned(),
             args: vec!["install".to_owned(), "|".to_owned(), "sh".to_owned()],
@@ -700,7 +681,6 @@ mod tests {
         let mut e = minimal_entry("bad/harness");
         let err = e.validate().unwrap_err();
         assert!(format!("{err}").contains("invalid HarnessId"));
-        // Also test via from_entries
         e.harness = "CON".to_owned();
         assert!(e.validate().is_err());
     }

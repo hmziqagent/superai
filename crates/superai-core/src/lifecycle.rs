@@ -1,8 +1,5 @@
-//! Instance lifecycle orchestration (INS-01..09): default inspection,
-//! mirrored creation, rename, reconfigure, detach, remove, repair. Every
-//! operation is a previewable compensated transaction; harness state is read
-//! fresh from disk, and the registry record commits only after target
-//! verification.
+//! Instance lifecycle orchestration (INS-01..09): inspect, create, rename,
+//! reconfigure, detach, remove, repair; the registry record commits last.
 
 #![expect(
     clippy::assigning_clones,
@@ -145,12 +142,8 @@ pub enum CreateSource {
     ConfigRoot(AbsolutePath),
 }
 
-/// Asset-inheritance choice for a create request (INS-02).
-///
-/// Shared assets the adapter declares link-safe are linked by default. An
-/// opted-out name must be an adapter-declared shared asset
-/// ([`Adapter::mirror_link_paths`]); anything else is a blocking conflict.
-/// Opted-out assets are copied so the new instance owns a private copy.
+/// Asset-inheritance choice for a create request (INS-02): declared shared
+/// assets link by default; an opt-out must be declared, else it blocks.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AssetInheritance {
     /// Link every adapter-declared shared asset (INS-04 step 4 default).
@@ -184,23 +177,18 @@ pub struct CreateRequest {
     pub isolation: Isolation,
     /// Template the instance was built from, if any.
     pub template: Option<TemplateRef>,
-    /// Provider input (INS-02): when set, a planned credential exists, so
-    /// preflight requires the harness to declare a writable secret sink
-    /// ([`crate::provider::resolve_api_key_sink`]); a harness without one
-    /// is a blocking conflict, not a warning.
+    /// Provider input (INS-02): when set a credential is planned, so the
+    /// harness must declare a writable secret sink; without one it blocks.
     pub provider: Option<ProviderId>,
     /// Wrapper path to generate, if any.
     pub wrapper: Option<WrapperPath>,
     /// Explicit target root, if the caller wants to control the location (e.g. tests).
     pub target_root: Option<AbsolutePath>,
-    /// Daemon port for `DaemonService` isolation, if the caller chose one
-    /// (INS-02). `None` defers allocation to daemon start (probe-and-reserve
-    /// with a fresh conflict check, WRP-07); `Some(port)` is conflict-checked
-    /// during preflight.
+    /// Daemon port for `DaemonService` isolation (INS-02): `None` defers
+    /// allocation to daemon start; `Some(port)` is conflict-checked at preflight.
     pub daemon_port: Option<u16>,
-    /// Asset-inheritance choice (INS-02): which adapter-declared shared
-    /// assets to inherit (link) versus copy privately. See
-    /// [`AssetInheritance`].
+    /// Asset-inheritance choice (INS-02): which declared shared assets to
+    /// inherit (link) versus copy privately. See [`AssetInheritance`].
     pub asset_inheritance: AssetInheritance,
 }
 
@@ -404,11 +392,8 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Credential file names that must never be mirrored, gathered from the
-/// adapter corpus and docs/harness-configs: OAuth/token stores, secret
-/// stores, environment key files, and local secrets overlays. Matched
-/// against path components, so mimo's nested `data/auth.json` is caught
-/// while the benign neighbour `.env.example` is not.
+/// Credential file names that must never be mirrored (corpus-derived),
+/// matched on path components so nested secrets are caught, `.env.example` not.
 const CREDENTIAL_FILE_NAMES: &[&str] = &[
     "credentials",
     ".credentials.json",
@@ -422,16 +407,12 @@ const CREDENTIAL_FILE_NAMES: &[&str] = &[
     "gptme.local.toml",
 ];
 
-/// Substrings marking credential material anywhere in a relative mirror
-/// path; covers `.anthropic/credentials`-style paths and every file under a
-/// `credentials/` tree.
+/// Substrings marking credential material anywhere in a relative mirror path;
+/// covers `.anthropic/credentials`-style paths and `credentials/` trees.
 const CREDENTIAL_PATH_MARKERS: &[&str] = &["credentials", ".keychain"];
 
-/// Whether a relative mirror path names credential material: a
-/// [`CREDENTIAL_PATH_MARKERS`] substring, or a component equal to a
-/// [`CREDENTIAL_FILE_NAMES`] entry or an adapter-declared name. Credential
-/// entries are classified [`MirrorKind::ExternalAuth`] and never copied:
-/// instances re-establish credentials through the external-auth path.
+/// Whether a relative mirror path names credential material; such entries are
+/// classified [`MirrorKind::ExternalAuth`] and never copied (re-auth instead).
 fn is_credential_path(relative: &Path, credential_names: &[String]) -> bool {
     let rel = relative.to_string_lossy();
     if CREDENTIAL_PATH_MARKERS
@@ -451,11 +432,8 @@ fn is_credential_path(relative: &Path, credential_names: &[String]) -> bool {
     })
 }
 
-/// File names of every secret-store surface the adapter declares: defense
-/// in depth beyond the static corpus list. File-backed
-/// [`SurfaceOwnership::ExternalSecretStore`] surfaces contribute their file
-/// name (`workspace/.env (project)` becomes `.env`); inline env-var surfaces
-/// contribute nothing.
+/// File names of every secret-store surface the adapter declares: defense in
+/// depth beyond the static corpus list (file-backed surfaces contribute names).
 fn adapter_credential_file_names(adapter: &dyn Adapter) -> Vec<String> {
     adapter
         .config_surfaces()
@@ -611,10 +589,8 @@ fn build_mirror_plan(
                 mode,
             });
         } else if matches_declared_path(&relative, link_paths) {
-            // INS-02 asset-inheritance exclusion: copy the shared asset
-            // privately instead of linking it. Directory entries are
-            // recreated implicitly by their file copies (the staging layer
-            // creates parents), so they stay out of the byte-copy set.
+            // INS-02 asset-inheritance exclusion: copy the shared asset privately;
+            // directories are recreated implicitly by their file copies.
             if std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_dir()) {
                 skipped.push(MirrorEntry {
                     source: src,
@@ -643,9 +619,8 @@ fn build_mirror_plan(
                 mode,
             });
         } else if matches_declared_path(&relative, rewrite_files) {
-            // Adapter-declared rewrite: the file embeds the config root path.
-            // Only TRANSFORMED when the content actually carries it; otherwise
-            // a plain copy is the honest plan.
+            // Adapter-declared rewrite: only TRANSFORMED when the content actually
+            // carries the config root path; otherwise a plain copy is honest.
             let content_has_root = std::fs::read_to_string(&src)
                 .map(|text| text.contains(&source_root_str))
                 .unwrap_or(false);
@@ -669,9 +644,8 @@ fn build_mirror_plan(
                 });
             }
         } else if std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_dir()) {
-            // Directory entries never enter the byte-copy set: their files
-            // are copied individually and the staging layer creates every
-            // parent, so the directory is recreated implicitly.
+            // Directory entries never enter the byte-copy set: files are copied
+            // individually and the staging layer creates every parent.
             skipped.push(MirrorEntry {
                 source: src,
                 target,
@@ -727,10 +701,8 @@ pub struct DefaultInspectPreview {
     pub preview: OperationPreview,
 }
 
-/// Inspect the default install for a harness without touching config.
-///
-/// A missing config is still a valid `needs_auth` target; inspection never
-/// creates it.
+/// Inspect the default install for a harness without touching config; a
+/// missing config is still a valid `needs_auth` target, never created here.
 pub fn inspect_default(
     harness: &HarnessId,
     registry: &Registry,
@@ -982,9 +954,8 @@ pub fn inspect_default_with_home(
     })
 }
 
-/// Commit registration of a default instance that was previewed.
-///
-/// Writes only the registry file (with backup); harness config is untouched.
+/// Commit registration of a default instance that was previewed: writes only
+/// the registry file (with backup); harness config is untouched.
 pub fn register_default(
     preview: &DefaultInspectPreview,
     registry_path: &Path,
@@ -1123,11 +1094,8 @@ fn build_default_instance(
     })
 }
 
-/// Stable instance id derived from a prefix, the harness, and the config root.
-///
-/// Same inputs always yield the same id, so a preview can show the id the
-/// commit will record without the two ever diverging. Falls back to a bare
-/// digest when the prefixed form would exceed the id length limit.
+/// Stable instance id derived from prefix, harness, and config root: preview
+/// and commit always agree. Falls back to a bare digest at the length limit.
 fn stable_instance_id(
     prefix: &str,
     harness: &HarnessId,
@@ -1161,18 +1129,14 @@ fn stable_instance_id(
     }
 }
 
-/// Preview of adopting an unmanaged candidate config root.
-///
-/// Adoption records what is already on disk. It never copies, migrates,
-/// normalizes, or reformats harness config, and it never invents a wrapper:
-/// the only write [`adopt`] performs is the superai-owned registry record.
+/// Preview adopting an unmanaged candidate root: records what is on disk,
+/// never copies or reformats, never invents a wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptPreview {
     /// Candidate config root being adopted, as observed (absolute, normalized).
     pub candidate_root: AbsolutePath,
-    /// Home scope the foreign-ownership check ran under at preview time.
-    ///
-    /// Commit re-runs that check fresh under the same scope.
+    /// Home scope the foreign-ownership check ran under at preview time;
+    /// commit re-runs that check fresh under the same scope.
     pub home: Option<PathBuf>,
     /// Harness proven by the fingerprint at preview time (Medium confidence
     /// or better; a canonical config file carried the proof).
@@ -1181,13 +1145,11 @@ pub struct AdoptPreview {
     pub fingerprint: Fingerprint,
     /// Foreign-manager check evidence captured at preview time.
     pub foreign: ForeignCheck,
-    /// Isolation class for the harness from the registry catalog.
-    ///
-    /// [`Isolation::Unknown`] when the proven harness has no catalog entry.
+    /// Isolation class for the harness from the catalog; `Unknown` when the
+    /// proven harness has no catalog entry.
     pub isolation: Isolation,
-    /// Digests of the candidate's canonical config files at preview time.
-    ///
-    /// Conflict token: commit requires the same set with the same digests.
+    /// Digests of the candidate's canonical config files at preview time;
+    /// commit requires the same set with the same digests.
     pub config_digests: Vec<(String, String)>,
     /// Name the adopted record will carry (caller-chosen, validated).
     pub name: InstanceName,
@@ -1199,11 +1161,8 @@ pub struct AdoptPreview {
     pub preview: OperationPreview,
 }
 
-/// Isolation class recorded for an adopted harness.
-///
-/// The recorded isolation is the harness's declared class from the catalog,
-/// never a claim that superai relocated anything. Uncataloged harnesses
-/// record [`Isolation::Unknown`] rather than a guess.
+/// Isolation class recorded for an adopted harness: the declared class from
+/// the catalog, never a relocation claim. Uncataloged records `Unknown`.
 fn adopted_isolation(harness: &HarnessId) -> Isolation {
     crate::harness_catalog::find_by_id(harness.as_str())
         .map_or(Isolation::Unknown, |entry| entry.isolation)
@@ -1222,15 +1181,8 @@ fn format_config_tokens(tokens: &[(String, String)]) -> String {
     }
 }
 
-/// Preview adopting an unmanaged candidate config directory as instance `name`.
-///
-/// Proves the harness fingerprint fresh at
-/// [`ADOPTION_CONFIDENCE_FLOOR`][crate::discovery::ADOPTION_CONFIDENCE_FLOOR]
-/// (Medium or better: a canonical config file must carry the proof, a
-/// directory name alone never does), blocks foreign ownership, requires a
-/// fresh readable candidate, and surfaces registry collisions (name, id,
-/// already-recorded root) as conflicts that block commit. Read-only: no file
-/// is created, written, or modified.
+/// Preview adopting an unmanaged candidate as instance `name`: fingerprint at
+/// the confidence floor, foreign check, collision checks. Read-only.
 pub fn preview_adopt(
     candidate: &Path,
     name: &InstanceName,
@@ -1416,15 +1368,8 @@ pub fn preview_adopt(
     })
 }
 
-/// Commit an adoption preview: write the registry record and nothing else.
-///
-/// Every adoption check is re-proven fresh at commit time (disk is truth):
-/// the fingerprint (still at the Medium confidence floor), the
-/// foreign-ownership block, and the readability of the candidate via
-/// [`can_adopt`]; the canonical config digests against the preview's token;
-/// and the registry, re-read from disk, for name, id, and config-root
-/// collisions. The candidate's config files are never modified; the only
-/// write is the superai-owned registry record, committed last.
+/// Commit an adoption preview: every check re-proven fresh (disk is truth);
+/// the only write is the superai-owned registry record, committed last.
 pub fn adopt(preview: &AdoptPreview, registry_path: &Path) -> Result<OperationResult> {
     if !preview.preview.conflicts.is_empty() {
         return Err(CoreError::Validation {
@@ -1622,11 +1567,8 @@ fn disk_space_status(available: Option<u64>, required: u64) -> DiskSpaceStatus {
     }
 }
 
-/// Measure available bytes on the filesystem containing `path` (INS-02).
-///
-/// Unix: the platform's own `df -k -P <path>` report (argv tokens, no
-/// shell). Other platforms: `None`; std exposes no statvfs, and no number
-/// is invented.
+/// Measure available bytes on the filesystem containing `path` (INS-02):
+/// `df -k -P` argv tokens on unix; `None` elsewhere, no invented number.
 fn disk_space_available(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -1709,8 +1651,7 @@ fn preflight_create(
             }
         }
         // WRP-03: destination checks run through the real resolver (PATH
-        // executable collisions, case folding, registry collisions,
-        // unowned-file refusal) and surface as preflight conflicts.
+        // collisions, case folding, registry collisions, unowned-file refusal).
         let bin_dir = wrapper_path
             .as_path()
             .parent()
@@ -1794,8 +1735,7 @@ fn preflight_create(
     }
 
     // INS-02: the enum-level refusal plus the catalog's declared class; a
-    // relocated-root request against a fixed-path harness surfaces here,
-    // before any target is built.
+    // relocated-root request against a fixed-path harness surfaces here.
     if request.isolation == Isolation::Unsupported {
         conflicts.push(Conflict {
             code: "isolation_unsupported".to_owned(),
@@ -1930,9 +1870,8 @@ fn preflight_create(
         }
     }
 
-    // INS-02: the plan's byte total must fit on the target filesystem.
-    // Availability comes from `df -k -P`; when it cannot be measured, the
-    // typed warning stands in, never an invented number.
+    // INS-02: the plan's byte total must fit on the target filesystem;
+    // unmeasurable availability stays a typed warning, never an invented number.
     let fs_probe_path = nearest_existing_ancestor(target_root);
     let status = disk_space_status(disk_space_available(&fs_probe_path), planned_bytes);
     match status {
@@ -1985,7 +1924,6 @@ fn preflight_create(
         }
     }
 
-    // Template/provider compatible: simplified check if template harness matches request harness?
     if let Some(tmpl) = &request.template
         && tmpl.name.as_str() != request.harness.as_str()
         && !tmpl.name.as_str().contains(request.harness.as_str())
@@ -2001,9 +1939,8 @@ fn preflight_create(
         });
     }
 
-    // INS-02: the harness-declared sink for a provider credential. Without a
-    // planned provider the sink outcome is advisory; with one, a credential
-    // is planned and an unresolvable sink is a blocking conflict.
+    // INS-02: the harness-declared sink for a provider credential; with a
+    // planned provider, an unresolvable sink is a blocking conflict.
     match crate::provider::resolve_api_key_sink(adapter) {
         Ok(sink) => {
             let provider_note = request
@@ -2045,8 +1982,7 @@ fn preflight_create(
     }
 
     // Provider input validity (INS-02): a planned provider must exist in the
-    // bundled catalog; an unknown id is a blocking conflict, never a silent
-    // pass.
+    // bundled catalog; an unknown id blocks, never a silent pass.
     if let Some(provider_id) = &request.provider {
         let known = crate::provider::load_bundled_providers()
             .map(|providers| {
@@ -2065,8 +2001,7 @@ fn preflight_create(
     }
 
     // INS-02/WRP-07: an explicitly chosen daemon port must be free now; a
-    // deferred port is allocated probe-and-reserve at daemon start with a
-    // fresh conflict check.
+    // deferred port is allocated probe-and-reserve at daemon start.
     if request.isolation == Isolation::DaemonService {
         let port_check = match request.daemon_port {
             Some(port) => {
@@ -2107,8 +2042,7 @@ fn preflight_create(
     }
 
     // INS-02: the real discovery check (markers, claude-multi config links),
-    // not a bare marker-file probe. Ambiguity does not block a read-only
-    // mirror but is surfaced.
+    // not a bare marker probe. Ambiguity surfaces but does not block a mirror.
     let foreign = is_foreign_managed(source_root, home_dir().as_deref());
     if foreign.is_foreign {
         conflicts.push(Conflict {
@@ -2146,15 +2080,8 @@ fn template_transform_targets(target_root: &Path, template: Option<&TemplateRef>
     }
 }
 
-/// Compute a mirror plan for copying from `source_root` to `target_root`.
-///
-/// Uses the adapter's exclusions plus the credential gate: paths named after
-/// credential material (see `is_credential_path`) and files the adapter
-/// declares as external secret-store surfaces are skipped for external
-/// re-authentication instead of being copied. Adapter-declared link-safe
-/// shared assets are classified [`MirrorKind::Linked`] (INS-03/04) and
-/// files whose content embeds the config root are classified
-/// [`MirrorKind::Transformed`].
+/// Compute a mirror plan from `source_root` to `target_root`: adapter
+/// exclusions plus the credential gate; linked and transformed entries classified.
 pub fn plan_mirror(
     source_root: &Path,
     target_root: &Path,
@@ -2181,10 +2108,7 @@ pub fn plan_mirror_for_template(
 }
 
 /// [`plan_mirror_for_template`] with an explicit asset-inheritance choice
-/// (INS-02): declared shared assets named in the choice are copied instead
-/// of linked. Exclusion names are validated against the adapter's declared
-/// link-safe assets; an undeclared name is a typed error, never a silent
-/// skip.
+/// (INS-02): opted-out names must be declared, else a typed error.
 pub fn plan_mirror_with_asset_choice(
     source_root: &Path,
     target_root: &Path,
@@ -2210,9 +2134,8 @@ pub fn plan_mirror_with_asset_choice(
     )
 }
 
-/// INS-02: every opted-out name must be an adapter-declared link-safe
-/// shared asset; a name the adapter already mirror-excludes needs no
-/// inheritance choice.
+/// INS-02: opted-out names must be declared link-safe assets; a name the
+/// adapter already mirror-excludes needs no inheritance choice.
 fn validate_asset_exclusions(
     asset_inheritance: &AssetInheritance,
     link_paths: &[String],
@@ -2242,10 +2165,8 @@ fn validate_asset_exclusions(
     Ok(())
 }
 
-/// Preview creation of a mirrored instance.
-///
-/// Performs preflight, computes the mirror plan, and returns an
-/// `OperationPreview` without mutating disk.
+/// Preview creation of a mirrored instance: preflight, mirror plan, an
+/// `OperationPreview`; disk untouched.
 pub fn preview_create_mirrored(
     request: &CreateRequest,
     registry: &Registry,
@@ -2263,9 +2184,8 @@ pub fn preview_create_mirrored(
     )
 }
 
-/// The mirror plan for a create request. An exclusion the adapter does not
-/// declare is planned as if unchosen: preflight surfaces the blocking
-/// conflict, and the commit path refuses the same request.
+/// The mirror plan for a create request; an undeclared exclusion is planned
+/// as unchosen: preflight surfaces the conflict, commit refuses.
 fn mirror_plan_for_create(
     request: &CreateRequest,
     adapter: &dyn Adapter,
@@ -2564,15 +2484,8 @@ fn resolve_source_and_target(
     Ok((source_root, target_root))
 }
 
-/// Isolate and configure a target root from a source, applying template
-/// mutations, shared-asset links, and wrapper generation, all via file
-/// actions that are validated transactionally.
-///
-/// INS-04 transaction order: 1. create target root. 2. copy mirror (linked
-/// entries become symlinks, transformed entries carry their mutation).
-/// 3. template mutations to target only. 4. link shared assets. 5. wrapper.
-/// The DRF-05 marker (`.superai-instance`, carrying the stable id) is written
-/// into the target so reconciliation matches identity before paths.
+/// Isolate and configure a target root from a source, all via transactionally
+/// validated file actions (INS-04 order: root, mirror, mutations, links, wrapper).
 #[expect(
     clippy::too_many_lines,
     reason = "INS-04 step assembly covers every mirror kind explicitly"
@@ -2727,11 +2640,8 @@ fn wrapper_plan_for(instance: &Instance, adapter: &dyn Adapter) -> WrapperPlan {
     })
 }
 
-/// Apply a plan-observed unix mode to a superai-owned target path (INS-03
-/// mode preservation). Best-effort by design: the transaction already
-/// content-verified the copy, and a chmod failure must not fail the whole
-/// create after the bytes landed; the copy keeps the transaction's default
-/// mode. No-op off unix.
+/// Apply a plan-observed unix mode to a superai-owned target (INS-03);
+/// best-effort: a chmod failure never fails the create after bytes landed.
 fn apply_observed_mode(path: &Path, mode: Option<u32>) {
     #[cfg(unix)]
     if let Some(mode) = mode {
@@ -2816,13 +2726,8 @@ fn guess_document_kind(path: &Path) -> superai_config::document::DocumentKind {
     }
 }
 
-/// Mutate settings bytes with template markers, or refuse honestly.
-///
-/// codec-honesty (DOC-05): if `existing` bytes are present they must parse as
-/// strict JSON. JSONC content (comments, trailing commas; amp's declared
-/// settings kind) must not be silently swapped for an empty map and
-/// rewritten as normalized JSON: that destroys every foreign key and comment.
-/// Refuse with the typed lossy-write error instead.
+/// Mutate settings bytes with template markers, or refuse honestly (DOC-05):
+/// JSONC input is never rewritten as normalized JSON; refuse typed instead.
 fn mutate_settings_with_template(
     target: &Path,
     existing: Option<&[u8]>,
@@ -2859,12 +2764,8 @@ fn mutate_settings_with_template(
     })
 }
 
-/// Commit creation of a mirrored instance.
-///
-/// Transaction order per INS-04: create target root, copy mirror, apply
-/// template mutations to target only, link shared assets, generate wrapper,
-/// validate via adapter, add the registry record last. Failure before the
-/// registry commit rolls target/wrapper back or quarantines residuals.
+/// Commit creation of a mirrored instance (INS-04 order, registry record last);
+/// failure before the registry commit rolls back or quarantines residuals.
 pub fn create_mirrored(
     request: CreateRequest,
     registry_path: &Path,
@@ -3130,11 +3031,8 @@ fn quarantine_root_and_wrapper(target_root: &Path, wrapper: Option<&WrapperPath>
     }
 }
 
-/// Preview rename of an instance.
-///
-/// Rename affects `InstanceName`, wrapper command/path, and display labels;
-/// the config root is never renamed. Collision checks are platform-aware and
-/// wrapper replacement is atomic.
+/// Preview rename: affects `InstanceName`, wrapper command/path, labels; the
+/// config root is never renamed. Platform-aware collisions, atomic wrapper swap.
 pub fn preview_rename(
     registry: &Registry,
     old_name: &str,
@@ -3265,9 +3163,8 @@ pub fn preview_rename(
     })
 }
 
-/// Commit rename of an instance, preserving its id and config root.
-///
-/// Wrapper command/path is updated if it currently equals the old name (case-folded). Replacement is atomic and verified.
+/// Commit rename, preserving id and config root; wrapper command/path updates
+/// when it equals the old name (case-folded).
 pub fn rename_instance(
     registry_path: &Path,
     old_name: &str,
@@ -3351,10 +3248,8 @@ pub fn rename_instance(
                 reason: format!("new wrapper path invalid: {e}"),
             })?;
         if removed.wrapper.is_some() {
-            // INS-05/INS-09: the marker embeds the instance name, so a
-            // verbatim byte move would read as WrapperDrift on the next
-            // repair scan. Regenerate through the wrapper writer (marker +
-            // digest under the new name, atomic, moved bytes backed up).
+            // The marker embeds the instance name, so a verbatim byte move would
+            // read as WrapperDrift; regenerate through the wrapper writer instead.
             let (content, _) = expected_wrapper_for(&removed, adapter)?;
             if let Some(wrapper_ref) = &mut removed.wrapper {
                 wrapper_ref.path = new_wrapper_path;
@@ -3440,11 +3335,8 @@ pub fn rename_instance(
     })
 }
 
-/// One reconfiguration action (INS-06). Every variant maps to a real
-/// mutation path: provider changes render through [`crate::provider_render`]
-/// (PRV-03/08), template re-application goes through the same mutation
-/// create uses, MCP toggles act on the adapter's declared destination, and
-/// skill relinking re-applies the skill mode.
+/// One reconfiguration action (INS-06); every variant maps to a real mutation
+/// path (provider render, template re-apply, MCP destination, skill relink).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconfigureAction {
     /// Add or update a provider's endpoint/model entries on the instance.
@@ -3482,12 +3374,8 @@ pub enum ReconfigureAction {
     /// Re-apply the instance's skill links (idempotent relink of the
     /// adapter-declared skills destination).
     RelinkSkills,
-    /// Enable or disable an INSTALLED plugin on the adapter-declared
-    /// destination (INS-06 plugin kind): the plugin lifecycle from plan 10
-    /// (`plugin::set_plugin_enabled`), registry flag first, then the
-    /// destination mutation (config-entry toggle or bundle stage/unstage),
-    /// foreign entries/files preserved. Execution-backed plugin kinds are
-    /// refused here; they need the harness's own command.
+    /// Enable/disable an INSTALLED plugin on the adapter-declared destination
+    /// (INS-06); foreign entries preserved, execution-backed kinds refused.
     SetPluginEnabled {
         /// Plugin id, exactly as recorded in the plugin registry.
         plugin: String,
@@ -3529,8 +3417,7 @@ fn resolve_bundled_provider(
 }
 
 /// Resolve the provider definitions a provider action needs (owned, so the
-/// borrowed [`crate::provider_render::ProviderChange`] can be built at each
-/// call site with locals that outlive it).
+/// borrowed change outlives each call site).
 fn resolve_action_providers(
     action: &ReconfigureAction,
 ) -> Result<(
@@ -3559,9 +3446,8 @@ fn resolve_action_providers(
     }
 }
 
-/// Construct the borrowed provider change for an action whose definitions
-/// are already resolved. Non-provider actions are refused (they never reach
-/// this helper through [`resolve_action_providers`]).
+/// Construct the borrowed provider change for an already-resolved action;
+/// non-provider actions are refused.
 fn provider_change_with<'a>(
     action: &'a ReconfigureAction,
     primary: &'a crate::provider::ProviderDefinition,
@@ -3650,16 +3536,14 @@ fn mcp_dest_path(
     Ok((instance.config_root.as_path().join(&decl.dest_file), decl))
 }
 
-/// The superai-owned plugin registry root for a home (INS-06 plugin kind):
-/// `<home>/.superai/plugins`, outside every harness tree, the same
-/// placement discipline as the skills root.
+/// The superai-owned plugin registry root: `<home>/.superai/plugins`, outside
+/// every harness tree, same discipline as the skills root.
 fn plugin_registry_root(home: &Path) -> PathBuf {
     home.join(".superai").join("plugins")
 }
 
-/// Destination path a plugin declaration mutates for `instance`: the config
-/// FILE for config-entry plugins, the bundle DIRECTORY otherwise (its parent
-/// is the instance root, which is what `plugin::set_plugin_enabled` expects).
+/// Destination path a plugin declaration mutates: the config FILE for
+/// config-entry plugins, the bundle DIRECTORY otherwise.
 fn plugin_dest_path(instance: &Instance, decl: &crate::adapter::PluginAdapterDecl) -> PathBuf {
     if decl.kind == crate::adapter::PluginKind::DirectoryBundle
         && let Some(dir) = decl.dest_dir.as_deref()
@@ -3670,9 +3554,8 @@ fn plugin_dest_path(instance: &Instance, decl: &crate::adapter::PluginAdapterDec
     }
 }
 
-/// Resolve the plugin registry record for `plugin` FRESH from the registry at
-/// `home` (disk is truth). `Err` carries the typed load failure; `Ok(None)`
-/// means the id is unknown (or invalid), never guessed at.
+/// Resolve the plugin registry record FRESH from disk; `Ok(None)` means the
+/// id is unknown, never guessed at.
 fn plugin_record_for(home: &Path, plugin: &str) -> Result<Option<crate::plugin::PluginRecord>> {
     let registry = crate::plugin::PluginRegistry::load(&plugin_registry_root(home))?;
     Ok(crate::ids::PluginId::new(plugin)
@@ -3680,10 +3563,8 @@ fn plugin_record_for(home: &Path, plugin: &str) -> Result<Option<crate::plugin::
         .and_then(|id| registry.get(&id).cloned()))
 }
 
-/// Preview reconfigure of provider/template/skills/MCP for an instance
-/// (INS-06): loads the record, re-inspects harness files FRESH, builds the
-/// real adapter mutations, and previews semantic + lexical redacted diffs.
-/// No file is written.
+/// Preview reconfigure (INS-06): load the record, re-inspect harness files
+/// FRESH, preview redacted diffs; no file is written.
 pub fn preview_reconfigure(
     registry: &Registry,
     name: &str,
@@ -3712,7 +3593,6 @@ pub fn preview_reconfigure_with_home(
         reason: format!("instance {name} not found for reconfigure"),
     })?;
 
-    // Fresh snapshot of config root
     let config_snap = snapshot(instance.config_root.as_path());
     let settings_path = instance.config_root.as_path().join("settings.json");
 
@@ -3749,7 +3629,6 @@ pub fn preview_reconfigure_with_home(
         });
     }
 
-    // Verify adapter can validate instance
     if let Err(e) = adapter.validate_instance(instance) {
         conflicts.push(Conflict {
             code: "validation_failed".to_owned(),
@@ -4098,11 +3977,8 @@ pub fn preview_reconfigure_with_home(
     })
 }
 
-/// Commit reconfigure (INS-06): read fresh, apply the REAL adapter
-/// mutations (provider rendering, template re-apply, MCP toggle, skill
-/// relink) through their transaction layers, then re-resolve capabilities
-/// and health WITHOUT persisting mirrors. Registry changes only for
-/// superai-owned provenance/version facts after file verification.
+/// Commit reconfigure (INS-06): REAL adapter mutations through their
+/// transaction layers; registry changes only after file verification.
 pub fn reconfigure(
     registry_path: &Path,
     name: &str,
@@ -4112,10 +3988,8 @@ pub fn reconfigure(
     reconfigure_with_home(registry_path, name, adapter, request, home_dir().as_deref())
 }
 
-/// [`reconfigure`] with an explicit home scope: the crash-journal root, the
-/// skills registry root, and the plugin registry root all resolve under the
-/// caller's home (tests stay hermetic; callers handling a non-ambient home
-/// should prefer this variant).
+/// [`reconfigure`] with an explicit home scope: journal, skills, and plugin
+/// roots resolve under the caller's home (tests stay hermetic).
 #[expect(
     clippy::too_many_lines,
     reason = "commit applies every reconfigure action kind"
@@ -4151,9 +4025,8 @@ pub fn reconfigure_with_home(
     let mut diagnostics: Vec<String> = Vec::new();
     let mut verification: Vec<VerificationResult> = Vec::new();
 
-    // WriteFile-kind targets per action order: the byte-restorable surfaces
-    // the compensator below reverts. Link farms (skills relink) and bundle
-    // directories are not byte-restorable and stay uncompensated.
+    // WriteFile-kind targets in action order: the byte-restorable surfaces the
+    // compensator reverts; link farms and bundles stay uncompensated.
     let write_targets: Vec<(u32, PathBuf)> = preview
         .actions
         .iter()
@@ -4176,9 +4049,8 @@ pub fn reconfigure_with_home(
             &mut diagnostics,
             &mut verification,
         ) {
-            // First action failed: nothing is applied, the typed error
-            // stands. A mid-list failure rolls the applied actions back
-            // instead of leaving a half-applied request on disk.
+            // First action failed: nothing applied, the typed error stands; a mid-list
+            // failure rolls the applied actions back.
             if order == 0 {
                 return Err(failure);
             }
@@ -4223,10 +4095,8 @@ pub fn reconfigure_with_home(
     })?;
     adapter.validate_instance(updated_instance)?;
 
-    // Re-resolve capabilities and health WITHOUT persisting mirrors (INS-06):
-    // capability resolution is fresh from adapter/provider/template sources;
-    // the health summary reports the detected provider and its compat
-    // verdict; reconfigure never fires a live network probe.
+    // Re-resolve capabilities and health without persisting mirrors (INS-06);
+    // reconfigure never fires a live network probe.
     let capability_sources = crate::capability_resolver::InstanceCapabilitySources::default();
     let resolved =
         crate::capability_resolver::resolve_for_instance(updated_instance, &capability_sources);
@@ -4287,9 +4157,8 @@ pub fn reconfigure_with_home(
     })
 }
 
-/// Apply ONE reconfigure action, appending its applied descriptions,
-/// diagnostics, and verification results. Errors flow to the caller's
-/// compensator in [`reconfigure_with_home`].
+/// Apply ONE reconfigure action; errors flow to the caller's compensator
+/// in [`reconfigure_with_home`].
 #[expect(
     clippy::too_many_lines,
     reason = "one commit pass over every reconfigure action kind"
@@ -4780,12 +4649,8 @@ pub enum RemoveChoice {
     RecordAndWrapper,
     /// Remove record, wrapper, and superai-created instance root (quarantined).
     RecordWrapperAndRoot,
-    /// Remove the record plus superai's fixed-path config entries: saved
-    /// profiles and the active-identity record under the superai-owned
-    /// profile store (INS-08, enabled by INS-10). The harness's own fixed
-    /// config file is NEVER touched: superai never captured pre-activation
-    /// bytes, so the on-disk content stays exactly as last activated
-    /// (surfaced as a limitation in the preview).
+    /// Remove the record plus superai's fixed-path entries (profiles and the
+    /// active identity, INS-08); the harness's own fixed config file is never touched.
     FixedPathEntries,
 }
 
@@ -5019,9 +4884,7 @@ pub fn remove_instance_with_home(
         });
     }
 
-    // INS-08: remove superai's fixed-path config entries, every saved
-    // profile and the active-identity record under the superai-owned store.
-    // The store directory is superai-owned (outside the harness tree), so
+    // INS-08: remove the fixed-path entries; the store is superai-owned, so
     // removing it is safe; the harness config file is never touched.
     let mut fixed_path_store_cleared = false;
     if choice == RemoveChoice::FixedPathEntries
@@ -5045,7 +4908,6 @@ pub fn remove_instance_with_home(
         }
     }
 
-    // Remove wrapper if requested
     let mut wrapper_removed = false;
     if matches!(
         choice,
@@ -5063,7 +4925,6 @@ pub fn remove_instance_with_home(
         }
     }
 
-    // Quarantine instance root if requested and safe
     let mut root_quarantined = false;
     let mut quarantine_path: Option<PathBuf> = None;
     if choice == RemoveChoice::RecordWrapperAndRoot && is_safe_to_remove_root(&instance) {
@@ -5185,14 +5046,12 @@ fn expected_wrapper_for(instance: &Instance, adapter: &dyn Adapter) -> Result<(S
     wrapper_helper::generate_shell_wrapper(instance, &plan)
 }
 
-/// The template version marker lifecycle writes into mutated settings
-/// (`superai_template_version`); INS-09 compares the registry record's
-/// template version against this on-disk fact.
+/// The template version marker lifecycle writes into mutated settings; INS-09
+/// compares the record's version against this on-disk fact.
 const TEMPLATE_VERSION_MARKER_KEY: &str = "superai_template_version";
 
-/// Read the on-disk template version marker from the instance settings, if
-/// the file parses (strict JSON gate; JSONC content yields `None`, never a
-/// stripped read).
+/// Read the on-disk template version marker; strict JSON gate, JSONC yields
+/// `None`, never a stripped read.
 fn on_disk_template_version(instance: &Instance) -> Option<String> {
     let settings = instance.config_root.as_path().join("settings.json");
     let bytes = std::fs::read(settings).ok()?;
@@ -5203,10 +5062,8 @@ fn on_disk_template_version(instance: &Instance) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Detect repairs needed for all instances (INS-09): missing wrapper,
-/// FULL-CONTENT wrapper drift, missing config root, missing binary, adapter
-/// version change, template version drift against the on-disk marker, and
-/// incomplete transaction journals.
+/// Detect repairs needed for all instances (INS-09): wrapper drift (full
+/// content), missing roots/binaries, version drift, incomplete journals.
 pub fn detect_repairs(registry: &Registry, adapter: &dyn Adapter) -> Vec<RepairItem> {
     detect_repairs_with_home(registry, adapter, home_dir().as_deref())
 }
@@ -5247,9 +5104,8 @@ pub fn detect_repairs_with_home(
                         continue;
                     }
                 };
-                // Full-content comparison: any byte difference from the
-                // deterministic regeneration is drift, even when a digest
-                // substring survives inside an edited file.
+                // Full-content comparison: any byte difference from the deterministic
+                // regeneration is drift, even when a digest substring survives.
                 if content != expected_content {
                     let owned = wrapper_helper::is_owned_wrapper(
                         wrapper_path,
@@ -5277,7 +5133,6 @@ pub fn detect_repairs_with_home(
             }
         }
 
-        // Missing config root
         if !inst.config_root.as_path().exists() {
             items.push(RepairItem {
                 instance: inst.id.clone(),
@@ -5302,7 +5157,6 @@ pub fn detect_repairs_with_home(
             });
         }
 
-        // Adapter version change
         if inst.adapter_revision != crate::adapter::ADAPTER_REVISION {
             items.push(RepairItem {
                 instance: inst.id.clone(),
@@ -5340,11 +5194,8 @@ pub fn detect_repairs_with_home(
         }
     }
 
-    // Incomplete transaction journals (INS-09): any journal file still on
-    // disk under the superai journal root is an operation that never
-    // verified to completion and is pending recovery. Journal findings
-    // are attributed to the pseudo-instance `journal`, never to an
-    // arbitrary registry record.
+    // Incomplete journals (INS-09): a journal still on disk is pending
+    // recovery, attributed to the pseudo-instance `journal`.
     if let Some(home) = home
         && let (Ok(id), Ok(name)) = (InstanceId::new("journal"), InstanceName::new("journal"))
     {
@@ -5372,10 +5223,7 @@ pub fn detect_repairs_with_home(
 }
 
 /// Repair action for incomplete transaction journals (INS-09): production
-/// recovery through the journal layer: inspect the filesystem, restore from
-/// recorded backups, never replay planned content. Journals are attributed
-/// to the pseudo-instance `journal` by [`detect_repairs`], so repairing a
-/// concrete instance never sweeps global recovery state.
+/// recovery restores from recorded backups, never replays planned content.
 pub fn repair_incomplete_journals(home: &Path) -> Result<Vec<String>> {
     let report = superai_config::journal::recover_pending(home)?;
     let summaries = report
@@ -5394,11 +5242,8 @@ pub fn repair_incomplete_journals(home: &Path) -> Result<Vec<String>> {
     Ok(summaries)
 }
 
-/// Preview repair for a single instance.
-///
-/// Repair never overwrites a changed wrapper unless ownership/content digest proves it is superai-created or caller explicitly adopts it.
-/// WRP-08: wrapper repairs preview a REAL redacted content diff (expected vs
-/// on-disk), not a description-only placeholder.
+/// Preview repair for a single instance; never overwrites a changed wrapper
+/// without the ownership/content proof (WRP-08: real redacted diff).
 #[expect(
     clippy::too_many_lines,
     reason = "preview covers every repair kind with real diffs"
@@ -5547,12 +5392,8 @@ pub fn preview_repair(
     })
 }
 
-/// Commit repair for an instance, ownership-aware.
-///
-/// MissingBinary repair RE-DETECTS the binary: a found installation updates
-/// the record's pinned binary; nothing found clears the pin (marking the
-/// instance binary-missing honestly instead of pointing at a dead path).
-/// IncompleteJournal repair runs the production recovery.
+/// Commit repair, ownership-aware: MissingBinary RE-DETECTS (found re-pins,
+/// absent clears the stale pin); IncompleteJournal runs production recovery.
 #[expect(clippy::too_many_lines, reason = "commit covers every repair kind")]
 pub fn repair(
     registry_path: &Path,
@@ -5602,7 +5443,6 @@ pub fn repair(
                         w.content_digest = new_digest;
                         w.generator_version = wrapper_helper::GENERATOR_VERSION.to_owned();
                     }
-                    // Replace instance in registry
                     registry.remove(name);
                     registry.insert(updated.clone())?;
                     actions_completed.push(CompletedAction {
@@ -5650,9 +5490,8 @@ pub fn repair(
                 order += 1;
             }
             RepairKind::MissingBinary => {
-                // Re-detect the harness binary; a found install re-pins the
-                // record, nothing found clears the stale pin (binary-missing
-                // is marked honestly, never left pointing at a dead path).
+                // Re-detect the binary: found re-pins the record, absent clears the
+                // stale pin (binary-missing is marked honestly).
                 let detections = crate::detect::detect_all(&instance.harness);
                 let mut updated = instance.clone();
                 match detections.first() {
@@ -5713,9 +5552,8 @@ pub fn repair(
                 }
             }
             RepairKind::IncompleteJournal => {
-                // Pseudo-instance finding: recovered through the dedicated
-                // [`repair_incomplete_journals`] action, never as a side
-                // effect of repairing a concrete instance.
+                // Pseudo-instance finding: recovered through the dedicated action,
+                // never as a side effect of repairing a concrete instance.
                 diagnostics.push(
                     "incomplete journal reported; run repair_incomplete_journals (or let startup recovery handle it)"
                         .to_owned(),
@@ -5765,9 +5603,8 @@ pub enum OrphanWrapperChoice {
         /// DIFFERENT root (caller explicitly overrides).
         force: bool,
     },
-    /// Quarantine the wrapper file. Only offered when the file itself proves
-    /// safe to move: a superai marker whose digest verifies (target/digest
-    /// proof per DRF-07).
+    /// Quarantine the wrapper: only when a superai marker's digest verifies
+    /// (DRF-07 target/digest proof).
     Quarantine,
 }
 
@@ -5782,9 +5619,8 @@ pub struct OrphanResolution {
     pub recorded_instance: Option<InstanceId>,
 }
 
-/// Resolve one orphan-wrapper finding per DRF-07. Never touches a foreign
-/// or opaque launcher: Record requires a superai marker, Quarantine
-/// additionally requires the marker digest to verify.
+/// Resolve one orphan-wrapper finding per DRF-07; never touches a foreign
+/// launcher: Record needs the marker, Quarantine needs the digest too.
 pub fn resolve_orphan_wrapper(
     finding: &WrapperFinding,
     choice: &OrphanWrapperChoice,
@@ -5951,9 +5787,8 @@ pub fn resolve_orphan_wrapper(
     }
 }
 
-/// Quarantine an unmanaged config root (DRF-07): only on the caller's
-/// EXPLICIT request, only when ownership is unmanaged; recorded, foreign,
-/// and ambiguous roots are refused.
+/// Quarantine an unmanaged config root (DRF-07): explicit request only;
+/// recorded, foreign, and ambiguous roots are refused.
 pub fn quarantine_unmanaged_root(path: &Path, home: Option<&Path>) -> Result<OrphanResolution> {
     let ownership = crate::discovery::classify_ownership(path, &Registry::default(), home);
     if ownership != Ownership::Unmanaged {
@@ -5991,13 +5826,8 @@ pub fn quarantine_unmanaged_root(path: &Path, home: Option<&Path>) -> Result<Orp
     })
 }
 
-/// Adopt a previewed candidate AND create its superai wrapper (DRF-06
-/// optional step 5): record-first (the registry record is committed by
-/// [`adopt`]), then the wrapper is generated from the adapter's plan and
-/// the record is updated with the wrapper reference. The candidate config
-/// itself is never touched; the wrapper only names its root. Wrapper
-/// failure rolls the record back so adoption stays atomic from the user's
-/// perspective.
+/// Adopt a previewed candidate AND create its wrapper (DRF-06 step 5):
+/// record-first, candidate config never touched; wrapper failure rolls back.
 pub fn adopt_with_wrapper(
     preview: &AdoptPreview,
     registry_path: &Path,
@@ -6458,11 +6288,8 @@ mod tests {
 
     #[test]
     fn mirror_with_jsonc_settings_refuses_instead_of_stripping_comments() {
-        // codec-honesty (DOC-05): harnesses whose settings files carry JSONC
-        // (comments/trailing commas, e.g. amp's declared settings surface)
-        // must fail with the typed lossy-write error rather than being
-        // re-serialized as normalized JSON, which would drop every comment
-        // and every foreign key.
+        // codec-honesty (DOC-05): JSONC settings must fail with the typed
+        // lossy-write error, never be re-serialized as normalized JSON.
         let tmp = unique_temp("mirror_jsonc_refusal");
         let registry_path = tmp.join("registry.json");
         let adapter = make_adapter("claude-code");
@@ -6522,10 +6349,8 @@ mod tests {
 
     #[test]
     fn mirror_plan_never_copies_credential_named_files() {
-        // INS-03: credential/keychain entries must land ONLY in
-        // `external_auth`, never in `copied`, even when no adapter exclusion
-        // covers them: credentials are re-established per instance through
-        // the external-auth path, never mirrored.
+        // INS-03: credential/keychain entries land ONLY in `external_auth`,
+        // never `copied`: credentials are re-established per instance.
         let tmp = unique_temp("mirror_plan_creds");
         let source_root = tmp.join("source");
         std::fs::create_dir_all(source_root.join(".keychain")).unwrap();
@@ -6576,10 +6401,8 @@ mod tests {
 
     #[test]
     fn mirror_plan_adapter_exclusions_and_credential_gate_never_copy() {
-        // Adapter-excluded files appear only in `skipped` (no
-        // double-classification into `copied`), and the credential gate still
-        // catches credential names the adapter exclusions do not list (bare
-        // `credentials` and `auth.keychain` here).
+        // Adapter-excluded files appear only in `skipped`; the credential gate
+        // still catches names the exclusions do not list.
         let tmp = unique_temp("mirror_plan_exclusions");
         let adapter = make_adapter("claude-code");
         let source_root = tmp.join("source");
@@ -6636,9 +6459,8 @@ mod tests {
 
     #[test]
     fn create_mirrored_target_lacks_credential_files_without_adapter_exclusions() {
-        // End-to-end INS-03: bare `credentials` and `auth.keychain` are NOT
-        // covered by the generic adapter exclusions, so only the plan's
-        // credential gate can keep them out of the mirrored target root.
+        // End-to-end INS-03: bare `credentials` and `auth.keychain` are not
+        // adapter-excluded; only the credential gate keeps them out.
         let tmp = unique_temp("mirror_e2e_creds");
         let registry_path = tmp.join("registry.json");
         let adapter = make_adapter("claude-code");
@@ -6683,10 +6505,8 @@ mod tests {
 
     #[test]
     fn mirror_plan_static_gate_covers_corpus_credential_names() {
-        // Judge r1 MAJOR: the static name list must cover the credential
-        // filenames the adapter corpus actually uses (auth.json, mcp-auth.json,
-        // secrets stores, .env, local secrets overlays), matched on path
-        // components so nested paths are caught and benign near-misses are not.
+        // Judge r1 MAJOR: the static list must cover the corpus's credential
+        // filenames, matched on path components.
         let tmp = unique_temp("mirror_plan_corpus_creds");
         let source_root = tmp.join("source");
         for dir in ["data", "workspace", "sub"] {
@@ -6763,9 +6583,8 @@ mod tests {
 
     #[test]
     fn mirror_plan_mimo_auth_files_stay_external() {
-        // Judge r1 MAJOR repro: mimo stores OAuth tokens at data/auth.json and
-        // data/mcp-auth.json, and its plan_mirror_exclusions list neither;
-        // mirroring a mimo config root must keep both out of the copy set.
+        // Judge r1 MAJOR repro: mimo's OAuth tokens live at data/auth.json and
+        // data/mcp-auth.json; neither is adapter-excluded.
         let tmp = unique_temp("mirror_plan_mimo");
         let adapter = crate::adapters::mimo::MimoAdapter::new().unwrap();
         let source_root = tmp.join("source");
@@ -6805,11 +6624,8 @@ mod tests {
 
     #[test]
     fn mirror_plan_skips_adapter_declared_secret_surfaces() {
-        // Defense in depth: gptme declares config.local.toml, gptme.local.toml
-        // and .env as ExternalSecretStore file surfaces and its mirror
-        // exclusions list none of them; the adapter-declared names feed the
-        // same credential gate, so adapters add coverage beyond the static
-        // corpus list without lifecycle changes.
+        // Defense in depth: adapter-declared secret-store names feed the same
+        // credential gate, adding coverage beyond the static list.
         let tmp = unique_temp("mirror_plan_gptme");
         let adapter = crate::adapters::gptme::GptmeAdapter::new().unwrap();
         let source_root = tmp.join("source");
@@ -6846,9 +6662,8 @@ mod tests {
             "ordinary settings must still be copied"
         );
 
-        // The extraction itself: the adapter's declared secret-store file
-        // surfaces contribute their file names, while inline env-var surfaces
-        // (ids like "env (...)") contribute nothing.
+        // Extraction: file-backed secret-store surfaces contribute names;
+        // inline env-var surfaces contribute nothing.
         let derived = adapter_credential_file_names(&adapter);
         for expected in [".env", "config.local.toml", "gptme.local.toml"] {
             assert!(
@@ -6865,9 +6680,7 @@ mod tests {
 
     #[test]
     fn mirror_plan_gates_adapter_provided_credential_names_beyond_static_list() {
-        // The gate consumes adapter-provided names it has never seen: a file
-        // named by the adapter's secret-store declaration is skipped even
-        // though no static list carries it.
+        // The gate consumes adapter-provided names no static list carries.
         let tmp = unique_temp("mirror_plan_adapter_names");
         let source_root = tmp.join("source");
         std::fs::create_dir_all(&source_root).unwrap();
@@ -7158,10 +6971,8 @@ mod tests {
 
     #[test]
     fn reconfigure_reapplies_template_and_sees_external_edit() {
-        // INS-06: reconfigure performs REAL mutations; re-applying the
-        // template mutates only the template-owned keys, preserves foreign
-        // keys (including ones edited externally after the record was
-        // written), and writes no demo marker.
+        // INS-06: re-apply mutates only template-owned keys and preserves
+        // foreign keys, including externally edited ones.
         let tmp = unique_temp("reconfigure_external");
         let registry_path = tmp.join("registry.json");
         let root = tmp.join(".claude-work");
@@ -7317,10 +7128,8 @@ mod tests {
 
     #[test]
     fn reconfigure_refuses_jsonc_settings_instead_of_stripping() {
-        // codec-honesty (DOC-05): JSONC settings (comments/trailing commas)
-        // must make reconfigure fail with the typed lossy-write error before
-        // any disk mutation. The unparseable bytes must never become a
-        // fabricated empty map.
+        // codec-honesty (DOC-05): JSONC settings fail with the typed
+        // lossy-write error before any disk mutation.
         let tmp = unique_temp("reconfigure_jsonc");
         let registry_path = tmp.join("registry.json");
         let root = tmp.join(".claude-work");
@@ -7386,10 +7195,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// INS-06: SetMcpEnabled mutates the adapter-declared MCP destination
-    /// through the mcp transaction layer: the owned server is disabled in
-    /// place, foreign servers and foreign top-level keys survive, and an
-    /// unknown server is a preview conflict that blocks the commit.
+    /// INS-06: SetMcpEnabled mutates the declared MCP destination; foreign
+    /// servers and keys survive, an unknown server is a preview conflict.
     #[test]
     fn reconfigure_toggles_mcp_server_and_preserves_foreign() {
         let tmp = unique_temp("reconfigure_mcp");
@@ -7499,9 +7306,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// INS-06: RelinkSkills re-applies the skill mode link against the
-    /// home-scoped skills registry; a harness without a skills surface is a
-    /// preview conflict that blocks the commit.
+    /// INS-06: RelinkSkills re-applies the skill mode link; a harness without a
+    /// skills surface is a preview conflict.
     #[test]
     fn reconfigure_relinks_skills_against_home_scoped_registry() {
         let tmp = unique_temp("reconfigure_skills");
@@ -7570,11 +7376,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// INS-06 (plugin kind): SetPluginEnabled drives the plan-10 plugin
-    /// lifecycle on the adapter-declared destination: disable unstages the
-    /// owned bundle while foreign files in the shared dir survive, enable
-    /// re-stages from the recorded source, and an uninstalled plugin is a
-    /// preview conflict that blocks the commit.
+    /// INS-06 (plugin kind): SetPluginEnabled drives the plugin lifecycle;
+    /// foreign files survive, an uninstalled plugin is a preview conflict.
     #[test]
     fn reconfigure_toggles_plugin_through_plugin_lifecycle() {
         let tmp = unique_temp("reconfigure_plugin");
@@ -7695,10 +7498,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// A failure after earlier actions already applied rolls the applied
-    /// mutations back to their request-start bytes instead of leaving a
-    /// half-applied request on disk. A corrupt skills registry passes the
-    /// preview (never loaded there) and fails the RelinkSkills commit.
+    /// A failure after earlier actions applied rolls them back to request-start
+    /// bytes; a corrupt skills registry passes preview and fails the commit.
     #[test]
     fn reconfigure_mid_list_failure_rolls_back_applied_actions() {
         let tmp = unique_temp("reconfigure_rollback");
@@ -8240,9 +8041,8 @@ mod tests {
         let tmp = unique_temp("adopt_low_confidence");
         let registry_path = tmp.join("registry.json");
         let home = tmp.join("home");
-        // Name pattern only: the directory name matches `.claude*` but holds
-        // NO canonical config file, so the fingerprint is Confidence::Low and
-        // a directory name alone cannot establish harness identity (DRF-02).
+        // Name pattern only: no canonical file, so the fingerprint is Low and
+        // a directory name alone cannot establish identity (DRF-02).
         let candidate = home.join(".claude-notes");
         std::fs::create_dir_all(&candidate).unwrap();
         std::fs::write(candidate.join("notes.txt"), "shopping list").unwrap();
@@ -8319,9 +8119,8 @@ mod tests {
         let preview = preview_adopt(&candidate, &name, &Registry::default(), Some(&home)).unwrap();
         assert!(preview.preview.conflicts.is_empty());
 
-        // The canonical file that carried the proof is removed after preview:
-        // the fresh fingerprint degrades to name-pattern-only, so the floor
-        // re-check at commit must refuse (before any registry write).
+        // The proof-carrier removed after preview: the fresh fingerprint
+        // degrades, so the floor re-check at commit must refuse.
         std::fs::remove_file(candidate.join("settings.json")).unwrap();
 
         let err = adopt(&preview, &registry_path).unwrap_err();
@@ -8346,10 +8145,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// Platform: Linux/macOS; proof-carrier readability via mode 0o000. The
-    /// aider fingerprint branch proves identity from the canonical file's
-    /// PRESENCE alone, so only an unreadable file can reach the
-    /// "no readable canonical config file" refusal.
+    /// Platform: Linux/macOS; readability via mode 0o000. The aider branch
+    /// proves identity from file PRESENCE alone.
     #[cfg(unix)]
     #[test]
     fn adopt_refuses_when_no_canonical_config_file_is_readable() {
@@ -8767,9 +8564,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// INS-02: the caller can opt a declared shared asset out of
-    /// inheritance; the mirror then owns a
-    /// private COPY instead of a shared link.
+    /// INS-02: opting out a declared shared asset gives the mirror a private
+    /// COPY instead of a shared link.
     #[test]
     fn asset_inheritance_choice_copies_excluded_shared_asset() {
         let tmp = unique_temp("asset_inheritance_copy");
@@ -8819,8 +8615,7 @@ mod tests {
     }
 
     /// INS-02: exclusion is only permitted where the adapter declares the
-    /// asset; an unknown name is a blocking preflight conflict, and the
-    /// mirror refuses to build rather than silently skipping.
+    /// asset; an unknown name blocks preflight.
     #[test]
     fn asset_inheritance_undeclared_exclusion_is_a_preflight_conflict() {
         let tmp = unique_temp("asset_inheritance_bad");
@@ -8908,8 +8703,7 @@ mod tests {
         let tmp = unique_temp("post_wrapper_rollback");
         let registry_path = tmp.join("registry.json");
         // Adapter whose harness id never matches: plan_wrapper falls back to
-        // the generic plan, validate_instance then REFUSES after the
-        // transaction wrote target + wrapper.
+        // generic, validate_instance REFUSES after the transaction wrote.
         let adapter = make_adapter("other-harness");
         let source = tmp.join("source");
         std::fs::create_dir_all(&source).unwrap();
@@ -9051,9 +8845,8 @@ mod tests {
         let wrapper = renamed.wrapper.as_ref().expect("wrapper preserved");
         assert_eq!(wrapper.path.as_path(), new_wrapper);
         assert_eq!(wrapper.command_name.as_str(), "work2");
-        // On-disk bytes equal the deterministic regeneration from the record
-        // (what detect_repairs compares against); the recorded digest is the
-        // marker digest is_owned_wrapper verifies.
+        // On-disk bytes equal the deterministic regeneration; the recorded
+        // digest is the marker digest is_owned_wrapper verifies.
         let (expected_regen, regen_digest) = expected_wrapper_for(renamed, &adapter).unwrap();
         assert_eq!(
             std::fs::read_to_string(&new_wrapper).unwrap(),
@@ -9077,9 +8870,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&tmp));
     }
 
-    /// INS-09/R1 regression: rename then detect_repairs finds NO wrapper
-    /// drift, because rename regenerates the wrapper through the deterministic
-    /// generator instead of moving stale bytes with the old marker.
+    /// INS-09/R1 regression: rename regenerates the wrapper, so detect_repairs
+    /// finds NO drift afterwards.
     #[test]
     fn rename_leaves_no_wrapper_drift_for_repair_detection() {
         let tmp = unique_temp("rename_no_drift");
@@ -9457,9 +9249,8 @@ mod tests {
         assert!(foreign.exists());
         drop(std::fs::remove_dir_all(&tmp));
     }
-    /// INS-09: incomplete-transaction-journal detection + the dedicated
-    /// repair action. The journal lives under an ISOLATED home so the test
-    /// never sweeps the developer's real recovery state.
+    /// INS-09: journal detection + the dedicated repair action; the journal
+    /// lives under an ISOLATED home.
     #[test]
     fn detect_and_repair_incomplete_journal() {
         let tmp = unique_temp("journal_repair");
@@ -9497,10 +9288,8 @@ mod tests {
         assert!(!journal_file.exists(), "recovered journal is removed");
         drop(std::fs::remove_dir_all(&tmp));
     }
-    /// INS-08: the fixed-path config-entries-only removal choice clears the
-    /// superai-owned profile store (profiles + active identity) for a
-    /// fixed-path instance, never touching the harness config bytes, and is
-    /// refused for non-fixed-path instances.
+    /// INS-08: the config-entries-only removal clears the superai-owned
+    /// profile store; refused for non-fixed-path instances.
     #[test]
     fn remove_fixed_path_entries_clears_store_only() {
         let tmp = unique_temp("remove_fixed_path");

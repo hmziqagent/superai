@@ -1,6 +1,5 @@
-//! Junie adapter: relocated-root via `JUNIE_HOME`, primary writable surface
-//! `config.json` (JSON), plus `mcp/mcp.json`, `models`, `skills`, `agents`.
-//! Research source: `docs/harness-configs/junie-cli.md` (last verified 2026-08-25).
+//! Junie adapter: relocated root via `JUNIE_HOME`, writable `config.json`
+//! plus `mcp/mcp.json`, `models`, `skills`, `agents`.
 
 use std::path::{Path, PathBuf};
 
@@ -78,7 +77,6 @@ impl JunieAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$JUNIE_HOME` or `~/.junie`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -94,17 +92,14 @@ impl JunieAdapter {
         Some(PathBuf::from(home).join(".junie"))
     }
 
-    /// Build the config.json path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.json")
     }
 
-    /// Build the mcp.json path for a given config root.
     fn mcp_path_for_root(root: &Path) -> PathBuf {
         root.join("mcp").join("mcp.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -527,7 +522,7 @@ impl Adapter for JunieAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (junie-cli.md: user `~/.junie/mcp/mcp.json`, project `.junie/mcp/mcp.json`; `JUNIE_HOME` relocates)
+    /// MCP: `~/.junie/mcp/mcp.json` (user) or `.junie/mcp/mcp.json` (project), relocated by `JUNIE_HOME`.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp/mcp.json",
@@ -538,7 +533,7 @@ impl Adapter for JunieAdapter {
         ))
     }
 
-    /// EXT-06/07: plugin mechanism (junie-cli.md: `~/.junie/extensions` default extensions directory, overridable)
+    /// Extension directory defaults to `~/.junie/extensions` and is overridable.
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "extensions",

@@ -1,8 +1,5 @@
 //! Core error taxonomy.
-//!
-//! Each variant carries safe resource identity (paths, ids, digests) and
-//! causal context. Secret-bearing values are wrapped in [`RedactedString`]
-//! which never exposes the inner value via `Debug`, `Display`, or `Serialize`.
+//! Secret-bearing values go in [`RedactedString`]; it never exposes them.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -10,9 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Wrapper for secret-bearing values in errors.
-///
-/// Debug, Display, and Serialize all emit `[REDACTED]`. The raw secret is
-/// only available via [`Self::expose_secret`].
+/// Debug, Display, and Serialize emit `[REDACTED]`; raw only via `expose_secret`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RedactedString(String);
 
@@ -306,9 +301,8 @@ pub enum CoreError {
         owner: String,
     },
 
-    /// The evidence collected for a candidate is too weak to act on it.
-    /// Carries what the operation required, what was observed, and the
-    /// evidence lines behind it: paths and markers only, never content.
+    /// The evidence collected for a candidate is too weak to act on it:
+    /// paths and markers only, never content.
     #[error(
         "insufficient evidence for {path}: requires {required}, observed {observed}: {evidence:?}"
     )]
@@ -394,8 +388,7 @@ pub enum CoreError {
     },
 
     /// A recorded daemon pid cannot be proven to be the process superai
-    /// started (WRP-07: start-time or executable mismatch, or no platform
-    /// evidence). Never a signal authorization.
+    /// started. Never a signal authorization.
     #[error("process identity mismatch for pid {pid}: {reason}")]
     ProcessIdentityMismatch {
         /// Pid that failed identity verification.
@@ -404,9 +397,8 @@ pub enum CoreError {
         reason: String,
     },
 
-    /// Evidence about a candidate's owner is ambiguous (DRF-04): more than
-    /// one manager plausibly owns it. Ambiguity BLOCKS adopt and remove; it
-    /// never silently resolves to unmanaged.
+    /// Ownership evidence is ambiguous: more than one manager plausibly owns
+    /// it. Ambiguity BLOCKS adopt and remove; never resolves to unmanaged.
     #[error("ambiguous ownership for {path}: {evidence:?}")]
     AmbiguousOwnership {
         /// Path with ambiguous ownership.
@@ -416,8 +408,7 @@ pub enum CoreError {
     },
 
     /// A fixed-path activation cannot swap profiles because the app may
-    /// still be writing the active path (WRP-06). The caller must confirm
-    /// the app has exited before re-activating.
+    /// still be writing the active path; confirm exit before re-activating.
     #[error("app may still write {path}: {reason}")]
     AppMayStillWrite {
         /// Active harness path the app may still be writing.
@@ -426,10 +417,8 @@ pub enum CoreError {
         reason: String,
     },
 
-    /// Installing or updating this harness has no safe non-interactive path
-    /// (PKG-10): desktop apps and marketplace flows need the user to act.
-    /// The instructions name the documented install path; superai never
-    /// downloads unknown binaries in their place.
+    /// No safe non-interactive install path exists (desktop apps, marketplace
+    /// flows); superai never downloads unknown binaries in the user's place.
     #[error("external install required for harness `{harness}`: {instructions}")]
     ExternalInstallRequired {
         /// Harness identifier.
@@ -508,7 +497,6 @@ mod tests {
     )]
     fn all_taxonomy_variants_carry_safe_identity() {
         let tmp_root = crate::test_util::tmp_abs_str("user/.claude/settings.json");
-        // Construct each variant with safe identity and ensure Display works.
         let variants: Vec<CoreError> = vec![
             CoreError::Validation {
                 field: "name".to_owned(),
@@ -645,7 +633,6 @@ mod tests {
             let debug = format!("{err:?}");
             assert!(!display.is_empty());
             assert!(!debug.is_empty());
-            // Safe identities are present; secrets are not.
             assert!(!display.contains("super-secret"));
             assert!(!debug.contains("super-secret"));
         }

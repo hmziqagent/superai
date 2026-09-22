@@ -39,8 +39,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current settings shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Selectors superai owns inside `settings.json`; everything else
-/// round-trips untouched via `superai-config::json`.
+/// Selectors superai owns inside `settings.json`; other keys round-trip untouched.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "env.ANTHROPIC_BASE_URL",
@@ -54,8 +53,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "env.CLAUDE_CODE_USE_FOUNDRY",
 ];
 
-/// Isolation is `relocated-root`: the wrapper points `CLAUDE_CONFIG_DIR` at
-/// the instance `config_root` and execs `claude`.
+/// `relocated-root` isolation: the wrapper points `CLAUDE_CONFIG_DIR` at the instance root.
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeAdapter {
     id: HarnessId,
@@ -74,8 +72,7 @@ impl ClaudeCodeAdapter {
         })
     }
 
-    /// Pin an explicit `claude` binary; it wins over the `PATH` scan
-    /// (mirrors the `SUPERAI_CONFIGURED_BINARY_CLAUDE_CODE` detection source).
+    /// Pin an explicit `claude` binary that wins over the `PATH` scan.
     pub fn with_configured_binary(path: PathBuf) -> Result<Self, CoreError> {
         let id = HarnessId::new(HARNESS_ID_STR)?;
         Ok(Self {
@@ -99,7 +96,6 @@ impl ClaudeCodeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// A pinned configured binary wins over the `PATH` scan.
     fn find_binary(&self) -> Option<PathBuf> {
         if let Some(pinned) = &self.configured_binary
             && pinned.is_file()
@@ -109,7 +105,6 @@ impl ClaudeCodeAdapter {
         super::find_in_path(&[EXECUTABLE])
     }
 
-    /// Resolve the default config root: `$CLAUDE_CONFIG_DIR` or `~/.claude`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -125,12 +120,10 @@ impl ClaudeCodeAdapter {
         Some(PathBuf::from(home).join(".claude"))
     }
 
-    /// Build the settings.json path for a given config root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -339,7 +332,6 @@ impl Adapter for ClaudeCodeAdapter {
         mcp_surface.backup_required = true;
         surfaces.push(mcp_surface);
 
-        // Credentials surface: .credentials.json: external secret store, not writable.
         let creds_resolver = PathResolver::new(
             Some("$CLAUDE_CONFIG_DIR/.credentials.json"),
             Some("$CLAUDE_CONFIG_DIR/.credentials.json"),
@@ -477,8 +469,6 @@ impl Adapter for ClaudeCodeAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shapes / owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -489,8 +479,7 @@ impl Adapter for ClaudeCodeAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 per docs/harness-configs/claude-code.md §1.2; rules fire
-        // only when the key is present, foreign keys stay untouched.
+        // Rules fire only when the key is present; foreign keys stay untouched.
         match surface_id {
             "settings.json" => Some(
                 SurfaceSchema::new()
@@ -544,7 +533,7 @@ impl Adapter for ClaudeCodeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (claude-code.md: project `.mcp.json` team-shared servers; the user-scope `~/.claude.json` store is harness-managed and deliberately not declared)
+    /// Only the project `.mcp.json` is declared; the user-scope `~/.claude.json` store stays harness-managed.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",
@@ -555,7 +544,6 @@ impl Adapter for ClaudeCodeAdapter {
         ))
     }
 
-    /// EXT-06/07: plugin mechanism (claude-code.md: `~/.claude/plugins/` installed plugins/marketplaces; `CLAUDE_CONFIG_DIR` relocates it)
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",
@@ -1065,7 +1053,6 @@ mod tests {
             after["env"]["ANTHROPIC_BASE_URL"],
             serde_json::Value::String("https://new.example.com".to_owned())
         );
-        // Verify old value is gone, new value present.
         assert_ne!(
             after["env"]["ANTHROPIC_BASE_URL"],
             serde_json::Value::String("https://old.example.com".to_owned())
@@ -1086,7 +1073,6 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
 
-        // Remove auth keys.
         superai_config::json::edit(&path, |map| {
             if let Some(env) = map.get_mut("env").and_then(|v| v.as_object_mut()) {
                 env.remove("ANTHROPIC_API_KEY");
@@ -1107,18 +1093,15 @@ mod tests {
     fn secret_redaction_placeholder() {
         use crate::error::RedactedString;
         let secret = RedactedString::new("sk-ant-secret-123");
-        // Debug and Display must not contain the secret.
         let debug = format!("{secret:?}");
         let display = format!("{secret}");
         assert!(!debug.contains("sk-ant-secret-123"));
         assert!(!display.contains("sk-ant-secret-123"));
         assert!(debug.contains("[REDACTED]"));
         assert!(display.contains("[REDACTED]"));
-        // Serialization must also redact.
         let json = serde_json::to_string(&secret).unwrap();
         assert!(!json.contains("sk-ant-secret-123"));
         assert!(json.contains("[REDACTED]"));
-        // Expose is explicit.
         assert_eq!(secret.expose_secret(), "sk-ant-secret-123");
     }
 
@@ -1133,14 +1116,11 @@ mod tests {
 
     #[test]
     fn conflict_detection_placeholder_no_panic() {
-        // Placeholder: ensure detection and validation can be called repeatedly without side effects.
         let a = adapter();
         let r1 = a.detection();
         let r2 = a.detection();
-        // Evidence may vary (e.g., timing), but structure should be consistent.
         assert_eq!(r1.present, r2.present);
         assert_eq!(r1.confidence, r2.confidence);
-        // Validate instance twice.
         let inst = sample_instance_with_root(&crate::test_util::tmp_abs_str(".claude-work"));
         a.validate_instance(&inst).unwrap();
         a.validate_instance(&inst).unwrap();
@@ -1151,7 +1131,6 @@ mod tests {
         let tmp_root = crate::test_util::tmp_abs_str("user/.claude-isolated");
         let a = adapter();
         assert_eq!(a.scan_candidates().len(), 4);
-        // Simulate wrapper generation: env var must be CLAUDE_CONFIG_DIR.
         let inst = sample_instance_with_root(&tmp_root);
         let plan = a.plan_wrapper(&inst).unwrap();
         assert!(!plan.env_vars.is_empty());
@@ -1162,7 +1141,6 @@ mod tests {
 
     #[test]
     fn jsonc_stripping_allows_comments() {
-        // Claude Code settings are JSONC-tolerant; ensure jsonc loader handles comments.
         let dir = crate::test_util::temp_dir_unique("claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.jsonc");
@@ -1252,10 +1230,8 @@ mod tests {
         let a = adapter();
         let dir = crate::test_util::temp_dir_unique("claude-schema");
         std::fs::create_dir_all(&dir).unwrap();
-        // Missing surfaces: fresh instance validates.
         let inst = sample_instance_with_root(dir.to_str().unwrap());
         a.validate_instance(&inst).unwrap();
-        // Valid settings.json passes.
         std::fs::write(dir.join("settings.json"), br#"{"model": "sonnet"}"#).unwrap();
         a.validate_instance(&inst).unwrap();
         // env must be an object; a string violates the declared schema.
@@ -1274,11 +1250,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// The fixture pair documents the settings-era boundary: the legacy file
-    /// carries the pre-2.0 minimal shape (env + permissions only), the
-    /// current file carries the 2.x shape (hooks, statusLine, enabledPlugins,
-    /// fallbackModel). Version resolution classifies 2.x as the compatible
-    /// schema range for the current-era file.
+    /// Fixture pair splits the settings eras: legacy is the pre-2.0 minimal
+    /// shape, current is 2.x; 2.x classifies as the compatible schema range.
     #[test]
     fn boundary_fixtures_split_settings_eras() {
         let legacy = fixture_path("settings.boundary_legacy.json");
@@ -1290,11 +1263,9 @@ mod tests {
         let current_value = std::fs::read(&current).unwrap();
         let legacy_map = superai_config::json::load_value(&legacy).unwrap();
         let current_map = superai_config::json::load_value(&current).unwrap();
-        // Legacy era: no 2.x-only keys.
         assert!(legacy_map.get("hooks").is_none());
         assert!(legacy_map.get("enabledPlugins").is_none());
         assert!(legacy_map.get("fallbackModel").is_none());
-        // Current era: 2.x keys present.
         assert!(current_map.get("hooks").is_some());
         assert!(current_map.get("enabledPlugins").is_some());
         assert!(current_map.get("fallbackModel").is_some());
@@ -1319,9 +1290,8 @@ mod tests {
 
     #[test]
     fn boundary_era_matches_version_resolution_range() {
-        // version.txt records a 2.x detection; the adapter maps it to the
-        // current schema (compatible). Pre-2.0 detections map legacy-era but
-        // still resolve through the same schema version per the research doc.
+        // version.txt records a 2.x detection, inside the compatible range;
+        // pre-2.0 detections resolve through the same schema version.
         let version_text = std::fs::read_to_string(fixture_path("version.txt"))
             .unwrap()
             .trim()
@@ -1337,8 +1307,6 @@ mod tests {
             Some(2),
             "fixture version must be 2.x: {version_text}"
         );
-        // 2.x is inside the documented compatible range for the current-era
-        // settings fixture.
         let res = adapter().version_resolution();
         if res.detected_version.as_deref() == parsed.as_deref() {
             assert!(res.compatible);

@@ -1,10 +1,5 @@
-//! Plugin abstraction and lifecycle (EXT-06/07).
-//!
-//! Plugin kinds and destinations come from the adapter decl
-//! ([`crate::adapter::PluginAdapterDecl`]). Safe scope: file/config plugins
-//! only; kinds needing package-installer execution return `RequiresApproval`
-//! instead of running anything. Removal touches exactly the recorded owned
-//! entries, and a shared dependency is retained until no consumer remains.
+//! Plugin abstraction and lifecycle (EXT-06/07): file/config scope only;
+//! removal keeps a shared dependency until its last consumer is gone.
 
 #![expect(
     clippy::assigning_clones,
@@ -44,9 +39,8 @@ fn contains_shell_metachars(value: &str) -> bool {
             return true;
         }
     }
-    // On Windows, `\` is the native path separator that every absolute
-    // locator contains, not a shell escape; everywhere else it stays a
-    // quoting metachar and is rejected.
+    // On Windows `\` is the native separator in every absolute locator;
+    // elsewhere it is a quoting metachar and stays rejected.
     if !cfg!(windows) && value.contains('\\') {
         return true;
     }
@@ -83,10 +77,8 @@ fn validate_plugin_locator(locator: &str, kind: PluginKind) -> Result<()> {
     match kind {
         PluginKind::DirectoryBundle | PluginKind::ConfigEntry | PluginKind::ExtensionScript => {
             if locator.contains(':') && !locator.starts_with("file://") {
-                // Allow ':' only as a Windows drive/UNC prefix (e.g. `C:\`,
-                // `\\?\C:\`): the prefix component proves it is an absolute
-                // local path, not a scheme or traversal trick. A colon
-                // anywhere else in the path stays rejected.
+                // ':' passes only as a Windows drive/UNC prefix: the prefix
+                // component proves a local path, not a scheme.
                 let path = Path::new(locator);
                 let has_drive_prefix =
                     matches!(path.components().next(), Some(Component::Prefix(_)));
@@ -215,9 +207,8 @@ pub struct PluginRecord {
     /// Optional dependency key (e.g., npm package name) for shared tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_key: Option<String>,
-    /// Files staged into the harness destination for DirectoryBundle plugins
-    /// (paths relative to the instance config root, EXT-07). Removal touches
-    /// exactly these owned files.
+    /// Files staged into the destination for DirectoryBundle plugins
+    /// (EXT-07); removal touches exactly these.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_files: Option<Vec<String>>,
 }
@@ -251,11 +242,8 @@ pub struct PluginRegistry {
     pub records: Vec<PluginRecord>,
     /// Foreign top-level keys preserved from file.
     pub foreign: Map<String, Value>,
-    /// Entries that failed to deserialize on load, surfaced instead of
-    /// silently dropped: each carries its array index, the `id` hint when
-    /// one is readable, and the parse reason. They are NOT part of
-    /// `records`; a store() rewrites the file without them, so a caller
-    /// acting on a registry with skips must report them first.
+    /// Entries that failed to deserialize on load; NOT part of `records`,
+    /// and a store() rewrites the file without them, so report skips first.
     pub skipped: Vec<SkippedPluginRecord>,
 }
 
@@ -324,9 +312,8 @@ impl PluginRegistry {
                 });
             }
         };
-        // Records that fail to deserialize are reported, never hidden: a
-        // corrupted entry used to vanish silently, and the next store()
-        // would drop it for good.
+        // Failed deserializations are surfaced, never hidden: the next
+        // store() would drop a silently skipped entry for good.
         let mut records: Vec<PluginRecord> = Vec::new();
         let mut skipped: Vec<SkippedPluginRecord> = Vec::new();
         if let Some(arr) = obj.get("plugins").and_then(|v| v.as_array()) {
@@ -474,10 +461,8 @@ impl PluginRegistry {
         })
     }
 
-    /// Install a plugin source via the registry (file/config safe scope).
-    ///
-    /// Kinds that would need package-installer execution return
-    /// `RequiresApproval` instead of executing.
+    /// Install a plugin source via the registry (file/config safe scope);
+    /// execution-requiring kinds return `RequiresApproval`.
     pub fn install(
         &mut self,
         source: &PluginSource,
@@ -577,10 +562,8 @@ impl PluginRegistry {
             .map(|outcome| outcome.map(|o| o.record))
     }
 
-    /// Remove an owned plugin entry and report shared-dependency retention
-    /// (EXT-06/07: a shared package dependency is not removed until no
-    /// consumer remains; the outcome names every dependency key still
-    /// referenced by other installed plugins).
+    /// Remove an owned plugin entry and report retained shared dependencies
+    /// (EXT-06/07: kept until no consumer remains).
     pub fn remove_with_report(&mut self, id: &PluginId) -> Result<Option<PluginRemoval>> {
         let idx = match self.records.iter().position(|r| &r.id == id) {
             Some(i) => i,
@@ -674,8 +657,7 @@ pub struct PluginInstallPreview {
 }
 
 /// Outcome of a plugin removal (EXT-06/07): the removed record plus every
-/// shared dependency key still referenced by other installed plugins (those
-/// dependencies are retained, not removed).
+/// shared dependency key still referenced by other installed plugins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRemoval {
     /// The removed record.
@@ -699,9 +681,8 @@ struct BundleFile {
     bytes: Vec<u8>,
 }
 
-/// Read every regular file under `source_dir` (bounded; symlinks and special
-/// files refused: bundle content must not escape the destination through
-/// links).
+/// Read every regular file under `source_dir`, bounded; symlinks and
+/// special files are refused so content cannot escape through links.
 fn read_bundle_files(source_dir: &Path) -> Result<Vec<BundleFile>> {
     fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<BundleFile>) -> Result<()> {
         if depth > MAX_BUNDLE_DEPTH {
@@ -802,13 +783,8 @@ fn bundle_digest(files: &[BundleFile]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Stage a DirectoryBundle plugin's files into the adapter-declared
-/// destination through a compensated transaction (EXT-07). The declared
-/// digest is verified against the staged content; a foreign bundle at the
-/// destination is refused with `ForeignOwnership`; bundle bytes stay opaque
-/// (nothing is parsed or executed); harness discovery is verified when the
-/// adapter declares a manifest. Returns the persisted registry record with
-/// the staged file list attached.
+/// Stage a DirectoryBundle through a compensated transaction (EXT-07):
+/// digest verified, foreign destination refused, staged list persisted.
 pub fn install_directory_bundle(
     registry: &mut PluginRegistry,
     source: &PluginSource,
@@ -953,8 +929,7 @@ pub fn install_directory_bundle(
     }
 
     // Discovery verification runs before cleanup: on failure the staged
-    // files and the prepare-phase recovery backups (beside the staged files
-    // as `<name>.bak.<millis>.<suffix>`) are left in place for recovery.
+    // files and their `<name>.bak.<millis>.<suffix>` backups stay for recovery.
     if let Some(manifest) = decl.discovery_manifest.as_deref()
         && !dest_bundle.join(manifest).is_file()
     {
@@ -993,9 +968,8 @@ pub fn install_directory_bundle(
         }
     }
 
-    // Backups of the old owned content are dead weight only now, after
-    // discovery and read-back verification; every earlier failure path
-    // retains them for recovery.
+    // Old-content backups are dead weight only after discovery and
+    // read-back verification; earlier failure paths retain them.
     if let Some(commit) = &outcome.commit {
         for backup in &commit.backups {
             let path = backup.backup_path.as_path();
@@ -1023,10 +997,8 @@ pub fn install_directory_bundle(
     Ok(record)
 }
 
-/// Remove a staged DirectoryBundle plugin: exactly the recorded owned files
-/// are removed through the transaction, the (now possibly empty) bundle
-/// directory is pruned when superai owns it, and the registry record is
-/// dropped with a shared-dependency retention report (EXT-07 removal).
+/// Remove a staged DirectoryBundle (EXT-07): exactly the recorded owned
+/// files go, owned empty directories are pruned, shared deps reported.
 pub fn remove_directory_bundle(
     registry: &mut PluginRegistry,
     id: &PluginId,
@@ -1133,11 +1105,8 @@ pub fn remove_directory_bundle(
     registry.remove_with_report(id)
 }
 
-/// Enable or disable an installed plugin with per-adapter enforcement
-/// (EXT-06): config-entry plugins toggle their destination entry (disable
-/// removes the entry, enable re-adds it); directory
-/// bundles toggle their staged files the same way. The registry record's
-/// enabled flag is the superai-owned source of truth either way.
+/// Enable/disable an installed plugin (EXT-06): the destination entry (or
+/// staged files) toggles with it; the registry flag is the source of truth.
 pub fn set_plugin_enabled(
     registry: &mut PluginRegistry,
     decl: &PluginAdapterDecl,
@@ -1206,9 +1175,8 @@ pub fn set_plugin_enabled(
     Ok(registry.get(&source.id).cloned().unwrap_or(record))
 }
 
-/// Read a JSON config file at `path` fresh, returning outer map and inner plugin map under `key`.
-///
-/// For non-existent file, returns empty maps.
+/// Read a JSON config fresh: outer map plus inner plugin map under `key`;
+/// a missing or empty file reads as empty maps.
 fn read_outer_and_inner_json(
     path: &Path,
     key: &str,
@@ -1320,9 +1288,8 @@ fn write_outer_with_inner_json(
     Ok(())
 }
 
-/// Install a config-entry plugin into a JSON destination file, preserving foreign keys.
-///
-/// This is the safe-scope helper for `PluginKind::ConfigEntry`.
+/// Install a config-entry plugin into a JSON destination, preserving
+/// foreign keys (safe-scope helper for `PluginKind::ConfigEntry`).
 pub fn install_config_entry(
     dest_path: &Path,
     dest_key: &str,
@@ -1440,7 +1407,6 @@ mod tests {
             RestartBehavior::None,
         );
 
-        // Traversal in locator should be rejected
         let bad = PluginSource {
             id: PluginId::new("good-id").unwrap(),
             kind: PluginKind::ConfigEntry,
@@ -1454,7 +1420,6 @@ mod tests {
             "should reject traversal, got {err:?}"
         );
 
-        // Good locator should succeed
         let good = PluginSource {
             id: PluginId::new("good-id").unwrap(),
             kind: PluginKind::ConfigEntry,
@@ -1465,7 +1430,6 @@ mod tests {
         let rec = reg.install(&good, Some(&decl)).unwrap();
         assert_eq!(rec.id.as_str(), "good-id");
 
-        // Shell metachars should be rejected
         let bad2 = PluginSource {
             id: PluginId::new("bad2").unwrap(),
             kind: PluginKind::ConfigEntry,
@@ -1486,7 +1450,6 @@ mod tests {
     fn plugin_requires_approval_for_npm() {
         let root = tmp_root("approval");
         let mut reg = PluginRegistry::load(&root).unwrap();
-        // Decl that requires execution for NpmRef
         let decl_exec = PluginAdapterDecl::requires_execution(
             "npm",
             "package.json",
@@ -1513,7 +1476,6 @@ mod tests {
             }
             other => panic!("expected RequiresApproval, got {other:?}"),
         }
-        // File/config plugin should not require approval
         let decl_safe = PluginAdapterDecl::file_config(
             "plugins.json",
             Some("plugins"),
@@ -1560,7 +1522,6 @@ mod tests {
         reg.install(&src1, Some(&decl)).unwrap();
         reg.install(&src2, Some(&decl)).unwrap();
 
-        // Inject foreign key directly into registry file
         let file = reg.file();
         let bytes = std::fs::read(&file).unwrap();
         let mut val: Value = serde_json::from_slice(&bytes).unwrap();
@@ -1572,10 +1533,8 @@ mod tests {
             reg2.foreign.get("foreignKey").and_then(|v| v.as_str()),
             Some("keep-me")
         );
-        // Remove one owned
         let removed = reg2.remove(&PluginId::new("owned1").unwrap()).unwrap();
         assert!(removed.is_some());
-        // Reload and check foreign still there and other owned still there
         let reg3 = PluginRegistry::load(&root).unwrap();
         assert_eq!(
             reg3.foreign.get("foreignKey").and_then(|v| v.as_str()),
@@ -1591,7 +1550,6 @@ mod tests {
     #[test]
     fn config_entry_foreign_preservation() {
         let path = tmp_file("cfg");
-        // Create config with foreign top-level and foreign plugin
         let mut outer = Map::new();
         outer.insert("model".to_owned(), Value::String("sonnet".to_owned()));
         outer.insert("extra".to_owned(), Value::String("foreign".to_owned()));
@@ -1625,7 +1583,6 @@ mod tests {
         assert!(m.contains_key("foreign-plugin"));
         assert!(m.contains_key("owned-plugin"));
 
-        // Removal leaves foreign
         remove_config_entry(&path, "plugins", &PluginId::new("owned-plugin").unwrap()).unwrap();
         let content2 = std::fs::read(&path).unwrap();
         let val2: Value = serde_json::from_slice(&content2).unwrap();
@@ -1648,7 +1605,6 @@ mod tests {
             PluginKind::ConfigEntry,
             RestartBehavior::None,
         );
-        // Two records sharing one dependency_key exercise the retention logic.
         let rec1 = PluginRecord {
             id: PluginId::new("plug-a").unwrap(),
             kind: PluginKind::ConfigEntry,
@@ -1674,12 +1630,10 @@ mod tests {
         reg.records.push(rec1);
         reg.records.push(rec2);
         reg.store().unwrap();
-        // Remove one, shared dep should still have a consumer
         reg.remove(&PluginId::new("plug-a").unwrap()).unwrap();
         let remaining = reg.find_shared_consumers("shared-package");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id.as_str(), "plug-b");
-        // Remove second, no consumers left
         reg.remove(&PluginId::new("plug-b").unwrap()).unwrap();
         let remaining2 = reg.find_shared_consumers("shared-package");
         assert!(remaining2.is_empty());
@@ -1709,7 +1663,6 @@ mod tests {
         assert!(!disabled.enabled);
         let enabled = reg.enable(&PluginId::new("toggle").unwrap()).unwrap();
         assert!(enabled.enabled);
-        // Remove is different
         reg.remove(&PluginId::new("toggle").unwrap()).unwrap();
         assert!(reg.get(&PluginId::new("toggle").unwrap()).is_none());
         drop(std::fs::remove_dir_all(&root));
@@ -1781,7 +1734,6 @@ mod tests {
         };
         let record = install_directory_bundle(&mut reg, &src, &decl, &instance_root).unwrap();
 
-        // Files staged to the adapter-declared destination.
         let manifest_path = instance_root
             .join("plugins")
             .join("test-plugin")
@@ -1795,12 +1747,10 @@ mod tests {
                 .join("greet.md")
                 .is_file()
         );
-        // Record carries the digest and the exact staged file list.
         assert!(record.digest.as_deref().is_some_and(|d| d.len() == 64));
         let staged = record.staged_files.unwrap();
         assert!(staged.contains(&"plugins/test-plugin/plugin.json".to_owned()));
         assert!(staged.contains(&"plugins/test-plugin/skills/greet.md".to_owned()));
-        // Re-load: the record persisted.
         let reloaded = PluginRegistry::load(&home.join("registry-root")).unwrap();
         assert!(
             reloaded
@@ -1808,7 +1758,6 @@ mod tests {
                 .is_some()
         );
 
-        // Removal takes exactly the owned files and reports the record.
         let outcome = remove_directory_bundle(
             &mut reg,
             &PluginId::new("test-plugin").unwrap(),
@@ -1837,7 +1786,6 @@ mod tests {
             RestartBehavior::Restart,
         );
 
-        // Foreign bundle already at the destination, no registry record.
         let foreign = instance_root.join("plugins").join("other-plugin");
         std::fs::create_dir_all(&foreign).unwrap();
         std::fs::write(foreign.join("foreign.txt"), b"foreign\n").unwrap();
@@ -1860,7 +1808,6 @@ mod tests {
             b"foreign\n"
         );
 
-        // Declared digest mismatch refuses before any staging.
         let src_bad = PluginSource {
             id: PluginId::new("digest-plugin").unwrap(),
             kind: PluginKind::DirectoryBundle,
@@ -1881,7 +1828,6 @@ mod tests {
         let home = tmp_root("bundle-nodisc");
         let instance_root = home.join("instance");
         let source_dir = home.join("bundle-src");
-        // Bundle WITHOUT the manifest the adapter declares as required.
         make_bundle(&source_dir, false);
         let mut reg = PluginRegistry::load(&home.join("registry-root")).unwrap();
         let decl = PluginAdapterDecl::directory_bundle(
@@ -1903,8 +1849,6 @@ mod tests {
             }
             other => panic!("expected discovery Verification, got {other:?}"),
         }
-        // No registry record for a failed install, and nothing staged on
-        // disk either (fail-fast pre-check).
         assert!(reg.get(&PluginId::new("manifestless").unwrap()).is_none());
         assert!(
             !instance_root.join("plugins").join("manifestless").exists(),
@@ -1916,8 +1860,7 @@ mod tests {
     #[test]
     fn restage_over_owned_install_cleans_backups_only_after_verification() {
         // Backup cleanup is ordered after discovery verification and the
-        // read-back verify; the cleaned-up end state proves cleanup ran only
-        // once verification completed.
+        // read-back verify; the end state proves cleanup ran post-verification.
         let home = tmp_root("bundle-restage");
         let instance_root = home.join("instance");
         let source_dir = home.join("bundle-src");
@@ -1945,9 +1888,8 @@ mod tests {
         assert!(record.staged_files.is_some_and(|f| !f.is_empty()));
         assert!(bundle_dir.join("plugin.json").is_file());
 
-        // After the verified re-stage no recovery backups may remain in the
-        // harness plugin directory (cleanup runs post-verification), and no
-        // `.bak.` sibling may linger anywhere under the destination root.
+        // After the verified re-stage no `.bak.` sibling may remain
+        // anywhere under the destination root.
         fn has_backup(path: &Path) -> bool {
             if path.is_file() {
                 return path
@@ -1970,8 +1912,7 @@ mod tests {
         );
 
         // A refused re-stage (digest mismatch) must not touch the verified
-        // install: backups are only created by a prepare phase that runs,
-        // and the refused path stops before staging.
+        // install: the refused path stops before staging.
         let mut bad = src.clone();
         bad.digest = Some("0".repeat(64));
         assert!(matches!(
@@ -2001,13 +1942,11 @@ mod tests {
         reg.records.push(mk("plug-a"));
         reg.records.push(mk("plug-b"));
         reg.store().unwrap();
-        // First removal reports the retained shared dependency.
         let outcome = reg
             .remove_with_report(&PluginId::new("plug-a").unwrap())
             .unwrap()
             .unwrap();
         assert_eq!(outcome.retained_shared_deps, vec!["shared-pkg".to_owned()]);
-        // Last consumer removal reports none.
         let last = reg
             .remove_with_report(&PluginId::new("plug-b").unwrap())
             .unwrap()
@@ -2040,7 +1979,6 @@ mod tests {
             version: Some("1.0.0".to_owned()),
             digest: None,
         };
-        // The bundle installer must refuse a config-entry kind.
         assert!(matches!(
             install_directory_bundle(&mut reg, &src, &decl, &home),
             Err(CoreError::Validation { .. })
@@ -2048,8 +1986,6 @@ mod tests {
         install_config_entry(&dest, "plugins", &src).unwrap();
         reg.install(&src, Some(&decl)).unwrap();
 
-        // Disable: registry flag + destination entry removed (reversible),
-        // foreign entry preserved.
         let disabled = set_plugin_enabled(&mut reg, &decl, &dest, &src, false).unwrap();
         assert!(!disabled.enabled);
         let val: Value = serde_json::from_slice(&std::fs::read(&dest).unwrap()).unwrap();
@@ -2057,7 +1993,6 @@ mod tests {
         assert!(!plugins.contains_key("owned-plugin"));
         assert!(plugins.contains_key("foreign-plugin"));
 
-        // Enable: entry re-added.
         let enabled = set_plugin_enabled(&mut reg, &decl, &dest, &src, true).unwrap();
         assert!(enabled.enabled);
         let val2: Value = serde_json::from_slice(&std::fs::read(&dest).unwrap()).unwrap();

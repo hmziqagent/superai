@@ -1,7 +1,5 @@
-//! Legacy Kimi CLI adapter: legacy root `~/.kimi` (`config.toml` + `mcp.json`),
-//! `MigrationOnly` (detect/inspect/backup/export); retired in favour of
-//! kimi-code-cli.
-//! Research source: `docs/harness-configs/kimi-cli.md` (last verified 2026-08-25).
+//! Legacy Kimi CLI adapter: fixed root `~/.kimi` (`config.toml` + `mcp.json`),
+//! migration-only; retired in favour of kimi-code-cli.
 
 use std::path::PathBuf;
 
@@ -82,7 +80,6 @@ impl LegacyKimiAdapter {
         MIGRATION_TIP
     }
 
-    /// Resolve default legacy root `~/.kimi`.
     fn default_config_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -93,7 +90,6 @@ impl LegacyKimiAdapter {
         Some(PathBuf::from(home).join(".kimi"))
     }
 
-    /// Collect evidence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -383,7 +379,7 @@ impl Adapter for LegacyKimiAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (kimi-cli.md: legacy `~/.kimi/` tree; `kimi migrate` carries MCP servers over)
+    /// Legacy `~/.kimi/mcp.json`; `kimi migrate` carries the servers over.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -397,7 +393,6 @@ impl Adapter for LegacyKimiAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented for the legacy CLI (kimi-cli.md)")
     }

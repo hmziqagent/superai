@@ -1,13 +1,5 @@
 //! QAL-10/11 secret and path abuse verification (core layer).
-//!
-//! The sentinel is injected through provider, template, env, JSON, and
-//! wrapper vectors; after every operation the registry, previews, results,
-//! errors, snapshots, backup catalogs, and wrapper content must contain no
-//! plain sentinel (allowed only inside the harness config file and its
-//! backup, 0o600 on unix). Path abuses (traversal selectors, symlink swap
-//! races, broad deletion, shell metachars, ANSI escapes, private/file
-//! redirects, oversized inputs, symlink escapes, PID reuse) must all be
-//! rejected without panic or leak.
+//! The sentinel may live only in the harness config file and its backup; every path abuse must be rejected without panic or leak.
 
 use std::path::Path;
 
@@ -112,10 +104,8 @@ mod tests {
         let content = format!(r#"{{"api_key":"{SENTINEL}","model":"sonnet","other":"keep"}}"#);
         std::fs::write(&cfg_path, &content).unwrap();
 
-        // Verify harness config DOES contain sentinel (allowed)
         assert!(contains_sentinel(&std::fs::read(&cfg_path).unwrap()));
 
-        // A stored registry must not contain the sentinel.
         let reg_path = dir.join("registry.json");
         let mut reg = Registry::default();
         let inst = sample_instance(&dir, "work-json");
@@ -125,13 +115,10 @@ mod tests {
         assert_no_sentinel_bytes(&reg_bytes, "registry");
         let reg_str = String::from_utf8_lossy(&reg_bytes);
         assert!(!reg_str.contains(SENTINEL));
-        // Registry debug must not leak
         assert_no_sentinel_in_debug(&reg, "registry debug");
-        // Registry instances serialization must not contain forbidden fields anyway, but also not sentinel
         let reg_json: serde_json::Value = serde_json::from_slice(&reg_bytes).unwrap();
         assert_no_sentinel_in_json(&reg_json, "registry json value");
 
-        // Simulate operation preview/result that contains redacted diff
         let diff_redacted = superai_config::raw_editor::find_redaction_spans(
             content.as_bytes(),
             superai_config::document::DocumentKind::StrictJson,
@@ -140,18 +127,14 @@ mod tests {
             !diff_redacted.is_empty(),
             "api_key should be detected as secret span"
         );
-        // Ensure preview lexical diff would be redacted (contains [REDACTED] not sentinel)
         let preview_lexical = "api_key: [REDACTED] model: sonnet".to_owned();
         assert!(!preview_lexical.contains(SENTINEL));
         assert!(preview_lexical.contains("[REDACTED]"));
 
-        // Snapshot must not contain sentinel
         let snap = superai_config::snapshot::snapshot(&cfg_path);
         assert_no_sentinel_in_debug(&snap, "snapshot");
-        // Snapshot digest is hash, not raw
         assert!(snap.digest.is_some());
 
-        // Backup catalog must not contain sentinel
         let backups = superai_config::backup::list_backups(&cfg_path).unwrap();
         assert_no_sentinel_in_debug(&backups, "backup catalog");
 
@@ -170,7 +153,6 @@ mod tests {
             "backup entry debug must not leak sentinel"
         );
 
-        // Wrapper generation must not embed sentinel
         let mut inst2 = sample_instance(&dir, "work-wrapper-json");
         let wrapper_path =
             WrapperPath::new(dir.join("bin/work-wrapper").to_string_lossy().as_ref()).unwrap();
@@ -188,19 +170,15 @@ mod tests {
             "wrapper must not contain sentinel"
         );
         assert!(!digest.contains(SENTINEL));
-        // Wrapper file after write must not contain sentinel
         crate::wrapper::write_wrapper(&wrapper_path, &content_wrapper).unwrap();
         let wrapper_bytes = std::fs::read(wrapper_path.as_path()).unwrap();
         assert!(!contains_sentinel(&wrapper_bytes));
 
-        // Diagnostics for invalid JSON carrying the sentinel stay redacted.
         let bad_json = format!(r#"{{"api_key":"{SENTINEL}","bad": }}"#);
         let diag = superai_config::raw_editor::validate(
             bad_json.as_bytes(),
             superai_config::document::DocumentKind::StrictJson,
         );
-        // Even if diagnostics are produced, they must not contain sentinel plain
-        // Our validate produces diagnostics with generic messages, not including value; check
         for d in diag {
             assert!(
                 !d.message.contains(SENTINEL),
@@ -221,23 +199,19 @@ mod tests {
         std::fs::write(&env_path, &content).unwrap();
         assert!(contains_sentinel(&std::fs::read(&env_path).unwrap()));
 
-        // Env validation should detect secret spans
         let spans = superai_config::raw_editor::find_redaction_spans(
             content.as_bytes(),
             superai_config::document::DocumentKind::Env,
         );
         assert!(!spans.is_empty(), "env secret should be redacted");
 
-        // Simulate diff preview redaction
         let new_content = format!("API_KEY={SENTINEL}\nNEW=1\n");
         let diff = superai_config::raw_editor::diff(
             content.as_bytes(),
             new_content.as_bytes(),
             superai_config::document::DocumentKind::Env,
         );
-        // The diff's redaction spans must cover the sentinel line.
         assert!(!diff.redaction_spans.is_empty());
-        // The env file's backup must not leak via its catalog.
         superai_config::backup::backup(&env_path).unwrap();
         let backups = superai_config::backup::list_backups(&env_path).unwrap();
         assert_no_sentinel_in_debug(&backups, "env backup catalog");
@@ -265,7 +239,6 @@ mod tests {
         let reg_bytes = std::fs::read(&reg_path).unwrap();
         assert_no_sentinel_bytes(&reg_bytes, "registry must not contain provider sentinel");
 
-        // Template value validation rejects sentinel-shaped values.
         let patch = OwnedPatch {
             selector: "key:api_key".to_owned(),
             value: json!(SENTINEL),
@@ -302,7 +275,6 @@ mod tests {
                 || msg.to_ascii_lowercase().contains("forbidden")
         );
 
-        // Directly via a template file.
         let tmpl = Template {
             schema_version: crate::template::TEMPLATE_SCHEMA_VERSION,
             id: TemplateId::new("test-tmpl").unwrap(),
@@ -337,10 +309,8 @@ mod tests {
         let dir = temp_dir("sentinel-wrapper");
         std::fs::create_dir_all(&dir).unwrap();
         let inst = sample_instance(&dir, "work-wrap");
-        // Inject a sentinel env value into the plan (a malicious template's
-        // move). The generator embeds plan env values verbatim; the
-        // enforcement point is template validation, which rejects
-        // secret-shaped wrapper_env values before a plan can ever exist.
+        // The generator embeds plan env values verbatim; the enforcement
+        // point is template validation, upstream of any plan.
         let mut plan = crate::wrapper::plan_wrapper_for_instance(&inst, None);
         plan.env_vars
             .push(("API_KEY".to_owned(), SENTINEL.to_owned()));
@@ -365,7 +335,6 @@ mod tests {
 
     #[test]
     fn template_traversal_selector_is_rejected() {
-        // Selector containing ".." should be rejected
         let cases = [
             "../",
             "key:../evil",
@@ -397,7 +366,6 @@ mod tests {
             }
         }
 
-        // Template path traversal is rejected as well
         for p in [
             "../evil.json",
             "a/../b.json",
@@ -413,7 +381,6 @@ mod tests {
             assert!(!msg.contains(SENTINEL));
         }
 
-        // Test ensure_path_safe rejects escape
         let base = crate::test_util::tmp_abs("superai/base");
         let err = crate::template_fetch::ensure_path_safe(&base, "../escape.json");
         assert!(err.is_err(), "ensure_path_safe should reject traversal");
@@ -421,7 +388,6 @@ mod tests {
 
     #[test]
     fn symlink_swap_race_in_core_transaction_is_detected() {
-        // Similar to config test but via core transaction with FileAction
         #[cfg(unix)]
         {
             let dir = temp_dir("core-symlink-race");
@@ -435,15 +401,12 @@ mod tests {
             std::os::unix::fs::symlink(&target_a, &link).unwrap();
 
             let snap = superai_config::snapshot::snapshot(&link);
-            // Swap before commit
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&target_b, &link).unwrap();
 
-            // For core, we test that snapshot is_modified detects swap
             let snap_after = superai_config::snapshot::snapshot(&link);
             assert!(superai_config::snapshot::is_modified(&snap, &snap_after));
 
-            // Also test via the mutation boundary with the pre-swap token
             let res = superai_config::transaction::commit_file_expecting(
                 "core-symlink-race",
                 &link,
@@ -465,9 +428,8 @@ mod tests {
         use superai_config::transaction::RemoveKind;
         use superai_config::transaction::validate_remove_target;
 
-        // validate_quarantine_target rejects broad roots, home, globs, foreign.
-        // The filesystem root is broad on every platform (unix `/` via the
-        // string match list, windows `C:\` via `windows_shaped_broad_root`).
+        // The filesystem root is broad on every platform: unix `/` and
+        // windows `C:\` both land in the refusal.
         let fs_root = if cfg!(windows) {
             PathBuf::from("C:\\")
         } else {
@@ -478,7 +440,6 @@ mod tests {
             validate_quarantine_target(&fs_root).is_err(),
             "quarantine {fs_root:?} should reject"
         );
-        // Globs
         for p in [
             tmp.join("*.json"),
             tmp.join("logs").join("*.log"),
@@ -490,7 +451,6 @@ mod tests {
                 "glob {p:?} should reject"
             );
         }
-        // Unresolved vars
         for p in [
             tmp.join("$HOME/foo"),
             tmp.join("%USERPROFILE%/bar"),
@@ -501,15 +461,12 @@ mod tests {
                 "var {p:?} should reject"
             );
         }
-        // Traversal
         assert!(validate_quarantine_target(&tmp.join("../etc")).is_err());
-        // Relative
         assert!(validate_quarantine_target(Path::new("relative")).is_err());
         // Windows-shaped broad root is refused on every platform (inert on
         // unix where it is not absolute).
         assert!(validate_quarantine_target(Path::new("C:\\Windows")).is_err());
 
-        // validate_remove_target also rejects broad
         for kind in [
             RemoveKind::InstanceRoot,
             RemoveKind::WrapperFile,
@@ -523,24 +480,15 @@ mod tests {
             assert!(validate_remove_target(Path::new("relative/path"), kind).is_err());
         }
 
-        // Foreign-managed simulation: quarantine should not be allowed for foreign path that is not superai-owned
-        // We treat any path under /tmp that has a marker of foreign ownership as still rejected if it's home-like
         // Just ensure no panic and proper error
         let foreign = crate::test_util::tmp_abs("claude-multi").join("config.json");
-        // This path itself is a file, not a directory to quarantine, but validate will check existence; may succeed if file exists?
-        // We just ensure the validation doesn't panic
         drop(validate_quarantine_target(&foreign));
     }
 
     #[test]
     fn shell_metachars_in_names_are_handled_safely() {
-        // Instance/skill/plugin ids should reject shell metachars via path safety, not necessarily via id validation directly
-        // But we test that transaction with shell metachars in path is rejected and doesn't execute shell
-
-        // Ids carrying shell patterns: either the id layer rejects them, or
-        // they must survive plan validation and path handling without a
-        // panic (execution safety lives in run_command, which never uses a
-        // shell, exercised at the bottom of this test).
+        // Either the id layer rejects these, or plan handling must not
+        // panic; run_command never uses a shell (checked below).
         let bad_ids = ["$(rm -rf)", "`whoami`", "a&&b", "a|b", "a;b", "a>out"];
         for bad in bad_ids {
             if let Ok(sid) = SkillId::new(bad) {
@@ -566,9 +514,7 @@ mod tests {
             }
         }
 
-        // Test process run_command does not interpret shell metachars. The
-        // unix-shell metachar guarantee is exercised with a real `echo`
-        // binary, which windows does not ship.
+        // The real-`echo` probe is unix-only; windows ships no echo binary.
         #[cfg(unix)]
         {
             let token = "$(whoami) && echo pwned | cat".to_owned();
@@ -596,19 +542,16 @@ mod tests {
 
         for input in [malicious, osc, csi] {
             let ver = crate::process::extract_version(input);
-            // Should either be None or sanitized without escape chars
             if let Some(v) = ver {
                 assert!(
                     !v.contains('\x1b'),
                     "version must not contain ANSI escape: input {input:?} got {v:?}"
                 );
                 assert!(!v.contains('\x07'), "version must not contain BEL: {v:?}");
-                // Also check that sentinel not leaked (if sentinel were in input, it should be stripped)
                 assert!(!v.contains(SENTINEL));
             }
         }
 
-        // Test with sentinel embedded in version output (should not leak)
         let sentinel_version = format!("\x1b[31m{SENTINEL}\x1b[0m 1.2.3");
         let ver = crate::process::extract_version(&sentinel_version);
         if let Some(v) = ver {
@@ -616,7 +559,6 @@ mod tests {
             assert!(!v.contains('\x1b'));
         }
 
-        // Huge version output should be truncated and not panic
         let huge = "x".repeat(10 * 1024);
         let ver_huge = crate::process::extract_version(&huge);
         assert!(ver_huge.is_some());
@@ -625,7 +567,6 @@ mod tests {
 
     #[test]
     fn template_url_redirect_to_private_and_file_is_rejected() {
-        // HTTPS only, no file:// with traversal, no private IPs
         let cases = [
             ("http://example.com/catalog.json", true), // should reject (not https)
             ("https://example.com/catalog.json", false), // should accept
@@ -664,7 +605,6 @@ mod tests {
             }
         }
 
-        // ensure_path_safe rejects traversal
         let base = crate::test_util::tmp_abs("base");
         drop(crate::template_fetch::ensure_path_safe(&base, "../escape.json").unwrap_err());
         drop(crate::template_fetch::ensure_path_safe(&base, "a/../../b.json").unwrap_err());
@@ -679,7 +619,6 @@ mod tests {
 
     #[test]
     fn huge_5mb_deep_config_is_bounded() {
-        // Similar to config test but at core template level: template file 5MB should be rejected via MAX_TEMPLATE_BYTES
         let huge = vec![b'a'; crate::template::MAX_TEMPLATE_BYTES + 1];
         let res = Template::from_json_bytes(&huge);
         assert!(res.is_err(), "huge template should be rejected");
@@ -691,7 +630,6 @@ mod tests {
                 || msg.to_ascii_lowercase().contains("limit")
         );
 
-        // Deep nested JSON via template: create a template with deeply nested value that is large
         let deep_value = {
             let mut s = String::from("{\"a\":");
             for _ in 0..250 {
@@ -707,8 +645,6 @@ mod tests {
         // Deep may be valid or not, but must not panic
         drop(parsed);
 
-        // Also test huge 5MB via core's template fetch path: ensure it handles without unbounded allocation
-        // We already tested MAX_TEMPLATE_BYTES, now test that raw_editor validate handles 5MB gracefully
         let huge_json = format!(r#"{{"data":"{}"}}"#, "x".repeat(5 * 1024 * 1024));
         let bytes = huge_json.into_bytes();
         assert!(bytes.len() > 5 * 1024 * 1024);
@@ -717,19 +653,16 @@ mod tests {
             &bytes,
             superai_config::document::DocumentKind::StrictJson,
         );
-        // Should not panic; diagnostics may be empty (valid huge json)
         drop(diags);
     }
 
     #[test]
     fn plugin_skill_symlink_escape_is_rejected() {
-        // Create a fake skill registry dir with a skill containing symlink escape
         let dir = temp_dir("skill-symlink-escape");
         let registry_root = dir.join("registry");
         std::fs::create_dir_all(&registry_root).unwrap();
         let skill_dir = registry_root.join("my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        // Write minimal SKILL.md
         let skill_md = r"---
 name: my-skill
 description: test skill
@@ -741,11 +674,9 @@ description: test skill
 
         #[cfg(unix)]
         {
-            // Create symlink that tries to escape
             let outside = dir.join("outside.txt");
             std::fs::write(&outside, b"outside").unwrap();
             let link = skill_dir.join("evil-link");
-            // Absolute symlink should be rejected
             std::os::unix::fs::symlink(&outside, &link).unwrap();
             let res = crate::skills::validate_skill_tree(&skill_dir);
             assert!(
@@ -759,7 +690,6 @@ description: test skill
                     || msg.to_ascii_lowercase().contains("relative")
             );
 
-            // Clean absolute link, try traversal via relative
             std::fs::remove_file(&link).unwrap();
             let traversal_target = Path::new("../../outside.txt");
             std::os::unix::fs::symlink(traversal_target, &link).unwrap();
@@ -771,13 +701,10 @@ description: test skill
             let msg2 = format!("{:?}", res2.unwrap_err());
             assert!(!msg2.contains(SENTINEL));
 
-            // Clean and test that a valid relative symlink inside registry is allowed
             std::fs::remove_file(&link).unwrap();
             let valid_target = Path::new("data.txt");
             std::os::unix::fs::symlink(valid_target, &link).unwrap();
             let res3 = crate::skills::validate_skill_tree(&skill_dir);
-            // This should succeed (or at least not be rejected for escape)
-            // validate_skill_tree checks symlink target is relative without .., so this should pass
             assert!(
                 res3.is_ok(),
                 "valid symlink inside skill should not be rejected: {:?}",
@@ -789,7 +716,6 @@ description: test skill
 
         #[cfg(not(unix))]
         {
-            // On non-unix, just test that directory validation doesn't panic
             let res = crate::skills::validate_skill_tree(&skill_dir);
             res.expect("skill tree validation should succeed on non-unix");
         }
@@ -799,11 +725,9 @@ description: test skill
 
     #[test]
     fn pid_reuse_is_detected() {
-        // Simulate PID file containing old PID that has been reused
         let dir = temp_dir("pid-reuse");
         std::fs::create_dir_all(&dir).unwrap();
         let pid_file = dir.join("daemon.pid");
-        // Write old PID 99999
         std::fs::write(&pid_file, b"99999").unwrap();
         let pid_in_file: u32 = String::from_utf8_lossy(&std::fs::read(&pid_file).unwrap())
             .trim()
@@ -811,25 +735,21 @@ description: test skill
             .unwrap();
         assert_eq!(pid_in_file, 99999);
 
-        // Simulate that system now has PID 99999 but belongs to different process
         let daemon = crate::failure::DaemonFixture::unrelated_pid("test-daemon", 99999);
         assert!(!daemon.ready);
         assert!(daemon.reason.as_ref().unwrap().contains("unrelated"));
         // Our check: pid file content should not be trusted if process is unrelated
         let actual_pid = 1111; // different from file
         assert_ne!(pid_in_file, actual_pid);
-        // Simulate that even if PID matches numerically but process name differs, it's not ready
         let same_pid_but_different =
             crate::failure::DaemonFixture::unrelated_pid("other-daemon", 99999);
         assert_eq!(same_pid_but_different.pid, Some(99999));
         assert!(!same_pid_but_different.ready);
 
-        // Also test that a ready daemon with matching PID is considered ready
         let ready = crate::failure::DaemonFixture::ready("test-daemon", 4242);
         assert!(ready.ready);
         assert_eq!(ready.pid, Some(4242));
 
-        // Ensure no sentinel leak in pid handling errors
         let err = crate::error::CoreError::DaemonNotReady {
             harness: "test".to_owned(),
             reason: format!("pid {pid_in_file} unrelated"),
@@ -842,7 +762,6 @@ description: test skill
 
     #[test]
     fn errors_and_debug_never_contain_sentinel_plain() {
-        // Generate various errors that might have been influenced by sentinel and ensure they are redacted
         let sentinel_err = crate::error::CoreError::Validation {
             field: "test".to_owned(),
             reason: format!(
@@ -855,7 +774,6 @@ description: test skill
         let dbg = format!("{sentinel_err:?}");
         assert!(!dbg.contains(SENTINEL));
 
-        // Test that RedactedString never leaks
         let redacted = crate::error::RedactedString::new(SENTINEL);
         let dbg_r = format!("{redacted:?}");
         let disp_r = format!("{redacted}");
@@ -870,25 +788,19 @@ description: test skill
     fn registry_never_contains_sentinel_even_after_sentinel_in_harness_config() {
         let dir = temp_dir("registry-sentinel-scan");
         std::fs::create_dir_all(&dir).unwrap();
-        // Create harness config with sentinel
         let cfg = dir.join("settings.json");
         std::fs::write(&cfg, format!(r#"{{"api_key":"{SENTINEL}"}}"#)).unwrap();
-        // Create registry
         let reg_path = dir.join("registry.json");
         let mut reg = Registry::default();
         reg.insert(sample_instance(&dir, "scan1")).unwrap();
         reg.insert(sample_instance(&dir, "scan2")).unwrap();
         reg.store(&reg_path).unwrap();
 
-        // Scan registry file
         let reg_bytes = std::fs::read(&reg_path).unwrap();
         assert_no_sentinel_bytes(&reg_bytes, "registry file");
-        // Scan via helper that would be used in CI
         let reg_str = String::from_utf8_lossy(&reg_bytes);
         assert!(!scan_str(&reg_str));
 
-        // Simulate operation preview/result that would be generated after harness config edit
-        // Ensure preview doesn't contain sentinel even though harness config does
         let preview = crate::operation::OperationPreview {
             id: crate::ids::OperationId::new("op-scan").unwrap(),
             kind: crate::operation::OperationKind::UpdateConfig,
@@ -945,10 +857,8 @@ description: test skill
     fn windows_reserved_long_case_crlf_are_handled_without_panic_or_leak() {
         let dir = temp_dir("windows-long-case-crlf-core");
         std::fs::create_dir_all(&dir).unwrap();
-        // Windows reserved names: ensure validation rejects them as instance names or as quarantine targets
         for reserved in ["CON", "PRN", "AUX", "NUL", "COM1", "LPT1"] {
             let inst_res = InstanceName::new(reserved);
-            // InstanceName should reject Windows reserved case-insensitively
             if let Ok(name) = inst_res {
                 assert_ne!(
                     name.as_str().to_ascii_uppercase(),
@@ -956,7 +866,6 @@ description: test skill
                     "reserved {reserved:?} should be rejectable or at least not collide silently"
                 );
             }
-            // Quarantine target validation must reject Windows-style absolute with drive letter if treated as traversal
             let win_path_str = format!("C:\\Windows\\{reserved}.txt");
             let win_path = Path::new(&win_path_str);
             let q_res = superai_config::quarantine::validate_quarantine_target(win_path);
@@ -983,7 +892,6 @@ description: test skill
             let _ = report;
             drop(std::fs::remove_file(&long_path));
         }
-        // Case-insensitive collision via registry
         let mut reg = Registry::default();
         let h = HarnessId::new("claude-code").unwrap();
         let n1 = InstanceName::new("MyWork").unwrap();
@@ -1026,7 +934,6 @@ description: test skill
                 || msg.to_ascii_lowercase().contains("name")
         );
         assert!(!msg.contains(SENTINEL));
-        // CRLF
         let crlf_path = dir.join("crlf_core.json");
         let crlf_bytes = b"{\r\n  \"model\": \"opus\"\r\n}";
         std::fs::write(&crlf_path, crlf_bytes).unwrap();
@@ -1075,7 +982,6 @@ description: test skill
                 drop(std::fs::remove_file(&path));
             }
         }
-        // Broad deletion must reject traversal and absolute private redirects
         let fs_root2 = if cfg!(windows) {
             PathBuf::from("C:\\")
         } else {
@@ -1087,7 +993,6 @@ description: test skill
             assert!(r.is_err(), "broad {p:?} must be rejected");
             assert!(!format!("{:?}", r.unwrap_err()).contains(SENTINEL));
         }
-        // Huge
         let huge = vec![b'a'; crate::template::MAX_TEMPLATE_BYTES + 1024];
         let tr = Template::from_json_bytes(&huge);
         assert!(tr.is_err());

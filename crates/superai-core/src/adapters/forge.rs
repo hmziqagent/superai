@@ -1,5 +1,4 @@
-//! Forge adapter: `forge` binary, config root `~/.forge` or `$FORGE_CONFIG`,
-//! primary writable surface `.forge.toml` (TOML), isolation `relocated-root`.
+//! Forge adapter: `forge` binary, config root `~/.forge` or `$FORGE_CONFIG`, writable `.forge.toml`.
 //! Research source: `docs/harness-configs/forge.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
@@ -79,7 +78,6 @@ impl ForgeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$FORGE_CONFIG` or `~/.forge`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -95,12 +93,10 @@ impl ForgeAdapter {
         Some(PathBuf::from(home).join(".forge"))
     }
 
-    /// Build the `.forge.toml` path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join(".forge.toml")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -488,7 +484,7 @@ impl Adapter for ForgeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (forge.md: global `~/.forge/.mcp.json`; `disable: true` toggles without deleting; `FORGE_CONFIG` relocates the user scope)
+    /// `disable: true` toggles a server without deleting it; `FORGE_CONFIG` relocates the user scope.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",
@@ -499,7 +495,6 @@ impl Adapter for ForgeAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (forge.md)")
     }

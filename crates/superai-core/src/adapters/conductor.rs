@@ -37,8 +37,7 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// Constrained note: macOS worktrees/profile scoped.
 pub const CONSTRAINED_NOTE: &str = "user/repo TOML `~/.conductor/settings.toml` + `.conductor/settings.toml` + `.local`/`.managed` scopes, macOS worktrees `~/conductor/workspaces/` with CONDUCTOR_PORT..+9 per workspace, OS-bound: macOS desktop app, conductor build only, provider `claude_provider`/`codex_provider` + Bedrock/Vertex routing, profiles not fully isolated without containers";
 
-/// Owned selectors for provider/executor/model mutation.
-/// TOML top-level keys owned inside settings.toml.
+/// TOML top-level keys superai owns inside settings.toml.
 pub const OWNED_SELECTORS: &[&str] = &[
     "claude_code_executable_path",
     "codex_executable_path",
@@ -56,8 +55,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "scripts.archive",
 ];
 
-/// `Constrained` and `os_bound`: provider/model is per-profile TOML; true
-/// multi-account isolation needs OS users or containers.
+/// `Constrained` and `os_bound`: provider/model is per-profile TOML; real isolation needs OS users or containers.
 #[derive(Debug, Clone)]
 pub struct ConductorAdapter {
     id: HarnessId,
@@ -85,7 +83,6 @@ impl ConductorAdapter {
         CONSTRAINED_NOTE
     }
 
-    /// Resolve the default user settings path `~/.conductor/settings.toml`.
     fn default_user_settings() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -96,7 +93,6 @@ impl ConductorAdapter {
         Some(PathBuf::from(home).join(".conductor").join("settings.toml"))
     }
 
-    /// Build detection evidence about workspaces, TOMLs, and executors.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -478,7 +474,6 @@ impl Adapter for ConductorAdapter {
         let mut plan = WrapperPlan::new(
             "os_bound via macOS worktree + CONDUCTOR_* env + TOML scopes (constrained)",
         );
-        // Worktree path is per-instance root; CONDUCTOR_WORKSPACE_PATH points there.
         plan.env_vars.push((
             "CONDUCTOR_WORKSPACE_PATH".to_owned(),
             instance.config_root.to_string(),
@@ -545,14 +540,12 @@ impl Adapter for ConductorAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "orchestrator: agents keep their native MCP config; conductor exposes an MCP server API but no own MCP config file (orchestrators.md)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("orchestrator: no own plugin mechanism documented (orchestrators.md)")
     }

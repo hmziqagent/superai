@@ -1,6 +1,5 @@
 //! Pi adapter: relocated-root via `PI_CODING_AGENT_DIR`; JSON
 //! settings/auth/models surfaces under the config root.
-//! Research source: `docs/harness-configs/pi.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -77,7 +76,6 @@ impl PiAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$PI_CODING_AGENT_DIR` or `~/.pi/agent`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -93,12 +91,10 @@ impl PiAdapter {
         Some(PathBuf::from(home).join(".pi").join("agent"))
     }
 
-    /// Build the settings.json path for a given config root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -519,14 +515,12 @@ impl Adapter for PiAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "MCP is intentionally not built in; integrations come from extensions/packages (pi.md: intentionally does not include built-in MCP)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions are TypeScript modules loaded via -e/--extension flags/npm/git; no file-staged plugin mechanism (pi.md)",

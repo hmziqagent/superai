@@ -1,6 +1,5 @@
-//! Kimi Code adapter: relocated-root via `KIMI_CODE_HOME`, primary writable
-//! surface `config.toml` (TOML) plus MCP JSON.
-//! Research source: `docs/harness-configs/kimi-cli.md` (last verified 2026-08-25).
+//! Kimi Code adapter: relocated root via `KIMI_CODE_HOME`, writable
+//! `config.toml` plus MCP JSON.
 
 use std::path::{Path, PathBuf};
 
@@ -87,7 +86,6 @@ impl KimiCodeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$KIMI_CODE_HOME` or `~/.kimi-code`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -103,12 +101,10 @@ impl KimiCodeAdapter {
         Some(PathBuf::from(home).join(".kimi-code"))
     }
 
-    /// Build the config.toml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.toml")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -479,7 +475,7 @@ impl Adapter for KimiCodeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (kimi-cli.md MCP config: `$KIMI_CODE_HOME/mcp.json`; project `.kimi-code/mcp.json` overrides by name)
+    /// MCP in `$KIMI_CODE_HOME/mcp.json`; project `.kimi-code/mcp.json` overrides servers by name.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp.json",
@@ -490,7 +486,7 @@ impl Adapter for KimiCodeAdapter {
         ))
     }
 
-    /// EXT-06/07: plugin mechanism (kimi-cli.md 5: marketplace plugins package skills + MCP servers + data sources)
+    /// Marketplace plugins bundle skills, MCP servers, and data sources in one record.
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::requires_execution(
             "kimi plugins marketplace (/plugins)",
@@ -989,10 +985,8 @@ mod tests {
         assert!(!boxed.plan_mirror_exclusions().is_empty());
     }
 
-    /// `fixtures/kimi_code_cli` duplicates this corpus for the
-    /// `kimi-code-cli` catalog id; the adapter reads `fixtures/kimi_code`.
-    /// The guard keeps the alias a faithful byte-copy instead of a silently
-    /// drifting duplicate.
+    /// `fixtures/kimi_code_cli` must stay a byte-copy of `fixtures/kimi_code`
+    /// so the alias catalog id cannot silently drift.
     #[test]
     fn alias_corpus_dir_stays_in_sync_with_kimi_code() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");

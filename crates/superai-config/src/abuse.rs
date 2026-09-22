@@ -1,7 +1,5 @@
-//! QAL-10/11 config-layer abuse verification (secret + path).
-//!
-//! - Sentinel `sk-superai-test-sentinel-12345-fake` may appear only in harness config file and its backup with 0o600 on unix.
-//! - Path abuses are rejected without panic or leak: traversal, symlink swap race, broad deletion, shell metachars, huge deep config.
+//! QAL-10/11 abuse verification: the sentinel may appear only in the
+//! harness config and its backup; path abuses reject without panic or leak.
 
 use std::path::Path;
 
@@ -75,14 +73,12 @@ mod tests {
         let content = format!(r#"{{"api_key":"{SENTINEL}","model":"sonnet"}}"#);
         std::fs::write(&cfg_path, &content).unwrap();
 
-        // Harness config file does contain sentinel (allowed)
         let cfg_bytes = std::fs::read(&cfg_path).unwrap();
         assert!(
             contains_sentinel(&cfg_bytes),
             "harness config must contain sentinel here"
         );
 
-        // A 0o600 config file must back up to a 0o600 copy on unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -112,7 +108,6 @@ mod tests {
             assert_eq!(orig_mode, 0o600, "harness config must be 0o600");
         }
 
-        // Backup catalog (list_backups debug) must NOT contain sentinel plain
         let backups = list_backups(&cfg_path).unwrap();
         let catalog_dbg = format!("{backups:?}");
         assert!(
@@ -127,7 +122,6 @@ mod tests {
             );
         }
 
-        // Snapshot debug must not contain sentinel (snapshot stores digest only)
         let snap = snapshot(&cfg_path);
         let snap_dbg = format!("{snap:?}");
         assert!(
@@ -150,7 +144,6 @@ mod tests {
             std::fs::write(&target_b, br#"{"model":"b-different-content"}"#).unwrap();
 
             let link = dir.join("link.json");
-            // Ensure link does not exist
             drop(std::fs::remove_file(&link));
             std::os::unix::fs::symlink(&target_a, &link).unwrap();
 
@@ -159,7 +152,6 @@ mod tests {
             assert!(snap.is_symlink);
             assert!(snap.digest.is_some());
 
-            // Swap symlink to point to b
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&target_b, &link).unwrap();
 
@@ -169,12 +161,8 @@ mod tests {
                 "swap should be detected as modified"
             );
 
-            // Attempt atomic write with original snapshot should abort. With
-            // the dir declared as a follow root the write would follow the
-            // link (MUT-02) and the caller's token detects the swap; with NO
-            // roots declared the boundary refuses to follow the symlink at
-            // all; both paths abort, neither overwrites through the swapped
-            // link.
+            // With the dir as a follow root the caller's token must catch the
+            // swapped link (MUT-02); rootless, the boundary refuses to follow.
             let res = crate::transaction::commit_file_expecting_with_roots(
                 "abuse-symlink-race",
                 &link,
@@ -203,8 +191,6 @@ mod tests {
                 other => panic!("expected SymlinkFollowRefused, got {other:?}: rootless"),
             }
 
-            // Verify no sentinel leak in error (if sentinel had been involved, it would not appear)
-            // Use sentinel-injected variant: create file with sentinel, snapshot, swap, ensure error doesn't leak
             let sentinel_file = dir.join("sentinel.json");
             std::fs::write(&sentinel_file, format!(r#"{{"api_key":"{SENTINEL}"}}"#)).unwrap();
             let link2 = dir.join("link2.json");
@@ -233,7 +219,6 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            // On non-unix, just ensure snapshot logic doesn't panic for regular file swap
             let dir = temp_root("symlink-race-nonunix");
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("file.json");
@@ -254,14 +239,12 @@ mod tests {
 
     #[test]
     fn broad_deletion_targets_are_rejected() {
-        // Direct broad roots
         for p in ["/", "/home", "/tmp", "/usr", "/etc"] {
             let err = validate_quarantine_target(Path::new(p));
             assert!(err.is_err(), "broad root {p} should be rejected, got ok");
             let msg = format!("{:?}", err.unwrap_err());
             assert!(!msg.contains(SENTINEL), "error must not leak sentinel");
         }
-        // Home directory
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
             && home.is_absolute()
             && home.exists()
@@ -273,9 +256,8 @@ mod tests {
                 home.display()
             );
         }
-        // Windows style: `C:\Windows` is a broad windows root on every host;
-        // on Windows via the drive-root/system-dir rule, on unix via the
-        // absolute-path requirement (it parses as relative there).
+        // `C:\Windows` is rejected on every host: drive-root rule on Windows,
+        // the absolute-path requirement on unix (parses as relative there).
         for win_root in [
             "C:\\Windows",
             "c:\\program files",
@@ -299,7 +281,6 @@ mod tests {
         );
         assert!(err.is_err(), "C:\\Windows should be rejected for removal");
 
-        // Globs
         for p in [
             std::env::temp_dir().join("*.json"),
             PathBuf::from("/var/*.log"),
@@ -308,7 +289,6 @@ mod tests {
             let err = validate_quarantine_target(&p);
             assert!(err.is_err(), "glob {} should be rejected", p.display());
         }
-        // Unresolved variables
         for p in [
             std::env::temp_dir().join("$HOME/foo"),
             std::env::temp_dir().join("%USERPROFILE%/bar"),
@@ -320,16 +300,12 @@ mod tests {
                 p.display()
             );
         }
-        // Traversal
         let err = validate_quarantine_target(&std::env::temp_dir().join("../etc/passwd"));
         assert!(err.is_err(), "traversal should be rejected");
 
-        // Relative should be rejected
         let err = validate_quarantine_target(Path::new("relative/path"));
         assert!(err.is_err(), "relative should be rejected");
 
-        // Quarantine dir itself should be rejected (if HOME exists)
-        // We do best-effort: if quarantine_base succeeds, that path should be rejected
         if let Ok(qb) = crate::quarantine::quarantine_base() {
             let err = validate_quarantine_target(&qb);
             assert!(err.is_err(), "quarantine base should be rejected");
@@ -361,9 +337,7 @@ mod tests {
             "a\nb",
         ];
         for name in bad_names {
-            // Absolute path containing shell metachars should be rejected by transaction path safety
             let bad_path = dir.join(name);
-            // Try to create a transaction with that path as Write target
             let op_id = OperationId::new(&format!("op-shell-{}", name.len())).unwrap();
             let action = FileAction::Write {
                 path: bad_path.clone(),
@@ -387,7 +361,6 @@ mod tests {
             }
         }
 
-        // Also test via quarantine validation which checks shell-like globs? Not shell but similar.
         let shell_path = std::env::temp_dir().join("$(rm -rf)/file.json");
         let err = validate_quarantine_target(&shell_path);
         assert!(
@@ -404,7 +377,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("huge.json");
 
-        // 300-deep nested objects plus a separate 5MB payload.
         let mut json = String::new();
         let depth = 300;
         for _ in 0..depth {
@@ -421,20 +393,17 @@ mod tests {
 
         let deep_bytes = json.into_bytes();
         assert!(deep_bytes.len() < 10 * 1024 * 1024, "deep bytes bounded");
-        // Must not panic whether the depth parses or not.
         drop(crate::raw_editor::validate(
             &deep_bytes,
             DocumentKind::StrictJson,
         ));
 
-        // Huge 5MB should be handled: validate should not panic, and atomic_write should handle size
         let huge_bytes = huge_json.into_bytes();
         assert!(
             huge_bytes.len() >= 5 * 1024 * 1024,
             "huge bytes should be at least 5MB, got {}",
             huge_bytes.len()
         );
-        // Check that transaction staging validates size: it should not panic, may succeed or fail but bounded
         let op_id = OperationId::new("op-huge-5mb").unwrap();
         let action = FileAction::Write {
             path: path.clone(),
@@ -442,22 +411,17 @@ mod tests {
             kind: DocumentKind::StrictJson,
         };
         let mut txn = Transaction::new(op_id, vec![action]);
-        // validate_plan should not panic even with huge content (content not checked there)
         let plan_res = txn.validate_plan();
         assert!(
             plan_res.is_ok(),
             "plan valid for huge path, content not yet checked"
         );
 
-        // Huge-but-valid content may stage successfully; either way no
-        // panic and no sentinel leak.
         match txn.prepare() {
             Ok(()) => {
-                // Clean up staged temps
                 for t in txn.staged_temps {
                     drop(std::fs::remove_file(t));
                 }
-                // Also check that huge content doesn't contain sentinel
                 assert!(!contains_sentinel(&huge_bytes));
             }
             Err(e) => {
@@ -466,7 +430,6 @@ mod tests {
             }
         }
 
-        // Cleanup
         drop(std::fs::remove_file(&path));
         for b in list_backups(&path).unwrap() {
             drop(std::fs::remove_file(b.backup_path));
@@ -476,7 +439,6 @@ mod tests {
 
     #[test]
     fn huge_deep_nested_yaml_and_toml_bounded() {
-        // Similar for YAML/TOML deep via direct validate
         let depth = 250;
         let mut yaml = String::new();
         for i in 0..depth {
@@ -491,7 +453,6 @@ mod tests {
         yaml.push_str("leaf: 1\n");
         let y_bytes = yaml.into_bytes();
         let diags = crate::raw_editor::validate(&y_bytes, DocumentKind::Yaml);
-        // Should not panic
         drop(diags);
         assert!(y_bytes.len() < 2 * 1024 * 1024);
 
@@ -512,7 +473,6 @@ mod tests {
         let dir = temp_root("malformed-huge");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Create a file with sentinel, then try to corrupt it with huge malformed content and ensure backup/error don't leak
         let path = dir.join("malformed.json");
         let sentinel_content = format!(r#"{{"api_key":"{SENTINEL}"}}"#);
         std::fs::write(&path, &sentinel_content).unwrap();
@@ -520,7 +480,7 @@ mod tests {
 
         // Commit malformed huge content through the boundary as an opaque
         // payload; parse-validating kinds fail closed at staging instead.
-        let bad_content = vec![b'{'; 2 * 1024 * 1024]; // 2MB of '{'
+        let bad_content = vec![b'{'; 2 * 1024 * 1024];
         let res = crate::transaction::commit_file_expecting(
             "abuse-huge",
             &path,
@@ -528,30 +488,25 @@ mod tests {
             DocumentKind::Opaque,
             Some(&snap),
         );
-        // The boundary writes whatever opaque bytes it is given; errors (or
-        // the overwrite itself) must not leak the sentinel.
+        // The boundary writes opaque bytes verbatim; neither error nor overwrite may leak the sentinel.
         if let Err(e) = res {
             let msg = format!("{e:?}");
             assert!(!msg.contains(SENTINEL));
         } else {
-            // If it succeeded, verify file now contains bad content not sentinel (since we overwrote)
             let new_bytes = std::fs::read(&path).unwrap();
             assert!(
                 !contains_sentinel(&new_bytes),
                 "overwritten file should not contain sentinel"
             );
-            // Backup should contain sentinel
             let backups = list_backups(&path).unwrap();
             if let Some(b) = backups.first() {
                 let backup_bytes = std::fs::read(&b.backup_path).unwrap();
                 assert!(contains_sentinel(&backup_bytes));
-                // But catalog must not leak
                 let cat = format!("{b:?}");
                 assert!(!cat.contains(SENTINEL));
             }
         }
 
-        // Ensure staged validation would reject the bad content if via transaction
         let op_id = OperationId::new("op-malformed-huge").unwrap();
         #[expect(clippy::redundant_clone, reason = "retain path for later cleanup")]
         let action = FileAction::Write {
@@ -573,7 +528,6 @@ mod tests {
 
     #[test]
     fn windows_reserved_and_long_and_case_insensitive_and_crlf_are_handled() {
-        // QAL-09/11: Windows reserved, long paths, case-insensitive collisions, CRLF, no panic or leak
         let dir = temp_root("windows-long-crlf");
         std::fs::create_dir_all(&dir).unwrap();
         // Windows reserved device names are rejected at plan validation on
@@ -595,7 +549,6 @@ mod tests {
                 drop(std::fs::remove_file(&path));
             }
         }
-        // A 300-char path must not panic; either outcome stays bounded.
         let long_name = "a".repeat(300);
         let long_path = dir.join(format!("{long_name}.json"));
         let long_res = std::panic::catch_unwind(|| {
@@ -612,14 +565,9 @@ mod tests {
             assert!(msg.len() <= 8192);
             assert!(!msg.contains(SENTINEL));
         }
-        // Cleanup long file if created
         drop(std::fs::remove_file(&long_path));
-        // Case-variant names: on a case-sensitive filesystem these are two
-        // distinct files and their snapshot digests must differ; on a
-        // case-insensitive filesystem (default APFS) the second write lands on
-        // the SAME physical file, so both names observe one installation and
-        // the digests must agree. Probe which filesystem kind we are on by
-        // reading back through the first name after the second write.
+        // Case-insensitive fs (default APFS): both names are one file and the
+        // digests agree; case-sensitive: two files. Read back the first name.
         let lower = dir.join("case.json");
         let upper = dir.join("CASE.json");
         std::fs::write(&lower, br#"{"a":1}"#).unwrap();
@@ -640,17 +588,13 @@ mod tests {
             );
         }
         assert!(!format!("{snap_lower:?}").contains(SENTINEL));
-        // CRLF handling: env/json with CRLF must not panic and must round-trip.
-        // FS truth: CRLF is ordinary whitespace for JSON; load and edit both
-        // succeed on every platform, and the edit lands the new key while the
-        // on-disk file stays parseable.
+        // CRLF is ordinary JSON whitespace, so load and edit succeed everywhere.
         let crlf_path = dir.join("crlf.json");
         let crlf_content = b"{\r\n  \"a\": 1,\r\n  \"b\": \"val\"\r\n}";
         std::fs::write(&crlf_path, crlf_content).unwrap();
         let diags = crate::raw_editor::validate(crlf_content, DocumentKind::StrictJson);
         drop(diags);
         let load = crate::json::load_value(&crlf_path);
-        // JSON with CRLF is valid (whitespace includes CRLF)
         assert!(load.is_ok(), "CRLF json must parse: {load:?}");
         let edit_res = crate::json::edit(&crlf_path, |m| {
             m.insert("c".to_owned(), serde_json::Value::String("new".to_owned()));
@@ -676,7 +620,6 @@ mod tests {
 
     #[test]
     fn shell_metachars_and_symlink_escape_do_not_leak_and_are_bounded() {
-        // QAL-11: shell metachars in intermediate paths and symlink escape via transaction must be rejected safely
         let dir = temp_root("shell-escape-bounded");
         std::fs::create_dir_all(&dir).unwrap();
         let bad_segments = [
@@ -684,7 +627,6 @@ mod tests {
         ];
         for seg in bad_segments {
             let path = dir.join(format!("{seg}.json"));
-            // Path containing metachars is legal as file name on unix but transaction must handle without shell interpolation
             let res = std::panic::catch_unwind(|| {
                 crate::transaction::commit_file(
                     "abuse-metachars",
@@ -696,13 +638,11 @@ mod tests {
             assert!(res.is_ok(), "metachars {seg:?} must not panic");
             if let Ok(Ok(report)) = res {
                 let _ = report;
-                // If file was created, ensure its content is exactly what we wrote and error paths didn't leak sentinel
                 let bytes = std::fs::read(&path).unwrap();
                 assert_eq!(bytes, br#"{"a":1}"#);
                 drop(std::fs::remove_file(&path));
             }
         }
-        // Symlink escape: create a symlink inside dir that points outside, then ensure transaction via symlink does not write outside without detecting
         #[cfg(unix)]
         {
             let outside = temp_root("outside-target");
@@ -721,7 +661,6 @@ mod tests {
                 DocumentKind::StrictJson,
                 Some(&snap),
             );
-            // Should succeed via symlink (followed) but is_modified must handle symlink target; at least must not panic and must not leak
             if let Err(e) = res {
                 let msg = format!("{e:?}");
                 assert!(!msg.contains(SENTINEL));

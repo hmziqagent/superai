@@ -1,8 +1,5 @@
-//! `OpenClaw` adapter: long-running `daemon_service` (Node service,
-//! ports/gateway), config `~/.openclaw/openclaw.json` (JSON5) + `.env`,
-//! relocation via `OPENCLAW_HOME`/`OPENCLAW_STATE_DIR`/`OPENCLAW_CONFIG_PATH`;
-//! `ResearchBlocked` until gateway and schema gaps close.
-//! Research source: `docs/harness-configs/openclaw.md` (last verified 2026-08-25).
+//! `OpenClaw` adapter: long-running daemon (ports/gateway), config
+//! `~/.openclaw/openclaw.json` + `.env`; research-blocked pending gateway.
 
 use std::path::PathBuf;
 
@@ -53,13 +50,8 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// Research-blocked reason.
 pub const BLOCKED_REASON: &str = "daemon state, gateway/schema incomplete: ports, gateway security, multi-agent, plugin/skill paths unverified; long-running service not per-invocation CLI";
 
-/// Daemon-class facts the current research state allows to be wired (WRP-07).
-///
-/// The generic daemon machinery (`crate::daemon`) is harness-agnostic; this
-/// declaration is what openclaw's research state honestly permits today: no
-/// port/bind facts are verified in the corpus, so superai neither invents a
-/// port range nor drives start/stop for this harness until the gateway
-/// research closes.
+/// Daemon facts the corpus honestly permits: no verified port/bind, so
+/// superai invents no port range and drives no start/stop for openclaw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConstraints {
     /// Whether the corpus verifies a port range/bind for the gateway.
@@ -109,7 +101,6 @@ impl OpenClawAdapter {
         BLOCKED_REASON
     }
 
-    /// Resolve default state dir.
     fn default_state_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(STATE_DIR_ENV_VAR)
             && !dir.trim().is_empty()
@@ -130,7 +121,6 @@ impl OpenClawAdapter {
         Some(PathBuf::from(home).join(".openclaw"))
     }
 
-    /// Collect evidence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -434,10 +424,8 @@ impl Adapter for OpenClawAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 (read side; writes are ResearchBlocked until gateway/schema
-        // complete): root shapes + the provider-tree keys documented in
-        // docs/harness-configs/openclaw.md §3 (agents.defaults.model,
-        // models.providers).
+        // Read side only; writes stay ResearchBlocked. Shapes follow
+        // openclaw.md §3: agents.defaults.model, models.providers.
         match surface_id {
             "openclaw.json" => Some(
                 SurfaceSchema::new()
@@ -450,14 +438,12 @@ impl Adapter for OpenClawAdapter {
         }
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "research-blocked; the openclaw.json schema is not walked end to end in the corpus (openclaw.md)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("skills/plugin layout not walked end to end in the corpus (openclaw.md)")
     }
@@ -512,8 +498,8 @@ mod tests {
 
     #[test]
     fn daemon_constraints_report_unverified_ports_and_blocked_lifecycle() {
-        // WRP-07 declaration honesty: the daemon machinery exists, but the
-        // research state does not verify ports or permit lifecycle control.
+        // The daemon machinery exists, but research verifies no ports and
+        // permits no lifecycle control.
         let c = super::daemon_constraints();
         assert!(!c.ports_verified);
         assert!(

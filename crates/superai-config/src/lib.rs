@@ -1,8 +1,5 @@
-//! Layer 1: harness config files.
-//!
-//! Every operation reads the file fresh, backs it up, and writes back preserving
-//! keys superai does not model. Nothing is cached: the harness, an editor, or a
-//! synced folder can change these files between two calls.
+//! Layer 1: harness config files. Every operation reads fresh, backs up,
+//! and writes back preserving keys superai does not model.
 
 /// QAL-10/11 secret and path abuse verification.
 pub mod abuse;

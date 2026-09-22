@@ -1,6 +1,5 @@
-//! Kode adapter: relocated-root via `KODE_CONFIG_DIR` (with `CLAUDE_CONFIG_DIR`
-//! compat), primary writable surface `config.json` (JSON).
-//! Research source: `docs/harness-configs/kode.md` (last verified 2026-08-25).
+//! Kode adapter: relocated root via `KODE_CONFIG_DIR` (with `CLAUDE_CONFIG_DIR`
+//! compat), writable `config.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -86,7 +85,6 @@ impl KodeAdapter {
         CONFIG_ENV_VAR_COMPAT
     }
 
-    /// Resolve the default config root: `$KODE_CONFIG_DIR` or `$CLAUDE_CONFIG_DIR` or `~/.kode`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -107,12 +105,10 @@ impl KodeAdapter {
         Some(PathBuf::from(home).join(".kode"))
     }
 
-    /// Build the config.json path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -528,7 +524,7 @@ impl Adapter for KodeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (kode.md: global `mcpServers` in the global config; project `.mcp.json` recommended)
+    /// Global `mcpServers` lives in config.json; the project `.mcp.json` is the recommended surface.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.json",
@@ -539,7 +535,6 @@ impl Adapter for KodeAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             ".kode-plugin manifests documented at project scope but installs flow through the /plugin command; requires harness execution (kode.md)",

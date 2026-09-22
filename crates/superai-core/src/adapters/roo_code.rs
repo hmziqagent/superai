@@ -1,7 +1,5 @@
 //! Roo Code adapter: archived 2026-05, `MigrationOnly`, successor kilo-code.
-//! VS Code extension surfaces under globalStorage plus project `.roomodes` /
-//! `.roo/mcp.json`.
-//! Research source: `docs/harness-configs/roo-code.md` (last verified 2026-08-25).
+//! VS Code globalStorage surfaces plus project `.roomodes` / `.roo/mcp.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -76,7 +74,6 @@ impl RooCodeAdapter {
         MIGRATION_TIP
     }
 
-    /// Resolve default config storage dir (approx).
     fn default_storage_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -114,7 +111,6 @@ impl RooCodeAdapter {
         )
     }
 
-    /// Collect evidence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -444,7 +440,6 @@ impl Adapter for RooCodeAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (roo-code.md MCP paths: project `.roo/mcp.json`; the global store lives inside VS Code globalStorage)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -460,7 +455,6 @@ impl Adapter for RooCodeAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "community Marketplace installs land as mode YAML through the VS Code UI; no superai-writable plugin record documented (roo-code.md)",

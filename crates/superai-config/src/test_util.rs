@@ -37,14 +37,12 @@ pub(crate) fn keep_mode_from_env() -> KeepMode {
 }
 
 thread_local! {
-    /// Whether a panic has been observed on this thread. The default test
-    /// harness runs each test on its own thread, so a thread-local flag is a
-    /// per-test failure signal for the retain-on-failure policy.
+    /// Whether this thread panicked: the default harness runs each test on
+    /// its own thread, so the flag is a per-test failure signal.
     static PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Install the panic tracker used by retain-on-failure. Idempotent; chains to
-/// the previous hook so test failure output is unchanged.
+/// Install the panic tracker; idempotent, chains to the previous hook.
 pub(crate) fn install_panic_tracker() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -56,11 +54,8 @@ pub(crate) fn install_panic_tracker() {
     });
 }
 
-/// Create a unique temporary directory for a per-test isolated filesystem.
-///
-/// Uses `SystemTime` millis, an atomic counter, process id, and a hasher
-/// for uniqueness. The directory is created on disk. No global `HOME` or
-/// cwd mutation is performed.
+/// Unique temp dir on disk from millis, an atomic counter, pid, and a
+/// hash; no global `HOME` or cwd mutation.
 pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,11 +75,8 @@ pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     dir
 }
 
-/// Clear the Windows readonly attribute from every file under `root`.
-///
-/// `std::fs::remove_dir_all` cannot delete readonly files on Windows; the
-/// suite never creates them deliberately, but backups of readonly sources
-/// legitimately carry the attribute and must still clean up.
+/// Clear the Windows readonly attribute under `root`: remove_dir_all
+/// cannot delete readonly files, and backups can legitimately carry it.
 #[cfg(windows)]
 fn clear_readonly_recursive(root: &Path) {
     fn clear_one(path: &Path) {
@@ -96,8 +88,6 @@ fn clear_readonly_recursive(root: &Path) {
         }
         let mut perm = meta.permissions();
         if perm.readonly() {
-            // Windows-only code path: the readonly attribute is the only
-            // permission bit that exists there.
             #[expect(
                 clippy::permissions_set_readonly_false,
                 reason = "windows-only path; the readonly attribute is the only permission bit"
@@ -128,18 +118,14 @@ fn clear_readonly_recursive(root: &Path) {
     visit(root);
 }
 
-/// RAII temporary directory that cleans up on drop, honoring the
-/// retain-on-failure policy from [`KEEP_ENV`] (QAL-01).
+/// RAII temp dir honoring the retain-on-failure policy from [`KEEP_ENV`].
 #[derive(Debug)]
 pub(crate) struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    /// Create a new isolated temporary directory with the given prefix.
-    ///
-    /// Installs the panic tracker so `SUPERAI_TEST_KEEP=failed` can observe
-    /// the dropping test's failure state.
+    /// New isolated dir; installs the panic tracker for `SUPERAI_TEST_KEEP=failed`.
     pub(crate) fn new(prefix: &str) -> Self {
         install_panic_tracker();
         Self {
@@ -157,8 +143,7 @@ impl TempDir {
         self.path.join(name)
     }
 
-    /// The decision applied at drop time, exposed for tests so the policy can
-    /// be exercised without mutating the process environment.
+    /// The drop-time decision, exposed so tests can drive it without the env.
     pub(crate) fn should_keep(mode: KeepMode, panicked: bool) -> bool {
         match mode {
             KeepMode::All => true,
@@ -195,7 +180,6 @@ mod tests {
         let dir = temp_dir_unique("config-iso");
         assert!(dir.exists());
         assert!(dir.is_dir());
-        // Write a file to ensure isolation.
         let file = dir.join("probe.txt");
         std::fs::write(&file, b"hello").unwrap();
         assert!(file.exists());
@@ -223,7 +207,6 @@ mod tests {
                 std::thread::spawn(move || {
                     let dir = temp_dir_unique("config-parallel");
                     assert!(dir.exists(), "thread {i} dir missing");
-                    // Ensure we can create a file inside.
                     let probe = dir.join("t.txt");
                     std::fs::write(&probe, format!("{i}").as_bytes()).unwrap();
                     assert_eq!(std::fs::read_to_string(&probe).unwrap(), format!("{i}"));
@@ -253,22 +236,18 @@ mod tests {
 
     #[test]
     fn keep_decision_matrix() {
-        // default: always delete
         assert!(!TempDir::should_keep(KeepMode::No, false));
         assert!(!TempDir::should_keep(KeepMode::No, true));
-        // failed: keep only when the dropping test panicked
         assert!(!TempDir::should_keep(KeepMode::Failed, false));
         assert!(TempDir::should_keep(KeepMode::Failed, true));
-        // all: always keep
         assert!(TempDir::should_keep(KeepMode::All, false));
         assert!(TempDir::should_keep(KeepMode::All, true));
     }
 
     #[test]
     fn drop_respects_injected_keep_decision() {
-        // The drop-path behavior for each policy, driven through the same
-        // decision the Drop impl applies (the env var itself is read at drop
-        // time and cannot be safely mutated in a parallel test process).
+        // Each policy's drop decision driven directly: the env var is read
+        // at drop time and cannot be mutated in a parallel test process.
         for (mode, panicked, kept) in [
             (KeepMode::No, false, false),
             (KeepMode::No, true, false),
@@ -299,12 +278,10 @@ mod tests {
             PANICKED.with(std::cell::Cell::get),
             "the panicking thread must be flagged"
         );
-        // A separate thread stays unflagged.
         let other = std::thread::spawn(|| PANICKED.with(std::cell::Cell::get))
             .join()
             .unwrap_or(true);
         assert!(!other, "other threads must not inherit the flag");
-        // The flag is observable exactly where Drop reads it.
         assert!(TempDir::should_keep(
             KeepMode::Failed,
             PANICKED.with(std::cell::Cell::get)

@@ -1,18 +1,8 @@
-//! Failure-injection surface for the mutation family (QAL-06).
-//!
-//! Production mutation functions (`atomic`, `backup`, `transaction`) accept an
-//! optional [`Injector`] trait object and call [`Injector::inject`] at every
-//! boundary named by [`Point`]; without one the calls compile away to a
-//! single branch on an `Option`, so real runs and the failure matrix
-//! exercise the same production path. The trait lives in this crate (not
-//! `superai-core`) because the mutation family is layer 1; higher layers
-//! implement it with their own deterministic counters (see `superai-core`
-//! `failure::TestInjector`).
+//! Mutation-boundary failure injection (QAL-06): production paths take an
+//! optional [`Injector`] fired at every [`Point`]; `None` costs one branch.
 
-/// A boundary in the mutation pipeline that can fail.
-///
-/// The set mirrors the failure tests required by subplan 02 plus the §4.2
-/// prepare-to-commit conflict recheck. Ordering of variants is stable.
+/// A boundary in the mutation pipeline that can fail. The set mirrors the
+/// failure tests plus the §4.2 recheck; variant order is stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Point {
     /// Opening the existing file for backup.
@@ -31,8 +21,7 @@ pub enum Point {
     TempFlush,
     /// Validating staged output (parse).
     ParseStaged,
-    /// The prepare-to-commit conflict recheck (§4.2): comparing the current
-    /// on-disk state to the expectation recorded at prepare time.
+    /// The prepare-to-commit recheck (§4.2): on-disk state vs the expectation.
     ConflictRecheck,
     /// Atomic rename/replace.
     AtomicReplace,
@@ -46,8 +35,7 @@ pub enum Point {
     SecondFile,
     /// The third file of a multi-file transaction.
     ThirdFile,
-    /// The operation journal was just written at the `plan` phase; a failure
-    /// here simulates a crash with the journal left at that phase (MUT-09).
+    /// Journal written at `plan`; a failure simulates a crash there (MUT-09).
     JournalPlan,
     /// Journal advanced to `prepare_backup`; crash simulation.
     JournalPrepareBackup,
@@ -90,19 +78,14 @@ impl std::fmt::Display for Point {
     }
 }
 
-/// Deterministic failure injection into production mutation paths.
-///
-/// `inject` returns `Err` to simulate the named boundary failing; `Ok(())`
-/// lets the production code continue. Implementations must be cheap and
-/// side-effect free apart from their counters.
+/// Deterministic failure injection: `Err` simulates the boundary failing.
+/// Implementations stay cheap and side-effect free apart from counters.
 pub trait Injector: Send + Sync + std::fmt::Debug {
     /// Possibly fail for `point`.
     fn inject(&self, point: Point) -> crate::Result<()>;
 }
 
 /// Invoke an optional injector, short-circuiting on failure.
-///
-/// `None` costs one branch; production callers pass `Option<&dyn Injector>`.
 pub(crate) fn run(injector: Option<&dyn Injector>, point: Point) -> crate::Result<()> {
     if let Some(injector) = injector {
         injector.inject(point)

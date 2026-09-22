@@ -48,8 +48,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Top-level keys superai owns in providers.json; everything else
-/// round-trips untouched via `superai-config::json`.
+/// Top-level keys superai owns in providers.json; other keys round-trip untouched.
 pub const OWNED_SELECTORS: &[&str] = &[
     "apiProvider",
     "openAiBaseUrl",
@@ -64,8 +63,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
 /// Owned selectors for MCP servers inside `cline_mcp_settings.json`.
 pub const MCP_OWNED_SELECTORS: &[&str] = &["mcpServers"];
 
-/// Isolation is `ide-user-data`: `CLINE_DATA_DIR` for the CLI/SDK side,
-/// `--user-data-dir` / `--extensions-dir` for VS Code.
+/// `ide-user-data` isolation: `CLINE_DATA_DIR` for the CLI, `--user-data-dir`/`--extensions-dir` for VS Code.
 #[derive(Debug, Clone)]
 pub struct ClineAdapter {
     id: HarnessId,
@@ -98,7 +96,6 @@ impl ClineAdapter {
         super::find_in_path(&[EXECUTABLE]).or_else(|| super::find_in_path(&[VSCODE_EXECUTABLE]))
     }
 
-    /// Resolve the default config root: `$CLINE_DATA_DIR` or `~/.cline`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(DATA_DIR_ENV_VAR)
             && !dir.trim().is_empty()
@@ -114,7 +111,6 @@ impl ClineAdapter {
         Some(PathBuf::from(home).join(".cline"))
     }
 
-    /// Resolve the default VS Code globalStorage path for Cline MCP settings.
     fn vscode_global_storage_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -170,7 +166,6 @@ impl ClineAdapter {
         }
     }
 
-    /// Build detection evidence about Cline config and VS Code storage.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -363,7 +358,6 @@ impl Adapter for ClineAdapter {
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("cline"),
                 path.display()
             ));
-            // Only probe cline binary, not code.
             let file_name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -690,8 +684,6 @@ impl Adapter for ClineAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::IdeUserData | Isolation::RelocatedRoot | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shapes / owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -702,8 +694,6 @@ impl Adapter for ClineAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 per docs/harness-configs/cline.md: providers.json holds
-        // provider metadata; cline_mcp_settings.json holds mcpServers.
         match surface_id {
             "providers.json" | "global-settings.json" => Some(
                 SurfaceSchema::new()
@@ -755,7 +745,6 @@ impl Adapter for ClineAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (cline.md 1.4: `cline_mcp_settings.json`)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "cline_mcp_settings.json",
@@ -766,7 +755,6 @@ impl Adapter for ClineAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "no plugin mechanism documented; extensions are VS Code-level, not Cline plugins (cline.md)",
@@ -1171,7 +1159,6 @@ mod tests {
         let path = fixture_path("settings.minimal.json");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let map = superai_config::json::load(&path).unwrap();
-        // Minimal may be empty or contain only telemetrySetting.
         assert!(
             map.is_empty()
                 || map.contains_key("telemetrySetting")
@@ -1370,7 +1357,6 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let read = std::fs::read_to_string(&path).unwrap();
         assert!(read.contains("Cline Rules"));
-        // Simulate edit: append rule, ensure original preserved.
         let mut updated = read;
         updated.push_str("- New rule\n");
         std::fs::write(&path, updated).unwrap();
@@ -1440,7 +1426,6 @@ mod tests {
             .unwrap();
         assert_eq!(vscode.kind, DocumentKind::Json);
         assert_eq!(vscode.scope, ConfigScope::User);
-        // Should mention globalStorage in resolver.
         assert!(vscode.path_resolver.fallback.contains("globalStorage"));
     }
 

@@ -1,5 +1,4 @@
 //! Layer 2: instances, templates, and capabilities.
-//!
 //! Exposes capabilities upward; harness identity stays below this line.
 
 /// QAL-10/11 secret and path abuse verification.
@@ -87,13 +86,12 @@ pub mod activation;
 /// Daemon lifecycle: port allocation, identity, readiness, start/stop (WRP-07).
 pub mod daemon;
 
-/// Multi-instance alias core: per-alias relocated roots, seeded MCP/plugin
-/// sets, third-party provider overrides, HOME-virtualized desktop
-/// instances, and launch composition (run-4 area a, run-5 area A).
+/// Multi-instance alias core: relocated roots, seeded MCP/plugin sets, and
+/// launch composition.
 pub mod alias;
 
-/// Symlink-swap profiles over parameterized fixed config paths: the
-/// desktop alternative for unrelocatable harnesses (run-5 area A).
+/// Symlink-swap profiles over parameterized fixed config paths, for
+/// harnesses that cannot relocate.
 pub mod profile;
 
 #[cfg(test)]

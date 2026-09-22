@@ -1,8 +1,5 @@
 //! Registered harness catalog: the 51 planned product surfaces.
-//!
-//! Every row from `docs/plans/03-harness-adapters.md` provisional ledger is
-//! present with its entry gate, source link, and reason. This satisfies the
-//! HAD exit gate "every ledger row is registered in code".
+//! Every ledger row from `docs/plans/03-harness-adapters.md` is registered here.
 
 use serde::{Deserialize, Serialize};
 
@@ -93,10 +90,7 @@ impl CatalogEntry {
 }
 
 /// All 51 provisional ledger rows.
-///
-/// Order follows the table in `docs/plans/03-harness-adapters.md` with the
-/// subsequent orchestrator additions. Every surface has a source link and
-/// a non-empty reason.
+/// Order follows the plan table; every surface has a source and reason.
 pub const ENTRIES: &[CatalogEntry] = &[
     CatalogEntry {
         id: "aider",
@@ -681,12 +675,8 @@ pub fn find_by_id(id: &str) -> Option<&'static CatalogEntry> {
     ENTRIES.iter().find(|entry| entry.id == id)
 }
 
-/// Build the concrete adapter for `id`, if one exists.
-///
-/// Returns `None` when `id` has no concrete adapter implementation; callers
-/// fall back to a [`GenericAdapter`] built from the catalog row. This is the
-/// single registry of concrete adapter constructors; consumers resolve
-/// harness ids through here instead of duplicating per-adapter wiring.
+/// Build the concrete adapter for `id`, if one exists; otherwise callers
+/// fall back to a [`GenericAdapter`] built from the catalog row.
 #[expect(
     clippy::too_many_lines,
     reason = "catalog has 51 entries with per-adapter branching"
@@ -957,10 +947,7 @@ pub(crate) fn concrete_adapter_for(id: &str) -> Option<Box<dyn Adapter>> {
 }
 
 /// Build one adapter per catalog entry.
-///
-/// Every entry resolves through [`concrete_adapter_for`]; ids without a
-/// concrete adapter get a [`GenericAdapter`] built from the catalog row, so
-/// the returned count always equals `ENTRIES.len()`.
+/// The returned count always equals `ENTRIES.len()`.
 pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
     let mut out = Vec::with_capacity(ENTRIES.len());
     for entry in ENTRIES {
@@ -991,9 +978,7 @@ pub fn all_ids() -> Vec<&'static str> {
 }
 
 /// Whether the harness supports skill registry workflows.
-///
-/// Only harnesses with `Full`, `Constrained`, or `SingleInstance` support
-/// are considered skill-capable; others are read-only or blocked.
+/// Only `Full`, `Constrained`, or `SingleInstance` support counts.
 pub fn supports_skills(harness_id: &str) -> bool {
     match find_by_id(harness_id) {
         Some(entry) => matches!(
@@ -1005,8 +990,7 @@ pub fn supports_skills(harness_id: &str) -> bool {
 }
 
 /// Skill modes available for a harness, derived from its adapter support.
-///
-/// Returns empty for unknown or unsupported harnesses.
+/// Empty for unknown or unsupported harnesses.
 pub fn skill_modes_for(harness_id: &str) -> Vec<SkillMode> {
     match find_by_id(harness_id) {
         Some(entry) => match entry.support {
@@ -1033,10 +1017,8 @@ pub fn all_skill_supported_ids() -> Vec<&'static str> {
         .collect()
 }
 
-/// Verify that catalog skill support is consistent with adapter `supported_skill_modes`.
-///
-/// For every catalog entry, the catalog helper `skill_modes_for` must agree
-/// with the live adapter's `supported_skill_modes`. This catches ledger drift.
+/// Verify that catalog skill support matches the adapter's `supported_skill_modes`.
+/// Catches ledger drift between the catalog rows and the live adapters.
 pub fn verify_skill_support_consistency() -> Result<(), CoreError> {
     // Build the adapter set once; constructing it per entry is 51x the cost.
     let adapters = all_adapters();
@@ -1158,9 +1140,6 @@ mod tests {
 
     #[test]
     fn every_entry_has_support_state() {
-        // Ensure we exercise every AdapterSupport variant at least once and
-        // that each entry has a ledger support that is not accidentally left
-        // as a default.
         let mut has_full = false;
         let mut has_constrained = false;
         let mut has_single = false;
@@ -1184,7 +1163,6 @@ mod tests {
                 AdapterSupport::ReadOnly => has_read_only = true,
             }
         }
-        // We expect to see all 7 provisional states in the catalog.
         assert!(has_full, "must have at least one Full");
         assert!(has_constrained, "must have at least one Constrained");
         assert!(has_single, "must have at least one SingleInstance");

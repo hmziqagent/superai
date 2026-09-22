@@ -1,8 +1,5 @@
-//! Kilo Code adapter: layered JSONC (`~/.config/kilo/kilo.jsonc` global,
-//! `./kilo.jsonc`, `./.kilo/kilo.jsonc`), isolation `ide-user-data` via
-//! `HOME`/`XDG_CONFIG_HOME` plus VS Code `--user-data-dir`, constrained until
-//! relocated-root is verified.
-//! Research source: `docs/harness-configs/kilo-code.md` (last verified 2026-08-25).
+//! Kilo Code adapter: layered JSONC (global `~/.config/kilo/kilo.jsonc`, then
+//! project `kilo.jsonc`); isolation via HOME/`XDG_CONFIG_HOME` plus `--user-data-dir`.
 
 use std::path::{Path, PathBuf};
 
@@ -102,8 +99,8 @@ impl KiloAdapter {
         {
             return Some(kilo);
         }
-        // The VS Code `code` binary is fallback evidence; no .exe spelling,
-        // matching the historical scan.
+        // `code` is only fallback evidence; there is no .exe spelling, so
+        // this misses the Windows binary.
         let path_var = std::env::var("PATH").ok()?;
         let sep = if cfg!(windows) { ';' } else { ':' };
         for dir in path_var.split(sep) {
@@ -559,7 +556,7 @@ impl Adapter for KiloAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (kilo-code.md 5.1: top-level `mcp` key in kilo.jsonc; local argv-array commands, `kilo mcp` CLI)
+    /// Top-level `mcp` key in kilo.jsonc, managed via the `kilo mcp` CLI; commands are argv arrays.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "global kilo.jsonc",
@@ -570,7 +567,6 @@ impl Adapter for KiloAdapter {
         ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "modes/marketplaces managed through the Settings webview; no file-staged plugin mechanism documented (kilo-code.md)",

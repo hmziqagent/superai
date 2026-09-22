@@ -33,8 +33,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Kebab-case keys matching long CLI options without `--`; everything else
-/// round-trips untouched via `superai-config::yaml`.
+/// Kebab-case keys mirroring long CLI options; other keys round-trip untouched.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "weak-model",
@@ -45,8 +44,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "edit-format",
 ];
 
-/// Isolation is `explicit-config`: the wrapper relocates `HOME` and passes
-/// explicit `--config` / `--env-file` paths inside the instance root.
+/// `explicit-config` isolation: relocated `HOME` plus `--config`/`--env-file` paths.
 #[derive(Debug, Clone)]
 pub struct AiderAdapter {
     id: HarnessId,
@@ -69,7 +67,6 @@ impl AiderAdapter {
         EXECUTABLE
     }
 
-    /// Resolve the default HOME for config lookup.
     fn default_home() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("HOME")
             && !home.trim().is_empty()
@@ -84,7 +81,6 @@ impl AiderAdapter {
         None
     }
 
-    /// Build detection evidence about aider config and env files.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -251,7 +247,6 @@ impl Adapter for AiderAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Searched git-root/cwd/home; explicit --config overrides.
         let yml_resolver = PathResolver::new(
             Some(
                 "~/.aider.conf.yml / ./.aider.conf.yml / $GIT_ROOT/.aider.conf.yml (or --config <path>)",
@@ -430,8 +425,6 @@ impl Adapter for AiderAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::ExplicitConfig | Isolation::RelocatedRoot | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shapes / owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -442,8 +435,6 @@ impl Adapter for AiderAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03 per docs/harness-configs/aider.md §3: kebab-case keys typed
-        // like their CLI flags; legacy OpenAI switches map to env.
         match surface_id {
             ".aider.conf.yml" | ".aider.model.settings.yml" => Some(
                 SurfaceSchema::new()
@@ -515,12 +506,10 @@ impl Adapter for AiderAdapter {
         vec![crate::adapter::SkillMode::CopySelected]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some("aider documents no MCP server support (docs/harness-configs/aider.md)")
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("aider documents no plugin mechanism (docs/harness-configs/aider.md)")
     }
@@ -1145,8 +1134,7 @@ mod tests {
     #[test]
     fn yaml_comment_changing_write_refused_and_comments_preserved() {
         // codec-honesty (DOC-06): comments parse on read, but a changing write
-        // on a comment-bearing YAML file is refused instead of normalizing the
-        // comments away; the on-disk bytes survive verbatim.
+        // on a comment-bearing YAML file is refused; the bytes survive verbatim.
         let dir = crate::test_util::temp_dir_unique("aider");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("comment.yml");
@@ -1267,10 +1255,8 @@ mod tests {
 
         let legacy_map = superai_config::json::load(&legacy).unwrap();
         let current_map = superai_config::json::load(&current).unwrap();
-        // Legacy era: bare-OpenAI gpt-4 entries only.
         assert!(legacy_map.contains_key("openai/gpt-4"));
         assert!(!legacy_map.contains_key("openrouter/anthropic/claude-sonnet-4"));
-        // Current era: routed providers (openrouter) present.
         assert!(current_map.contains_key("openrouter/anthropic/claude-sonnet-4"));
 
         for path in [&legacy, &current] {
@@ -1292,8 +1278,7 @@ mod tests {
 
     #[test]
     fn boundary_version_resolution_is_compatible_for_recorded_detection() {
-        // version.txt records `aider 0.84.0`; the documented compatible range
-        // (current schema) accepts it.
+        // version.txt records `aider 0.84.0`, inside the compatible range.
         let version_text = std::fs::read_to_string(fixture_path("version.txt"))
             .unwrap()
             .trim()

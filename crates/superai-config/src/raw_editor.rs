@@ -1,11 +1,5 @@
-//! Raw editor backend: read/validate/diff/commit (RAW-01..07).
-//!
-//! Interface-neutral services for future editors to open harness files,
-//! display parse diagnostics, preview semantic and lexical changes, and
-//! commit safely. Every `read` is fresh from disk, `validate` never touches
-//! disk, `diff` returns redacted previews, and `commit` validates, checks the
-//! conflict token, backs up, atomically replaces, and verifies. Sensitive
-//! content travels in [`SensitiveContent`] whose `Debug` is redacted.
+//! Raw editor backend (RAW-01..07): fresh reads, disk-free validation,
+//! redacted diffs, and commits that back up, replace atomically, and verify.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,10 +14,8 @@ use crate::document::{Diagnostic, DocumentKind, Encoding, NewlineStyle};
 use crate::error::{ConfigError, Result};
 use crate::snapshot::{Snapshot, is_modified, snapshot};
 
-/// Sensitive bytes whose `Debug`/`Display` are redacted.
-///
-/// The raw secret is only available via [`Self::expose`] or
-/// [`Self::expose_str`] (RAW-01: no Debug/log/telemetry serialization).
+/// Sensitive bytes whose `Debug`/`Display` are redacted; the raw value is
+/// reachable only via [`Self::expose`] (RAW-01).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SensitiveContent(Vec<u8>);
 
@@ -123,10 +115,7 @@ fn offset_to_line_col(bytes: &[u8], offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Fresh document as seen by the raw editor.
-///
-/// Contains sensitive content plus conflict token, diagnostics, and metadata.
-/// `Debug` is redacted via [`SensitiveContent`].
+/// Fresh document: sensitive content plus conflict token, diagnostics, metadata.
 #[derive(Debug, Clone)]
 pub struct RawDocument {
     /// Path the document was loaded from.
@@ -161,10 +150,8 @@ impl RawDocument {
     }
 }
 
-/// Interface-agnostic raw editor service: open, validate, diff, commit.
-///
-/// No caching and no interface types; `commit` validates, checks the
-/// conflict token, backs up, atomically replaces, and verifies.
+/// Stateless raw editor service; `commit` validates, checks the conflict
+/// token, backs up, atomically replaces, and verifies.
 #[derive(Debug, Clone, Default)]
 pub struct RawEditor;
 
@@ -174,12 +161,8 @@ impl RawEditor {
         Self
     }
 
-    /// Open `path` fresh from disk, detecting kind via [`DocumentKind::from_path`].
-    ///
-    /// Returns a [`crate::document::SourceDocument`] envelope. Missing file is
-    /// an error (distinct from empty). Wrapper is sensitive via [`RawDocument`]
-    /// when needed; this path uses the neutral `SourceDocument` for kind
-    /// detection and diagnostics.
+    /// Open `path` fresh as a `SourceDocument`; a missing file is an error,
+    /// distinct from empty.
     pub fn open(&self, path: &Path) -> Result<crate::document::SourceDocument> {
         crate::document::SourceDocument::load(path)
     }
@@ -194,9 +177,8 @@ impl RawEditor {
         validate(content, kind)
     }
 
-    /// Validate `content` for `kind` with an adapter-supplied semantic
-    /// schema (DOC-09): syntax + semantic validator + deprecation
-    /// diagnostics at validate-time. Never touches disk.
+    /// Syntax plus adapter semantic-validator and deprecation diagnostics
+    /// (DOC-09); never touches disk.
     pub fn validate_with_schema(
         &self,
         content: &[u8],
@@ -206,7 +188,7 @@ impl RawEditor {
         validate_with_schema(content, kind, schema)
     }
 
-    /// Diff `old` vs `new` for `kind`, producing redacted lexical diff and semantic ops.
+    /// Diff `old` vs `new` for `kind`: redacted lexical diff plus semantic ops.
     pub fn diff(&self, old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
         diff(old, new, kind)
     }
@@ -237,18 +219,14 @@ impl RawEditor {
     }
 }
 
-/// Maximum document size accepted by validation (RAW-02). Larger drafts are
-/// a diagnostic before any parse, bounding parser work on hostile input.
+/// Size bound on validation (RAW-02); larger drafts diagnose before any parse.
 pub const MAX_VALIDATION_BYTES: usize = 1_048_576;
 
-/// Validate `content` for `kind` without touching disk.
-///
-/// Syntax diagnostics only. Empty buffer is not automatically an empty
-/// document (RAW-05): TOML/YAML/env accept one, JSON kinds require `{}`.
+/// Syntax diagnostics only, disk-free. Empty is not automatically valid
+/// (RAW-05): JSON kinds require the explicit `{}`.
 pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // RAW-02 size validation: bound the work before any parse.
     if content.len() > MAX_VALIDATION_BYTES {
         diagnostics.push(Diagnostic::new(
             1,
@@ -272,15 +250,13 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
             col,
             format!("invalid utf-8 at {line}:{col} ({len} byte(s))"),
         ));
-        // Without valid UTF-8 we cannot parse further for text kinds.
         return diagnostics;
     }
 
     let text = std::str::from_utf8(without_bom).unwrap_or_default();
     if text.trim().is_empty() {
-        // RAW-05: the format decides whether an empty buffer is a valid
-        // document. TOML/YAML/env have empty documents; JSON kinds do not:
-        // their empty document is the explicit `{}` object.
+        // RAW-05: the format decides whether empty is valid: TOML/YAML/env
+        // have empty documents, JSON kinds require the explicit `{}`.
         if matches!(kind, DocumentKind::StrictJson | DocumentKind::JsonC) {
             diagnostics.push(Diagnostic::new(
                 1,
@@ -304,9 +280,8 @@ pub fn validate(content: &[u8], kind: DocumentKind) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// Validate managed-span sentinels in a text fragment (DOC-08): duplicate,
-/// partial, mis-ordered, or nested sentinels are diagnostics so the
-/// fragment fails closed instead of being guessed at.
+/// Validate managed spans (DOC-08): duplicate/partial/mis-ordered/nested
+/// sentinels are diagnostics, so the fragment fails closed.
 fn validate_text_fragment(text: &str) -> Vec<Diagnostic> {
     match crate::span_codec::SpanCodec::default().validate(text) {
         Ok(_) => Vec::new(),
@@ -318,9 +293,8 @@ fn validate_text_fragment(text: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// Validate with an adapter-supplied semantic schema (DOC-09): syntax,
-/// semantic-validator, and deprecation diagnostics at validate time. Never
-/// touches disk. Unparsable content gets syntax diagnostics only.
+/// Syntax + semantic + deprecation diagnostics at validate time; unparsable
+/// content gets syntax diagnostics only.
 pub fn validate_with_schema(
     content: &[u8],
     kind: DocumentKind,
@@ -386,7 +360,6 @@ fn validate_json(text: &str) -> Vec<Diagnostic> {
 
 fn validate_jsonc(text: &str) -> Vec<Diagnostic> {
     let stripped = crate::jsonc::strip_jsonc(text);
-    // If original empty after stripping, it's valid.
     if stripped.trim().is_empty() {
         return Vec::new();
     }
@@ -429,7 +402,6 @@ fn validate_env(text: &str) -> Vec<Diagnostic> {
         if without_export.is_empty() {
             continue;
         }
-        // Must contain '='
         if !without_export.contains('=') {
             diags.push(Diagnostic::new(
                 idx.saturating_add(1),
@@ -502,10 +474,7 @@ fn is_valid_env_key(key: &str) -> bool {
     true
 }
 
-/// Semantic operation describing a change at a selector.
-///
-/// For JSON/YAML/env, the selector is a key path; for TOML it may be a table
-/// path. Lexical details (whitespace, comments) are excluded.
+/// One semantic change at a selector; lexical details excluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticOp {
     /// Human-readable selector, e.g. `key:model` or `table:servers.prod`.
@@ -529,12 +498,8 @@ pub struct RedactionSpan {
     pub reason: String,
 }
 
-/// A formatting-change warning in a diff (DOC-10).
-///
-/// Emitted when surrounding formatting must change even though the
-/// semantics elsewhere do not: the codec that owns the document rewrites
-/// layout (whitespace, indentation, newlines) on changing writes, so the
-/// lexical change extends beyond the edited values.
+/// Emitted when a changing write must reformat surrounding layout, so the
+/// lexical change extends beyond the edited values (DOC-10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffWarning {
     /// Human-readable explanation naming the codec and the reformatting.
@@ -552,16 +517,12 @@ pub struct DiffResult {
     pub redaction_spans: Vec<RedactionSpan>,
     /// Whether the two contents are byte-identical.
     pub is_noop: bool,
-    /// Formatting-change warnings (DOC-10): surrounding formatting must
-    /// change though semantics elsewhere do not.
+    /// Formatting-change warnings (DOC-10).
     pub formatting_warnings: Vec<DiffWarning>,
 }
 
-/// Produce semantic ops, lexical diff, and redaction spans for `old` vs `new`.
-///
-/// Neither buffer is written to disk. `kind` selects the parser for semantic
-/// comparison; lexical diff is always line-oriented after UTF-8 lossy
-/// conversion (binary files produce a size/digest summary).
+/// Produce semantic ops, lexical diff, and redaction spans; neither buffer
+/// is written. Binary input yields a size/digest summary.
 pub fn diff(old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
     let is_noop = old == new;
 
@@ -579,11 +540,8 @@ pub fn diff(old: &[u8], new: &[u8], kind: DocumentKind) -> DiffResult {
     }
 }
 
-/// DOC-10 formatting-change warnings from the codec that owns the document.
-///
-/// Fires only when the buffers differ and semantic ops exist: the edit
-/// changes values, and the codec's layout-normalizing write would reach
-/// beyond them.
+/// Fires only when the buffers differ and semantic ops exist: the codec's
+/// layout-normalizing write would reach beyond the edited values.
 fn formatting_change_warnings(
     old: &[u8],
     new: &[u8],
@@ -600,9 +558,8 @@ fn formatting_change_warnings(
         DocumentKind::StrictJson => crate::json::formatting_change_warning(old_text),
         DocumentKind::JsonC => crate::jsonc::formatting_change_warning(old_text),
         DocumentKind::Toml => crate::toml_file::formatting_change_warning(old_text),
-        // env rewrites only edited lines (lexical-preserving edit path);
-        // yaml changing writes are refused outright; text fragments change
-        // only inside managed spans; opaque never reaches a codec write.
+        // env rewrites only edited lines; yaml changing writes are refused;
+        // fragments change only inside spans; opaque never reaches a codec.
         DocumentKind::Yaml
         | DocumentKind::Env
         | DocumentKind::TextFragment
@@ -819,8 +776,7 @@ fn toml_semantic_diff(old: &[u8], new: &[u8]) -> Vec<SemanticOp> {
         Err(_) => return Vec::new(),
     };
     // to_string comparison catches equal serializations cheaply; per-key
-    // comparison gives per-selector ops, with a whole-document fallback when
-    // only decor changed.
+    // comparison gives per-selector ops, with a whole-document fallback.
     let old_str = old_doc.to_string();
     let new_str = new_doc.to_string();
     if old_str == new_str {
@@ -1057,11 +1013,8 @@ fn value_to_string(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| format!("{v:?}"))
 }
 
-/// Find secret-bearing spans in `content` for UI redaction.
-///
-/// Marks the value region after `:` or `=` on lines whose key mentions
-/// `apikey`, `api_key`, `secret`, `token`, `password`, `authorization`,
-/// `bearer`, or `auth` (case-insensitive). Binary content yields no spans.
+/// Mark the value region after `:`/`=` on lines whose key mentions a secret
+/// marker (case-insensitive). Binary content yields no spans.
 #[expect(clippy::manual_let_else, reason = "explicit match is clearer")]
 pub fn find_redaction_spans(content: &[u8], _kind: DocumentKind) -> Vec<RedactionSpan> {
     let text = match std::str::from_utf8(content) {
@@ -1116,8 +1069,7 @@ fn redaction_span_for_line(line: &str, line_offset: usize) -> Option<RedactionSp
     })
 }
 
-/// Case-insensitive secret markers shared by preview redaction and span
-/// detection (span detection additionally matches the broader `auth`).
+/// Secret markers shared by redaction and span detection (spans also match `auth`).
 fn contains_secret_marker(lower: &str) -> bool {
     lower.contains("apikey")
         || lower.contains("api_key")
@@ -1128,10 +1080,7 @@ fn contains_secret_marker(lower: &str) -> bool {
         || lower.contains("bearer")
 }
 
-/// Read a document fresh from disk, detecting kind via extension.
-///
-/// A missing file is an `Io`/`NotFound` error, keeping missing vs empty
-/// distinct.
+/// Read fresh, detecting kind via extension; missing is an error, not empty.
 pub fn read(path: &Path) -> Result<RawDocument> {
     let bytes = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let kind = DocumentKind::from_path(path);
@@ -1155,18 +1104,13 @@ pub fn read(path: &Path) -> Result<RawDocument> {
     })
 }
 
-/// Create a missing config file transactionally (RAW-05).
-///
-/// An existing target is refused as a conflict. Missing parents are created
-/// as owned steps of a compensated [`Transaction`](crate::transaction::Transaction);
-/// a failure rolls back exactly the created file plus the now-empty owned
-/// parents. The format's empty-document rule applies.
+/// Create a missing file transactionally (RAW-05): existing targets are a
+/// conflict; failure rolls back exactly the created file and owned parents.
 pub fn create_file(path: &Path, new_content: &[u8]) -> Result<CommitReport> {
     create_file_with_injector(path, new_content, None)
 }
 
-/// [`create_file`] with an optional fault injector (RAW-05 rollback tests
-/// drive REAL creation-path failures through it).
+/// [`create_file`] with a fault injector driving real creation-path failures.
 pub fn create_file_with_injector(
     path: &Path,
     new_content: &[u8],
@@ -1197,9 +1141,8 @@ pub fn create_file_with_injector(
             digest,
         ));
     }
-    // Each missing ancestor becomes its own owned CreateDir step, ordered
-    // parents-first so rollback removes exactly the created file plus the
-    // now-empty owned parents, never anything foreign.
+    // Each missing ancestor is its own owned CreateDir step, parents-first,
+    // so rollback removes exactly the created file and empty owned parents.
     let mut steps: Vec<crate::transaction::FileAction> = Vec::new();
     let mut missing_ancestors: Vec<PathBuf> = Vec::new();
     let mut probe = path.parent();
@@ -1245,9 +1188,8 @@ pub fn create_file_with_injector(
     }
     let outcome = tx.execute()?;
     if !outcome.success {
-        // The compensation pass may leave empty owned parents behind; remove
-        // only paths this operation created, only while empty, deepest first.
-        // The target did not exist at entry, so anything at `path` is ours.
+        // Remove only paths this operation created, only while empty, deepest
+        // first; the target did not exist at entry, so anything there is ours.
         if path.exists() {
             drop(std::fs::remove_file(path));
         }
@@ -1294,11 +1236,8 @@ pub struct CommitReport {
     pub is_noop: bool,
 }
 
-/// Commit `new_content` to `path` after validation and conflict check.
-///
-/// `Some(expected_digest)` must match the on-disk digest exactly or the
-/// commit aborts with `ConcurrentModification`. Invalid content never
-/// touches disk.
+/// `Some(expected_digest)` must match the on-disk digest or the commit
+/// aborts with `ConcurrentModification`; invalid content never touches disk.
 pub fn commit(
     path: &Path,
     new_content: &[u8],
@@ -1317,11 +1256,8 @@ pub fn commit_with_snapshot(
     commit_inner(path, new_content, digest_opt, expected)
 }
 
-/// DOC-08 commit gate for text fragments: the change must be confined to
-/// managed spans. Both sides need well-formed sentinels ([`ConfigError::InvalidSpans`]
-/// otherwise) and identical bytes outside all spans, else the write is
-/// refused with [`ConfigError::UnmanagedSpanWrite`]. A missing file compares
-/// against empty content, so creation requires span-only content.
+/// DOC-08 gate: both sides need well-formed sentinels and identical bytes
+/// outside all spans, else the write is refused (missing file = empty).
 fn enforce_span_only_change(path: &Path, new_content: &[u8]) -> Result<()> {
     let old_bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -1452,17 +1388,13 @@ fn commit_inner(
         ));
     }
 
-    // Validate before any disk mutation.
     validate_for_commit(path, new_content, kind)?;
 
-    // DOC-08: text fragments accept managed-span edits only: bytes outside
-    // managed spans must be identical between the current file and the new
-    // content; whole-file rewrites stay opaque/read-only.
+    // DOC-08: fragments accept span-only edits; whole-file rewrites stay read-only.
     if kind == DocumentKind::TextFragment {
         enforce_span_only_change(path, new_content)?;
     }
 
-    // Fresh snapshot and conflict check.
     let current_snapshot = snapshot(path);
 
     if let Some(expected) = expected_snapshot {
@@ -1503,7 +1435,6 @@ fn commit_inner(
         ));
     }
 
-    // No-op check: if file exists and content already equal, no write.
     if current_snapshot.exists
         && let Ok(existing) = std::fs::read(path)
         && existing == new_content
@@ -1517,7 +1448,6 @@ fn commit_inner(
         });
     }
 
-    // Reject directory targets
     if current_snapshot.is_dir {
         return Err(ConfigError::io(
             path,
@@ -1525,16 +1455,14 @@ fn commit_inner(
         ));
     }
 
-    // Backup before first mutation if file exists.
     let backup = if current_snapshot.exists {
         backup_with_reason(path, "raw editor pre-commit backup")?
     } else {
         None
     };
 
-    // The replacement goes through the shared transaction commit core. The
-    // conflict token is the caller's expected snapshot when supplied; the
-    // fresh snapshot's pre-rename recheck covers the no-token case.
+    // The conflict token is the caller's expected snapshot when supplied;
+    // the fresh snapshot's pre-rename recheck covers the no-token case.
     let token = expected_snapshot.unwrap_or(&current_snapshot);
     let staged = crate::transaction::stage_temp_file(path, new_content, None)?;
     if let Err(e) = crate::transaction::commit_staged_file(path, &staged, Some(token), None) {
@@ -1542,7 +1470,6 @@ fn commit_inner(
         return Err(e);
     }
 
-    // Read-back verification: fresh read and parse, plus digest check.
     let read_back = std::fs::read(path).map_err(|e| ConfigError::io(path, e))?;
     let expected_digest_new = compute_digest(new_content);
     let actual_digest = compute_digest(&read_back);
@@ -1554,7 +1481,6 @@ fn commit_inner(
             ),
         ));
     }
-    // Parse verification ensures written file is syntactically valid.
     validate_for_commit(path, &read_back, kind)?;
 
     let new_snapshot = snapshot(path);
@@ -1596,7 +1522,6 @@ mod tests {
         );
         assert!(dbg.contains("[REDACTED]"));
         assert_eq!(format!("{secret}"), "[REDACTED]");
-        // expose still works
         assert_eq!(secret.expose(), b"my-secret-api-key-123");
     }
 
@@ -1770,7 +1695,6 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let snap = snapshot(&path);
         let digest = snap.digest.as_deref().unwrap_or_default().to_owned();
-        // Ensure no prior backups
         let before_backups = crate::backup::list_backups(&path).unwrap().len();
         let report = commit(&path, content, Some(&digest)).unwrap();
         assert!(report.is_noop);
@@ -1781,7 +1705,6 @@ mod tests {
             "no-op should not create backup"
         );
         drop(std::fs::remove_file(&path));
-        // clean backups
         for entry in crate::backup::list_backups(&path).unwrap() {
             drop(std::fs::remove_file(entry.backup_path));
         }
@@ -1793,7 +1716,6 @@ mod tests {
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let snap = snapshot(&path);
         let digest = snap.digest.as_deref().unwrap_or_default().to_owned();
-        // External edit
         std::fs::write(&path, br#"{"a":2}"#).unwrap();
         let new_content = br#"{"a":3}"#;
         let err = commit(&path, new_content, Some(&digest)).unwrap_err();
@@ -1834,7 +1756,6 @@ mod tests {
         assert!(!report.is_noop);
         let after = std::fs::read(&path).unwrap();
         assert_eq!(after, new_content);
-        // Verify foreign preserved via load
         let loaded = crate::json::load_value(&path).unwrap();
         assert_eq!(loaded["foreign"], Value::String("keep".into()));
         assert_eq!(loaded["extra"], Value::String("x".into()));
@@ -1888,9 +1809,7 @@ mod tests {
         let old = b"a: 1\nb: 2\n";
         let new = b"a: 1\nb: 2\n\n";
         let res = diff(old, new, DocumentKind::Yaml);
-        // YAML trailing newline difference may be semantic no-op
         assert!(!res.lexical_unified_diff.is_empty() || res.is_noop || res.semantic_ops.is_empty());
-        // At least semantic should be empty if values equal
         let old_val = yaml_serde::from_str::<Value>(std::str::from_utf8(old).unwrap()).unwrap();
         let new_val = yaml_serde::from_str::<Value>(std::str::from_utf8(new).unwrap()).unwrap();
         if old_val == new_val {
@@ -1907,12 +1826,10 @@ mod tests {
             !res.redaction_spans.is_empty(),
             "secret-bearing content should produce redaction spans"
         );
-        // Ensure spans point inside new content where secret occurs
         let new_str = std::str::from_utf8(new).unwrap();
         let span = &res.redaction_spans[0];
         let secret_slice = new_str.get(span.start..span.end).unwrap_or_default();
         assert!(secret_slice.contains("super-secret-value") || span.reason.contains("secret"));
-        // Lexical diff preview should be redacted
         assert!(
             !res.lexical_unified_diff.contains("super-secret-value"),
             "lexical diff should be redacted preview"
@@ -1964,7 +1881,6 @@ mod tests {
         );
         let after = std::fs::read(&path).unwrap();
         assert_eq!(after, content);
-        // Second commit with same content is noop
         let snap = snapshot(&path);
         let report2 = commit(&path, content, snap.digest.as_deref()).unwrap();
         assert!(report2.is_noop);
@@ -2016,7 +1932,6 @@ mod tests {
     #[test]
     fn raw_editor_service_validate_each_kind() {
         let editor = RawEditor::new();
-        // JSON
         assert!(
             editor
                 .validate(br#"{"a":1}"#, DocumentKind::StrictJson)
@@ -2027,7 +1942,6 @@ mod tests {
                 .validate(b"{ invalid }", DocumentKind::StrictJson)
                 .is_empty()
         );
-        // JSONC
         assert!(
             editor
                 .validate(b"{\"a\": 1, // comment\n}", DocumentKind::JsonC)
@@ -2043,17 +1957,14 @@ mod tests {
                 .validate(b"{ invalid json }", DocumentKind::JsonC)
                 .is_empty()
         );
-        // TOML
         assert!(editor.validate(b"a = 1\n", DocumentKind::Toml).is_empty());
         assert!(!editor.validate(b"a = [\n", DocumentKind::Toml).is_empty());
-        // YAML
         assert!(editor.validate(b"a: 1\n", DocumentKind::Yaml).is_empty());
         assert!(
             !editor
                 .validate(b"a: [unclosed\n", DocumentKind::Yaml)
                 .is_empty()
         );
-        // Env
         assert!(
             editor
                 .validate(b"API_KEY=val\nMODEL=opus\n", DocumentKind::Env)
@@ -2069,7 +1980,6 @@ mod tests {
                 .validate(b"1INVALID=value\n", DocumentKind::Env)
                 .is_empty()
         );
-        // TextFragment always valid if utf8
         assert!(
             editor
                 .validate(b"just some text\nmore\n", DocumentKind::TextFragment)
@@ -2085,26 +1995,21 @@ mod tests {
     #[test]
     fn raw_editor_service_diff_and_redaction() {
         let editor = RawEditor::new();
-        // JSON diff
         let old = br#"{"a":1}"#;
         let new = br#"{"a":2}"#;
         let res = editor.diff(old, new, DocumentKind::StrictJson);
         assert!(!res.semantic_ops.is_empty());
         assert!(!res.lexical_unified_diff.is_empty());
-        // Redaction
         let old2 = br#"{"api_key":"old"}"#;
         let new2 = br#"{"api_key":"super-secret-value"}"#;
         let res2 = editor.diff(old2, new2, DocumentKind::StrictJson);
         assert!(!res2.redaction_spans.is_empty());
         assert!(!res2.lexical_unified_diff.contains("super-secret-value"));
-        // Env redaction
         let spans = editor.find_redaction_spans(b"API_KEY=secret123\n", DocumentKind::Env);
         assert!(!spans.is_empty());
-        // Toml redaction
         let toml_spans =
             editor.find_redaction_spans(b"api_key = \"secret123\"\n", DocumentKind::Toml);
         assert!(!toml_spans.is_empty());
-        // Yaml redaction
         let yaml_spans = editor.find_redaction_spans(b"password: mysecret\n", DocumentKind::Yaml);
         assert!(!yaml_spans.is_empty());
     }
@@ -2112,7 +2017,6 @@ mod tests {
     #[test]
     fn raw_editor_service_invalid_never_written_per_kind() {
         let editor = RawEditor::new();
-        // JSON
         let path_json = unique_scratch("svc-invalid-json", ".json");
         std::fs::write(&path_json, br#"{"a":1}"#).unwrap();
         let snap = snapshot(&path_json);
@@ -2125,7 +2029,6 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path_json).unwrap(), br#"{"a":1}"#);
         drop(std::fs::remove_file(&path_json));
-        // TOML
         let path_toml = unique_scratch("svc-invalid-toml", ".toml");
         std::fs::write(&path_toml, b"a = 1\n").unwrap();
         let snap = snapshot(&path_toml);
@@ -2138,7 +2041,6 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path_toml).unwrap(), b"a = 1\n");
         drop(std::fs::remove_file(&path_toml));
-        // YAML
         let path_yaml = unique_scratch("svc-invalid-yaml", ".yaml");
         std::fs::write(&path_yaml, b"a: 1\n").unwrap();
         let snap = snapshot(&path_yaml);
@@ -2151,7 +2053,6 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path_yaml).unwrap(), b"a: 1\n");
         drop(std::fs::remove_file(&path_yaml));
-        // Env
         let path_env = unique_scratch("svc-invalid-env", ".env");
         std::fs::write(&path_env, b"API_KEY=val\n").unwrap();
         let snap = snapshot(&path_env);
@@ -2169,7 +2070,6 @@ mod tests {
     #[test]
     fn raw_editor_service_jsonc_and_text_fragment_commit() {
         let editor = RawEditor::new();
-        // JSONC with comments should commit correctly
         let path_jsonc = unique_scratch("svc-jsonc", ".jsonc");
         drop(std::fs::remove_file(&path_jsonc));
         let content = b"{\"a\": 1, // comment\n}";
@@ -2182,7 +2082,6 @@ mod tests {
             drop(std::fs::remove_file(b.backup_path));
         }
 
-        // Text fragment: DOC-08 span-managed writes only.
         let path_txt = unique_scratch("svc-txt", ".txt");
         drop(std::fs::remove_file(&path_txt));
         // Plain whole-file creation is opaque and refused.
@@ -2195,12 +2094,10 @@ mod tests {
             !path_txt.exists(),
             "refused fragment creation must not touch disk"
         );
-        // Span-only creation is accepted.
         let span_only = b"# superai:begin:managed\nowned body\n# superai:end:managed\n";
         let report2 = editor.commit(&path_txt, span_only, None).unwrap();
         assert!(!report2.is_noop);
         assert_eq!(std::fs::read(&path_txt).unwrap(), span_only);
-        // Whole-file rewrite that changes unmanaged bytes is refused.
         let rewrite =
             b"different prelude\n# superai:begin:managed\nowned body\n# superai:end:managed\n";
         match editor.commit(&path_txt, rewrite, None) {
@@ -2246,7 +2143,6 @@ mod tests {
 
     #[test]
     fn diff_json_semantic_change_on_minified_file_warns_formatting() {
-        // Minified input: a changing write must reformat surrounding layout.
         let old = br#"{"a":1,"b":2}"#;
         let new = br#"{"a":2,"b":2}"#;
         let res = diff(old, new, DocumentKind::StrictJson);
@@ -2311,7 +2207,6 @@ mod tests {
                 Some("model".to_owned()),
             )]);
 
-        // Semantic violation + deprecated key in use.
         let diags = editor.validate_with_schema(
             br#"{"model":1,"oldModel":"x"}"#,
             DocumentKind::StrictJson,
@@ -2326,7 +2221,6 @@ mod tests {
             == crate::document::DiagnosticSeverity::Deprecation
             && d.message.contains("oldModel")));
 
-        // Clean document: only syntax check applies.
         let clean = editor.validate_with_schema(
             br#"{"model":"opus"}"#,
             DocumentKind::StrictJson,
@@ -2334,14 +2228,12 @@ mod tests {
         );
         assert!(clean.is_empty(), "{clean:?}");
 
-        // Unparsable content: syntax diagnostics only, validator skipped.
         let broken =
             editor.validate_with_schema(b"{ nope", DocumentKind::StrictJson, Some(&schema));
         assert!(!broken.is_empty());
         assert!(broken.iter().all(|d| d.message.contains("invalid")
             || d.severity == crate::document::DiagnosticSeverity::Error));
 
-        // No schema supplied: behaves like plain validate.
         assert!(
             editor
                 .validate_with_schema(br#"{"a":1}"#, DocumentKind::StrictJson, None)
@@ -2552,7 +2444,6 @@ mod tests {
                 "{kind:?} empty document must stay valid"
             );
         }
-        // The explicit empty object remains valid.
         assert!(validate(b"{}", DocumentKind::StrictJson).is_empty());
     }
 
@@ -2635,10 +2526,8 @@ mod tests {
         std::fs::create_dir_all(base.join("nested")).unwrap();
         std::fs::write(base.join("nested/foreign.txt"), b"keep me").unwrap();
         let target = base.join("nested/owned/deep/settings.json");
-        // Fail the creation transaction at the real atomic-replace boundary
-        // (QAL-06 discipline): the owned parents had already been created,
-        // and the compensated transaction removes exactly them; no file
-        // lands, foreign content keeps its directories.
+        // Fail at the real atomic-replace boundary: the compensated
+        // transaction removes exactly the owned parents; foreign stays.
         let err = create_file_with_injector(
             &target,
             br#"{"model":"opus"}"#,
@@ -2658,7 +2547,6 @@ mod tests {
             "foreign content keeps its directories"
         );
 
-        // A failure even earlier (staged-content parse) never touches disk.
         let target2 = base.join("nested/owned2/settings.json");
         let err2 = create_file_with_injector(
             &target2,

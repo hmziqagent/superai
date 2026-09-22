@@ -1,6 +1,5 @@
-//! Mistral Vibe adapter: relocated-root via `VIBE_HOME`, primary writable
-//! surface `config.toml` (TOML) with skills/tools/MCP.
-//! Research source: `docs/harness-configs/mistral-vibe.md` (last verified 2026-08-25).
+//! Mistral Vibe adapter: relocated root via `VIBE_HOME`, writable
+//! `config.toml` covering skills/tools/MCP.
 
 use std::path::{Path, PathBuf};
 
@@ -80,7 +79,6 @@ impl MistralVibeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$VIBE_HOME` or `~/.vibe`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -96,12 +94,10 @@ impl MistralVibeAdapter {
         Some(PathBuf::from(home).join(".vibe"))
     }
 
-    /// Build the config.toml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.toml")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -153,7 +149,6 @@ impl MistralVibeAdapter {
         } else {
             evidence.push(format!("{CONFIG_ENV_VAR} not set, using ~/.vibe"));
         }
-        // Check project .vibe/config.toml
         let project_cfg = Path::new(".vibe").join("config.toml");
         if project_cfg.exists() {
             evidence.push(format!("project config found at {}", project_cfg.display()));
@@ -499,7 +494,6 @@ impl Adapter for MistralVibeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (mistral-vibe.md 5: `[[mcp_servers]]` array of tables identified by `name`)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -515,7 +509,6 @@ impl Adapter for MistralVibeAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (mistral-vibe.md)")
     }

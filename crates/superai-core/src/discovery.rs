@@ -1,8 +1,5 @@
 //! Discovery, ownership, and drift classification.
-//!
-//! Scans adapter-driven candidate roots, fingerprints harness identity,
-//! classifies ownership (including foreign managers like `claude-multi`),
-//! and produces a bounded drift report without mutating scanned files.
+//! Bounded scans and fingerprints; never mutates scanned files.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -13,7 +10,6 @@ use crate::registry::Registry;
 use crate::state::Ownership;
 
 /// Confidence for a fingerprint.
-///
 /// Evidence is what matters; a directory name alone is `Low` at best.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Confidence {
@@ -60,8 +56,7 @@ pub struct ForeignCheck {
     /// Evidence lines.
     pub evidence: Vec<String>,
     /// Whether the evidence is AMBIGUOUS (DRF-04): a foreign manager is
-    /// plausibly present but no direct link proves ownership. Ambiguity
-    /// blocks adopt/remove; it never silently resolves to unmanaged.
+    /// plausibly present but unproven. Ambiguity blocks adopt/remove.
     pub ambiguous: bool,
 }
 
@@ -213,8 +208,7 @@ pub enum WrapperFindingKind {
 }
 
 /// One group of findings sharing a harness and (when matched) an instance
-/// (DRF-08: findings grouped by harness/instance with support/version,
-/// risk and next operations).
+/// (DRF-08), with support/version, risk, and next operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftGroup {
     /// Harness the group belongs to.
@@ -251,8 +245,6 @@ pub struct DriftReport {
     /// Permission errors skipped during the scan, surfaced as diagnostics.
     pub permission_diagnostics: Vec<String>,
 }
-
-// helpers: tilde/env expansion and path match
 
 fn expand_tilde(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
@@ -297,7 +289,6 @@ fn expand_env_var_pattern(pattern: &str, home: &Path) -> Option<PathBuf> {
     if val.trim().is_empty() {
         return None;
     }
-    // If val contains ~, expand it.
     Some(expand_tilde(&val, home))
 }
 
@@ -312,7 +303,6 @@ fn expand_pattern(pattern: &str, home: &Path) -> Option<PathBuf> {
     if pattern.starts_with('$') || pattern.starts_with("${") {
         return expand_env_var_pattern(pattern, home);
     }
-    // Already absolute or relative fallback handling
     let candidate = PathBuf::from(pattern);
     if candidate.is_absolute() {
         Some(candidate)
@@ -352,16 +342,8 @@ fn known_prefixes() -> &'static [&'static str] {
     ]
 }
 
-// fingerprinting
-
-/// Fingerprint a candidate config root using multiple signals.
-///
-/// Never decides on directory name alone. Evidence includes:
-/// - canonical filenames (`settings.json`, `config.toml`, etc.)
-/// - schema keys when the file can be read without secrets
-/// - path pattern
-/// - adjacent layout (presence of sibling state files)
-/// - matching binary presence (via `PATH` probe only, not by executing)
+/// Fingerprint a candidate config root using multiple signals; never decides
+/// on directory name alone (canonical files, schema keys, layout, PATH lookup).
 #[expect(
     clippy::excessive_nesting,
     reason = "fingerprint multi-signal branches are explicit"
@@ -530,10 +512,8 @@ pub fn fingerprint_candidate(path: &Path) -> Fingerprint {
         evidence.push("adjacent history.jsonl present".to_owned());
     }
 
-    // Version marker (DRF-02 signal): a `version.txt` beside the canonical
-    // config is the corpora's install-era marker. It corroborates a
-    // canonical-file identification (Medium -> High, multiple consistent
-    // signals) but can never promote a name-pattern-only match.
+    // Version marker (DRF-02): corroborates a canonical-file identification
+    // (Medium -> High) but never promotes a name-pattern-only match.
     let version_marker = path.join("version.txt");
     if version_marker.is_file() {
         evidence.push(format!(
@@ -550,9 +530,8 @@ pub fn fingerprint_candidate(path: &Path) -> Fingerprint {
         }
     }
 
-    // Matching binary/app install (DRF-02 signal): PATH lookup ONLY; the
-    // binary is never executed during fingerprinting. Corroborating
-    // evidence; a directory name alone still cannot establish the harness.
+    // Matching binary/app install (DRF-02): PATH lookup ONLY, the binary is
+    // never executed during fingerprinting; corroborating evidence only.
     if let Some(harness) = harness_found.and_then(|s| HarnessId::new(s).ok()) {
         let exe = crate::wrapper::executable_for_harness(&harness);
         if let Some(found) = binary_on_path_from_env(&exe) {
@@ -587,13 +566,8 @@ fn read_bounded(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     Ok(text)
 }
 
-// foreign-manager detection
-
-/// Orchestrator workspace markers (DRF-04) per
-/// docs/harness-configs/orchestrators.md: each GUI orchestrator keeps its
-/// managed workspaces under a well-known root. A candidate living under one
-/// of those roots is orchestrator-managed; superai never adopts or removes
-/// another manager's workspace.
+/// Orchestrator workspace markers (DRF-04): each GUI orchestrator keeps its
+/// managed workspaces under a well-known root; such candidates are foreign.
 const ORCHESTRATOR_WORKSPACE_MARKERS: &[(&str, &str)] = &[
     // Vibe Kanban: worktrees live under `.vibe-kanban-workspaces/`
     // (configurable in Settings → General, but the default is the marker).
@@ -607,14 +581,7 @@ const ORCHESTRATOR_WORKSPACE_MARKERS: &[(&str, &str)] = &[
 ];
 
 /// Detect whether `path` is a workspace managed by a known GUI orchestrator
-/// (DRF-04 "orchestrator-managed profiles where local evidence exists").
-///
-/// Evidence is structural and local only: a path component sequence matching
-/// a documented orchestrator workspace root (compared case-insensitively on
-/// the separator-normalized path, so Windows separators match too), or a
-/// home-level orchestrator settings file (`~/.conductor/settings.toml`,
-/// `~/.sculptor/.env`) that references the candidate (bounded read, the
-/// same discipline as the claude-multi config check). Nothing is executed.
+/// (DRF-04). Evidence is structural and local only; nothing is executed.
 fn detect_orchestrator_manager(path: &Path, home: Option<&Path>) -> Option<(&'static str, String)> {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let lowered = normalized.to_ascii_lowercase();
@@ -663,16 +630,8 @@ fn detect_orchestrator_manager(path: &Path, home: Option<&Path>) -> Option<(&'st
     None
 }
 
-/// Detect whether `path` is owned by a foreign manager.
-///
-/// Checks in order:
-/// - `.foreign-managed` marker inside the candidate
-/// - `.claude-multi` sibling marker
-/// - `$HOME/.claude-multi/config.json` referencing the candidate
-/// - orchestrator-managed workspace roots / settings (DRF-04)
-/// - generic `.superai-foreign` marker
-///
-/// Never parses a known secret store; only bounded reads of small config files.
+/// Detect whether `path` is owned by a foreign manager (marker files,
+/// claude-multi config references, orchestrator roots). Bounded reads only.
 #[expect(
     clippy::excessive_nesting,
     reason = "foreign check branches are explicit"
@@ -696,8 +655,7 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
     }
 
     // Orchestrator-managed workspaces (DRF-04): structural evidence first so
-    // an orchestrator workspace is never adoptable, regardless of what other
-    // markers sit beside it.
+    // such a workspace is never adoptable regardless of other markers.
     if let Some((owner, reason)) = detect_orchestrator_manager(path, home) {
         evidence.push(reason);
         return ForeignCheck {
@@ -768,9 +726,8 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
                     multi_dir.display(),
                     path.display()
                 ));
-                // DRF-04: a foreign manager is plausibly present but nothing
-                // links THIS candidate to it, ambiguous evidence, never a
-                // silent unmanaged classification.
+                // DRF-04: a foreign manager is plausibly present but nothing links
+                // THIS candidate to it: ambiguous, never silently unmanaged.
                 ambiguous = true;
             }
         }
@@ -796,11 +753,8 @@ pub fn is_foreign_managed(path: &Path, home: Option<&Path>) -> ForeignCheck {
     }
 }
 
-// PATH adjacency + package-manager shim detection (DRF-02/04)
-
-/// Find `name` as an executable file on a `PATH`-shaped string (lookup
-/// only; nothing is executed). Pure over its inputs so tests can pass a
-/// synthetic PATH.
+/// Find `name` as an executable on a `PATH`-shaped string (lookup only,
+/// nothing is executed). Pure over its inputs.
 pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
     let separator = if cfg!(windows) { ';' } else { ':' };
     for dir in path_var.split(separator) {
@@ -811,9 +765,8 @@ pub fn binary_on_path(path_var: &str, name: &str) -> Option<PathBuf> {
         if candidate.is_file() && is_executable(&candidate) {
             return Some(candidate);
         }
-        // Windows executability is extension-based: when the bare name has
-        // no extension, probe the core PATHEXT extensions so a lookup of
-        // `claude` resolves the installed `claude.exe`/`claude.cmd`.
+        // Windows executability is extension-based: probe the core PATHEXT
+        // extensions so a lookup of `claude` resolves `claude.exe`/`.cmd`.
         #[cfg(windows)]
         if Path::new(name).extension().is_none()
             && let Some(found) = ["exe", "cmd", "bat", "com"]
@@ -858,10 +811,7 @@ fn binary_on_path_from_env(name: &str) -> Option<PathBuf> {
 }
 
 /// Detect whether `path` is a package-manager shim rather than an instance
-/// wrapper (DRF-04). mise shims are tiny generated shell scripts that exec
-/// `mise x --` / `mise run`; asdf shims look the same shape. A shim is
-/// NEVER a superai wrapper and NEVER a config root; ownership stays with
-/// the package manager.
+/// wrapper (DRF-04): mise/asdf shims are NEVER a superai wrapper or config root.
 pub fn detect_shim_manager(path: &Path) -> Option<&'static str> {
     let data = std::fs::read(path).ok()?;
     if data.len() > 16 * 1024 {
@@ -881,21 +831,14 @@ pub fn detect_shim_manager(path: &Path) -> Option<&'static str> {
     None
 }
 
-// ownership classification
-
-/// Classify ownership of a candidate path given the current registry and home.
-///
-/// Recorded roots take their record's ownership; proven foreign-managed
-/// paths are `ForeignManaged`; otherwise existence on disk decides between
-/// `Unmanaged` and `Detached`. Ambiguous evidence never merges on name
-/// alone.
+/// Classify ownership of a candidate path given the registry and home:
+/// recorded roots take their record's ownership; ambiguous never merges on name.
 pub fn classify_ownership(path: &Path, registry: &Registry, home: Option<&Path>) -> Ownership {
     classify_ownership_with_foreign(path, registry, &is_foreign_managed(path, home))
 }
 
-/// [`classify_ownership`] with an already-computed foreign check, so a
-/// drift-report pass runs the (stat-heavy) foreign check once per
-/// candidate instead of twice.
+/// [`classify_ownership`] with an already-computed foreign check, so a drift
+/// pass runs the stat-heavy foreign check once per candidate, not twice.
 fn classify_ownership_with_foreign(
     path: &Path,
     registry: &Registry,
@@ -934,19 +877,11 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-// candidate root discovery (bounded)
-
 const MAX_HOME_ENTRIES: usize = 1024;
 const MAX_XDG_ENTRIES: usize = 256;
 
-/// Collect adapter-derived candidate patterns for the scan.
-///
-/// Patterns come from every adapter in the harness catalog via
-/// [`crate::harness_catalog::all_adapters`]: concrete adapters contribute
-/// their `scan_candidates`, and a harness without a concrete adapter falls
-/// back to the generic `~/.<id>` hints of [`crate::adapter::GenericAdapter`].
-/// The scanner keeps only patterns that expand to an existing path (see
-/// [`scan_candidate_roots_limited`]).
+/// Collect adapter-derived candidate patterns: concrete adapters contribute
+/// `scan_candidates`; harnesses without one get generic `~/.<id>` hints.
 fn candidate_patterns() -> Vec<String> {
     crate::harness_catalog::all_adapters()
         .iter()
@@ -954,10 +889,8 @@ fn candidate_patterns() -> Vec<String> {
         .collect()
 }
 
-/// Scan `home` for candidate config roots.
-///
-/// Bounded: no unrestricted crawl, at most one level under `home` and `.config`,
-/// at most `MAX_HOME_ENTRIES` entries, skips permission errors, never parses secret stores.
+/// Scan `home` for candidate config roots, bounded: at most one level under
+/// `home` and `.config`, `MAX_HOME_ENTRIES` cap, secrets never parsed.
 pub fn scan_candidate_roots(home: &Path) -> Vec<PathBuf> {
     scan_candidate_roots_limited(home, MAX_HOME_ENTRIES)
 }
@@ -967,9 +900,8 @@ pub fn scan_candidate_roots_limited(home: &Path, max_entries: usize) -> Vec<Path
     scan_with_diagnostics(home, &ScanOptions::with_entry_limit(max_entries)).candidates
 }
 
-/// Scan inputs (DRF-01): adapter defaults and globs, env hints, plus
-/// USER-SPECIFIED roots and the wrapper directories to scan for orphan
-/// launchers. Everything stays bounded.
+/// Scan inputs (DRF-01): adapter defaults and globs, env hints, user-specified
+/// roots, and wrapper directories. Everything stays bounded.
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     /// User-specified extra scan roots (absolute paths). Included as-is when
@@ -1001,10 +933,8 @@ impl ScanOptions {
     }
 }
 
-/// Default user-owned bin directories wrappers are installed into
-/// (DRF-03 "configured wrapper directories"): `~/.local/bin` (XDG) and
-/// superai's own `~/.superai/bin`. Only these get the bounded one-level
-/// wrapper scan, never a PATH crawl.
+/// Default user-owned wrapper directories (DRF-03): `~/.local/bin` (XDG) and
+/// `~/.superai/bin`; only these get the bounded wrapper scan, never PATH.
 pub fn default_wrapper_dirs(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".local").join("bin"),
@@ -1021,10 +951,8 @@ pub struct ScanReport {
     pub permission_diagnostics: Vec<String>,
 }
 
-/// Expand a single-level glob pattern (`prefix/*.ext` or `prefix/*`) under
-/// `home` into at most `MAX_GLOB_ENTRIES` existing paths. Patterns without
-/// `*` are handled by [`expand_pattern`]; a glob in any component other
-/// than the last is not expanded (bounded by design).
+/// Expand a single-level glob (`prefix/*.ext`, `prefix/*`) under `home` into
+/// at most `MAX_GLOB_ENTRIES` paths; globs below the last component do not expand.
 fn expand_glob_candidates(pattern: &str, home: &Path) -> Vec<PathBuf> {
     const MAX_GLOB_ENTRIES: usize = 256;
     let Some(star) = pattern.find('*') else {
@@ -1075,8 +1003,7 @@ fn expand_glob_candidates(pattern: &str, home: &Path) -> Vec<PathBuf> {
 }
 
 /// Bounded scan with user-specified roots, glob expansion, a wall-clock
-/// budget, and permission diagnostics surfaced instead of swallowed
-/// (DRF-01). Never parses known secret stores.
+/// budget, and permission diagnostics surfaced (DRF-01).
 #[expect(clippy::excessive_nesting, reason = "scan branches are explicit")]
 #[expect(clippy::too_many_lines, reason = "scan is bounded and explicit")]
 pub fn scan_with_diagnostics(home: &Path, options: &ScanOptions) -> ScanReport {
@@ -1106,9 +1033,7 @@ pub fn scan_with_diagnostics(home: &Path, options: &ScanOptions) -> ScanReport {
     }
 
     // 1) Explicit adapter patterns: plain patterns expand directly; glob
-    // patterns (amazon-q `~/.aws/amazonq/cli-agents/*.json`, warp
-    // `~/.warp/workflows/*.yaml`, …) get a bounded single-level expansion
-    // instead of being silently dropped.
+    // patterns get a bounded single-level expansion, never silently dropped.
     for pattern in candidate_patterns() {
         if std::time::Instant::now() >= deadline {
             diagnostics.push("scan time budget reached during pattern expansion".to_owned());
@@ -1244,10 +1169,8 @@ pub fn scan_with_diagnostics(home: &Path, options: &ScanOptions) -> ScanReport {
     }
 }
 
-/// Deduplicate candidates by file identity without losing display path.
-///
-/// On Unix, two paths that point to the same inode/device are considered one.
-/// Otherwise, lexical dedup is used. The first occurrence's display path is kept.
+/// Deduplicate candidates by file identity (inode/device on unix, else
+/// lexical) without losing the first display path.
 pub fn deduplicate_by_identity(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
@@ -1301,12 +1224,8 @@ fn dedup_by_identity_lexical(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-/// Find unmanaged candidates by scanning `home` and filtering against the registry.
-///
-/// This is the "actual disk scan vs candidates param" extension: instead of
-/// requiring the caller to supply candidates, we scan `home` directly and
-/// filter. The registry's own `unmanaged_dirs` can then be fed the scan result
-/// if needed.
+/// Find unmanaged candidates by scanning `home` and filtering against the
+/// registry, foreign ownership, and existing wrapper ties.
 pub fn find_unmanaged_candidates(registry: &Registry, home: &Path) -> Vec<PathBuf> {
     let candidates = scan_candidate_roots(home);
     crate::registry::unmanaged_dirs(registry, &candidates)
@@ -1319,11 +1238,8 @@ pub fn find_unmanaged_candidates(registry: &Registry, home: &Path) -> Vec<PathBu
         .collect()
 }
 
-/// Scan the CONFIGURED wrapper directories only (DRF-03): a bounded,
-/// one-level-deep listing of each dir (at most 512 entries), classifying
-/// every file without executing it. superai wrappers whose instance id has
-/// no registry record are `OrphanWrapper` findings; package-manager shims are
-/// distinguished from wrappers (DRF-04).
+/// Scan the CONFIGURED wrapper directories only (DRF-03): bounded one-level
+/// listing, no execution; orphans, shims, and foreign launchers classified.
 #[expect(
     clippy::excessive_nesting,
     reason = "wrapper-dir classification branches are explicit"
@@ -1431,11 +1347,8 @@ pub fn scan_wrapper_dirs(dirs: &[PathBuf], registry: &Registry) -> Vec<WrapperFi
     findings
 }
 
-// registry reconciliation (DRF-05)
-
-/// Marker file name superai writes into config roots it creates; carries
-/// the stable `InstanceId` so reconciliation matches identity FIRST, before
-/// any path comparison (DRF-05).
+/// Marker file superai writes into config roots it creates; carries the
+/// stable `InstanceId` so reconciliation matches identity FIRST (DRF-05).
 pub const INSTANCE_MARKER_FILE: &str = ".superai-instance";
 
 /// Read the `InstanceId` marker from a config root, when present.
@@ -1535,8 +1448,6 @@ pub fn reconcile(
     out
 }
 
-// drift report (DRF-08)
-
 /// Classify one candidate into a drift category + risk + next operations
 /// (DRF-08). Pure over its inputs.
 #[expect(
@@ -1600,10 +1511,8 @@ fn classify_finding(
                         vec!["repair: regenerate the wrapper (INS-09)".to_owned()],
                     );
                 }
-                // Strict ownership check (WRP-08 discipline, matching the
-                // repair path's full-content comparison): parseable marker +
-                // digest EQUALITY. A merely-edited wrapper that still happens
-                // to contain the digest string is drift, not health.
+                // Strict ownership check (WRP-08, full-content comparison): a merely
+                // edited wrapper still containing the digest string is drift.
                 if !crate::wrapper::is_owned_wrapper(wpath, Some(&wrapper.content_digest)) {
                     return (
                         DriftCategory::WrapperChanged,
@@ -1789,9 +1698,8 @@ fn build_groups(
     groups
 }
 
-/// Pick the category a group is summarized under: the most severe, by a
-/// fixed severity order, so a healthy group with one broken wrapper still
-/// surfaces the break.
+/// Pick the category a group is summarized under: the most severe by a fixed
+/// order, so one broken wrapper still surfaces.
 fn pick_primary_category(categories: &[DriftCategory]) -> DriftCategory {
     let order = [
         DriftCategory::ForeignManaged,
@@ -1818,12 +1726,8 @@ fn pick_primary_category(categories: &[DriftCategory]) -> DriftCategory {
     DriftCategory::RecordedHealthy
 }
 
-/// Detect duplicate config roots and duplicate wrapper commands among the
-/// registry records (DRF drift categories).
-/// One duplicate-record finding: what collides, how risky it is, the
-/// human description naming both instances, and the path the finding is
-/// attached to (the colliding root or wrapper itself, never an arbitrary
-/// first record's root).
+/// Detect duplicate config roots and wrapper commands among registry records;
+/// findings attach to the colliding path itself, never an arbitrary record.
 struct RecordDuplicate {
     category: DriftCategory,
     risk: RiskLevel,
@@ -1865,13 +1769,8 @@ fn detect_record_duplicates(registry: &Registry) -> Vec<RecordDuplicate> {
     out
 }
 
-/// Produce a drift report for `home` against the current `registry`.
-///
-/// The report is read-only and contains no UI formatting. It records
-/// the timestamp, scanned scope, fingerprint, ownership, foreign evidence,
-/// whether each candidate is recorded, the drift category/risk/next
-/// operations per finding, wrapper-directory findings (DRF-03), and
-/// harness/instance groups (DRF-08).
+/// Produce a read-only drift report for `home` against `registry`: scope,
+/// fingerprints, ownership, categories/risks/next-ops, groups (DRF-08).
 pub fn drift_report(registry: &Registry, home: &Path) -> DriftReport {
     drift_report_with_options(
         registry,
@@ -1991,16 +1890,8 @@ pub fn drift_report_with_options(
     }
 }
 
-// adoption helper (record-first, config-preserving)
-
-/// Minimum fingerprint confidence adoption requires.
-///
-/// [`Confidence::Medium`] is the lowest level that requires a canonical config
-/// file to be present: `fingerprint_candidate` only assigns `Medium` or
-/// `High` inside a canonical-file branch, while [`Confidence::Low`] is
-/// name-pattern only and [`Confidence::None`] is no evidence at all. DRF-02
-/// forbids a directory name alone from establishing harness identity, so
-/// `Low` can never satisfy this floor.
+/// Minimum fingerprint confidence adoption requires: `Medium` needs a
+/// canonical config file; a directory name alone never satisfies the floor.
 pub const ADOPTION_CONFIDENCE_FLOOR: Confidence = Confidence::Medium;
 
 /// Whether `confidence` carries more than a name-pattern match.
@@ -2008,19 +1899,8 @@ fn meets_adoption_floor(confidence: Confidence) -> bool {
     matches!(confidence, Confidence::High | Confidence::Medium)
 }
 
-/// Validate that a candidate can be adopted.
-///
-/// Checks: the candidate is a real directory or file, harness fingerprint
-/// at or above [`ADOPTION_CONFIDENCE_FLOOR`] (a canonical config file must
-/// prove the harness; a directory name alone never does), a readable
-/// canonical config file, no foreign ownership, and a fresh readable
-/// candidate. Returns the fingerprint on success. Never copies, migrates,
-/// normalizes, or reformats the harness config.
-///
-/// A symlinked candidate (dotfiles/stow setups point `~/.claude` at a
-/// repository checkout) is adopted through the link iff its fully resolved
-/// target stays inside `home`'s tree; a link escaping the scanned root is
-/// refused, and a symlink with no `home` boundary to check is refused too.
+/// Validate that a candidate can be adopted: fingerprint at the floor,
+/// readable canonical config, no foreign ownership; never copies or reformats.
 pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
     let meta = std::fs::symlink_metadata(candidate).map_err(|e| CoreError::Validation {
         field: "candidate".to_owned(),
@@ -2068,8 +1948,7 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
         });
     }
     // A Medium+ fingerprint implies a canonical file exists; it must also be
-    // READABLE, or the digest token adoption compares between preview and
-    // commit would be empty and that check would pass vacuously.
+    // READABLE, or the digest token adoption compares would pass vacuously.
     if canonical_config_digests(candidate).is_empty() {
         return Err(CoreError::InsufficientEvidence {
             path: candidate.to_path_buf(),
@@ -2101,11 +1980,8 @@ pub fn can_adopt(candidate: &Path, home: Option<&Path>) -> Result<Fingerprint> {
     Ok(fingerprint)
 }
 
-/// Canonical config file names adoption uses as its conflict token.
-///
-/// These are the readable harness files [`fingerprint_candidate`] proves
-/// identity from, never a secret store, so a digest over exactly this set
-/// is the minimal token that says "the proof still stands".
+/// Canonical config file names adoption uses as its conflict token: the
+/// readable files identity is proven from, never a secret store.
 const ADOPTION_TOKEN_FILES: &[&str] = &[
     "settings.json",
     "config.toml",
@@ -2116,14 +1992,8 @@ const ADOPTION_TOKEN_FILES: &[&str] = &[
     ".aider.model.metadata.json",
 ];
 
-/// Fresh digests of a candidate's canonical config files.
-///
-/// Returns one `(file name, digest)` pair per canonical file that is present
-/// and readable, in [`ADOPTION_TOKEN_FILES`] order. Never reads a secret
-/// store. Adoption compares this set between preview and commit: the same
-/// names with the same digests mean the fingerprint proof still holds for the
-/// bytes it was proven on. A canonical file that exists but cannot be read
-/// contributes no pair (its content was never part of the proof either).
+/// Fresh digests of a candidate's canonical config files, one pair per file
+/// present and readable; adoption compares this set preview vs commit.
 pub fn canonical_config_digests(candidate: &Path) -> Vec<(String, String)> {
     let mut tokens: Vec<(String, String)> = Vec::new();
     for name in ADOPTION_TOKEN_FILES {
@@ -2135,8 +2005,6 @@ pub fn canonical_config_digests(candidate: &Path) -> Vec<(String, String)> {
     tokens
 }
 
-// Tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2144,7 +2012,6 @@ mod tests {
     use crate::instance::{Instance, TemplateRef};
     use crate::paths::AbsolutePath;
     use crate::state::{InstanceOrigin, Isolation};
-    // Ownership already imported via super::*
 
     fn tmp_home(label: &str) -> PathBuf {
         crate::test_util::temp_dir_unique(label)
@@ -2173,7 +2040,6 @@ mod tests {
     #[test]
     fn scan_finds_claude_variants_in_temp_home() {
         let home = tmp_home("scan_claude_variants");
-        // Clean previous
         for name in [
             ".claude-aaa",
             ".claude-abogo",
@@ -2184,7 +2050,6 @@ mod tests {
             std::fs::create_dir_all(&p).unwrap();
             std::fs::write(p.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
         }
-        // Also create .codex and .aider
         let codex = home.join(".codex");
         std::fs::create_dir_all(&codex).unwrap();
         std::fs::write(codex.join("config.toml"), "model = \"gpt-4\"").unwrap();
@@ -2225,7 +2090,6 @@ mod tests {
             std::fs::create_dir_all(p).unwrap();
             std::fs::write(p.join("settings.json"), "{}").unwrap();
         }
-        // Registry records r1
         let mut reg = Registry::default();
         reg.insert(sample_instance(
             "work",
@@ -2257,7 +2121,6 @@ mod tests {
         let foreign_root = home.join(".claude-foreign-one");
         std::fs::create_dir_all(&foreign_root).unwrap();
         std::fs::write(foreign_root.join("settings.json"), "{}").unwrap();
-        // Simulate claude-multi referencing it
         let multi_dir = home.join(".claude-multi");
         std::fs::create_dir_all(&multi_dir).unwrap();
         let cfg = multi_dir.join("config.json");
@@ -2286,10 +2149,8 @@ mod tests {
         std::fs::remove_dir_all(&multi_dir).unwrap_or(());
     }
 
-    /// DRF-04: orchestrator-managed workspace roots (Vibe Kanban /
-    /// Conductor / Sculptor per docs/harness-configs/orchestrators.md) are
-    /// classified foreign-owned with the orchestrator named, and adoption is
-    /// refused, superai never takes over another manager's workspace.
+    /// DRF-04: orchestrator-managed workspace roots (Vibe Kanban, Conductor,
+    /// Sculptor) classify foreign with the orchestrator named; adoption refuses.
     #[test]
     fn orchestrator_workspaces_are_foreign_managed_and_block_adoption() {
         let home = tmp_home("orchestrator_foreign");
@@ -2370,7 +2231,6 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("settings.json"), "{}").unwrap();
         let link = home.join(".claude-link");
-        // Remove prior link if exists
         std::fs::remove_file(&link).unwrap_or(());
         #[cfg(unix)]
         {
@@ -2382,7 +2242,6 @@ mod tests {
                 1,
                 "symlinked roots must deduplicate to one entry, got {deduped:?}"
             );
-            // Display path preserved is the first one
             assert_eq!(deduped[0], real);
         }
         #[cfg(not(unix))]
@@ -2407,12 +2266,10 @@ mod tests {
             "bounded scan must respect limit via deduplication, got {} entries: {limited:?}",
             limited.len()
         );
-        // Ensure we didn't traverse recursively into subdirs arbitrarily
-        // Create deep nested dir inside one candidate and ensure scan doesn't crawl into it beyond top-level
+        // The scan is top-level only; it must not crawl into subdirectories.
         let deep = home.join(".claude-bulk-000").join("deep").join("nested");
         std::fs::create_dir_all(&deep).unwrap();
         let candidates2 = scan_candidate_roots_limited(&home, 100);
-        // Ensure deep nested path is not in candidates (only top-level)
         assert!(
             !candidates2.iter().any(|p| p == &deep),
             "scan must not crawl arbitrarily deep"
@@ -2529,15 +2386,12 @@ mod tests {
             before, after,
             "scan must not mutate file content or mtime (read-only)"
         );
-        // Also ensure content unchanged
         let content = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(content, r#"{"model":"sonnet"}"#);
     }
 
     /// Every catalog harness must resolve to its concrete adapter and every
-    /// adapter-specific candidate must be part of the discovery pattern set
-    /// (HAD-09/10/11): a future catalog row without a concrete adapter fails
-    /// here instead of silently falling back to generic `~/.<id>` hints.
+    /// adapter-specific candidate must be in the pattern set (HAD-09/10/11).
     #[test]
     fn scan_patterns_cover_every_catalog_concrete_adapter() {
         let patterns = candidate_patterns();
@@ -2559,10 +2413,8 @@ mod tests {
         }
     }
 
-    /// warp's CLI settings file is reachable only through
-    /// `WarpAdapter::scan_candidates`; the generic `~/.<id>` fallback never
-    /// listed it, no known home prefix matches, and the XDG crawl ignores
-    /// `warp-terminal`.
+    /// warp's CLI settings file is reachable only through `WarpAdapter::
+    /// scan_candidates`; no generic fallback or XDG crawl ever listed it.
     #[test]
     fn scan_finds_adapter_specific_warp_candidate() {
         let home = tmp_home("scan_warp_cli");
@@ -2580,9 +2432,8 @@ mod tests {
         );
     }
 
-    /// swe-agent's project-layout candidate `config/default.yaml` is likewise
-    /// adapter-specific: the generic fallback only ever offered
-    /// `~/.swe-agent`, and no known home prefix matches `config`.
+    /// swe-agent's project-layout candidate `config/default.yaml` is
+    /// adapter-specific: no generic fallback or home prefix matches `config`.
     #[test]
     fn scan_finds_adapter_specific_swe_agent_candidate() {
         let home = tmp_home("scan_swe_agent");
@@ -2605,9 +2456,8 @@ mod tests {
         let custom = home.join("customs").join("harness-config");
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join("settings.json"), r#"{"model":"x"}"#).unwrap();
-        // A glob candidate the adapter corpus really declares (swe-agent
-        // and trae-agent): `trajectories/*`, previously dropped by
-        // `contains('*') { continue }`.
+        // A glob candidate the adapter corpus really declares (swe-agent,
+        // trae-agent): `trajectories/*`, previously dropped entirely.
         let workspace = home.join("trajectories").join("run-1");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("traj.json"), "{}\n").unwrap();
@@ -2629,10 +2479,8 @@ mod tests {
         );
     }
 
-    /// DRF-02: version marker and binary adjacency are fingerprint signals,
-    /// the marker promotes a canonical-file match to High, the PATH lookup
-    /// adds evidence without executing anything, and a name pattern alone
-    /// still never rises above Low.
+    /// DRF-02: version marker and binary adjacency are fingerprint signals;
+    /// a name pattern alone never rises above Low.
     #[test]
     fn fingerprint_uses_version_marker_and_binary_adjacency() {
         let home = tmp_home("fp_signals");
@@ -2656,8 +2504,7 @@ mod tests {
         let bin_dir = home.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         // Windows executability is extension-based, so the fixture binary
-        // carries a PATHEXT extension there and the lookup finds it through
-        // the extension probe.
+        // carries a PATHEXT extension and the lookup finds it that way.
         let claude_name = if cfg!(windows) {
             "claude.exe"
         } else {
@@ -2700,9 +2547,8 @@ mod tests {
         assert_eq!(binary_on_path(&path_var, "plain-tool"), None);
     }
 
-    /// DRF-03/04: the wrapper-directory scan classifies superai wrappers,
-    /// records, orphans, package-manager shims, and foreign launchers, and
-    /// never executes anything.
+    /// DRF-03/04: the wrapper-directory scan classifies wrappers, orphans,
+    /// shims, and foreign launchers, and never executes anything.
     #[test]
     fn wrapper_dir_scan_classifies_shims_wrappers_and_orphans() {
         let home = tmp_home("scan_wrapper_dirs");
@@ -2798,9 +2644,8 @@ mod tests {
         assert!(matches!(foreign.kind, WrapperFindingKind::Foreign { .. }));
     }
 
-    /// DRF-04: ambiguous ownership evidence (a foreign manager is present but
-    /// links nothing) BLOCKS adoption instead of silently resolving to
-    /// unmanaged.
+    /// DRF-04: ambiguous ownership evidence (a foreign manager present but
+    /// linking nothing) BLOCKS adoption instead of resolving to unmanaged.
     #[test]
     fn ambiguous_ownership_blocks_adoption() {
         let home = tmp_home("ambiguous_blocks");
@@ -2873,9 +2718,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&outside_parent));
     }
 
-    /// DRF-05: reconciliation matches the `InstanceId` marker FIRST, a moved
-    /// root still matches its record before any path comparison, and never
-    /// merges on the display name.
+    /// DRF-05: reconciliation matches the `InstanceId` marker FIRST; a moved
+    /// root matches its record, and display names never merge.
     #[test]
     fn reconcile_matches_marker_first() {
         let home = tmp_home("reconcile_marker");
@@ -2904,7 +2748,6 @@ mod tests {
         assert_eq!(rows[0].candidate.as_deref(), Some(moved.as_path()));
         assert_eq!(rows[0].basis, Some(MatchBasis::InstanceMarker));
 
-        // read_instance_marker round-trips the id.
         assert_eq!(read_instance_marker(&moved), Some(marker_id));
 
         // Without the marker, the same mismatched paths do NOT match.
@@ -2917,17 +2760,14 @@ mod tests {
         );
     }
 
-    /// DRF-08: the drift report groups findings by harness/instance with risk
-    /// levels, adapter support/version, and recommended next operations.
-    /// Duplicate-record findings attach to the colliding root or wrapper
-    /// path, not to whichever record happens to be first.
+    /// DRF-08: the drift report groups findings by harness/instance with
+    /// risk, support/version, and next ops; duplicates attach to the collision.
     #[test]
     fn drift_report_attaches_duplicates_to_the_colliding_path() {
         let home = tmp_home("drift_dups");
         let root_a = crate::test_util::tmp_abs_str("u/.claude-dup-a");
-        // Insert and load both refuse a duplicated config_root; the
-        // duplicate-record findings are the defense for a registry that
-        // carries one anyway, so the test builds the shape unchecked.
+        // Insert refuses a duplicated config_root; the duplicate-record
+        // findings defend a registry that carries one anyway (built unchecked).
         let first = sample_instance(
             "alpha",
             root_a.as_str(),

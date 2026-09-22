@@ -1,10 +1,5 @@
-//! Operation executor (DOC-02): applies a typed [`Operation`] through the
-//! codec layer after enforcing every declared policy (owned keys,
-//! `expected_old`, duplicates, parent creation, redaction); a violation is
-//! a typed error and nothing is written. [`apply_to_value`] is the core
-//! over a semantic tree; [`apply`] is the file level, writing back only on
-//! a semantic change. JSONC/YAML keep `LossyWrite` refusals, TOML goes
-//! through `toml_edit` to preserve comments, text fragments are span-only.
+//! Applies a typed [`Operation`] through the codec layer after enforcing
+//! every policy; a violation is a typed error and nothing is written.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,14 +15,11 @@ use crate::error::{ConfigError, Result};
 /// Outcome of applying one operation through the executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationOutcome {
-    /// Whether the document's semantic value changed (a write happened or
-    /// is warranted).
+    /// Whether the semantic value changed (a write happened or is warranted).
     pub changed: bool,
-    /// Redacted human-readable summary of the edit; never contains
-    /// secret-shaped values or values covered by the redaction policy.
+    /// Redacted edit summary; never secret-shaped values.
     pub redacted_summary: String,
-    /// Codec warnings (e.g. DOC-10 formatting-change notes emitted when a
-    /// changing write must reformat surrounding layout).
+    /// Codec warnings (e.g. DOC-10 reformatting notes).
     pub warnings: Vec<String>,
 }
 
@@ -64,8 +56,7 @@ fn render_value(op: &Operation, value: &Value) -> String {
     }
 }
 
-/// Render a selector for summaries/errors per the operation's redaction
-/// policy.
+/// Render a selector per the redaction policy.
 fn render_selector(op: &Operation, selector: &str) -> String {
     if matches!(
         op.redaction_policy,
@@ -84,8 +75,7 @@ fn render_slot(op: &Operation, value: Option<&Value>) -> String {
     }
 }
 
-/// Canonical addressed form of a selector: dotted path for `Key` and
-/// `TomlTable`, typed string otherwise.
+/// Canonical addressed form: dotted for `Key`/`TomlTable`, typed otherwise.
 fn selector_address(selector: &Selector) -> String {
     match selector {
         Selector::Key(k) => k
@@ -99,8 +89,7 @@ fn selector_address(selector: &Selector) -> String {
     }
 }
 
-/// Addressed keys this operation touches (one per variant; merged keys are
-/// checked separately inside [`merge_into`]).
+/// Addressed keys this operation touches (merge keys checked in `merge_into`).
 fn addressed_keys(op: &Operation) -> Vec<String> {
     let base = selector_address(op.selector());
     match &op.kind {
@@ -137,8 +126,7 @@ fn candidate_forms(declared: &str) -> Vec<String> {
     forms
 }
 
-/// Whether `addressed` falls inside an owned-key declaration (exact or
-/// prefix path, mirroring template selector ownership).
+/// Whether `addressed` falls inside an owned declaration (exact or prefix path).
 fn owned_covers(owned: &str, addressed: &str) -> bool {
     let owned_forms = candidate_forms(owned);
     let addressed_forms = candidate_forms(addressed);
@@ -163,7 +151,7 @@ fn selector_string(op: &Operation) -> String {
     render_selector(op, &op.selector().to_typed_string())
 }
 
-/// Enforce `owned_keys` (DOC-02): reject selectors outside the owned set.
+/// Enforce `owned_keys`: reject selectors outside the owned set.
 fn check_ownership(path: &Path, op: &Operation) -> Result<()> {
     if ownership_holds(op) {
         return Ok(());
@@ -171,7 +159,7 @@ fn check_ownership(path: &Path, op: &Operation) -> Result<()> {
     Err(ConfigError::not_owned(path, selector_string(op)))
 }
 
-/// Enforce `expected_old` (DOC-02): mismatch is a typed conflict, no write.
+/// Enforce `expected_old`: mismatch is a typed conflict, no write.
 fn check_expected_old(path: &Path, op: &Operation, current: Option<&Value>) -> Result<()> {
     let Some(expected) = &op.expected_old else {
         return Ok(());
@@ -192,8 +180,7 @@ fn check_expected_old(path: &Path, op: &Operation, current: Option<&Value>) -> R
     ))
 }
 
-/// Navigate `segments` read-only. `Err` when an intermediate segment is not
-/// an object; `Ok(None)` when the path is missing.
+/// Read-only navigation; `Err` on non-object intermediates, `Ok(None)` when missing.
 fn navigate_ref<'a>(
     node: &'a Value,
     segments: &[String],
@@ -216,8 +203,7 @@ fn navigate_ref<'a>(
     }
 }
 
-/// Navigate `segments` mutably, creating missing objects when `create` is
-/// allowed (DOC-02 `create_parent`).
+/// Mutable navigation, creating missing objects when `create` allows.
 fn navigate_mut<'a>(
     node: &'a mut Value,
     segments: &[String],
@@ -251,8 +237,7 @@ fn navigate_mut<'a>(
     }
 }
 
-/// Split a `Key` (or `TomlTable`, joined as a dotted path) selector into
-/// (parent segments, leaf key).
+/// Split a `Key`/`TomlTable` selector into (parent segments, leaf key).
 fn key_target(selector: &Selector, path: &Path, op: &Operation) -> Result<(Vec<String>, String)> {
     let raw = match selector {
         Selector::Key(k) => k.as_str(),
@@ -459,9 +444,8 @@ fn merge_into(
     Ok(true)
 }
 
-/// Shared read-only array resolution for identity/directory operations:
-/// `Ok(None)` means the array is absent (creation allowed), `Err` when the
-/// selector does not address an array or the parent may not be created.
+/// Read-only array resolution: `Ok(None)` absent (creation allowed), `Err`
+/// when not an array or parent creation disallowed.
 fn resolve_array<'a>(
     path: &Path,
     op: &Operation,
@@ -666,9 +650,8 @@ fn root_array_edit(
     }
 }
 
-/// Enforce every declared policy of `op` against `value` and apply the edit
-/// in place (DOC-02 core). On violation the value is untouched and `path`
-/// is error context only (synthetic names fine for in-memory documents).
+/// Enforce every policy of `op` and apply the edit in place; on violation
+/// the value is untouched and `path` is error context only.
 pub fn apply_to_value(path: &Path, value: &mut Value, op: &Operation) -> Result<OperationOutcome> {
     check_ownership(path, op)?;
     let original = value.clone();
@@ -818,9 +801,8 @@ fn summarize(op: &Operation, before: &Value, after: &Value) -> String {
     )
 }
 
-/// Apply `op` to the document at `path` through the codec for `kind`:
-/// fresh read, policy enforcement, write back only on a semantic change
-/// (no-op byte identity). Opaque documents are refused.
+/// Apply `op` through the codec for `kind`: fresh read, policy enforcement,
+/// write back only on a semantic change. Opaque documents are refused.
 pub fn apply(path: &Path, kind: DocumentKind, op: &Operation) -> Result<OperationOutcome> {
     match kind {
         DocumentKind::StrictJson => apply_json_family(path, op, JsonFamily::Strict),
@@ -878,8 +860,7 @@ fn apply_json_family(path: &Path, op: &Operation, family: JsonFamily) -> Result<
     Ok(outcome)
 }
 
-/// Convert a `toml_edit` document to its semantic JSON value for policy
-/// checks and semantic validation.
+/// Convert a `toml_edit` document to its semantic JSON value.
 pub fn toml_document_to_value(doc: &DocumentMut) -> Value {
     table_to_value(doc.as_table())
 }
@@ -1075,8 +1056,7 @@ fn apply_toml(path: &Path, op: &Operation) -> Result<OperationOutcome> {
     Ok(outcome)
 }
 
-/// Mirror the policy-approved operation onto the `toml_edit` document so
-/// comments and decor survive (DOC-04).
+/// Mirror the policy-approved operation onto the `toml_edit` doc (DOC-04).
 fn toml_apply_mutation(path: &Path, op: &Operation, doc: &mut DocumentMut) -> Result<()> {
     let selector = op.selector().to_typed_string();
     match &op.kind {
@@ -1307,8 +1287,6 @@ fn apply_text_fragment(path: &Path, op: &Operation) -> Result<OperationOutcome> 
         });
     }
 
-    // The raw editor commit applies the DOC-08 span-only gate, backup,
-    // conflict detection, and read-back verification.
     crate::raw_editor::commit_with_snapshot(path, new_text.as_bytes(), Some(&snap))?;
     Ok(OperationOutcome {
         changed: true,
@@ -1323,14 +1301,11 @@ fn apply_text_fragment(path: &Path, op: &Operation) -> Result<OperationOutcome> 
     })
 }
 
-/// Render a span body for summaries, redacted per policy or when the
-/// rendered form is secret-shaped.
+/// Render a span body for summaries, redacted per policy or when secret-shaped.
 fn redact_span_body(op: &Operation, body: &str) -> String {
     let rendered = Value::String(body.to_owned());
     render_value(op, &rendered)
 }
-
-// tests
 
 #[cfg(test)]
 mod tests {
@@ -1349,8 +1324,6 @@ mod tests {
             value,
         })
     }
-
-    // owned_keys
 
     #[test]
     fn owned_keys_accept_declared_selector() {
@@ -1389,8 +1362,6 @@ mod tests {
         assert!(matches!(err, ConfigError::NotOwned { .. }));
     }
 
-    // expected_old
-
     #[test]
     fn expected_old_match_proceeds_and_mismatch_conflicts() {
         let path = Path::new("(mem)");
@@ -1422,7 +1393,6 @@ mod tests {
     #[test]
     fn expected_old_absence_expectation() {
         let path = Path::new("(mem)");
-        // Absent as expected -> applies.
         let mut doc = json!({});
         let op = set_op("key:model", json!("m1"))
             .with_owned_keys(vec!["model".into()])
@@ -1430,7 +1400,6 @@ mod tests {
         apply_to_value(path, &mut doc, &op).unwrap();
         assert_eq!(doc["model"], json!("m1"));
 
-        // Present but absence expected -> conflict.
         let mut doc2 = json!({"model": "x"});
         let err = apply_to_value(path, &mut doc2, &op).unwrap_err();
         assert!(matches!(err, ConfigError::OperationConflict { .. }));
@@ -1448,8 +1417,6 @@ mod tests {
         assert!(!rendered.contains("sk-new-value"), "{rendered}");
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
-
-    // duplicate_handling
 
     #[test]
     fn duplicate_error_rejects_existing_entry() {
@@ -1541,8 +1508,6 @@ mod tests {
         assert_eq!(servers[1], json!({"name": "b"}));
     }
 
-    // create_parent
-
     #[test]
     fn create_parent_true_creates_nested_objects() {
         let mut doc = json!({"keep": 1});
@@ -1577,8 +1542,6 @@ mod tests {
         assert_eq!(doc["a"], json!(5), "scalar intermediate is not clobbered");
     }
 
-    // redaction policy
-
     #[test]
     fn redaction_policy_redacts_summary_values() {
         let mut doc = json!({"api_key": "old"});
@@ -1593,7 +1556,6 @@ mod tests {
             outcome.redacted_summary
         );
         assert!(outcome.redacted_summary.contains("[REDACTED]"));
-        // The document itself still carries the real value.
         assert_eq!(doc["api_key"], json!("sk-brand-new"));
     }
 
@@ -1605,8 +1567,6 @@ mod tests {
         let outcome = apply_to_value(Path::new("(mem)"), &mut doc, &op).unwrap();
         assert!(!outcome.redacted_summary.contains("sk-secret-token-value"));
     }
-
-    // merge / ensure / enable-disable / remove
 
     #[test]
     fn merge_retains_foreign_keys_and_requires_owned_merge_keys() {
@@ -1698,8 +1658,6 @@ mod tests {
         assert!(!outcome.changed);
     }
 
-    // Index / Identity root-array selectors
-
     #[test]
     fn index_and_identity_selectors_edit_root_arrays() {
         let mut doc = json!([{"name": "a"}, {"name": "b"}]);
@@ -1732,8 +1690,6 @@ mod tests {
         let err = apply_to_value(Path::new("(mem)"), &mut doc, &op).unwrap_err();
         assert!(matches!(err, ConfigError::UnsupportedOperation { .. }));
     }
-
-    // Property: executor equals hand-applied for simple cases
 
     struct Prng(u64);
     impl Prng {
@@ -1801,7 +1757,6 @@ mod tests {
             let Value::Object(map) = current else { return };
             match map.get_mut(segment) {
                 Some(Value::Object(_)) => {
-                    // reborrow for next iteration
                     current = map.get_mut(segment).unwrap();
                 }
                 _ => return,
@@ -1817,7 +1772,6 @@ mod tests {
         let mut rng = Prng(0x5eed_1234);
         for iteration in 0..200 {
             let doc = random_doc(&mut rng, iteration);
-            // Random path of one or two segments within t0/t2 roots.
             let top = if rng.next_u64().is_multiple_of(2) {
                 "t0"
             } else {
@@ -1880,8 +1834,6 @@ mod tests {
         }
     }
 
-    // File-level application through the codecs
-
     #[test]
     fn file_apply_strict_json_set_and_noop_byte_identity() {
         let path = scratch("apply-json", ".json");
@@ -1895,11 +1847,9 @@ mod tests {
         let after = crate::json::load_value(&path).unwrap();
         assert_eq!(after["model"], json!("sonnet"));
         assert_eq!(after["foreign"], json!(1));
-        // Minified source: the changing write had to normalize layout.
         assert_eq!(outcome.warnings.len(), 1);
         assert!(outcome.warnings[0].contains("surrounding formatting"));
 
-        // No-op: byte identity preserved.
         let before = std::fs::read(&path).unwrap();
         let noop = set_op("key:model", json!("sonnet")).with_owned_keys(vec!["model".into()]);
         let outcome2 = apply(&path, DocumentKind::StrictJson, &noop).unwrap();
@@ -1958,7 +1908,6 @@ mod tests {
         assert!(after.contains("model = \"sonnet\""));
         assert!(after.contains("keep = true"));
 
-        // Table selector under an existing table.
         let nested = set_op("table:other.keep", json!(false))
             .with_owned_keys(vec!["other".into()])
             .with_expected_old(Some(json!(true)));
@@ -2008,8 +1957,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    // File-level text fragments (DOC-08 through the executor)
-
     #[test]
     fn file_apply_text_fragment_span_lifecycle() {
         let path = scratch("apply-frag", ".txt");
@@ -2030,7 +1977,6 @@ mod tests {
             "# superai:begin:managed\nfirst body\n# superai:end:managed\n"
         );
 
-        // Replace through Set, with a foreign prelude added by the user.
         std::fs::write(&path, format!("user prelude\n{disk}")).unwrap();
         let replace = Operation::new(EditOperation::Set {
             selector: Selector::ManagedSpan("managed".into()),
@@ -2045,7 +1991,6 @@ mod tests {
             "user prelude\n# superai:begin:managed\nsecond body\n# superai:end:managed\n"
         );
 
-        // expected_old mismatch on a span body is a typed conflict.
         let stale = Operation::new(EditOperation::Set {
             selector: Selector::ManagedSpan("managed".into()),
             value: Value::String("third".into()),
@@ -2056,7 +2001,6 @@ mod tests {
         assert!(matches!(err, ConfigError::OperationConflict { .. }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
 
-        // Remove restores the unmanaged bytes exactly.
         let remove = Operation::new(EditOperation::Remove {
             selector: Selector::ManagedSpan("managed".into()),
         })

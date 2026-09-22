@@ -1,10 +1,5 @@
-//! Validated identifiers and names.
-//!
-//! Each identifier is a newtype around `String` with strict validation.
-//! Validation rejects empty, `"."` / `".."`, path separators, NUL/control,
-//! Windows reserved device names, and trailing dots/spaces. Comparison
-//! collisions should use case folding ([`ToString::to_lowercase`]) while
-//! preserving the original display form.
+//! Validated identifiers and names: path-safe, control-free, no Windows
+//! reserved device names; comparisons case-fold, display case preserved.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -21,9 +16,6 @@ const RESERVED: &[&str] = &[
 ];
 
 /// Validate an identifier string for the given `kind`.
-///
-/// Rejects empty, `"."` / `".."`, separators (`/`, `\`, `:`), NUL/control
-/// characters, reserved Windows device names, and trailing dots/spaces.
 fn validate(kind: &str, value: &str) -> Result<(), CoreError> {
     if value.is_empty() {
         return Err(CoreError::InvalidIdentifier {
@@ -93,9 +85,6 @@ macro_rules! define_id {
             }
 
             /// Lowercase normalized form for case-folded collision checks.
-            ///
-            /// The original case is preserved in [`Self::as_str`]; this helper
-            /// provides the canonical form for duplicate detection.
             pub fn normalized(&self) -> String {
                 self.0.to_lowercase()
             }

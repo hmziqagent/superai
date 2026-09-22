@@ -1,8 +1,5 @@
-//! Harness adapter trait and supporting types.
-//!
-//! The adapter is the narrow seam between superai's domain and a single
-//! harness's on-disk layout. Every method is synchronous and object-safe so
-//! adapters can be stored as `Box<dyn Adapter>`.
+//! Harness adapter trait and supporting types: the narrow seam between
+//! superai's domain and one harness's on-disk layout (sync, object-safe).
 
 use std::fmt;
 use std::path::Path;
@@ -409,12 +406,8 @@ impl ConfigSurface {
     }
 }
 
-/// Required shape of a surface's document root (HAD-03 "root shape").
-///
-/// The four corpus shapes (JSON/JSONC object, TOML table, YAML mapping, env
-/// entries) all parse to an object-shaped semantic value tree; the distinct
-/// variants keep the declaration vocabulary honest per format so diagnostics
-/// name the shape the adapter's research documented.
+/// Required shape of a surface's document root (HAD-03): the distinct
+/// variants keep the declaration vocabulary honest per format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RootShape {
@@ -452,10 +445,7 @@ impl fmt::Display for RootShape {
 }
 
 /// Typed constraint on an owned key inside a surface's document (HAD-03).
-///
-/// The rule applies only when the key is present: owned keys are keys superai
-/// may write, so absence is legal (minimal configs omit them). A present key
-/// holding a different type is a schema violation.
+/// Applies only when the key is present; absence is legal (minimal configs).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OwnedKeyRule {
     /// Dotted key path, object segments only.
@@ -494,13 +484,8 @@ impl DeprecatedKeyDecl {
     }
 }
 
-/// Per-surface root-shape + owned-key schema (HAD-03 "root shape and
-/// semantic validator").
-///
-/// Declared by adapters via [`Adapter::surface_schema`] and consumed at
-/// validate time and by the adapter-aware raw-editor commit, so
-/// schema-invalid content is rejected before any write with diagnostics
-/// attributed to the harness and surface.
+/// Per-surface root-shape + owned-key schema (HAD-03), consumed at validate
+/// time and by adapter-aware commits; schema-invalid content never reaches disk.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SurfaceSchema {
     /// Required shape of the document root.
@@ -539,11 +524,8 @@ impl SurfaceSchema {
         self
     }
 
-    /// Build the engine-side [`SemanticSchema`] this declaration describes.
-    ///
-    /// The validator closure checks the root shape and every owned-key rule
-    /// against the parsed semantic value; deprecated keys are mapped onto the
-    /// engine's deprecation diagnostics (DOC-09).
+    /// Build the engine-side [`SemanticSchema`]: the validator checks the root
+    /// shape and owned-key rules; deprecated keys map to DOC-09 diagnostics.
     pub fn semantic_schema(&self) -> SemanticSchema {
         let root_shape = self.root_shape;
         let rules = self.owned_key_rules.clone();
@@ -618,14 +600,8 @@ fn validate_value_against(
     diagnostics
 }
 
-/// Validate `content` for a surface the adapter declares, applying the
-/// adapter's root-shape/owned-key schema at validate time (HAD-03).
-///
-/// Runs syntax + semantic + deprecation validation (DOC-09
-/// [`superai_config::raw_editor::validate_with_schema`]) and attributes every
-/// diagnostic to the harness and surface (`[<harness>/<surface>] <message>`)
-/// so failures are adapter-attributed. Surfaces without a declared schema get
-/// syntax diagnostics only. Pure: never touches disk.
+/// Validate `content` for a declared surface (HAD-03): syntax + semantic +
+/// deprecation, diagnostics attributed to `<harness>/<surface>`. Pure, no disk.
 pub fn validate_surface_content(
     adapter: &dyn Adapter,
     surface_id: &str,
@@ -652,14 +628,8 @@ pub fn validate_surface_content(
         .collect()
 }
 
-/// Validate existing on-disk surface content under `root` against the
-/// adapter's declared surface schemas (HAD-03 instance validation).
-///
-/// For every surface that declares a schema, `root/<surface-id>` is read
-/// fresh from disk when present; missing files are skipped (an unconfigured
-/// instance has nothing to validate). Error-severity diagnostics fail with
-/// [`CoreError::SchemaValidation`] carrying the adapter-attributed messages;
-/// deprecations and warnings do not block. Never writes.
+/// Validate on-disk surface content under `root` against declared schemas
+/// (HAD-03); missing files skip, error diagnostics fail, deprecations do not.
 pub fn validate_instance_surfaces(adapter: &dyn Adapter, root: &Path) -> Result<(), CoreError> {
     for surface in adapter.config_surfaces() {
         if adapter.surface_schema(&surface.id).is_none() {
@@ -728,9 +698,8 @@ impl VersionResolution {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StdioPolicy {
-    /// The process inherits the terminal (interactive/ACP frontends). The
-    /// wrapper uses `exec` replacement semantics so signals reach the
-    /// harness directly.
+    /// The process inherits the terminal (interactive/ACP frontends); the
+    /// wrapper uses `exec` so signals reach the harness directly.
     #[default]
     Terminal,
     /// The process runs detached from stdio (background daemon); output is
@@ -749,8 +718,7 @@ impl fmt::Display for StdioPolicy {
 }
 
 /// An auth prerequisite the harness needs before the wrapper can run
-/// (WRP-01). Always a reference, the env var NAME the harness reads or a
-/// login step the user performs in the harness itself, never a secret.
+/// (WRP-01): always a reference (env var NAME or login step), never a secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthPrerequisite {
     /// What must exist: an env var name or an in-harness login step.
@@ -788,14 +756,8 @@ impl AuthPrerequisite {
     }
 }
 
-/// Plan for invoking an isolated instance via a wrapper.
-///
-/// WRP-01: the full invocation specification (executable reference, argv
-/// policy, environment set/unset operations, working-directory policy,
-/// config/state paths, stdio/daemon behavior, auth prerequisites, and the
-/// isolation guarantees plus shared-state warnings the harness honestly
-/// has. Values are references (env var names, paths); secrets are never
-/// embedded here, in the registry, or in previews.
+/// Plan for invoking an isolated instance via a wrapper (WRP-01): the full
+/// invocation spec. Values are references; secrets are never embedded here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapperPlan {
     /// Environment variables to set before exec.
@@ -805,8 +767,7 @@ pub struct WrapperPlan {
     /// Human-readable description of the isolation mechanism.
     pub description: String,
     /// Environment variables to UNSET before exec (WRP-01/02): a global
-    /// credential must not leak into an isolated profile through an
-    /// inherited variable.
+    /// credential must not leak into an isolated profile.
     #[serde(default)]
     pub env_unset: Vec<String>,
     /// Executable reference: bare name resolved via `PATH`, or an absolute
@@ -830,9 +791,8 @@ pub struct WrapperPlan {
     /// What this isolation class guarantees (split surfaces).
     #[serde(default)]
     pub isolation_guarantees: Vec<String>,
-    /// State that stays SHARED across profiles despite the split (e.g. an
-    /// OS keychain, a subscription, cloud state), the honest constrained
-    /// channel.
+    /// State that stays SHARED across profiles despite the split (keychain,
+    /// subscription, cloud state): the honest constrained channel.
     #[serde(default)]
     pub shared_state_warnings: Vec<String>,
 }
@@ -908,12 +868,8 @@ impl fmt::Display for McpTransport {
     }
 }
 
-/// Shape of the MCP server container under `dest_key` (EXT-09).
-///
-/// The corpus documents two container families: name-keyed maps
-/// (`mcpServers`, codex `[mcp_servers.<name>]`, goose `extensions:`) and
-/// identity-field arrays (`[[mcp_servers]]` TOML tables keyed by `name`,
-/// continue's YAML `mcpServers:` list keyed by `name`).
+/// Shape of the MCP server container under `dest_key` (EXT-09): the corpus
+/// documents name-keyed maps and identity-field arrays keyed by `name`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpDestShape {
@@ -955,12 +911,7 @@ pub struct McpAdapterDecl {
     #[serde(default, skip_serializing_if = "mcp_shape_is_default")]
     pub shape: McpDestShape,
     /// Honest inspect/diff-only marker (EXT-09): `Some(reason)` marks a
-    /// destination the MCP lifecycle must not write. Reasons are
-    /// corpus-grounded: JSONC/YAML surfaces whose only codecs refuse
-    /// changing writes (`ConfigError::LossyWrite`), harness-managed stores
-    /// superai must not edit, read-only-supported harnesses, or native
-    /// schemas the canonical renderer cannot emit. Reads, inspection, and
-    /// diff previews keep working.
+    /// destination the MCP lifecycle must not write; reads still work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
 }
@@ -1049,8 +1000,7 @@ pub struct PluginAdapterDecl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest_dir: Option<String>,
     /// File name the harness requires inside an installed bundle for
-    /// discovery (EXT-07 step 6 harness-discovery verification), e.g.
-    /// antigravity's `plugin.json`.
+    /// discovery verification (EXT-07), e.g. antigravity's `plugin.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_manifest: Option<String>,
     /// Plugin kind this declaration handles.
@@ -1080,20 +1030,15 @@ pub enum SkillDisableMechanism {
         selector: String,
     },
     /// Dotted selector of a BOOLEAN switch that disables the documented
-    /// skill source (all-or-nothing, e.g. amp's
-    /// `amp.skills.disableClaudeCodeSkills`).
+    /// skill source (e.g. amp's `amp.skills.disableClaudeCodeSkills`).
     Switch {
         /// Dotted selector of the boolean.
         selector: String,
     },
 }
 
-/// Harness-config skill enable/disable mechanism declaration (EXT-04).
-///
-/// Declared by adapters whose corpus documents config keys controlling skill
-/// loading. `set_skill_enabled_via_config` writes these keys through the
-/// engine executor with ownership + expected-old conflict detection; where
-/// nothing is declared the operation refuses honestly.
+/// Harness-config skill enable/disable declaration (EXT-04): written through
+/// the engine executor. Undeclared = honest refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillConfigDecl {
     /// Config surface holding the mechanism keys (resolved inside the
@@ -1173,11 +1118,8 @@ impl PluginAdapterDecl {
         }
     }
 
-    /// Create a directory-bundle declaration (EXT-06/07): bundle files are
-    /// staged into `dest_dir` (relative to the instance config root) without
-    /// executing anything; `discovery_manifest` names the file the harness
-    /// requires inside the bundle for discovery verification when the corpus
-    /// documents one.
+    /// Create a directory-bundle declaration (EXT-06/07): files staged into
+    /// `dest_dir` without executing; `discovery_manifest` names the discovery file.
     pub fn directory_bundle(
         dest_dir: &str,
         discovery_manifest: Option<&str>,
@@ -1225,15 +1167,8 @@ impl PluginAdapterDecl {
     }
 }
 
-/// Harness-native capability declaration (CAP-03 source 1): what the
-/// harness's own transport can carry, independent of any provider.
-///
-/// The declaration is the TRANSPORT CONSTRAINT in capability resolution: an
-/// `absent` transport claim cannot be overridden by provider or template
-/// data ("provider capability cannot override incompatible harness
-/// transport"). A `native` transport claim is compatible with a provider
-/// that can satisfy the capability; `version_req` narrows the claim to
-/// installed harness versions that match.
+/// Harness-native capability declaration (CAP-03 source 1): the TRANSPORT
+/// CONSTRAINT in resolution; an `absent` claim nothing else can lift.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterCapabilityDecl {
     /// Capability this declaration concerns.
@@ -1241,8 +1176,7 @@ pub struct AdapterCapabilityDecl {
     /// What the harness transport supports for it.
     pub support: crate::capability::Support,
     /// Optional semver requirement on the installed harness version for the
-    /// claim to hold (CAP-04: native claim must be compatible with the
-    /// harness version).
+    /// claim to hold (CAP-04).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_req: Option<String>,
     /// Concise explanation (evidence shown in resolution results).
@@ -1272,11 +1206,8 @@ impl AdapterCapabilityDecl {
     }
 }
 
-/// Harness adapter: read-only probes plus plans for mutation.
-///
-/// Every implementor is object-safe, `Send + Sync`, and has no async methods.
-/// Plans describe what would be written; the caller commits via the safe
-/// mutation layer.
+/// Harness adapter: read-only probes plus plans for mutation; object-safe,
+/// `Send + Sync`, no async. Plans describe; the caller commits.
 pub trait Adapter: Send + Sync + fmt::Debug {
     /// Stable harness identifier.
     fn id(&self) -> HarnessId;
@@ -1314,27 +1245,14 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// File patterns to exclude when mirroring an instance root.
     fn plan_mirror_exclusions(&self) -> Vec<String>;
 
-    /// Relative paths inside a config root that are safe to LINK instead of
-    /// copy when mirroring (INS-03 `Linked` / INS-04 step 4 shared assets).
-    ///
-    /// A declared path must be shared, re-derivable state the harness reads
-    /// through the relocated root, e.g. a skills directory the harness
-    /// resolves through `$CONFIG_DIR/skills` and that superai already
-    /// manages by symlinking (EXT-03 `LinkAll`). The mirror plan classifies
-    /// matching entries [`crate::lifecycle::MirrorKind::Linked`] and the
-    /// create transaction installs a symlink instead of copying bytes.
-    /// Default: none (everything copyable is copied).
+    /// Relative paths safe to LINK instead of copy when mirroring (INS-03):
+    /// shared, re-derivable state only. Default: none (everything is copied).
     fn mirror_link_paths(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Relative file names whose CONTENT embeds the config-root path and
-    /// therefore must be rewritten (source root → target root) when
-    /// mirrored (INS-03 `Transformed`).
-    ///
-    /// Only files whose format genuinely carries absolute config paths
-    /// belong here (e.g. gptme's `config.toml` plugin search paths like
-    /// `~/.config/gptme/plugins`). Default: none.
+    /// Relative file names whose CONTENT embeds the config-root path and so
+    /// must be rewritten when mirrored (INS-03 `Transformed`). Default: none.
     fn mirror_content_rewrite_files(&self) -> Vec<String> {
         Vec::new()
     }
@@ -1348,25 +1266,15 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Validate that an instance record is coherent for this harness.
     fn validate_instance(&self, instance: &Instance) -> Result<(), CoreError>;
 
-    /// Root-shape/owned-key schema declared for a config surface (HAD-03).
-    ///
-    /// Adapters that have modeled a surface's semantics return its schema
-    /// keyed by the surface id; the raw editor consults it at validate time
-    /// and before adapter-aware commits. `None` (the default) means the
-    /// surface has no adapter-declared schema yet; syntax validation still
-    /// applies, semantic validation does not.
+    /// Root-shape/owned-key schema declared for a config surface (HAD-03);
+    /// `None` = no adapter-declared schema, syntax validation still applies.
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
         let _ = surface_id;
         None
     }
 
-    /// Refuse writes when `content` for `surface_id` belongs to a config era
-    /// that conflicts with the adapter's resolved schema era (HAD-05 step 5:
-    /// refuse writes on conflicting era).
-    ///
-    /// Returns a human reason naming the conflict when the write must be
-    /// refused; `None` (the default) means the adapter documents no era
-    /// boundary for the surface.
+    /// Refuse writes when `content` belongs to a conflicting config era
+    /// (HAD-05); `None` = no documented era boundary for the surface.
     fn era_conflict_reason(&self, surface_id: &str, content: &[u8]) -> Option<String> {
         let _ = (surface_id, content);
         None
@@ -1377,13 +1285,8 @@ pub trait Adapter: Send + Sync + fmt::Debug {
         Vec::new()
     }
 
-    /// Harness-native capability declarations (plan 09 CAP-03 source 1).
-    ///
-    /// Adapters that have modeled their harness's capability transport
-    /// return one declaration per catalog capability; resolution feeds these
-    /// as the transport constraint. `None`/empty (the default) means the
-    /// adapter has not declared capability transport; resolution treats the
-    /// pair as Unknown rather than guessing.
+    /// Harness-native capability declarations (CAP-03 source 1); empty means
+    /// undeclared, and resolution treats the pair as Unknown, never guessing.
     fn capability_declarations(&self) -> Vec<AdapterCapabilityDecl> {
         Vec::new()
     }
@@ -1393,11 +1296,8 @@ pub trait Adapter: Send + Sync + fmt::Debug {
         None
     }
 
-    /// Explicit MCP absence (EXT-09 coverage honesty): the harness's corpus
-    /// documents that it has NO MCP mechanism (e.g. pi: "intentionally does
-    /// not include built-in MCP"). `Some(reason)` distinguishes
-    /// verified-absent from not-yet-modeled and takes precedence over
-    /// [`Adapter::mcp_decl`].
+    /// Explicit MCP absence (EXT-09): the corpus documents NO MCP mechanism;
+    /// `Some(reason)` beats [`Adapter::mcp_decl`] and is verified-absent.
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         None
     }
@@ -1407,31 +1307,21 @@ pub trait Adapter: Send + Sync + fmt::Debug {
         None
     }
 
-    /// Explicit plugin-mechanism absence (EXT-06 coverage honesty): the
-    /// harness's corpus documents no plugin mechanism (or one whose contract
-    /// is unverified). `Some(reason)` distinguishes verified-absent from
-    /// not-yet-modeled and takes precedence over [`Adapter::plugin_decl`].
+    /// Explicit plugin-mechanism absence (EXT-06): `Some(reason)` distinguishes
+    /// verified-absent from not-yet-modeled and beats [`Adapter::plugin_decl`].
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         None
     }
 
-    /// Harness-config skill enable/disable mechanism declaration (EXT-04).
-    ///
-    /// Adapters whose corpus documents config keys that enable/disable
-    /// skills (allow/deny lists, disable switches, skill search paths)
-    /// declare them here; `set_skill_enabled_via_config` writes them through
-    /// the engine executor. `None` (the default) is an honest refusal: the
-    /// harness documents no such mechanism and superai must not invent one.
+    /// Skill enable/disable config declaration (EXT-04); `None` is an honest
+    /// refusal: superai must not invent an undocumented mechanism.
     fn skill_config_decl(&self) -> Option<SkillConfigDecl> {
         None
     }
 }
 
-/// Generic adapter constructed from catalog ledger data.
-///
-/// This is the runtime representation of a provisional ledger row. Real
-/// harness-specific adapters will replace the placeholder behaviours for
-/// detection, surfaces, and wrapper planning.
+/// Generic adapter constructed from catalog ledger data: the runtime shape
+/// of a provisional row; real adapters replace the placeholder behaviours.
 #[derive(Debug, Clone)]
 pub struct GenericAdapter {
     id: HarnessId,
@@ -1589,9 +1479,8 @@ impl Adapter for GenericAdapter {
             });
         }
         let mut plan = WrapperPlan::new(&format!("generic wrapper for {}", self.display_name));
-        // Provide a relocated-root style hint; real adapters use the correct
-        // env var. Dashes would leave the generated launcher dialect with a
-        // non-identifier key, so they fold to underscores.
+        // Relocated-root style hint; dashes fold to underscores so the launcher
+        // dialect keeps an identifier key.
         plan.env_vars.push((
             format!(
                 "{}_CONFIG_DIR",
@@ -1828,7 +1717,6 @@ mod tests {
         let plan = adapter.plan_wrapper(&inst).unwrap();
         assert!(!plan.description.is_empty());
         assert!(!plan.env_vars.is_empty());
-        // env var should contain the config root string
         let found = plan
             .env_vars
             .iter()

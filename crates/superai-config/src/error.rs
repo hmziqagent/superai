@@ -84,10 +84,8 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// A changing write was refused because the codec cannot preserve the
-    /// file's lexical content (comments, anchors, tags, scalar style,
-    /// trailing commas). The format stays read-only for such writes
-    /// (plans/01 DOC-05/DOC-06).
+    /// A changing write was refused: the codec cannot preserve the file's
+    /// lexical content, so the format stays read-only (DOC-05/DOC-06).
     #[error(
         "lossy write unsupported for {path}: {format} is read-only until a lexically preserving codec exists"
     )]
@@ -98,8 +96,7 @@ pub enum ConfigError {
         format: &'static str,
     },
 
-    /// The operation's selector addresses a key outside the operation's
-    /// declared `owned_keys` (DOC-02). Nothing was written.
+    /// Selector outside the operation's `owned_keys` (DOC-02); nothing written.
     #[error("selector {selector} is not within the owned keys declared for {path}")]
     NotOwned {
         /// Path of the document being edited.
@@ -108,8 +105,7 @@ pub enum ConfigError {
         selector: String,
     },
 
-    /// The value at the selector does not match the operation's `expected_old`
-    /// expectation (DOC-02). Typed conflict: nothing was written.
+    /// `expected_old` mismatch (DOC-02); typed conflict, nothing written.
     #[error("operation conflict at {selector} in {path}: expected {expected}, found {actual}")]
     OperationConflict {
         /// Path of the document being edited.
@@ -122,9 +118,7 @@ pub enum ConfigError {
         actual: String,
     },
 
-    /// The parent of the selector's path is missing and the operation did
-    /// not allow creating it (DOC-02 `create_parent` policy). Nothing was
-    /// written.
+    /// Selector parent missing and `create_parent` disabled; nothing written.
     #[error("missing parent for {selector} in {path} and create_parent is disabled")]
     ParentMissing {
         /// Path of the document being edited.
@@ -133,8 +127,7 @@ pub enum ConfigError {
         selector: String,
     },
 
-    /// The declared duplicate-handling mode rejects this edit (DOC-02
-    /// `duplicate_handling`). Nothing was written.
+    /// Duplicate-handling mode rejects this edit; nothing written.
     #[error("duplicate rejected at {selector} in {path}: {reason}")]
     DuplicateRejected {
         /// Path of the document being edited.
@@ -145,8 +138,7 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// The operation cannot be applied to this document kind or shape
-    /// (DOC-02). Typed refusal so callers fail closed instead of guessing.
+    /// Operation cannot apply to this kind/shape; callers fail closed.
     #[error("unsupported operation at {selector} on {path}: {reason}")]
     UnsupportedOperation {
         /// Path of the document being edited.
@@ -157,9 +149,8 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// Managed-span sentinels are missing, duplicated, unbalanced, or
-    /// nested (DOC-08). The fragment stays unwritten: fail closed rather
-    /// than guess which span is owned.
+    /// Managed-span sentinels missing/duplicated/unbalanced/nested (DOC-08);
+    /// the fragment stays unwritten: fail closed.
     #[error("invalid managed spans in {path}: {reason}")]
     InvalidSpans {
         /// Path of the fragment.
@@ -168,8 +159,7 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// A text-fragment write was refused because bytes outside managed
-    /// spans would change (DOC-08): whole-file rewrites stay read-only.
+    /// Fragment write refused: bytes outside managed spans would change (DOC-08).
     #[error("unmanaged text fragment write refused for {path}: {reason}")]
     UnmanagedSpanWrite {
         /// Path of the fragment.
@@ -178,9 +168,8 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// Two planned paths resolve to the same inode on one device (MUT-02):
-    /// a hard link alias. Committing both would mutate the same bytes twice
-    /// and break link sharing, so the plan is rejected.
+    /// Two planned paths share one inode (MUT-02): committing both would
+    /// mutate the same bytes twice, so the plan is rejected.
     #[error("hard link conflict at {path}: also targets {alias} ({reason})")]
     HardlinkConflict {
         /// Path that collided.
@@ -191,8 +180,7 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// An existing symlink does not point at the owned/expected target
-    /// (MUT-02/MUT-06). Nothing was replaced.
+    /// Existing symlink does not point at the owned target (MUT-02/06).
     #[error("symlink target mismatch at {path}: expected {expected}, found {actual}")]
     SymlinkTargetMismatch {
         /// Link path that was refused replacement.
@@ -203,9 +191,8 @@ pub enum ConfigError {
         actual: String,
     },
 
-    /// A recursive copy cannot proceed with the requested policy for this
-    /// entry (MUT-06): special file, broken/looping link under a
-    /// content-following policy, or platform limitation.
+    /// Recursive copy cannot proceed (MUT-06): special file, broken/looping
+    /// link under content-follow, or platform limitation.
     #[error("copy unsupported at {path}: {reason}")]
     UnsupportedCopy {
         /// Path the copy was refused for.
@@ -214,11 +201,8 @@ pub enum ConfigError {
         reason: String,
     },
 
-    /// A mutation target is (or resolves through) a symlink whose referent
-    /// lies OUTSIDE the adapter-allowed root set (MUT-02: follow an existing
-    /// symlink only after resolving the target within adapter-allowed
-    /// roots). Nothing was mutated; following it would silently mutate a
-    /// file the caller never declared authority over.
+    /// Symlink resolves outside the adapter-allowed roots (MUT-02); nothing
+    /// was mutated, following it would exceed declared authority.
     #[error(
         "symlink follow refused at {path}: resolves to {resolved}, outside allowed roots {roots}"
     )]

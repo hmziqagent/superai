@@ -1,27 +1,5 @@
-//! Multi-instance aliases: named, isolated launch configurations of a
-//! harness with a fresh relocated config root, seeded at creation with an
-//! MCP server set (through [`crate::mcp`], never raw writes), optionally a
-//! file-staged plugin set ([`crate::plugin`]) and a third-party provider
-//! override (names/URL/models only; tokens ride the launch env, never
-//! persisted). Launch composition always derives from the adapter's own
-//! [`crate::adapter::Adapter::plan_wrapper`], never the generic
-//! `env_var_for_harness` fallback.
-//!
-//! Layout under the caller-chosen base directory:
-//!
-//! ```text
-//! <base>/aliases.json                                  alias manifest
-//! <base>/<harness>/<alias-name>/                       alias config root
-//! <base>/<harness>/<alias-name>/.superai-alias         ownership marker
-//! <base>/<harness>/<alias-name>/.superai/plugins/      per-alias plugin registry
-//! <base>/<harness>/<alias-name>/.superai/provider.json per-alias provider reference
-//! <base>/.superai/quarantine/<operation_id>/           quarantined alias roots
-//! ```
-//!
-//! The on-disk manifest is the only registry: it is read fresh on every
-//! operation and written through the config crate's mutation boundary.
-//! Alias records carry no model/mcp/plugin data; the effective sets live in
-//! the harness's own files under the root, read fresh.
+//! Multi-instance aliases: isolated launch configs under a caller-chosen base;
+//! the on-disk manifest is the only registry, read fresh every operation.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -62,23 +40,18 @@ const MANIFEST_ALIASES_KEY: &str = "aliases";
 pub const ALIAS_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Per-alias provider reference file (run-5): names, URL, and model pinning
-/// ONLY, never a secret value, never in the alias manifest. The token rides
-/// the launch environment, supplied by the caller at composition time.
+/// only, never a secret; the token rides the launch env.
 pub const ALIAS_PROVIDER_REF_FILE: &str = ".superai/provider.json";
 
 /// Current provider-reference schema version.
 pub const ALIAS_PROVIDER_REF_SCHEMA_VERSION: u32 = 1;
 
 /// Harnesses whose real binaries demonstrably relocate their config under a
-/// virtualized `HOME` (run-4/run-5 live evidence; Electron appData for
-/// claude-desktop, the `CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"` launcher
-/// for chatgpt-desktop). Every other harness keeps the strict
-/// relocation-env guard.
+/// virtualized `HOME` (live evidence); every other harness keeps the guard.
 pub const HOME_VIRT_HARNESSES: &[&str] = &["claude-desktop", "chatgpt-desktop"];
 
 /// HOME-virt MCP destination overrides: the seeded file must land where the
-/// HOME-relocated binary actually reads it (keyed by harness id; the dest is
-/// relative to the alias root).
+/// HOME-relocated binary actually reads it (relative to the alias root).
 const HOME_VIRT_MCP_DESTS: &[(&str, &str)] = &[(
     "claude-desktop",
     // XDG_CONFIG_HOME=<root>/.config + Electron appData appname "Claude".
@@ -94,8 +67,7 @@ const CLAUDE_CODE_MODEL_VAR: &str = "ANTHROPIC_MODEL";
 const CLAUDE_CODE_HAIKU_VAR: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
 
 /// Deterministic instance id for an alias: stable across recreation of the
-/// same (harness, name, root) triple, so the manifest record and any
-/// regenerated wrapper stay consistent.
+/// same (harness, name, root) triple.
 fn derive_alias_instance_id(
     harness: &HarnessId,
     name: &InstanceName,
@@ -120,20 +92,14 @@ fn transaction_operation_id(prefix: &str) -> Result<superai_config::transaction:
     })
 }
 
-// ProviderProfile: third-party provider overrides on aliases
-
 /// How a harness carries a third-party provider override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderCarriage {
     /// The binary reads gateway endpoint/model/auth from its environment
-    /// (claude-code: `ANTHROPIC_*`); nothing is written into the harness
-    /// config.
+    /// (claude-code: `ANTHROPIC_*`); nothing is written to the config.
     EnvCarried,
     /// The binary reads a provider table from its config file (codex family:
-    /// `[model_providers.<id>]` in `$CODEX_HOME/config.toml`). Only the
-    /// `env_key` NAME is written; the token rides the launch env and the
-    /// harness validates it lazily (openai/codex model-provider-info,
-    /// 2026-09-19).
+    /// `$CODEX_HOME/config.toml`). Only the `env_key` NAME is written; the token rides the launch env.
     ConfigCarried,
 }
 
@@ -165,29 +131,22 @@ fn valid_env_var_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A third-party inference provider attached to an alias at creation.
-///
-/// The manifest and every state file carry NAMES, URLs, and model ids only;
-/// the token VALUE is never persisted. Callers supply it per launch
-/// (`provider_secrets` of [`alias_env`]/[`launch_composition`]), which is
-/// also the harness's own semantics: `ANTHROPIC_AUTH_TOKEN` /
-/// `ANTHROPIC_API_KEY` are per-launch env vars.
+/// A third-party inference provider attached to an alias at creation. The
+/// manifest and state files carry names/URLs/model ids only, never a token value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfile {
     /// Provider id; becomes the `model_providers.<id>` table key for the
     /// config-carried family.
     pub provider_id: ProviderId,
     /// Gateway base URL. The harness appends its protocol path (claude-code
-    /// and the desktop 3P gateway append `/v1/messages`; codex appends its
-    /// responses path to the `base_url`).
+    /// and the desktop 3P gateway append `/v1/messages`).
     pub base_url: String,
     /// Wire protocol the gateway serves.
     pub protocol: Protocol,
     /// Auth style the gateway expects.
     pub auth_style: AuthStyle,
     /// Env var NAME the token rides at launch (codex: the `env_key` written
-    /// into the provider table; claude-code: `ANTHROPIC_AUTH_TOKEN` for
-    /// bearer or `ANTHROPIC_API_KEY` for x-api-key).
+    /// into the provider table; claude-code: `ANTHROPIC_AUTH_TOKEN`).
     pub auth_env_var: String,
     /// Model pinning (`ANTHROPIC_MODEL` / codex `model`).
     pub model: Option<String>,
@@ -322,9 +281,8 @@ impl ProviderProfile {
         Ok(())
     }
 
-    /// The `ProviderDefinition` the provider surface machinery renders from
-    /// this profile (auth as a NAME only; the definition never sees a
-    /// secret).
+    /// The `ProviderDefinition` rendered from this profile (auth as a NAME
+    /// only; the definition never sees a secret).
     fn to_definition(&self) -> ProviderDefinition {
         let mut def = ProviderDefinition::new(self.provider_id.clone(), self.base_url.clone());
         def.display_name = self.provider_id.to_string();
@@ -337,8 +295,7 @@ impl ProviderProfile {
 }
 
 /// The persisted provider reference under the alias root: names, URL, and
-/// model pinning only, NEVER a secret value (the token rides the launch
-/// env, supplied per launch by the caller).
+/// model pinning only, never a secret value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ProviderRef {
     schema_version: u32,
@@ -357,9 +314,8 @@ fn provider_ref_path(root: &AbsolutePath) -> Result<AbsolutePath> {
     root.join(ALIAS_PROVIDER_REF_FILE)
 }
 
-/// Load the per-alias provider reference, fresh from disk. `Ok(None)` when
-/// the alias carries no provider. Malformed state is a typed schema error,
-/// never silently ignored.
+/// Load the per-alias provider reference, fresh from disk (`Ok(None)` when
+/// absent); malformed state is a typed schema error, never silently ignored.
 fn load_provider_ref(root: &AbsolutePath) -> Result<Option<ProviderRef>> {
     let path = provider_ref_path(root)?;
     match std::fs::read(path.as_path()) {
@@ -417,8 +373,6 @@ fn store_provider_ref(root: &AbsolutePath, profile: &ProviderProfile) -> Result<
     Ok(())
 }
 
-// AliasSpec
-
 /// Request to create an alias: harness, name, and the optional sets seeded
 /// into the fresh alias root at creation time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,26 +382,19 @@ pub struct AliasSpec {
     /// User-chosen alias label (also the root's last path segment).
     pub name: InstanceName,
     /// MCP servers seeded into the adapter-declared destination. The set
-    /// lives in the harness's own config file under the alias root, never in
-    /// the manifest record.
+    /// lives in the harness's own config file under the root, not the manifest.
     pub mcp_servers: Vec<McpServerDef>,
     /// Plugins staged through the adapter-declared plugin mechanism, where it
     /// is a file-staged `directory_bundle` (no external execution).
     pub plugins: Vec<PluginSource>,
-    /// Binary the alias launches when the adapter's plan does not name its
-    /// own executable (e.g. a pinned arena install). Resolution precedence
-    /// matches the wrapper generator: plan executable → this pin → the harness
-    /// default on `PATH`.
+    /// Binary the alias launches when the adapter's plan names no executable.
+    /// Resolution precedence: plan executable, then this pin, then PATH default.
     pub binary: Option<ExecutableRef>,
-    /// Third-party provider override (run-5). Env-carried for claude-code
-    /// (composed at launch); config-carried for the codex family (seeded into
-    /// the alias `CODEX_HOME` config at create). Never carries a secret value.
+    /// Third-party provider override (run-5): env-carried for claude-code,
+    /// config-carried for the codex family. Never carries a secret value.
     pub provider: Option<ProviderProfile>,
-    /// HOME-virtualized instance mode: the launch composition exports
-    /// `HOME=<alias-root>` and `XDG_CONFIG_HOME=<alias-root>/.config`.
-    /// Restricted to [`HOME_VIRT_HARNESSES`], for whom HOME IS the
-    /// relocation var (the alias guard is satisfied by construction);
-    /// every other harness keeps the strict relocation-env guard.
+    /// HOME-virtualized instance mode: launch exports `HOME=<alias-root>` and
+    /// `XDG_CONFIG_HOME=<alias-root>/.config`; restricted to [`HOME_VIRT_HARNESSES`].
     pub home_virt: bool,
 }
 
@@ -506,11 +453,8 @@ impl AliasSpec {
     }
 }
 
-/// Derive the alias config root: `<base>/<harness>/<alias-name>`.
-///
-/// Harness ids and alias names are validated identifiers (no separators, no
-/// `..`), so every (harness, name) pair addresses a root that is disjoint
-/// from every other pair's root and strictly nested under the base.
+/// Derive the alias config root: `<base>/<harness>/<alias-name>`. Validated
+/// identifiers keep every pair's root disjoint and nested under the base.
 pub fn alias_root(
     base_dir: &Path,
     harness: &HarnessId,
@@ -521,13 +465,8 @@ pub fn alias_root(
         .join(name.as_str())
 }
 
-// AliasRecord
-
-/// A recorded alias in the on-disk manifest.
-///
-/// Forbidden fields (never serialized): `model`, `endpoint`, api keys,
-/// skill/mcp/plugin lists; the alias's effective MCP/plugin state lives in
-/// the harness's own files under `root`, read fresh.
+/// A recorded alias in the on-disk manifest. Forbidden fields (never
+/// serialized): model, endpoint, api keys, skill/mcp/plugin lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AliasRecord {
     /// Harness this alias launches.
@@ -542,11 +481,8 @@ pub struct AliasRecord {
     /// Generated wrapper, when one was written at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapper: Option<WrapperRef>,
-    /// HOME-virtualized instance mode (run-5): launch composition exports
-    /// `HOME`/`XDG_CONFIG_HOME` at the alias root. Isolation metadata only,
-    /// the record still carries no model/provider/secret data (the provider
-    /// reference lives in `<root>/.superai/provider.json`; the MCP set in the
-    /// harness's own files under the root).
+    /// HOME-virtualized instance mode (run-5): the record still carries no
+    /// model/provider/secret data; the provider reference lives under the root.
     #[serde(default)]
     pub home_virt: bool,
     /// When the alias was created (ISO8601 UTC).
@@ -576,8 +512,6 @@ impl AliasRecord {
         })
     }
 }
-
-// Manifest (on-disk registry; read fresh every call)
 
 fn manifest_path(base_dir: &Path) -> PathBuf {
     base_dir.join(ALIAS_MANIFEST_FILE)
@@ -656,8 +590,6 @@ fn remove_manifest_record(base_dir: &Path, harness: &HarnessId, name: &str) -> R
     Ok(())
 }
 
-// Adapter-declared surfaces (honest refusal paths)
-
 /// The adapter's MCP declaration, refusing absence and read-only dests.
 fn writable_mcp_decl(harness: &HarnessId, adapter: &dyn Adapter) -> Result<McpAdapterDecl> {
     let Some(decl) = adapter.mcp_decl() else {
@@ -707,15 +639,8 @@ fn stageable_plugin_decl(harness: &HarnessId, adapter: &dyn Adapter) -> Result<P
     Ok(decl)
 }
 
-/// Build the HOME-virtualization launch plan (run-5 desktop alternative 1):
-/// `HOME=<alias-root>` plus `XDG_CONFIG_HOME=<alias-root>/.config`.
-///
-/// HOME is THE relocation var for the harnesses in [`HOME_VIRT_HARNESSES`]
-/// (Electron appData and the codex `~/.codex` default both resolve under
-/// it), so this plan satisfies the alias relocation guard by construction.
-/// It never sets `PATH` and never weakens the guard for other harnesses,
-/// callers must gate on [`HOME_VIRT_HARNESSES`] (this module does, in
-/// [`wrapper_plan_for_alias`]).
+/// Build the HOME-virtualization launch plan: `HOME=<alias-root>` plus
+/// `XDG_CONFIG_HOME=<alias-root>/.config`; never sets `PATH`.
 fn home_virt_wrapper_plan(root: &AbsolutePath) -> Result<WrapperPlan> {
     let config_root = root.join(".config")?;
     let mut plan = WrapperPlan::new(
@@ -740,12 +665,7 @@ fn home_virt_wrapper_plan(root: &AbsolutePath) -> Result<WrapperPlan> {
 }
 
 /// Plan the alias launch through the adapter's own `plan_wrapper`, refusing
-/// plans that would not isolate (no relocation vars) or that would override
-/// `PATH` (alias resolution must not change command lookup).
-///
-/// With `home_virt`, the plan is the composed HOME-virtualization plan and
-/// ONLY harnesses listed in [`HOME_VIRT_HARNESSES`] are accepted (the strict
-/// adapter-plan guard still applies to every other combination).
+/// plans without relocation vars or that override `PATH`.
 fn wrapper_plan_for_alias(
     adapter: &dyn Adapter,
     instance: &Instance,
@@ -798,19 +718,8 @@ fn wrapper_plan_for_alias(
     Ok(plan)
 }
 
-// Creation
-
-/// Create an alias: fresh relocated root, seeded MCP/plugin sets, optional
-/// generated wrapper, manifest record committed last.
-///
-/// Ordering follows the lifecycle create discipline: the root and marker are
-/// created through a compensated transaction; the MCP set is written through
-/// [`mcp::install_mcp_server`] at the adapter-declared destination, plugins
-/// stage through [`plugin::install_directory_bundle`], the wrapper (if any)
-/// goes through [`crate::wrapper::write_wrapper`] with its foreign-ownership
-/// refusal, and the manifest record is inserted only after everything else
-/// succeeded. Any seeding failure quarantines the fresh root before the
-/// error propagates, so a half-created alias never lingers.
+/// Create an alias: fresh root, seeded MCP/plugin sets, optional wrapper,
+/// manifest record committed last; a seeding failure quarantines the root.
 pub fn create_alias(
     base_dir: &Path,
     spec: &AliasSpec,
@@ -913,12 +822,8 @@ pub fn create_alias(
     }
 }
 
-/// Undo a partially created alias and report exactly what was left where:
-/// the root goes to quarantine (recoverable), and a wrapper this run wrote
-/// (byte-equal to `wrapper_content`) returns to its pre-create bytes or is
-/// removed when nothing pre-existed. The original error survives when the
-/// rollback fully succeeds; otherwise a Commit error carries the notes, so a
-/// half-created alias is never silent and a retry starts clean.
+/// Undo a partially created alias: root to quarantine, this run's wrapper
+/// restored; the original error survives a clean rollback.
 fn rollback_partial_alias(
     base_dir: &Path,
     root: &Path,
@@ -961,9 +866,8 @@ fn rollback_partial_alias(
     }
 }
 
-/// Return the wrapper path to its pre-create state. Only bytes provably this
-/// run's wrapper (byte-equal to `wrapper_content`) are touched, so a foreign
-/// launcher or an untouched pre-existing wrapper is left alone.
+/// Return the wrapper path to its pre-create state. Only bytes provably
+/// this run's wrapper are touched; foreign launchers are left alone.
 fn rollback_wrapper_file(
     path: &Path,
     wrapper_content: &[u8],
@@ -1040,8 +944,7 @@ fn create_alias_root(root: &AbsolutePath, harness: &HarnessId, name: &InstanceNa
 }
 
 /// The MCP destination relative to the alias root: under HOME-virt the file
-/// must land where the HOME-relocated binary reads it (adapter plan env,
-/// declared surface, and dest must agree; the factory-droid lesson).
+/// must land where the HOME-relocated binary reads it.
 fn alias_mcp_dest(harness: &HarnessId, decl_dest: &str, home_virt: bool) -> String {
     if home_virt
         && let Some((_, overridden)) = HOME_VIRT_MCP_DESTS
@@ -1074,8 +977,7 @@ fn seed_mcp_set(
 }
 
 /// Stage the plugin set through the existing `plugin` machinery, with the
-/// plugin registry colocated under the alias root so removing the alias
-/// removes the registry with it.
+/// plugin registry colocated under the alias root.
 fn seed_plugin_set(
     root: &AbsolutePath,
     harness: &HarnessId,
@@ -1094,16 +996,8 @@ fn seed_plugin_set(
     Ok(())
 }
 
-/// Seed the alias's third-party provider.
-///
-/// Env-carried (claude-code) writes nothing into the harness config; the
-/// composition exports `ANTHROPIC_*` at launch (see [`compose_provider_env`]).
-/// Config-carried (codex family) seeds the `[model_providers.<id>]` table
-/// plus `model_provider`/`model` into the alias's `CODEX_HOME` config.toml
-/// through [`commit_provider_change`]; chatgpt-desktop reaches the same
-/// surface through the codex redirect, its HOME-virt alias isolating
-/// `~/.codex` at `<root>/.codex`. Either way the persisted reference
-/// (`<root>/.superai/provider.json`) carries names/URL/models only.
+/// Seed the alias's third-party provider: env-carried composes at launch,
+/// config-carried seeds the codex `CODEX_HOME` table; the reference carries names only.
 fn seed_provider_profile(root: &AbsolutePath, spec: &AliasSpec) -> Result<()> {
     let Some(profile) = &spec.provider else {
         return Ok(());
@@ -1153,16 +1047,8 @@ fn seed_provider_profile(root: &AbsolutePath, spec: &AliasSpec) -> Result<()> {
     store_provider_ref(root, profile)
 }
 
-/// Compose the provider's launch environment for an alias from the persisted
-/// reference (read fresh) and the caller-supplied secrets.
-///
-/// Returns the non-secret overlay (endpoint/model vars for the env-carried
-/// family; nothing for the config-carried family, since its endpoint lives in the
-/// harness config) plus the secret entries (token under the recorded env var
-/// name). A missing secret produces a warning, never a failure: both
-/// families validate auth lazily (claude-code prompts at use; codex reads
-/// `env_key` at its first authenticated request, source-verified), so a
-/// launch without the token is a legitimate state the caller must see.
+/// Compose the provider's launch env from the persisted reference and the
+/// caller's secrets; a missing secret warns (both families validate lazily).
 fn compose_provider_env(
     harness: &HarnessId,
     root: &AbsolutePath,
@@ -1260,8 +1146,6 @@ fn quarantine_alias_root(base_dir: &Path, root: &Path) -> std::result::Result<Pa
         .map_err(CoreError::Config)
 }
 
-// Listing and lookup
-
 /// List every recorded alias, read fresh from the on-disk manifest.
 pub fn list_aliases(base_dir: &Path) -> Result<Vec<AliasRecord>> {
     load_manifest(base_dir)
@@ -1279,18 +1163,8 @@ pub fn get_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<Ali
         })
 }
 
-// Launch composition
-
-/// The composed launch environment for an alias: the plan's relocation
-/// variables pointing at the alias root (HOME-virt aliases get
-/// `HOME`/`XDG_CONFIG_HOME` instead), overlaid with the provider vars when
-/// the alias carries one. `PATH` is never part of it.
-///
-/// `provider_secrets` supplies token VALUES by env var NAME (the manifest and
-/// the per-alias provider reference store names only). Returned entries carry
-/// the raw values because exporting them is the point, callers must not log
-/// the result verbatim; [`launch_composition`] keeps them in a redacted
-/// channel instead.
+/// The composed launch environment for an alias: relocation vars at the
+/// root plus provider overlay. `PATH` is never part of it; values are raw, do not log.
 pub fn alias_env(
     base_dir: &Path,
     harness: &HarnessId,
@@ -1301,9 +1175,8 @@ pub fn alias_env(
     let record = get_alias(base_dir, harness, name)?;
     let instance = record.to_instance()?;
     let plan = wrapper_plan_for_alias(adapter, &instance, record.home_virt)?;
-    // Warnings are surfaced by `launch_composition`; the export list here is
-    // complete on its own (a lazily-validated missing token simply exports
-    // nothing for it).
+    // Warnings are surfaced by `launch_composition`; this export list is
+    // complete on its own (a missing token simply exports nothing).
     let (overlay, secrets) =
         compose_provider_env(harness, &record.root, provider_secrets, &mut Vec::new())?;
     let mut env = overlay_env(plan.env_vars, overlay);
@@ -1322,12 +1195,10 @@ pub struct LaunchComposition {
     /// `extra_args`.
     pub argv: Vec<String>,
     /// Environment variables to set (relocation vars plus non-secret
-    /// provider vars; same set the script exports plus the provider
-    /// overlay). `PATH` is never here.
+    /// provider overlay). `PATH` is never here.
     pub env: Vec<(String, String)>,
-    /// Provider auth entries (token under the recorded env var name). The
-    /// values are redacted in Debug/serialization, apply them to the child
-    /// environment exactly like `env`.
+    /// Provider auth entries (token under the recorded env var name); the
+    /// values are redacted in Debug, apply them to the child like `env`.
     pub secret_env: Vec<(String, RedactedString)>,
     /// Environment variables to unset before exec (WRP-02 leak guard).
     pub env_unset: Vec<String>,
@@ -1336,26 +1207,13 @@ pub struct LaunchComposition {
     /// Non-blocking composition notes (e.g. a provider token not supplied,
     /// the harness validates it lazily at first use).
     pub warnings: Vec<String>,
-    /// Deterministic `#!/bin/sh` launcher script (execs the binary with the
-    /// plan args and forwards the caller's `"$@"`). Carries the PLAN's
-    /// relocation env only: launcher files must stay secret-free, and the
-    /// provider set is caller-dependent per launch, use the direct-exec
-    /// channel (`argv` + `env` + `secret_env`) for provider overrides.
+    /// Deterministic `#!/bin/sh` launcher script carrying the PLAN's env only:
+    /// launcher files stay secret-free; provider vars ride direct exec.
     pub script: String,
 }
 
-/// Compose how an alias launches: the adapter plan's executable/args/env
-/// resolved against the alias root, plus the provider overlay when the alias
-/// carries one.
-///
-/// The executable resolves with the wrapper generator's precedence: the
-/// plan's own executable, else the record's pinned binary, else the harness
-/// default on `PATH`. `PATH` itself is never modified by the composed env.
-/// `extra_args` are appended to `argv` for direct exec; the script forwards
-/// them at runtime via `"$@"`. `provider_secrets` supplies token VALUES by
-/// env var NAME (never persisted anywhere by superai); a missing token
-/// yields a warning, not an error, both provider families validate auth
-/// lazily.
+/// Compose how an alias launches: executable/args/env resolved against the
+/// root (plan, then pinned binary, then PATH default) plus the provider overlay.
 pub fn launch_composition(
     base_dir: &Path,
     harness: &HarnessId,
@@ -1393,16 +1251,13 @@ pub fn launch_composition(
     })
 }
 
-// Removal
-
 /// Whether `path` is `base` itself or nested under it (component-wise).
 fn path_is_under(path: &Path, base: &Path) -> bool {
     path.starts_with(base)
 }
 
 /// Verify the alias marker names this harness and alias (case-folded on the
-/// name, matching lookup semantics). A missing or mismatched marker means
-/// the directory is not a managed alias root and must not be touched.
+/// name). A missing or mismatched marker means the root must not be touched.
 fn verify_alias_marker(root: &Path, harness: &HarnessId, name: &str) -> Result<()> {
     let marker_path = root.join(ALIAS_MARKER_FILE);
     let text = std::fs::read_to_string(&marker_path).map_err(|e| CoreError::ForeignOwnership {
@@ -1421,12 +1276,8 @@ fn verify_alias_marker(root: &Path, harness: &HarnessId, name: &str) -> Result<(
     }
 }
 
-/// Remove an alias: its wrapper (only when superai-owned with the recorded
-/// digest), its root (moved to quarantine: recoverable, never a blind
-/// recursive delete), and its manifest entry.
-///
-/// Refuses up front when the recorded root lies outside the alias base or
-/// the root lacks a matching ownership marker.
+/// Remove an alias: superai-owned wrapper, root to quarantine (never a
+/// blind delete), manifest entry; refuses outside-base roots or missing marker.
 pub fn remove_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<AliasRecord> {
     let base = AbsolutePath::from_path(base_dir)?;
     let record = get_alias(base_dir, harness, name)?;
@@ -1458,8 +1309,6 @@ pub fn remove_alias(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<
     remove_manifest_record(base_dir, harness, name)?;
     Ok(record)
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {
@@ -1770,9 +1619,8 @@ mod tests {
         }
     }
 
-    /// Alias quarantine ops currently recorded under the REAL home (prefix
-    /// filtering is race-free: only alias.rs mints `alias-*` operation ids,
-    /// and after the fix none of them target the home base at all).
+    /// Alias quarantine ops recorded under the REAL home (only alias.rs
+    /// mints `alias-*` operation ids; none target the home base).
     fn home_quarantine_alias_ops() -> Vec<String> {
         let Some(home) = std::env::var_os("HOME") else {
             return Vec::new();
@@ -1910,16 +1758,14 @@ mod tests {
     }
 
     /// A manifest-insert failure after a full seed must not vanish silently:
-    /// the wrapper is removed, and the error records exactly where the
-    /// un-quarantinable root sits, so the user can inspect and retry.
+    /// the wrapper is removed and the error records where the root sits.
     #[test]
     #[cfg(unix)]
     fn manifest_insert_failure_records_leftover_state() {
         use std::os::unix::fs::PermissionsExt;
         let base = base("rollback-manifest");
         // The harness dir is pre-created so root creation survives the base
-        // becoming read-only; only the manifest write needs base write
-        // access, and that is what must fail.
+        // becoming read-only; only the manifest write must fail.
         std::fs::create_dir_all(base.join("workbuddy")).unwrap();
         let wrapper_dir = base.join("bin");
         std::fs::create_dir_all(&wrapper_dir).unwrap();
@@ -2162,10 +2008,8 @@ mod tests {
         );
     }
 
-    /// Run-5 desktop harnesses: both apps have NO relocation mechanism
-    /// (verified-absent), so their plans carry no env vars and alias
-    /// creation is refused up front, before any root, marker, or manifest
-    /// write. Refusing is the honest outcome, not a missing feature.
+    /// Run-5 desktop harnesses have no relocation mechanism, so creation is
+    /// refused up front, before any root, marker, or manifest write.
     #[test]
     fn desktop_harnesses_refuse_alias_creation_at_the_relocation_guard() {
         for harness_id in ["claude-desktop", "chatgpt-desktop"] {
@@ -2196,11 +2040,8 @@ mod tests {
         }
     }
 
-    /// The redirected refusal (chatgpt-desktop): the store it reads belongs
-    /// to codex-cli, so its MCP surface is declared absent with the
-    /// remote-only + shared-store citation, and the wrapper plan points
-    /// aliasing at codex-cli. Seeding still refuses with the absence reason
-    /// even when a plan could be composed.
+    /// The chatgpt-desktop redirect: its store belongs to codex-cli, so the
+    /// MCP surface is declared absent and seeding refuses with that reason.
     #[test]
     fn chatgpt_desktop_alias_story_redirects_to_codex_cli() {
         let desktop = adapter("chatgpt-desktop");
@@ -2279,10 +2120,8 @@ mod tests {
 
     const DUMMY_TOKEN: &str = "sk-superai-mock-dummy-token-12345";
 
-    /// Env-carried family (claude-code): the alias composes the researcher's
-    /// exact `ANTHROPIC_*` set at launch; the token arrives from the CALLER,
-    /// never from disk, and a missing token degrades to a lazily-validated
-    /// warning instead of an error.
+    /// Env-carried family (claude-code): the alias composes `ANTHROPIC_*` at
+    /// launch; the token arrives from the CALLER, never from disk.
     #[test]
     fn env_carried_provider_composes_anthropic_vars_from_caller_secrets() {
         let base = base("provider-env");
@@ -2313,7 +2152,7 @@ mod tests {
         )
         .unwrap();
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-        // The researcher's exact semantics (code.claude.com env-vars):
+        // The researcher's exact semantics (code.claude.com env-vars).
         assert_eq!(
             get("ANTHROPIC_BASE_URL").as_deref(),
             Some("http://127.0.0.1:8787"),
@@ -2377,9 +2216,8 @@ mod tests {
         );
     }
 
-    /// Secret hygiene across BOTH families: the dummy token appears nowhere
-    /// in the alias manifest, the provider reference, or the seeded codex
-    /// config (whose `env_key` is a NAME by construction).
+    /// Secret hygiene across both families: the dummy token appears nowhere
+    /// in the manifest, the provider reference, or the seeded codex config.
     #[test]
     fn provider_secrets_never_reach_the_manifest_state_or_seeded_config() {
         let base = base("provider-secrets");
@@ -2427,8 +2265,7 @@ mod tests {
     }
 
     /// Config-carried family (codex-cli): the alias `CODEX_HOME` config.toml
-    /// gains the provider table with the researcher-exact shape, read back
-    /// fresh through the binary-independent loader.
+    /// gains the provider table, read back fresh through the loader.
     #[test]
     fn codex_provider_seeds_model_providers_table_round_trip() {
         let base = base("provider-codex");
@@ -2494,9 +2331,8 @@ mod tests {
         );
     }
 
-    /// The codex redirect (chatgpt-desktop): a HOME-virt alias of the desktop
-    /// app seeds the bundled-engine provider table at `<root>/.codex`; the
-    /// `CODEX_HOME` default under the virtualized HOME.
+    /// The codex redirect (chatgpt-desktop): a HOME-virt alias seeds the
+    /// provider table at `<root>/.codex`, the `CODEX_HOME` under virtual HOME.
     #[test]
     fn chatgpt_desktop_home_virt_alias_seeds_the_codex_redirect() {
         let base = base("provider-cgd");
@@ -2538,10 +2374,8 @@ mod tests {
         );
     }
 
-    /// HOME-virt desktop alias (claude-desktop): creation now SUCCEEDS where
-    /// the zero-env plan used to force a refusal, HOME is the relocation
-    /// var by construction, and the MCP set lands where the HOME-relocated
-    /// binary reads it (`<root>/.config/Claude/...`, Electron appData).
+    /// HOME-virt desktop alias (claude-desktop): HOME is the relocation var
+    /// by construction; MCP lands where the HOME-relocated binary reads it.
     #[test]
     fn claude_desktop_home_virt_alias_seeds_mcp_under_xdg_config() {
         let base = base("homevirt-claude");
@@ -2593,9 +2427,8 @@ mod tests {
         assert!(env.iter().all(|(k, _)| k != "PATH"));
     }
 
-    /// The guard is NOT weakened: HOME-virt is refused for harnesses whose
-    /// binaries have no HOME evidence, and without the flag the desktops
-    /// still refuse at the zero-env relocation guard.
+    /// The guard is NOT weakened: HOME-virt is refused without HOME
+    /// evidence; the desktops still refuse at the relocation guard.
     #[test]
     fn home_virt_is_refused_outside_the_modeled_desktop_set() {
         let base = base("homevirt-refuse");
@@ -2615,9 +2448,7 @@ mod tests {
     }
 
     /// Researcher-exact protocol/auth semantics are REFUSED, not coerced:
-    /// claude-code speaks anthropic-only over env; codex `wire_api` is
-    /// responses-only ("chat" removed); bearer-vs-x-api-key picks the env
-    /// var name; unmodeled harnesses have no provider surface at all.
+    /// anthropic-only env for claude-code, responses-only `wire_api` for codex.
     #[test]
     fn provider_protocol_auth_and_harness_mismatches_are_refused() {
         let base = base("provider-refuse");
@@ -2694,9 +2525,8 @@ mod tests {
         assert!(list_aliases(&base).unwrap().is_empty());
     }
 
-    /// Explicit provider-vs-plan precedence (routing requirement): the
-    /// provider overlay WINS on key conflict, appends otherwise, and never
-    /// introduces PATH.
+    /// Explicit provider-vs-plan precedence: the overlay WINS on key
+    /// conflict, appends otherwise, and never introduces PATH.
     #[test]
     fn overlay_env_provider_wins_on_conflict_and_appends_new_keys() {
         let base_env = vec![

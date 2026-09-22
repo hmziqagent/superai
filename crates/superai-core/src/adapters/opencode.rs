@@ -1,7 +1,5 @@
-//! `OpenCode` adapter: layered JSONC `opencode.json`/`opencode.jsonc`,
-//! relocated-root via `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG` (explicit file)
-//! and `OPENCODE_CONFIG_CONTENT` (inline) overrides.
-//! Research source: `docs/harness-configs/opencode.md` (last verified 2026-08-25).
+//! `OpenCode` adapter: layered JSONC `opencode.json`/`.jsonc`, relocated via
+//! `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` overrides.
 
 use std::path::{Path, PathBuf};
 
@@ -53,10 +51,8 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for provider/model mutation inside `opencode.json` (JSONC).
-///
-/// These are top-level keys superai owns; everything else round-trips untouched
-/// via `superai-config::jsonc`.
+/// Owned top-level keys inside `opencode.json`; everything else round-trips
+/// untouched via `superai-config::jsonc`.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "small_model",
@@ -109,7 +105,6 @@ impl OpenCodeAdapter {
         INLINE_CONFIG_ENV_VAR
     }
 
-    /// Resolve the default global config root: `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -125,17 +120,14 @@ impl OpenCodeAdapter {
         Some(PathBuf::from(home).join(".config").join("opencode"))
     }
 
-    /// Build the opencode.json path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("opencode.json")
     }
 
-    /// Build the tui.json path for a given config root.
     fn tui_path_for_root(root: &Path) -> PathBuf {
         root.join("tui.json")
     }
 
-    /// Build detection evidence about `OpenCode` config layers.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -223,7 +215,6 @@ impl OpenCodeAdapter {
     }
 }
 
-/// Resolve auth.json path: `~/.local/share/opencode/auth.json` or `$XDG_DATA_HOME/opencode/auth.json`.
 fn dirs_auth_path() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
         && !xdg.trim().is_empty()
@@ -566,8 +557,8 @@ impl Adapter for OpenCodeAdapter {
             | Isolation::ExplicitConfig
             | Isolation::EnvOnly
             | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shapes / owned-key rules.
+                // Surface content under the instance root must satisfy the
+                // declared root shapes and owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -578,9 +569,8 @@ impl Adapter for OpenCodeAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: types per the schema top-level keys table in
-        // docs/harness-configs/opencode.md §1. `model` is omitted on purpose:
-        // the documented example uses a string, but model-object forms exist.
+        // `model` is deliberately untyped: the docs show a string but
+        // model-object forms exist too (opencode.md §1).
         match surface_id {
             "opencode.json" | "opencode.jsonc" | "project opencode.json" => Some(
                 SurfaceSchema::new()
@@ -629,7 +619,6 @@ impl Adapter for OpenCodeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (opencode.md mcp servers: top-level `mcp` object in opencode.json JSONC)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "opencode.json",
@@ -640,7 +629,7 @@ impl Adapter for OpenCodeAdapter {
         ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06/07: plugin mechanism (opencode.md: npm `plugin` list plus files in `.opencode/plugins/` or `~/.config/opencode/plugins/`)
+    /// npm `plugin` list entries plus files in `.opencode/plugins/` or `~/.config/opencode/plugins/`.
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",

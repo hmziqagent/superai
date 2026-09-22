@@ -1,9 +1,5 @@
-//! Template fetch client (TPL-03).
-//!
-//! Provides blocking HTTPS fetch for catalog and template files with
-//! bounded redirects, size limits, timeouts, digest verification, and
-//! traversal rejection. Untrusted network data never reaches filesystem
-//! APIs without validation.
+//! Template fetch client (TPL-03): bounded HTTPS fetch, size limits,
+//! digest verification, traversal rejection before any filesystem use.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -188,11 +184,8 @@ pub fn validate_fetch_url(url: &str, context: &str) -> Result<(), TemplateFetchE
             })?;
             return Ok(());
         }
-        // An absolute local file-repo root is the fixture form. On Windows
-        // it legitimately contains a drive colon and native separators
-        // (`C:\...`), so only traversal is rejected here; the no-`:`/`\`
-        // rule above is for repo-relative template paths, not for the
-        // local root itself.
+        // A Windows absolute root legitimately carries a drive colon and
+        // native separators; only traversal is rejected for the root.
         if has_parent_component(path) {
             return Err(TemplateFetchError::InvalidUrl {
                 template: context.to_owned(),
@@ -231,12 +224,8 @@ fn has_parent_component(path: &Path) -> bool {
         .any(|comp| matches!(comp, std::path::Component::ParentDir))
 }
 
-// Core fetch: bytes with limits
-
-/// Fetch raw bytes from `url`: `file://` reads the local filesystem (tests
-/// only); anything else is a blocking HTTPS GET with `MAX_REDIRECTS`
-/// redirects, `MAX_BYTES` size cap, `FETCH_TIMEOUT_SECS` timeout, and
-/// `USER_AGENT` header.
+/// Fetch raw bytes: `file://` reads local (tests); else a blocking HTTPS
+/// GET with bounded redirects, size cap, timeout, `USER_AGENT`.
 pub fn fetch_bytes(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchError> {
     validate_fetch_url(url, context)?;
 
@@ -267,9 +256,8 @@ pub fn fetch_bytes(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchErr
     fetch_bytes_ureq(url, context)
 }
 
-/// Resolve a redirect `Location` against the current URL. Absolute https and
-/// same-origin absolute-path locations are accepted; relative paths are
-/// refused (fail-closed; no URL library in this workspace).
+/// Resolve a redirect `Location`: absolute https or same-origin
+/// absolute-path; relative paths refuse fail-closed.
 fn resolve_redirect(
     base: &str,
     location: &str,
@@ -431,8 +419,6 @@ fn map_ureq_error(err: ureq::Error, context: &str, url: &str) -> TemplateFetchEr
     }
 }
 
-// High-level fetchers
-
 /// Fetch and validate the catalog for `config` (HTTPS-only, size-capped;
 /// the returned catalog is already validated).
 pub fn fetch_catalog(config: &TemplateRepoConfig) -> Result<Catalog, TemplateFetchError> {
@@ -480,12 +466,8 @@ pub fn fetch_catalog_from_path(path: &Path) -> Result<Catalog, TemplateFetchErro
     Ok(catalog)
 }
 
-/// Fetch raw template bytes for a given template id and version, verifying
-/// digest against the catalog entry.
-///
-/// Lookup `template_id`/`version` in `catalog`, validate the file path for
-/// traversal, fetch the bytes, verify `MAX_BYTES`, verify SHA-256 digest
-/// matches the catalog's `digest`, and return the bytes.
+/// Fetch raw template bytes by id+version, validating the path and
+/// verifying the SHA-256 digest against the catalog entry.
 pub fn fetch_template_bytes(
     config: &TemplateRepoConfig,
     catalog: &Catalog,
@@ -569,9 +551,8 @@ pub fn verify_template_bytes(
     Ok(())
 }
 
-/// Ensure a relative template path never escapes `base` when joined.
-/// Lexical only: the filesystem is never touched; writers must use the
-/// returned path as-is.
+/// Ensure a relative path never escapes `base` when joined; lexical
+/// only, the returned path must be used as-is.
 pub fn ensure_path_safe(base: &Path, relative: &str) -> Result<PathBuf, TemplateFetchError> {
     validate_template_path(relative).map_err(|e| TemplateFetchError::InvalidUrl {
         template: relative.to_owned(),
@@ -600,8 +581,6 @@ pub fn ensure_path_safe(base: &Path, relative: &str) -> Result<PathBuf, Template
     }
     Ok(joined)
 }
-
-// Tests
 
 #[cfg(test)]
 #[expect(redundant_imports, reason = "test imports overlap")]
@@ -712,9 +691,8 @@ mod tests {
             tab_err.to_string().contains("control"),
             "tab-stripped decoy: {tab_err}"
         );
-        // Ordinary domains, including fc/fd initials and a public
-        // v4-mapped literal, stay fetchable; the mirror spelling has its
-        // '@' inside the query, so the host really is the public one.
+        // Ordinary domains, fc/fd initials, and a public v4-mapped literal
+        // stay fetchable; the mirror spelling's '@' sits inside the query.
         validate_fetch_url("https://fdtools.example.com/catalog.json", "catalog").unwrap();
         validate_fetch_url("https://example.com/catalog.json", "catalog").unwrap();
         validate_fetch_url("https://[::ffff:8.8.8.8]/catalog.json", "catalog").unwrap();

@@ -1,20 +1,5 @@
-//! Registry schema v1 with migration and validation.
-//!
-//! Top-level record:
-//! - `schema_version: u32` (currently 1)
-//! - `instances: Vec<Instance>`
-//! - any other top-level keys are foreign and preserved verbatim
-//!
-//! Instance record fields per FND-03:
-//! `id`, `name`, `harness`, `config_root`, `binary`, `wrapper`, `isolation`,
-//! `origin`, `ownership`, `template`, `created_at`, `adapter_revision`.
-//!
-//! Forbidden: `model`, `endpoint`, `key`, skill/plugin/mcp lists, etc.
-//!
-//! Migration: old records stored `name`/`harness`/`config_dir`/`binary_path`/`template{name,version}`
-//! without `schema_version` and without stable IDs. On load we validate with
-//! `ids`/`paths`, generate a stable `InstanceId` from `name+config_dir`, and set
-//! `origin = AdoptedLegacy`, `isolation = Unknown`, `ownership = ExplicitlyAdopted`.
+//! Registry schema v1 with migration and validation. Records carry no
+//! model/endpoint/key data; foreign top-level keys survive verbatim.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -82,9 +67,8 @@ pub(crate) fn now_iso8601() -> String {
     unix_secs_to_rfc3339(secs)
 }
 
-/// Operation-id string unique across threads and processes: millis,
-/// pid, and an in-process counter feed the hash. profile, alias, and
-/// `template_update` all draw from this one home.
+/// Operation-id string unique across threads and processes; profile,
+/// alias, and `template_update` all draw from this one home.
 pub(crate) fn unique_operation_string(prefix: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,11 +88,8 @@ pub(crate) fn unique_operation_string(prefix: &str) -> String {
 // SSRF gate, shared by template_fetch, health, and skills fetch. One home so
 // a new bypass spelling is fixed once, not per copy.
 
-/// Host of an http(s) URL, lowercased. Strips userinfo (`user:pass@`) and
-/// unwraps bracketed IPv6 literals (`[::1]:8443` -> `::1`), the forms that
-/// otherwise hide the real host from the private-range check. The authority
-/// ends at the first '/', '?', '#', or '\' (WHATWG special schemes treat '\'
-/// like '/'); anything before that is host, not decoy.
+/// Lowercased http(s) host: strips `user:pass@`, unwraps bracketed IPv6
+/// (`[::1]:8443` -> `::1`), and cuts the authority at '/', '?', '#', or '\'.
 pub(crate) fn extract_host(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
@@ -124,11 +105,8 @@ pub(crate) fn extract_host(url: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-/// True for hosts a fetch must never reach: `localhost`, empty, loopback,
-/// link-local, and RFC1918 space in every `inet_aton` spelling (dotted,
-/// hex, octal, and bare-u32 forms), and IPv6 literals judged numerically
-/// (unspecified, loopback, link-local, unique-local, and v4-mapped or
-/// v4-compatible tails judged by the embedded v4 address).
+/// Hosts a fetch must never reach: localhost, loopback, link-local, and
+/// RFC1918 in every `inet_aton` spelling; IPv6 literals judged numerically.
 pub(crate) fn is_private_host(host: &str) -> bool {
     // A trailing dot is the DNS root label: "localhost." is localhost.
     let h = host.to_ascii_lowercase();
@@ -144,9 +122,8 @@ pub(crate) fn is_private_host(host: &str) -> bool {
     is_private_v4_literal(h)
 }
 
-/// Dotted-IPv4-shaped literal in private/loopback/link-local space. Parses
-/// `inet_aton` forms numerically; unparseable dotted shapes fall back to
-/// the textual prefixes so coverage never widens.
+/// Dotted-IPv4-shaped literal in private/loopback/link-local space; parses
+/// `inet_aton` forms, unparseable shapes fall back to textual prefixes.
 fn is_private_v4_literal(h: &str) -> bool {
     if let Some(v) = parse_inet_aton(h) {
         return is_private_v4_u32(v);
@@ -175,9 +152,8 @@ fn is_private_v4_u32(v: u32) -> bool {
         || (first == 169 && second == 254)
 }
 
-/// `inet_aton` parse: 1-4 dot-separated parts, each decimal, octal (leading
-/// `0`), or hex (`0x`); the last part fills the remaining bytes. Digits-only
-/// and `0x` parts mean "address", never domain, so `beef` stays a domain.
+/// `inet_aton` parse: 1-4 dot-separated decimal/octal/hex parts, the last
+/// filling remaining bytes; digits-only parts mean address, never domain.
 fn parse_inet_aton(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.is_empty()
@@ -404,10 +380,8 @@ fn migrate_old_instance(old: OldInstance) -> Result<Instance> {
     Ok(inst)
 }
 
-/// The set of instances superai knows about, stored in its own records file.
-///
-/// Foreign top-level keys are preserved verbatim on store; only
-/// `schema_version` and `instances` are owned by superai.
+/// The set of instances superai knows about, in its own records file;
+/// only `schema_version` and `instances` are owned, foreign keys survive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registry {
     /// Schema version of the file. Currently 1.
@@ -436,15 +410,8 @@ impl Registry {
         Ok(home.join(".superai").join("instances.json"))
     }
 
-    /// Read the records file fresh. A missing file is an empty registry.
-    ///
-    /// Migration is applied transparently:
-    ///
-    /// - bare array → old vector, migrated
-    /// - object without `schema_version` but with `instances` → try new shape, fallback to old migration
-    /// - object with `schema_version` → must equal `SCHEMA_VERSION`, otherwise actionable error
-    ///
-    /// Foreign keys are ignored on load but preserved on store.
+    /// Read the records file fresh (a missing file is an empty registry);
+    /// legacy shapes migrate transparently, foreign keys survive store.
     #[expect(
         clippy::too_many_lines,
         reason = "migration branches for bare array and object with/without schema_version are intentionally explicit"
@@ -582,10 +549,8 @@ impl Registry {
         }
     }
 
-    /// Back up and write the records file, leaving any other key in it untouched.
-    ///
-    /// Only `schema_version` and `instances` are written; foreign keys are preserved
-    /// by loading the existing map fresh and merging.
+    /// Back up and write the records file; only `schema_version` and
+    /// `instances` are written, foreign keys preserved by a fresh merge.
     pub fn store(&self, path: &Path) -> Result<()> {
         self.validate()?;
         for inst in &self.instances {
@@ -717,10 +682,8 @@ impl Registry {
         Ok(())
     }
 
-    /// Add an instance, or fail if the `name`/`id`/`config_root`/`wrapper`
-    /// collides. [`Registry::validate`] is the single collision authority;
-    /// its errors name the conflicting key and instance, and a failed
-    /// insert leaves the registry untouched.
+    /// Add an instance or fail on collision; [`Registry::validate`] is the
+    /// single authority and a failed insert leaves the registry untouched.
     pub fn insert(&mut self, instance: Instance) -> Result<()> {
         instance.validate()?;
         self.instances.push(instance);
@@ -731,9 +694,8 @@ impl Registry {
         Ok(())
     }
 
-    /// Test-only constructor that skips validation: defensive consumers
-    /// (e.g. duplicate-record drift findings) must be testable for record
-    /// shapes that `load` and `insert` rightly refuse.
+    /// Test-only constructor skipping validation: defensive consumers must
+    /// be testable for record shapes `load`/`insert` rightly refuse.
     #[cfg(test)]
     pub(crate) fn from_instances_unchecked(instances: Vec<Instance>) -> Self {
         Self {
@@ -761,10 +723,8 @@ impl Registry {
         Some(self.instances.remove(idx))
     }
 
-    /// Rename an instance, preserving its `id`, `config_root`, `template`, etc.
-    ///
-    /// The wrapper's `command_name` is updated if it currently equals the old name
-    /// (case-folded). Collision checks are platform-aware (case-folded).
+    /// Rename an instance, preserving id/root/template; the wrapper's
+    /// `command_name` follows when it equalled the old name (case-folded).
     #[expect(
         clippy::indexing_slicing,
         reason = "idx validated via position search, bounds checked"
@@ -831,9 +791,8 @@ impl Registry {
     }
 }
 
-/// Config dirs on disk that no record and no wrapper accounts for.
-///
-/// Adoption or removal is the user's call; superai only reports what it found.
+/// Config dirs on disk that no record accounts for; adoption or removal
+/// is the user's call, superai only reports what it found.
 pub fn unmanaged_dirs(registry: &Registry, candidates: &[PathBuf]) -> Vec<PathBuf> {
     candidates
         .iter()
@@ -911,7 +870,6 @@ mod tests {
             None,
         ))
         .unwrap();
-        // case-fold collision: "WORK" vs "work"
         let dup = sample_instance(
             "WORK",
             &crate::test_util::tmp_abs_str("u/.claude-work2"),
@@ -977,7 +935,6 @@ mod tests {
         let mut r = Registry::default();
         r.insert(sample_instance("work", tmp_root.as_str(), "id-1", None))
             .unwrap();
-        // Same path normalized differently with extra slash
         let dup = sample_instance("other", tmp_root.as_str(), "id-2", None);
         let err = r.insert(dup).unwrap_err();
         match err {
@@ -1027,7 +984,6 @@ mod tests {
             "id-2",
             Some(crate::test_util::tmp_abs_str("wrapper2").as_str()),
         );
-        // Force wrapper command to collide case-folded
         dup.wrapper.as_mut().unwrap().command_name = InstanceName::new("WORK").unwrap();
         let err = r.insert(dup).unwrap_err();
         match err {
@@ -1049,7 +1005,6 @@ mod tests {
             None,
         ))
         .unwrap();
-        // New instance whose wrapper command collides with existing instance name "work"
         let mut with_wrapper = sample_instance(
             "other",
             &crate::test_util::tmp_abs_str(".claude-other"),
@@ -1146,13 +1101,11 @@ mod tests {
         .unwrap();
         r.store(&path).unwrap();
 
-        // Loaded registry must equal what we stored.
         let loaded = Registry::load(&path).unwrap();
         assert_eq!(loaded.instances().len(), 1);
         assert_eq!(loaded.schema_version(), SCHEMA_VERSION);
         assert_eq!(loaded.instances()[0].name.as_str(), "work");
 
-        // Foreign keys preserved.
         let raw = superai_config::json::load(&path).unwrap();
         assert_eq!(raw["schema"], serde_json::json!(7));
         assert_eq!(raw["custom"], serde_json::json!("keep-me"));
@@ -1183,7 +1136,6 @@ mod tests {
     #[test]
     fn migration_from_old_vector_and_instances_key() {
         let tmp_root = crate::test_util::tmp_abs_str("u/.claude-work");
-        // Test bare array migration
         let path = crate::test_util::temp_dir_unique("registry").join("migration_bare.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let old = vec![instance_legacy("work", tmp_root.as_str())];
@@ -1197,11 +1149,9 @@ mod tests {
         assert_eq!(inst.origin, InstanceOrigin::AdoptedLegacy);
         assert_eq!(inst.isolation, Isolation::Unknown);
         assert_eq!(inst.ownership, Ownership::ExplicitlyAdopted);
-        // Stable id is deterministic: same name+config yields same id on reload.
         let reg2 = Registry::load(&path).unwrap();
         assert_eq!(reg.instances()[0].id, reg2.instances()[0].id);
 
-        // Test object with instances key holding old shape
         let path2 = crate::test_util::temp_dir_unique("registry").join("migration_wrapped.json");
         let wrapped = serde_json::json!({
             "instances": [ {
@@ -1217,7 +1167,6 @@ mod tests {
         assert_eq!(reg3.instances().len(), 1);
         assert_eq!(reg3.instances()[0].name.as_str(), "oldie");
         assert_eq!(reg3.instances()[0].origin, InstanceOrigin::AdoptedLegacy);
-        // After storing, foreign key preserved and schema_version added.
         reg3.store(&path2).unwrap();
         let raw = superai_config::json::load(&path2).unwrap();
         assert_eq!(raw["keep"], serde_json::json!(123));
@@ -1292,7 +1241,6 @@ mod tests {
                 "forbidden field `{field}` must not be emitted: {text}"
             );
         }
-        // Also check top-level registry serialization
         let full_json = serde_json::to_string(&serde_json::json!({
             "schema_version": reg.schema_version(),
             "instances": reg.instances()
@@ -1311,7 +1259,6 @@ mod tests {
     fn unknown_enum_and_schema_failure_are_actionable() {
         let path = crate::test_util::temp_dir_unique("registry").join("unknown_enum.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Unknown isolation variant
         let bad = serde_json::json!({
             "schema_version": 1,
             "instances": [{
@@ -1340,7 +1287,6 @@ mod tests {
             "error must be actionable, got: {msg}"
         );
 
-        // Unsupported schema_version
         let bad2 = serde_json::json!({
             "schema_version": 999,
             "instances": []
@@ -1442,7 +1388,6 @@ mod tests {
                 .to_string(),
             tmp_root2.as_str()
         );
-        // Round-trip preserves foreign key
         reg2.store(&path2).unwrap();
         let raw = superai_config::json::load(&path2).unwrap();
         assert_eq!(raw["foreign_key"], serde_json::json!("preserve-me"));
@@ -1459,7 +1404,6 @@ mod tests {
             20,
             "expected 20 chars RFC3339 without millis: {ts}"
         );
-        // Known epoch
         let epoch = unix_secs_to_rfc3339(0);
         assert_eq!(epoch, "1970-01-01T00:00:00Z");
         let known = unix_secs_to_rfc3339(1_728_000_000);
@@ -1484,8 +1428,7 @@ mod tests {
     }
 
     /// SSRF shorthands that bypass prefix-only checks: `inet_aton` digit
-    /// forms, trailing-dot root labels, cloud metadata space, and IPv6
-    /// loopback/link-local/ULA/v4-mapped literals.
+    /// forms, trailing dots, metadata space, and IPv6 private literals.
     #[test]
     fn private_host_detection_covers_ssrf_shorthands() {
         for host in [

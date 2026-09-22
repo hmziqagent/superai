@@ -43,8 +43,7 @@ pub const EXTENSIONS_DIR_FLAG: &str = "--extensions-dir";
 /// Default CLI config fallback.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.cursor";
 
-/// The agent ignores `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` for `mcp.json`
-/// (probe-verified 2026-09-18; see mcp-readpath-r6.log).
+/// The agent ignores `CURSOR_CONFIG_DIR`/`XDG_CONFIG_HOME` for `mcp.json` (probe-verified 2026-09-18, mcp-readpath-r6.log).
 pub const MCP_READ_PATH_FALLBACK: &str = "~/.cursor/mcp.json";
 
 /// Research document link.
@@ -98,7 +97,6 @@ impl CursorAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve default CLI config root.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -131,7 +129,6 @@ impl CursorAdapter {
         Some(PathBuf::from(home).join(".cursor").join("mcp.json"))
     }
 
-    /// IDE user-data root default.
     fn default_user_data_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -580,8 +577,7 @@ impl Adapter for CursorAdapter {
         ]
     }
 
-    /// EXT-08/09: global `~/.cursor/mcp.json` plus the project copy; the
-    /// agent never reads `$CURSOR_CONFIG_DIR/mcp.json` (probe 2026-09-18).
+    /// The agent never reads `$CURSOR_CONFIG_DIR/mcp.json` (probe 2026-09-18).
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp.json",
@@ -592,7 +588,6 @@ impl Adapter for CursorAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "plugins managed via the Cursor Marketplace UI; no file-staged mechanism documented (cursor.md)",
@@ -692,9 +687,8 @@ mod tests {
         assert!(mcp.owned_selectors.contains(&"mcpServers".to_owned()));
     }
 
-    /// Live-probe regression pin (2026-09-18, agent 2026.09.15-d2fe57e): the
-    /// agent reads `mcp.json` only from `$HOME/.cursor/mcp.json` (+ project
-    /// `.cursor/mcp.json`): never from `$CURSOR_CONFIG_DIR/mcp.json`.
+    /// Live-probe pin (2026-09-18, agent 2026.09.15-d2fe57e): mcp.json is read
+    /// only from $HOME/.cursor/mcp.json (+ project copy), never `$CURSOR_CONFIG_DIR`.
     #[test]
     fn mcp_surface_pins_home_cursor_read_path() {
         let a = adapter();

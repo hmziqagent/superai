@@ -8,11 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Create a unique temporary directory for a per-test isolated filesystem.
-///
-/// Uses `SystemTime` millis, an atomic counter, process id, and a hasher
-/// for uniqueness. The directory is created on disk. No global `HOME` or
-/// cwd mutation is performed.
+/// Create a unique temporary directory for a per-test isolated filesystem
+/// (millis + atomic counter + pid + hash). No `HOME` or cwd mutation.
 pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -32,22 +29,14 @@ pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     dir
 }
 
-/// Canonical cross-platform replacement for unix-only `/tmp/...` literals in
-/// tests: a unique, created absolute directory under the platform temp dir.
-///
-/// `/tmp/...` carries no drive prefix on Windows and is rejected by
-/// `AbsolutePath` ("must be absolute"), while `std::env::temp_dir()` yields a
-/// valid absolute path on every platform.
+/// Cross-platform replacement for unix-only `/tmp/...` literals: a unique,
+/// created absolute dir (`/tmp` has no drive on Windows).
 pub(crate) fn tmp_abs(prefix: &str) -> PathBuf {
     temp_dir_unique(prefix)
 }
 
-/// String form of [`tmp_abs`] for call sites taking `&str` roots (instance
-/// roots, env-var value assertions, `AbsolutePath::new`, serde fixtures).
-///
-/// Rendered through `components` so `/` separators embedded in the prefix
-/// become native separators on Windows, matching how the production path
-/// newtypes normalize.
+/// String form of [`tmp_abs`] for `&str` call sites. Rendered through
+/// `components` so embedded `/` become native separators on Windows.
 pub(crate) fn tmp_abs_str(prefix: &str) -> String {
     let dir = temp_dir_unique(prefix);
     let mut native = PathBuf::new();

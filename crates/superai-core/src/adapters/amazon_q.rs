@@ -71,7 +71,6 @@ impl AmazonQAdapter {
         MIGRATION_TIP
     }
 
-    /// Resolve default config root `~/.aws/amazonq`.
     fn default_config_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -82,7 +81,6 @@ impl AmazonQAdapter {
         Some(PathBuf::from(home).join(".aws").join("amazonq"))
     }
 
-    /// Collect evidence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -384,7 +382,6 @@ impl Adapter for AmazonQAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (amazon-q-cli.md `mcpServers`; read-only per the migration-only ledger state)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -398,7 +395,6 @@ impl Adapter for AmazonQAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "IDE plugins end-of-support 2027-04-30; no CLI plugin mechanism documented (amazon-q-cli.md)",

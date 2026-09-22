@@ -41,8 +41,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Selectors superai owns inside `config.toml`; everything else round-trips
-/// untouched via `superai-config::toml_file`.
+/// Selectors superai owns inside `config.toml`; other keys round-trip untouched.
 pub const OWNED_SELECTORS: &[&str] = &[
     "model",
     "model_provider",
@@ -55,8 +54,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "sandbox_mode",
 ];
 
-/// Isolation is `relocated-root` via `CODEX_HOME`; profiles (>=0.134) live in
-/// `$CODEX_HOME/<name>.config.toml` under the same root.
+/// `relocated-root` via `CODEX_HOME`; profiles (>=0.134) live in `$CODEX_HOME/<name>.config.toml`.
 #[derive(Debug, Clone)]
 pub struct CodexCliAdapter {
     id: HarnessId,
@@ -84,7 +82,6 @@ impl CodexCliAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$CODEX_HOME` or `~/.codex`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -100,12 +97,10 @@ impl CodexCliAdapter {
         Some(PathBuf::from(home).join(".codex"))
     }
 
-    /// Build the config.toml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.toml")
     }
 
-    /// Build detection evidence about config root and TOML config.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -455,8 +450,6 @@ impl Adapter for CodexCliAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::RelocatedRoot | Isolation::Unknown => {
-                // HAD-03: surface content present under the instance root must
-                // satisfy the declared root shape / owned-key rules.
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -467,8 +460,8 @@ impl Adapter for CodexCliAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: `config.toml` and the >=0.134 profile files share one
-        // top-level shape; never nest under `[profiles.<name>]`.
+        // config.toml and profile files share one top-level shape; never nest
+        // the owned keys under [profiles.<name>].
         match surface_id {
             "config.toml" | "profile.config.toml" => Some(
                 SurfaceSchema::new()
@@ -533,7 +526,6 @@ impl Adapter for CodexCliAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (codex-cli.md MCP servers: `[mcp_servers.<name>]` TOML tables)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.toml",
@@ -544,13 +536,12 @@ impl Adapter for CodexCliAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("codex documents no plugin mechanism (codex-cli.md)")
     }
 }
 
-/// Config era of codex `config.toml` content (HAD-05).
+/// Config era of codex `config.toml` content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigEra {
     /// >=0.134: profiles are separate `$CODEX_HOME/<name>.config.toml` files.
@@ -561,8 +552,7 @@ pub enum ConfigEra {
     Unknown,
 }
 
-/// Legacy-era content carries an inline `[profiles.<name>]` table; >=0.134
-/// uses separate files, so current-era configs never contain `[profiles.`.
+/// Legacy inline `[profiles.*]` marks the old era; current-era configs never carry it.
 pub fn config_era(content: &[u8]) -> ConfigEra {
     let text = String::from_utf8_lossy(content);
     if text.contains("[profiles.") {
@@ -572,8 +562,7 @@ pub fn config_era(content: &[u8]) -> ConfigEra {
     }
 }
 
-/// Era-conflict check (HAD-05 step 5): a profile-file-era version (>=0.134)
-/// paired with legacy inline `[profiles.*]` content.
+/// Conflict when a >=0.134 version is paired with legacy inline `[profiles.*]` content.
 pub fn profile_era_conflict(version: &str, content: &[u8]) -> Option<String> {
     if is_profile_era(version) && config_era(content) == ConfigEra::InlineProfiles {
         return Some(format!(
@@ -583,7 +572,6 @@ pub fn profile_era_conflict(version: &str, content: &[u8]) -> Option<String> {
     None
 }
 
-/// Determine if version is in profile era (>=0.134.0).
 fn is_profile_era(version: &str) -> bool {
     // Unparseable versions count as legacy (fail-safe).
     let mut parts = version.split('.');
@@ -1085,7 +1073,6 @@ mod tests {
         })
         .unwrap();
         let after = superai_config::toml_file::load(&path).unwrap();
-        // model should be removed or empty
         assert!(after.get("model").is_none() || after["model"].as_str().is_none());
         drop(std::fs::remove_file(&path));
     }
@@ -1177,7 +1164,6 @@ mod tests {
                 "missing rule for {path}"
             );
         }
-        // Profile files share the same top-level schema.
         assert!(a.surface_schema("profile.config.toml").is_some());
         assert!(a.surface_schema("unknown").is_none());
     }
@@ -1221,7 +1207,6 @@ mod tests {
         let dir = crate::test_util::temp_dir_unique("codex-schema");
         std::fs::create_dir_all(&dir).unwrap();
         let inst = sample_instance_with_root(dir.to_str().unwrap());
-        // Missing config: fresh instance validates.
         a.validate_instance(&inst).unwrap();
         std::fs::write(dir.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
         a.validate_instance(&inst).unwrap();
@@ -1246,14 +1231,11 @@ mod tests {
         let legacy_bytes = std::fs::read(&legacy).unwrap();
         let current_bytes = std::fs::read(&current).unwrap();
 
-        // Era markers per docs/harness-configs/codex-cli.md §profiles.
         assert_eq!(config_era(&legacy_bytes), ConfigEra::InlineProfiles);
         assert_eq!(config_era(&current_bytes), ConfigEra::Unknown);
-        // The documented version boundary classifies the paired versions.
         assert!(!is_profile_era("0.133.9"));
         assert!(is_profile_era("0.134.0"));
 
-        // Both eras parse and satisfy the declared schema on read.
         for content in [&legacy_bytes, &current_bytes] {
             let diags = crate::adapter::validate_surface_content(
                 &adapter(),
@@ -1295,9 +1277,8 @@ mod tests {
         );
     }
 
-    /// Era-conflict refusal through the shared raw-editor boundary: a
-    /// profile-era adapter refuses to write legacy inline-profile content,
-    /// leaving the file untouched (HAD-05 step 5).
+    /// Era-conflict refusal through the raw-editor boundary: a profile-era
+    /// adapter refuses legacy inline-profile content, leaving the file untouched.
     #[test]
     fn commit_refuses_era_conflicting_content() {
         #[derive(Debug)]
@@ -1388,7 +1369,6 @@ mod tests {
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
         assert_eq!(std::fs::read(&path).unwrap(), original);
-        // Consistent-era content commits through the same boundary.
         let current: Vec<u8> = std::fs::read(fixture_path("config.boundary_current.toml")).unwrap();
         crate::raw_editor::commit_for_adapter(&path, &current, None, &adapter).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), current);

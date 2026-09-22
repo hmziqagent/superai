@@ -61,8 +61,7 @@ pub const LEGACY_OWNED_SELECTORS: &[&str] = &[
     "systemMessage",
 ];
 
-/// Isolation is `project-scope` with an explicit `--config` overlay;
-/// project-level `.continue/` directories are preserved.
+/// Isolation via `project-scope` with an explicit `--config` overlay; project `.continue/` dirs are preserved.
 #[derive(Debug, Clone)]
 pub struct ContinueDevAdapter {
     id: HarnessId,
@@ -85,7 +84,6 @@ impl ContinueDevAdapter {
         EXECUTABLE
     }
 
-    /// Resolve the default config root: `~/.continue`.
     fn default_config_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -96,12 +94,10 @@ impl ContinueDevAdapter {
         Some(PathBuf::from(home).join(".continue"))
     }
 
-    /// Build the config.yaml path for a given root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.yaml")
     }
 
-    /// Build detection evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -489,7 +485,6 @@ impl Adapter for ContinueDevAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (continue-dev.md 1.7: `mcpServers:` list of name-keyed entries)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.yaml",
@@ -501,7 +496,6 @@ impl Adapter for ContinueDevAdapter {
             .with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only; container is a name-keyed YAML list"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "no plugin mechanism documented; IDE extensions are the product distribution, not plugins (continue-dev.md)",
@@ -842,8 +836,7 @@ mod tests {
         let path = dir.join("preserve.yaml");
         std::fs::write(&path, "name: test\nforeignKey: keep-me\n").unwrap();
         // codec-honesty (DOC-06): changing YAML writes on existing files are
-        // refused outright; preservation is expressed by refusing, not by
-        // rewriting.
+        // refused outright; preservation is expressed by refusing.
         let result = superai_config::yaml::edit(&path, |map| {
             map.insert("models".to_owned(), serde_json::Value::Array(vec![]));
         });

@@ -1,7 +1,5 @@
-//! Factory Droid adapter: `droid` binary, layered `~/.factory/settings.json`
-//! with project overlay, `project-scope` isolation via HOME relocation.
-//! Research source: `docs/harness-configs/factory-droid.md` (last verified
-//! 2026-08-25; MCP destination live-verified 2026-09-18).
+//! Factory Droid adapter: `droid` binary, layered `~/.factory/settings.json` with project overlay.
+//! Research source: `docs/harness-configs/factory-droid.md` (last verified 2026-08-25; MCP dest live-verified 2026-09-18).
 
 use std::path::{Path, PathBuf};
 
@@ -42,8 +40,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version for current config shape.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Owned selectors for Factory Droid inside `settings.json`: local
-/// customModels and tool gating only; hosted/org policy keys stay foreign.
+/// Owned selectors inside `settings.json`: local customModels and tool gating; hosted/org keys stay foreign.
 pub const OWNED_SELECTORS: &[&str] = &[
     "customModels",
     "model",
@@ -79,7 +76,6 @@ impl FactoryDroidAdapter {
         EXECUTABLE
     }
 
-    /// Resolve the default config root: `~/.factory`.
     fn default_config_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -90,12 +86,10 @@ impl FactoryDroidAdapter {
         Some(PathBuf::from(home).join(".factory"))
     }
 
-    /// Build the settings.json path for a given root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Collect config evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -458,11 +452,8 @@ impl Adapter for FactoryDroidAdapter {
         ]
     }
 
-    /// EXT-08/09: `droid mcp add` (own writer) puts top-level `mcpServers`
-    /// into `~/.factory/mcp.json` (live-verified droid 0.222.0, 2026-09-18).
-    /// The dest nests under `.factory/` because the wrapper relocates HOME to
-    /// the instance root and the binary reads `$HOME/.factory/mcp.json` only;
-    /// a flat dest would never be read.
+    /// `droid mcp add` writes top-level `mcpServers` to `$HOME/.factory/mcp.json`
+    /// only (live-verified droid 0.222.0); under HOME relocation the dest must nest.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".factory/mcp.json",
@@ -473,7 +464,6 @@ impl Adapter for FactoryDroidAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (factory-droid.md)")
     }

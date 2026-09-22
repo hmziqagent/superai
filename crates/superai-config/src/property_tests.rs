@@ -1,8 +1,5 @@
-//! Property tests for QAL-03: manual loops with a deterministic RNG, no
-//! external dependency.
-//!
-//! Covers: no-op byte identity, unrelated survive, restore exact,
-//! preview deterministic, collision-safe normalization.
+//! Property tests (QAL-03): manual loops with a deterministic RNG, covering
+//! no-op identity, unrelated survival, exact restore, deterministic previews.
 
 #![expect(
     clippy::cast_possible_truncation,
@@ -63,7 +60,6 @@ mod tests {
                 return low;
             }
             let range = high.saturating_sub(low);
-            // Use u64 to avoid overflow.
             let v = self.next_u64() as usize;
             low.saturating_add(v % range)
         }
@@ -108,7 +104,6 @@ mod tests {
             1 => Value::Bool(rng.gen_bool()),
             2 => {
                 let n = rng.gen_range(0, 1000);
-                // Randomly int or float.
                 if rng.gen_bool() {
                     Value::Number(Number::from(n as i64))
                 } else {
@@ -122,7 +117,6 @@ mod tests {
                 Value::String(s)
             }
             4 => {
-                // Small array of primitives.
                 let len = rng.gen_range(0, 4);
                 let mut arr = Vec::with_capacity(len);
                 for _ in 0..len {
@@ -136,7 +130,6 @@ mod tests {
                 Value::Array(arr)
             }
             _ => {
-                // Nested object one level.
                 let len = rng.gen_range(0, 3);
                 let mut map = Map::new();
                 for _ in 0..len {
@@ -188,7 +181,6 @@ mod tests {
             std::fs::write(&path, &file_bytes).unwrap();
             let before = std::fs::read(&path).unwrap();
 
-            // No-op edit should preserve bytes and create no backup.
             crate::json::edit(&path, |_| {}).unwrap();
 
             let after = std::fs::read(&path).unwrap();
@@ -197,7 +189,6 @@ mod tests {
                 "no-op byte identity failed at iter {iter}: map={map:?}"
             );
 
-            // No backup should have been created for no-op.
             let backups = list_backups(&path).unwrap();
             assert!(
                 backups.is_empty(),
@@ -212,7 +203,6 @@ mod tests {
     fn property_no_op_byte_identity_toml() {
         for iter in 0..80 {
             let mut rng = Prng::new(iter as u64 + 0x00def33);
-            // Build a TOML doc with random keys.
             let mut doc = toml_edit::DocumentMut::new();
             let n = rng.gen_range(0, 5);
             for _ in 0..n {
@@ -242,7 +232,6 @@ mod tests {
         for iter in 0..80 {
             let mut rng = Prng::new(iter as u64 + 0x112233);
             let map = random_json_map(&mut rng, 4);
-            // Write normalized YAML via yaml serde, then test no-op edit preserves bytes.
             let text = if map.is_empty() {
                 String::new()
             } else {
@@ -269,7 +258,6 @@ mod tests {
         for iter in 0..100 {
             let mut rng = Prng::new(iter as u64 + 0x7777);
             let mut map = random_json_map(&mut rng, 5);
-            // Ensure at least 2 keys.
             while map.len() < 2 {
                 let k = random_key(&mut rng);
                 if !map.contains_key(&k) {
@@ -285,7 +273,6 @@ mod tests {
             ));
 
             let path = scratch_path("prop-unrelated-json", &format!("iter-{iter}.json"));
-            // Write initial file.
             std::fs::write(
                 &path,
                 serde_json::to_string_pretty(&Value::Object(map.clone()))
@@ -300,13 +287,11 @@ mod tests {
             .unwrap();
 
             let after = crate::json::load(&path).unwrap();
-            // Target changed.
             assert_eq!(
                 after.get(&target_key),
                 Some(&new_val),
                 "target not updated at {iter}"
             );
-            // Unrelated survive exactly.
             for k in keys {
                 if k == target_key {
                     continue;
@@ -320,10 +305,8 @@ mod tests {
                     "unrelated key {k} mutated at iter {iter}"
                 );
             }
-            // Order preservation: unrelated keys keep relative order.
             let before_order: Vec<&String> = map.keys().collect();
             let after_order: Vec<&String> = after.keys().collect();
-            // Filter to unrelated only and compare order.
             let before_unrelated: Vec<&String> = before_order
                 .into_iter()
                 .filter(|k| *k != &target_key)
@@ -350,12 +333,10 @@ mod tests {
             let mut keys = Vec::new();
             for i in 0..n {
                 let k = format!("KEY_{}_{}", iter, i);
-                // Ensure valid env key.
                 let v = rng.gen_string(2, 12, SIMPLE_CHARSET);
                 vars.insert(k.clone(), v);
                 keys.push(k);
             }
-            // Write initial env file with comments.
             let mut text = String::new();
             text.push_str("# generated\n");
             for k in &keys {
@@ -397,13 +378,11 @@ mod tests {
             let mut bytes = Vec::with_capacity(size);
             for _ in 0..size {
                 let b = rng.gen_range(0, 256) as u8;
-                // Keep utf8 mostly valid for readability, but allow arbitrary.
                 bytes.push(b);
             }
             let path = scratch_path("prop-restore", &format!("iter-{iter}.bin"));
             std::fs::write(&path, &bytes).unwrap();
 
-            // Capture permissions if unix.
             #[cfg(unix)]
             let orig_mode = {
                 use std::os::unix::fs::PermissionsExt;
@@ -412,7 +391,6 @@ mod tests {
 
             let entry = backup(&path).unwrap().expect("backup should exist");
             assert_eq!(entry.size, bytes.len() as u64, "size mismatch at {iter}");
-            // Overwrite with different bytes.
             let new_bytes = format!(
                 "overwritten-{iter}-{}",
                 rng.gen_string(4, 20, VALUE_CHARSET)
@@ -421,7 +399,6 @@ mod tests {
             std::fs::write(&path, &new_bytes).unwrap();
             assert_ne!(std::fs::read(&path).unwrap(), bytes, "overwrite failed");
 
-            // Restore via entry.
             restore_entry(&entry).unwrap();
             let restored = std::fs::read(&path).unwrap();
             assert_eq!(restored, bytes, "restore exact failed at {iter}");
@@ -436,7 +413,6 @@ mod tests {
                 );
             }
 
-            // Verify backup still verifies.
             assert!(
                 verify_backup(&entry).unwrap(),
                 "verify backup failed at {iter}"
@@ -494,15 +470,12 @@ mod tests {
 
     #[test]
     fn property_collision_safe_backup_suffix() {
-        // Generate many backups for same file quickly and ensure suffixes unique enough
-        // and ids never collide for distinct writes.
         let path = scratch_path("prop-collision", "target.json");
         std::fs::write(&path, b"initial").unwrap();
 
         let mut ids = HashSet::new();
 
         for iter in 0..100 {
-            // Mutate file each time so backup captures new state.
             let content = format!("content-{iter}").into_bytes();
             std::fs::write(&path, &content).unwrap();
             let entry = backup(&path).unwrap().unwrap();
@@ -511,7 +484,6 @@ mod tests {
                 ids.insert(id_str.clone()),
                 "backup id collision at iter {iter}: {id_str}"
             );
-            // Verify backup file exists and digest matches.
             assert!(entry.backup_path.exists(), "backup file missing at {iter}");
             assert!(verify_backup(&entry).unwrap(), "verify failed at {iter}");
         }
@@ -547,7 +519,6 @@ mod tests {
             let expected_digest = raw.digest.clone();
             let before_bytes = raw.content.expose().to_vec();
 
-            // Generate new content: either valid json or invalid.
             let make_invalid = rng.gen_bool() && iter % 3 == 0;
             let new_content = if make_invalid {
                 b"{ invalid json ".to_vec()
@@ -562,7 +533,6 @@ mod tests {
             );
             let is_valid = preview_docs.is_empty();
 
-            // If we expect conflict, modify file between preview and commit.
             let inject_conflict = rng.gen_bool() && iter % 4 == 0 && is_valid;
             if inject_conflict {
                 std::fs::write(&path, b"{\"a\":9999}").unwrap();
@@ -575,10 +545,8 @@ mod tests {
                     commit_res.is_err(),
                     "invalid content should not commit at {iter}"
                 );
-                // Ensure no mutation happened: file still either original or conflict-injected but not new_content
                 let cur = std::fs::read(&path).unwrap();
                 assert_ne!(cur, new_content, "invalid commit mutated file at {iter}");
-                // Restore for next check? Original should still be there if no conflict injection.
                 if !inject_conflict {
                     assert_eq!(
                         cur, before_bytes,
@@ -587,14 +555,12 @@ mod tests {
                 }
             } else if inject_conflict {
                 assert!(commit_res.is_err(), "conflict should abort at {iter}");
-                // File should be the conflict-injected content, not new_content
                 let cur = std::fs::read(&path).unwrap();
                 assert_ne!(
                     cur, new_content,
                     "conflict commit should not have written at {iter}"
                 );
             } else {
-                // Valid and no conflict: commit should succeed and file should equal new_content.
                 assert!(
                     commit_res.is_ok(),
                     "valid commit failed at {iter}: {:?}",
@@ -630,9 +596,6 @@ mod tests {
                 assert!(!dbg.contains("sk-superai-test-sentinel"));
                 assert!(b.backup_path.exists());
             }
-            // Commit through the mutation boundary, which verifies the
-            // snapshot token; a mutant skipping is_modified would let a
-            // stale write through.
             let new_content = format!(r#"{{"a":{}}}"#, iter + 1000).into_bytes();
             crate::transaction::commit_file_expecting(
                 "prop-backup-mutant",
@@ -647,11 +610,9 @@ mod tests {
                 new_content,
                 "write should succeed with correct snapshot at {iter}"
             );
-            // A mutant flipping is_modified to always false would silently
-            // overwrite external edits.
             std::fs::write(&path, &original).unwrap();
             let snap2 = snapshot(&path);
-            std::fs::write(&path, br#"{"a":9999}"#).unwrap(); // external edit
+            std::fs::write(&path, br#"{"a":9999}"#).unwrap();
             let snap3 = snapshot(&path);
             assert!(
                 is_modified(&snap2, &snap3),
@@ -683,7 +644,6 @@ mod tests {
             !spans.is_empty(),
             "secret spans must be found (mutant removed detection would yield empty)"
         );
-        // Diff must also redact
         let new_bytes = format!(r#"{{"api_key":"{sentinel}2","model":"sonnet"}}"#).into_bytes();
         let diff =
             crate::raw_editor::diff(bytes, &new_bytes, crate::document::DocumentKind::StrictJson);
@@ -695,13 +655,10 @@ mod tests {
             !diff.lexical_unified_diff.contains(sentinel),
             "diff lexical must not leak sentinel"
         );
-        // If mutant removed redaction, above asserts would fail
     }
 
     #[test]
     fn mutant_template_selector_traversal_is_rejected() {
-        // Traversal-shaped selectors must parse or reject without panicking;
-        // quarantine rejects traversal outright.
         let traversals = ["../", "a/../b", "..\\", "key:../escape", "table:../"];
         for t in traversals {
             drop(Selector::parse(t));

@@ -1,9 +1,5 @@
-//! iFlow CLI adapter: Gemini-fork, `MigrationOnly` (detect/inspect/backup/
-//! export, no new defaults, no deletion); sunset 2026-04-17, successor
-//! gemini-cli. Config: `~/.iflow/settings.json` (user), `.iflow/settings.json`
-//! (project), `/etc/iflow-cli/settings.json` or `$IFLOW_CLI_SYSTEM_SETTINGS_PATH`
-//! (system), plus env `IFLOW_*` overrides.
-//! Research source: `docs/harness-configs/iflow-cli.md` (last verified 2026-08-25).
+//! iFlow CLI adapter: Gemini fork, migration-only (sunset 2026-04-17, successor
+//! gemini-cli); settings in `~/.iflow/`, `.iflow/`, or a system-tier path.
 
 use std::path::{Path, PathBuf};
 
@@ -56,10 +52,8 @@ pub const SUCCESSOR_EXECUTABLE: &str = "gemini";
 /// Migration tip shown for migration-only support.
 pub const MIGRATION_TIP: &str = "iFlow CLI shutting down 2026-04-17 (UTC+8); migrate via gemini-cli (Gemini CLI lineage): IFLOW_* env vars map to GEMINI_* (apiKey/baseUrl/modelName), system settings IFLOW_CLI_SYSTEM_SETTINGS_PATH -> GEMINI system path, auth selectedAuthType iflow/openai-compatible; guide https://vibex.iflow.cn/t/topic/4819";
 
-/// Concrete adapter for iFlow CLI (`MigrationOnly`): `env_only` isolation
-/// (pure `IFLOW_*` env vars outrank all files) with optional
-/// `IFLOW_CLI_SYSTEM_SETTINGS_PATH` for file-based isolation; only
-/// detect/inspect/backup/export are supported.
+/// iFlow CLI adapter, migration-only: `IFLOW_*` env vars outrank all files;
+/// only detect/inspect/backup/export, no writes.
 #[derive(Debug, Clone)]
 pub struct IflowAdapter {
     id: HarnessId,
@@ -92,7 +86,6 @@ impl IflowAdapter {
         MIGRATION_TIP
     }
 
-    /// Resolve the default user config root: `~/.iflow`.
     fn default_config_root() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -103,7 +96,6 @@ impl IflowAdapter {
         Some(PathBuf::from(home).join(".iflow"))
     }
 
-    /// Build detection evidence about shutdown, config roots, and env.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -496,7 +488,6 @@ impl Adapter for IflowAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (iflow-cli.md 5: `mcpServers` in user/project settings.json)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -510,7 +501,6 @@ impl Adapter for IflowAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (iflow-cli.md)")
     }

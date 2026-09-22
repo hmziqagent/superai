@@ -5,9 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 
-/// How an instance satisfies a capability. Depends on the harness and the
-/// provider together: the same harness can be native on one provider and
-/// substituted on another.
+/// How an instance satisfies a capability. The same harness can be native on
+/// one provider and substituted on another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Support {
@@ -105,10 +104,8 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::Mcp,
 ];
 
-/// Parse a capability id (or documented alias) into the typed capability.
-///
-/// Unknown ids are a typed validation error, never silent absence (CAP-01).
-/// Matching is case-insensitive on the `snake_case` id and the catalog aliases.
+/// Parse a capability id or documented alias; unknown ids are a validation
+/// error, never silent absence.
 pub fn parse_capability_id(input: &str) -> Result<Capability> {
     let normalized = input.trim().to_ascii_lowercase();
     for entry in CAPABILITY_CATALOG {
@@ -144,7 +141,7 @@ impl std::fmt::Display for Capability {
     }
 }
 
-/// Parse a support value from data (CAP-01: reject unknown cleanly).
+/// Parse a support value from data.
 pub fn parse_support(input: &str) -> Result<Support> {
     match input.trim().to_ascii_lowercase().as_str() {
         "native" => Ok(Support::Native),

@@ -40,8 +40,7 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// HOME workaround note.
 pub const HOME_WORKAROUND_NOTE: &str = "no documented AGY_HOME/CONFIG_DIR; HOME relocation is undocumented workaround: verify before relying, especially on macOS keychain";
 
-/// Detect only. Writes stay blocked until the settings schema, per-OS
-/// auth/keyring behavior, plugin/skill/MCP paths, and HOME concurrency are known.
+/// Detect only; writes blocked pending settings schema, per-OS keyring, and HOME-concurrency verification.
 #[derive(Debug, Clone)]
 pub struct AntigravityAdapter {
     id: HarnessId,
@@ -69,7 +68,6 @@ impl AntigravityAdapter {
         HOME_WORKAROUND_NOTE
     }
 
-    /// Resolve default HOME.
     fn default_home() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("HOME")
             && !home.trim().is_empty()
@@ -84,7 +82,6 @@ impl AntigravityAdapter {
         None
     }
 
-    /// Collect evidence including research-blocked explanation.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -385,7 +382,6 @@ impl Adapter for AntigravityAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (antigravity-cli.md: `mcp_config.json` profiles)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp_config.json",
@@ -396,7 +392,6 @@ impl Adapter for AntigravityAdapter {
         ).with_read_only("research-blocked harness; remote entries use the serverUrl schema (antigravity-cli.md 5); inspect/diff only"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "plugin bundles documented (`plugin.json` under ~/.gemini/antigravity-cli/plugins/) but the harness is ResearchBlocked; revisit when research completes (antigravity-cli.md 5)",

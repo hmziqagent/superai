@@ -1,6 +1,5 @@
-//! `ChatGPT` Desktop adapter: read-only view of the `~/.codex` store shared
-//! with codex-cli. Research source: `docs/harness-configs/chatgpt-desktop.md`
-//! (verified 2026-09-18).
+//! `ChatGPT` Desktop adapter: read-only view of the `~/.codex` store shared with codex-cli.
+//! Research source: `docs/harness-configs/chatgpt-desktop.md` (verified 2026-09-18).
 
 use std::path::PathBuf;
 
@@ -25,12 +24,10 @@ pub const DISPLAY_NAME: &str = "ChatGPT Desktop (Codex)";
 /// The shared Codex store this app reads (owned by the codex-cli harness).
 pub const SHARED_STORE_HINT: &str = "~/.codex";
 
-/// Env var that relocates the shared store for the CLI only: documented for
-/// codex-cli; whether the GUI app honors it is NOT documented.
+/// Relocates the shared store for the CLI only; whether the GUI honors it is undocumented.
 pub const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 
-/// Desktop-only key inside the shared `config.toml` (official
-/// learn.chatgpt.com config-reference: "User-level only").
+/// Desktop-only key inside the shared `config.toml`, "User-level only" per the official reference.
 pub const DESKTOP_OWNED_SELECTOR: &str = "desktop.custom_file_handlers";
 
 /// Official statement on local MCP in Chat (help center 12584461).
@@ -71,8 +68,6 @@ impl ChatGptDesktopAdapter {
         &self.id
     }
 
-    /// The shared store root: `$CODEX_HOME` when set (the CLI-documented
-    /// knob), else the default `~/.codex`. Read-only for this adapter.
     fn shared_store_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CODEX_HOME_ENV_VAR)
             && !dir.trim().is_empty()
@@ -207,8 +202,6 @@ impl Adapter for ChatGptDesktopAdapter {
     fn config_surfaces(&self) -> Vec<ConfigSurface> {
         let mut surfaces = Vec::new();
 
-        // Shared with codex-cli; the one desktop-owned selector is
-        // desktop.custom_file_handlers.
         let config_resolver = PathResolver::new(
             Some("$CODEX_HOME/config.toml (shared with codex-cli)"),
             Some("$CODEX_HOME/config.toml (shared with codex-cli)"),
@@ -392,8 +385,6 @@ impl Adapter for ChatGptDesktopAdapter {
         Vec::new()
     }
 
-    /// EXT-09: Chat-surface MCP is remote-only; the local `[mcp_servers]`
-    /// inside `~/.codex/config.toml` belongs to codex-cli (modeled there).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "chat connects to remote MCP servers only (official position); the local \
@@ -402,8 +393,6 @@ impl Adapter for ChatGptDesktopAdapter {
         )
     }
 
-    /// EXT-06: MCP "apps" are server-side and web-managed; no local
-    /// plugin mechanism.
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "MCP apps are server-side and web-managed (developer mode); no local plugin \
@@ -539,9 +528,8 @@ mod tests {
         }
     }
 
-    /// The alias-contract pin: no env vars of its own (setting `CODEX_HOME`
-    /// here would fabricate GUI-level relocation), and the plan redirects to
-    /// codex-cli: `alias::create_alias` refuses on the empty env set.
+    /// Alias-contract pin: no env vars of its own (setting `CODEX_HOME` would
+    /// fabricate GUI relocation); `alias::create_alias` refuses on the empty set.
     #[test]
     fn plan_wrapper_sets_no_env_vars_and_redirects_to_codex_cli() {
         let a = adapter();
@@ -651,8 +639,7 @@ mod tests {
         );
     }
 
-    /// Schema round-trip: the populated corpus satisfies the declared table
-    /// root + desktop-key rule; a non-table root is rejected (HAD-03).
+    /// Corpus satisfies the table root + desktop-key rule; a non-table root is rejected.
     #[test]
     fn surface_schema_accepts_corpus_and_rejects_bad_root() {
         let a = adapter();

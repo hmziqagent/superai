@@ -1,6 +1,5 @@
 //! Sculptor adapter: orchestrator with global/per-repo env files, harness
 //! settings, and worktree/container isolation; `Constrained`.
-//! Research source: `docs/harness-configs/orchestrators.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -50,9 +49,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "dependencies.claude_code_binary",
 ];
 
-/// Concrete adapter for Sculptor (`Constrained`, `os_bound`): worktrees plus
-/// optional Docker backend; keychain forwarding and non-first-class agents
-/// keep it constrained.
+/// Concrete adapter for Sculptor (`Constrained`, `os_bound`): worktrees plus an optional Docker backend.
 #[derive(Debug, Clone)]
 pub struct SculptorAdapter {
     id: HarnessId,
@@ -80,7 +77,6 @@ impl SculptorAdapter {
         CONSTRAINED_NOTE
     }
 
-    /// Resolve the global env file `~/.sculptor/.env`.
     fn global_env_path() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -91,7 +87,6 @@ impl SculptorAdapter {
         Some(PathBuf::from(home).join(".sculptor").join(".env"))
     }
 
-    /// Build detection evidence about workspaces, env, containers, and harnesses.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -507,14 +502,12 @@ impl Adapter for SculptorAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "orchestrator: MCP servers are carried into managed harnesses via Claude settings sync; sculptor has no own MCP dest (orchestrators.md)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "orchestrator: bundled plugins are injected into Claude sessions by sculptor itself; no user plugin mechanism (orchestrators.md)",

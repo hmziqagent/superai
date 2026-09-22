@@ -1,16 +1,5 @@
-//! Three-way template update and transactional apply (TPL-06, TPL-07).
-//!
-//! Inputs:
-//! - `base`: previously applied `Template`
-//! - `new`: candidate `Template`
-//! - `local`: fresh current harness config (`serde_json::Map`)
-//!
-//! For each owned selector: local==base -> apply new, new==base -> keep local,
-//! local==new -> already applied, both differ -> conflict, missing/type-changed
-//! -> schema conflict. Foreign selectors are untouched.
-//!
-//! Preview contains old/new defaults, local values, auto-applicable edits,
-//! conflicts, wrapper and capability changes, and warnings.
+//! Three-way template update and transactional apply (TPL-06, TPL-07):
+//! local==base applies new, new==base keeps local, both differ conflicts.
 
 #![expect(
     clippy::excessive_nesting,
@@ -43,8 +32,6 @@ use crate::ids::TemplateVersion;
 use crate::instance::{Instance, TemplateRef};
 use crate::registry::Registry;
 use crate::template::{CapabilityChanges, Template, compute_digest};
-
-// Helpers
 
 fn json_type_name(value: &Value) -> &'static str {
     match value {
@@ -96,10 +83,8 @@ fn get_local_value(local: &Map<String, Value>, selector: &str) -> Option<Value> 
     Some(current)
 }
 
-/// Build the engine operation for one auto-applicable edit (DOC-02 caller
-/// migration: three-way edits route through the executor so
-/// `owned_keys`/`expected_old`/`create_parent` are enforced instead of
-/// hand-rolled JSON path editing).
+/// Engine operation for one edit: three-way edits route through the
+/// executor so `owned_keys/expected_old/create_parent` are enforced.
 fn edit_to_engine_operation(edit: &Edit, owned_keys: &[String]) -> Result<EngineOperation> {
     let selector = Selector::parse(&edit.selector).map_err(|e| CoreError::Validation {
         field: "patches.selector".to_owned(),
@@ -142,14 +127,8 @@ fn resolve_config_path(instance: &Instance, adapter: &dyn Adapter) -> PathBuf {
     instance.config_root.as_path().join("settings.json")
 }
 
-/// Load the local config map for a three-way merge, or refuse honestly.
-///
-/// codec-honesty (DOC-05): a missing or empty file legitimately yields an
-/// empty base map, but bytes that fail strict-JSON parsing (JSONC content,
-/// comments/trailing commas, e.g. amp's declared settings kind) must not be
-/// silently swapped for an empty map: the merge would then drop every local
-/// key and write normalized JSON over the file. Refuse with the typed
-/// lossy-write error instead.
+/// Load the local map for a three-way merge, or refuse honestly (DOC-05):
+/// unparseable bytes must not become an empty map; typed lossy-write error.
 fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -169,8 +148,6 @@ fn load_local_map(path: &Path) -> Result<Map<String, Value>> {
         Err(_) => Ok(Map::new()),
     }
 }
-
-// Public edit / conflict types
 
 /// One automatically applicable edit from the three-way merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,8 +217,6 @@ pub struct Conflict {
     /// Human message, redacted (no secrets).
     pub message: String,
 }
-
-// Wrapper / capability preview
 
 /// Wrapper changes included in the preview.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -322,7 +297,6 @@ fn compute_wrapper_changes(base: &Template, new: &Template) -> WrapperChanges {
             added_assets.push((*a).clone());
         }
     }
-    // Sort for determinism
     added_env.sort();
     removed_env.sort();
     changed_env.sort();
@@ -370,11 +344,8 @@ fn compute_capability_changes(base: &Template, new: &Template) -> CapabilityChan
     }
 }
 
-// Preview struct and core three-way
-
-/// Resolver-computed capability delta for an update preview (CAP-06):
-/// support and source BEFORE vs AFTER, from real resolution sources rather
-/// than a string diff of the template's capability map.
+/// Resolver-computed capability delta for a preview (CAP-06): support
+/// and source BEFORE vs AFTER, from real resolution sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilitySupportChange {
     /// Capability whose resolution changed.
@@ -441,16 +412,8 @@ impl UpdatePreview {
     }
 }
 
-/// Compute a three-way preview.
-///
-/// For each owned selector (union of `base` and `new` patches):
-/// - `local == base` -> apply `new`
-/// - `new == base` -> keep `local`
-/// - `local == new` -> already applied
-/// - both differ -> conflict
-/// - missing / type-changed -> schema conflict
-///
-/// Foreign selectors are untouched.
+/// Three-way preview per owned selector: local==base applies new,
+/// new==base keeps local, both differ conflicts; foreign untouched.
 pub fn preview_three_way(
     base: &Template,
     new: &Template,
@@ -536,10 +499,8 @@ pub fn preview_three_way(
     for selector in &union {
         let base_val = old_defaults.get(selector).cloned();
         let new_val = new_defaults.get(selector).cloned();
-        // Determine if selector is parseable as Key; if not, schema conflict.
         let path_opt = selector_to_path(selector);
         let local_val = if path_opt.is_none() {
-            // Non-Key selectors are schema conflicts if they appear in template
             conflicts.push(Conflict {
                 selector: selector.clone(),
                 base: base_val.clone(),
@@ -605,7 +566,6 @@ pub fn preview_three_way(
             });
             continue;
         }
-        // Equality branches
         if local_val == base_val {
             if new_val != base_val {
                 auto_applicable.push(Edit {
@@ -659,10 +619,8 @@ pub fn preview_three_way(
     }
 }
 
-/// Compute the resolver-backed capability delta between two templates
-/// (CAP-06): resolves every catalog capability with the adapter's
-/// declarations, the provider's capability data, and each template's own
-/// capability map, then reports support/source changes.
+/// Resolver-backed capability delta between two templates (CAP-06),
+/// reporting support/source changes from real resolution sources.
 pub fn compute_resolved_capability_delta(
     base: &Template,
     new: &Template,
@@ -704,9 +662,8 @@ pub fn compute_resolved_capability_delta(
     deltas
 }
 
-/// [`preview_three_way`] enriched with the resolver-computed capability
-/// delta (CAP-06): capability changes are visible, with sources, BEFORE any
-/// update commit.
+/// [`preview_three_way`] plus the resolver-computed capability delta
+/// (CAP-06): capability changes visible BEFORE any commit.
 pub fn preview_update_with_capability_resolution(
     base: &Template,
     new: &Template,
@@ -719,8 +676,6 @@ pub fn preview_update_with_capability_resolution(
         compute_resolved_capability_delta(base, new, adapter, provider);
     preview
 }
-
-// Apply outcome and transactional apply (TPL-07)
 
 /// Outcome of `apply_update`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -739,10 +694,8 @@ pub struct ApplyOutcome {
     pub conflict_token: Option<String>,
 }
 
-/// Verify in-memory template bytes: size cap, parses as the claimed
-/// template (id and version must agree), and matches the catalog digest
-/// when one is provided. The template's own `digest` field is only
-/// format-checked: the catalog digest is the integrity authority.
+/// Verify in-memory template bytes: size cap, id/version agreement,
+/// catalog digest match; the `digest` field is format-checked only.
 fn verify_template_bytes_in_memory(
     template: &Template,
     bytes: &[u8],
@@ -804,18 +757,8 @@ fn verify_template_bytes_in_memory(
     Ok(())
 }
 
-/// Apply a template update transactionally (TPL-07).
-///
-/// Steps:
-/// 1. re-fetch/verify required template files (in-memory bytes)
-/// 2. fresh-read instance config via snapshot
-/// 3. recompute three-way + conflict token
-/// 4. apply config/wrapper/assets via transaction.rs
-/// 5. validate harness instance via adapter
-/// 6. re-resolve capabilities
-/// 7. write new template version to registry last (only after verification)
-///
-/// Failure retains old version, no registry bump. Quarantine/rollback on failure.
+/// Apply a template update transactionally (TPL-07): verify bytes, fresh
+/// read, recompute three-way, transactional apply, registry written last.
 #[expect(
     clippy::too_many_arguments,
     reason = "transaction requires base/new bytes and adapter"
@@ -858,11 +801,9 @@ pub fn apply_update_with_catalog_digests(
     new_catalog_digest: Option<&str>,
     adapter: &dyn Adapter,
 ) -> Result<ApplyOutcome> {
-    // 1. re-fetch/verify required template files (in-memory bytes)
     verify_template_bytes_in_memory(base, base_bytes, base_catalog_digest, "base")?;
     verify_template_bytes_in_memory(new, new_bytes, new_catalog_digest, "new")?;
 
-    // Validate harness agreement
     if base.harness != instance.harness || new.harness != instance.harness {
         return Err(CoreError::Validation {
             field: "harness".to_owned(),
@@ -873,13 +814,10 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // CAP-04: incomplete capability coverage blocks the template USE path.
-    // Validating the candidate against the adapter that will receive it
-    // enforces both selector ownership (TPL-02) and capability completeness
-    // before any disk mutation.
+    // CAP-04: validating the candidate against the receiving adapter
+    // enforces selector ownership and completeness before any mutation.
     new.validate_against_adapter(adapter)?;
 
-    // 2. fresh-read instance config via snapshot (and registry)
     let registry = Registry::load(registry_path)?;
     let fresh_instance =
         registry
@@ -898,7 +836,6 @@ pub fn apply_update_with_catalog_digests(
     let conflict_token = snap_before.digest.clone();
     let local_map = load_local_map(&config_path)?;
 
-    // 3. recompute three-way + conflict token
     let preview = preview_three_way(base, new, &local_map);
     if !preview.conflicts.is_empty() {
         let msgs: Vec<String> = preview
@@ -925,10 +862,8 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // Build new config map by applying auto_applicable edits through the
-    // document engine (DOC-02 executor): owned keys are the template's own
-    // patch selectors, expected_old is each edit's observed `from` value,
-    // and parents may be created to mirror nested patch paths.
+    // Apply edits through the document engine (DOC-02): owned keys are
+    // the patch selectors, expected_old the observed `from`, parents created.
     let owned_keys: Vec<String> = base
         .patches
         .iter()
@@ -947,7 +882,6 @@ pub fn apply_update_with_catalog_digests(
         });
     };
 
-    // Serialize new config
     let serialized_value = Value::Object(new_local_map.clone());
     let mut new_bytes_serialized =
         serde_json::to_string_pretty(&serialized_value).map_err(|e| {
@@ -959,7 +893,6 @@ pub fn apply_update_with_catalog_digests(
     new_bytes_serialized.push('\n');
     let new_content = new_bytes_serialized.into_bytes();
 
-    // Prepare file actions
     let op_id_str = crate::registry::unique_operation_string("op");
     let tx_op_id = superai_config::transaction::OperationId::new(&op_id_str).map_err(|e| {
         CoreError::Validation {
@@ -969,7 +902,6 @@ pub fn apply_update_with_catalog_digests(
     })?;
 
     let mut steps: Vec<FileAction> = Vec::new();
-    // Config write
     steps.push(FileAction::Write {
         path: config_path.clone(),
         content: new_content.clone(),
@@ -1022,7 +954,6 @@ pub fn apply_update_with_catalog_digests(
         }
     }
 
-    // 4. apply config/wrapper/assets via transaction.rs
     let mut transaction = Transaction::new(tx_op_id, steps);
     let outcome = transaction.execute().map_err(CoreError::Config)?;
 
@@ -1086,7 +1017,6 @@ pub fn apply_update_with_catalog_digests(
         }
     }
 
-    // 5. validate harness instance via adapter
     let mut updated_instance = fresh_instance.clone();
     updated_instance.template = Some(TemplateRef {
         name: new.id.clone(),
@@ -1111,7 +1041,6 @@ pub fn apply_update_with_catalog_digests(
         });
     }
 
-    // 6. re-resolve capabilities
     let provider_id = new.provider.clone();
     let resolved = capability_resolver::resolve_all(&updated_instance.harness, &provider_id);
     // If any capability resolution yields Unknown source for required caps, add warning but not block
@@ -1170,7 +1099,6 @@ pub fn apply_update_with_catalog_digests(
         return Err(e);
     }
 
-    // Success
     Ok(ApplyOutcome {
         applied: preview.auto_applicable,
         verification: outcome.diagnostics_redacted,
@@ -1223,8 +1151,6 @@ mod tests {
             value,
         }
     }
-
-    // TPL-08 selector reset + CAP-04 completeness + CAP-06 resolved delta
 
     /// Local adapter declaring only ONE capability transport: the CAP-04
     /// completeness gate must reject templates against it.
@@ -1390,9 +1316,8 @@ mod tests {
 
     #[test]
     fn resolved_capability_delta_uses_sources_not_string_diff() {
-        // claude-code + glm: template override flips vision absent->native.
-        // The string capability_map diff alone cannot express the
-        // source-attributed before/after the resolver produces.
+        // Template override flips vision absent->native; the string diff
+        // alone cannot express the source-attributed before/after.
         let base = minimal_template("1.0.0", vec![patch("key:model", json!("glm-4"))]);
         let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
         new.capability_map.insert(
@@ -1444,7 +1369,6 @@ mod tests {
     #[test]
     fn preview_local_override_preserved_when_new_eq_base() {
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
-        // new unchanged for that selector
         let new = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let mut local = Map::new();
         local.insert("model".to_owned(), json!("my-custom-model"));
@@ -1459,10 +1383,8 @@ mod tests {
 
     #[test]
     fn apply_update_blocked_on_incomplete_capability_coverage() {
-        // FINDING-2 regression: the CAP-04 completeness gate must fire on the
-        // template USE path, an update whose capability coverage does not
-        // resolve against the target adapter is refused before any disk
-        // mutation, and the registry keeps the old version.
+        // CAP-04 on the USE path: an update whose capability coverage does
+        // not resolve is refused before any disk mutation.
         let tmp = crate::test_util::temp_dir_unique("tpl-cap04-apply");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".partial-work");
@@ -1560,9 +1482,8 @@ mod tests {
 
     #[test]
     fn apply_nested_selector_creates_parent_and_preserves_foreign() {
-        // DOC-02 caller migration: nested patch selectors route through the
-        // engine executor, creating intermediate objects while foreign keys
-        // and untouched siblings survive the apply.
+        // DOC-02: nested patch selectors route through the engine executor,
+        // creating parents while foreign keys and siblings survive.
         let tmp = crate::test_util::temp_dir_unique("tpl-update-nested");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-nested");
@@ -1707,7 +1628,6 @@ mod tests {
             preview.auto_applicable
         );
         assert_eq!(temp_edit.unwrap().to, None);
-        // model also should be auto
         assert!(
             preview
                 .auto_applicable
@@ -1725,11 +1645,9 @@ mod tests {
         local.insert("foreign_key".to_owned(), json!("keep_me"));
         local.insert("another".to_owned(), json!(123));
         let preview = preview_three_way(&base, &new, &local);
-        // preview only considers owned selectors
         assert_eq!(preview.local_values.len(), 1);
         assert!(preview.local_values.contains_key("key:model"));
         assert!(!preview.local_values.contains_key("foreign_key"));
-        // auto applicable only for owned
         assert_eq!(preview.auto_applicable.len(), 1);
     }
 
@@ -1786,7 +1704,6 @@ mod tests {
 
     #[test]
     fn apply_success_advances_version_and_retains_old_on_failure() {
-        // Prepare temp registry and config root
         let tmp = crate::test_util::temp_dir_unique("tpl-update");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-work");
@@ -1804,7 +1721,6 @@ mod tests {
         let base_bytes = serde_json::to_vec(&base_tmpl).unwrap();
         let new_bytes = serde_json::to_vec(&new_tmpl).unwrap();
 
-        // Create instance record pointing at base version
         let instance = Instance {
             id: crate::ids::InstanceId::new("test-instance-001").unwrap(),
             name: crate::ids::InstanceName::new("work").unwrap(),
@@ -1826,7 +1742,6 @@ mod tests {
         registry.insert(instance.clone()).unwrap();
         registry.store(&registry_path).unwrap();
 
-        // Write local config equal to base
         let mut local_map = Map::new();
         local_map.insert("model".to_owned(), json!("glm-4"));
         std::fs::write(
@@ -1846,7 +1761,6 @@ mod tests {
         let preview = preview_three_way(&base_tmpl, &new_tmpl, &local_for_preview);
         assert!(preview.can_auto_apply());
 
-        // Apply should succeed and bump registry version
         let outcome = apply_update(
             &instance,
             &registry_path,
@@ -1859,17 +1773,14 @@ mod tests {
         .unwrap();
         assert!(outcome.registry_updated);
         assert_eq!(outcome.applied.len(), 1);
-        // Verify registry now has new version
         let registry_after = Registry::load(&registry_path).unwrap();
         let updated = registry_after.get_by_id("test-instance-001").unwrap();
         assert_eq!(updated.template.as_ref().unwrap().version.as_str(), "1.2.0");
-        // Verify config file now has new value
         let new_config_text = std::fs::read_to_string(&config_path).unwrap();
         let new_val: Value = serde_json::from_str(&new_config_text).unwrap();
         assert_eq!(new_val["model"], json!("glm-4.5"));
 
-        // Failure case: create conflicting local and try to apply original base->new again
-        // Reset registry to old version for failure test: create a second instance
+        // Failure case: a second instance with a conflicting local value.
         let config_root2 = tmp.join(".claude-work2");
         std::fs::create_dir_all(&config_root2).unwrap();
         let config_path2 = config_root2.join("settings.json");
@@ -1900,10 +1811,8 @@ mod tests {
             serde_json::to_string_pretty(&Value::Object(conflict_local.clone())).unwrap() + "\n",
         )
         .unwrap();
-        // Preview for this should be conflict
         let preview_conflict = preview_three_way(&base_tmpl, &new_tmpl, &conflict_local);
         assert!(!preview_conflict.can_auto_apply());
-        // Apply should fail and retain old version
         let apply_res = apply_update(
             &instance2,
             &registry_path,
@@ -1921,23 +1830,17 @@ mod tests {
         let registry_after_fail = Registry::load(&registry_path).unwrap();
         let still = registry_after_fail.get_by_id("test-instance-002").unwrap();
         assert_eq!(still.template.as_ref().unwrap().version.as_str(), "1.1.0");
-        // Config file should remain conflict value, not overwritten to glm-4.5
         let after_fail_text = std::fs::read_to_string(&config_path2).unwrap();
         let after_fail_val: Value = serde_json::from_str(&after_fail_text).unwrap();
         assert_eq!(after_fail_val["model"], json!("custom-model"));
 
-        // Cleanup
         drop(std::fs::remove_dir_all(&tmp));
     }
 
     #[test]
     fn apply_update_refuses_jsonc_settings_instead_of_normalizing() {
-        // codec-honesty (DOC-05): a settings file carrying JSONC content
-        // (comments/trailing commas, e.g. amp's declared settings surface at
-        // a settings.json path) must make apply_update fail with the typed
-        // lossy-write error. Previously the unparseable bytes were swapped
-        // for an empty map and overwritten with normalized JSON, destroying
-        // every comment and every local (foreign) key.
+        // DOC-05: JSONC settings bytes (comments, trailing commas) must
+        // fail with the typed lossy error, never become an empty map.
         let tmp = crate::test_util::temp_dir_unique("tpl-update-jsonc");
         let registry_path = tmp.join("instances.json");
         let config_root = tmp.join(".claude-jsonc");
@@ -2016,7 +1919,6 @@ mod tests {
         let config_path = config_root.join("settings.json");
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let mut new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
-        // Set correct digests
         let base_bytes = serde_json::to_vec(&{
             let mut b = base.clone();
             b.digest = "a".repeat(64);
@@ -2081,7 +1983,6 @@ mod tests {
         let config_path = config_root.join("settings.json");
         let base = minimal_template("1.1.0", vec![patch("key:model", json!("glm-4"))]);
         let new = minimal_template("1.2.0", vec![patch("key:model", json!("glm-4.5"))]);
-        // Fix digests
         let base_bytes = {
             let mut b = base.clone();
             let tmp_bytes = serde_json::to_vec(&b).unwrap();
@@ -2129,7 +2030,6 @@ mod tests {
 
         // Take snapshot, then externally edit before commit
         let snap_before = snapshot(&config_path);
-        // External edit
         std::fs::write(
             &config_path,
             serde_json::to_string_pretty(&json!({"model":"externally-changed"})).unwrap() + "\n",
@@ -2146,7 +2046,6 @@ mod tests {
         };
         let preview = preview_three_way(&base_fixed, &new_fixed, &local_after);
         assert_eq!(preview.conflicts.len(), 1); // both modified
-        // Apply should fail due to conflict, retaining old version
         let adapter = crate::adapters::claude_code::ClaudeCodeAdapter::new().unwrap();
         let res = apply_update(
             &instance,

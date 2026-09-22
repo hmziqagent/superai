@@ -1,8 +1,5 @@
-//! Operation preview and result contracts.
-//!
-//! Every mutating workflow returns a [`OperationPreview`] before commit and a
-//! [`OperationResult`] after commit. No interface types are referenced; all
-//! fields are harness-agnostic, serializable, and redact secrets.
+//! Operation preview and result contracts: every mutating workflow returns
+//! a preview before commit and a result after; secrets stay redacted.
 
 use std::fmt;
 
@@ -588,7 +585,6 @@ mod tests {
     #[test]
     fn result_serializes_without_leaking_secret() {
         let mut result = sample_result();
-        // Put a diagnostic that has been redacted prior to insertion.
         let secret = "another-super-secret-99";
         let diagnostic_redacted =
             format!("apiKey was {}", crate::error::RedactedString::placeholder());
@@ -662,7 +658,6 @@ mod tests {
                 .to_string_lossy(),
             tmp_root
         );
-        // Ensure paths are normalized absolute (no traversal).
         for resource in &preview.resolved_resources {
             assert!(resource.path.as_path().is_absolute());
             for comp in resource.path.as_path().components() {
@@ -678,7 +673,6 @@ mod tests {
     fn rollback_status_display() {
         assert_eq!(RollbackStatus::Succeeded.to_string(), "succeeded");
         assert_eq!(RollbackStatus::NotNeeded.to_string(), "not_needed");
-        // Serialization round-trip.
         let json = serde_json::to_string(&RollbackStatus::Failed).unwrap();
         assert_eq!(json, "\"failed\"");
         let back: RollbackStatus = serde_json::from_str(&json).unwrap();

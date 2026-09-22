@@ -1,7 +1,5 @@
-//! gptme adapter: workspace plus explicit via `--workspace` and env
-//! (`GPTME_WORKSPACE`), global TOML `~/.config/gptme/config.toml` plus
-//! project `gptme.toml`; cloud managed service excluded.
-//! Research source: `docs/harness-configs/gptme.md` (last verified 2026-08-25).
+//! gptme adapter: workspace via `GPTME_WORKSPACE`/`--workspace`, global TOML
+//! `~/.config/gptme/config.toml` plus project `gptme.toml`; cloud service excluded.
 
 use std::path::{Path, PathBuf};
 
@@ -59,7 +57,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "settings.gear",
 ];
 
-/// Selectors for YAML project context (gptme.toml may be TOML but also YAML env overlay).
+/// Bare keys for the env overlay, not the dotted TOML selectors.
 pub const ENV_OWNED_SELECTORS: &[&str] = &["env", "OPENAI_API_KEY", "MODEL"];
 
 /// Concrete adapter for gptme.
@@ -90,7 +88,6 @@ impl GptmeAdapter {
         WORKSPACE_ENV_VAR
     }
 
-    /// Resolve the default global config root: `~/.config/gptme`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
             && !dir.trim().is_empty()
@@ -106,12 +103,10 @@ impl GptmeAdapter {
         Some(PathBuf::from(home).join(".config").join("gptme"))
     }
 
-    /// Build the global config path for a given root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.toml")
     }
 
-    /// Collect config evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -167,7 +162,6 @@ impl GptmeAdapter {
         }
     }
 
-    /// Default log root.
     fn default_log_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(LOGS_ENV_VAR)
             && !dir.trim().is_empty()
@@ -452,9 +446,8 @@ impl Adapter for GptmeAdapter {
         ]
     }
 
-    /// INS-03: `config.toml` embeds absolute config paths in content (the
-    /// documented plugin `paths` list, gptme.md §1.1), so a mirrored copy has
-    /// its config-root references rewritten to the target root.
+    /// `config.toml` embeds absolute config paths (plugin `paths`, gptme.md §1.1),
+    /// so a mirrored copy needs its config-root references rewritten.
     fn mirror_content_rewrite_files(&self) -> Vec<String> {
         vec!["config.toml".to_owned()]
     }
@@ -525,14 +518,12 @@ impl Adapter for GptmeAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "a config.toml [mcp] section is documented but the per-server schema is unverified in corpus (gptme.md points at gptme.org/docs/mcp.html, not fetched)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "python plugin system; config carries path lists (plugins.paths/enabled), no file-staged plugin record documented (gptme.md)",

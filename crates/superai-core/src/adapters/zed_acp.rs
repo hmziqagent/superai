@@ -1,6 +1,5 @@
 //! Zed ACP adapter: JSON settings.json with ACP wrapper registrations
 //! (`agent_servers.*`) and MCP (`context_servers`); `Constrained`.
-//! Research source: `docs/harness-configs/zed-acp.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -232,7 +231,6 @@ impl Adapter for ZedAcpAdapter {
             let mut notes = Vec::new();
             notes.push(format!("detected zed version {v}"));
             notes.push(format!("mapped to schema version {SCHEMA_VERSION_STR}"));
-            // Zed gates ACP wrapper registrations on version; note minimal gate
             notes.push("ACP agent_servers requires Zed >=0.180, MCP forwarding >=0.185".to_owned());
             let mut res =
                 VersionResolution::new(Some(v), Some(SCHEMA_VERSION_STR.to_owned()), true);
@@ -446,7 +444,6 @@ impl Adapter for ZedAcpAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (zed-acp.md 1.2: `context_servers` in settings.json)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "settings.json",
@@ -457,7 +454,6 @@ impl Adapter for ZedAcpAdapter {
         ).with_read_only("context_servers entries use a nested command object schema the canonical renderer does not emit; inspect/diff-only until a per-adapter renderer exists"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions are Zed addons/extensions managed by the editor, not the ACP agent (zed-acp.md)",

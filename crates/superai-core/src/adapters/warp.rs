@@ -1,6 +1,5 @@
 //! Warp adapter: CLI TOML settings, MCP JSON, workflows YAML; Linux XDG
 //! relocation only, `Constrained`.
-//! Research source: `docs/harness-configs/warp.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -58,9 +57,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "custom_model_routers",
 ];
 
-/// Concrete adapter for Warp (`Constrained`, `os_bound`): Linux CLI relocates
-/// via XDG env; macOS/app stores are fixed; `WARP_API_KEY` is the per-instance
-/// credential (no `WARP_HOME` exists).
+/// Concrete adapter for Warp (`Constrained`, `os_bound`): only the Linux CLI relocates (XDG); no `WARP_HOME` exists.
 #[derive(Debug, Clone)]
 pub struct WarpAdapter {
     id: HarnessId,
@@ -88,7 +85,6 @@ impl WarpAdapter {
         CONSTRAINED_NOTE
     }
 
-    /// Resolve the CLI settings path candidate (macOS `~/.warp_cli/settings.toml` or Linux XDG).
     fn cli_settings_path() -> Option<PathBuf> {
         if let Ok(xdg) = std::env::var(XDG_CONFIG_HOME_ENV_VAR)
             && !xdg.trim().is_empty()
@@ -142,7 +138,6 @@ impl WarpAdapter {
         }
     }
 
-    /// Build detection evidence about CLI config, MCP, workflows, and env.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -664,7 +659,6 @@ impl Adapter for WarpAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (warp.md 5.1: global `~/.warp/.mcp.json` (and CLI `~/.warp_cli/.mcp.json`) use the `mcpServers` map)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",
@@ -675,7 +669,6 @@ impl Adapter for WarpAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented; workflows are YAML commands, not plugins (warp.md)")
     }

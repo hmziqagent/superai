@@ -1,10 +1,5 @@
-//! Path and executable reference types.
-//!
-//! All stored paths are normalized absolute forms without following symlinks.
-//! Home or platform variable expansion is explicit at the adapter boundary
-//! via [`AbsolutePath::expand_home`] and sibling helpers. Relative paths
-//! containing `..` are always rejected. Symlink policy is handled by the
-//! mutation layer, not by these types.
+//! Path and executable reference types: normalized absolute forms, no
+//! symlink following, `..` always rejected; home expansion at the boundary.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -106,11 +101,8 @@ fn rekind(kind: &str, result: Result<AbsolutePath, CoreError>) -> Result<Absolut
     })
 }
 
-/// Normalized absolute path without following symlinks.
-///
-/// Construction rejects empty, NUL, non-absolute, and any `..` component.
-/// Lexical normalization removes `.` and duplicate separators but does not
-/// canonicalize or follow links.
+/// Normalized absolute path, no symlink following: rejects empty, NUL,
+/// non-absolute, and `..` components; normalization is lexical only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AbsolutePath(PathBuf);
 
@@ -130,12 +122,8 @@ impl AbsolutePath {
         Ok(Self(normalized))
     }
 
-    /// Expand a leading `~` or platform home variable using `home`, then
-    /// validate and normalize.
-    ///
-    /// This is the adapter resolution boundary: raw strings containing
-    /// `~`, `$HOME`, `${HOME}`, or `%USERPROFILE%` are expanded only here.
-    /// The stored form is always absolute and normalized.
+    /// Expand a leading `~` or platform home variable via `home`, then
+    /// validate. This is the adapter boundary: raw strings expand only here.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
         validate_not_empty("AbsolutePath", value)?;
         if value.contains('\0') {
@@ -474,10 +462,8 @@ impl<'de> Deserialize<'de> for ConfigSurfacePath {
     }
 }
 
-/// Absolute path to a generated wrapper executable.
-///
-/// Symlink policy is handled by the mutation layer; this type does not
-/// follow links.
+/// Absolute path to a generated wrapper executable; does not follow links,
+/// symlink policy lives in the mutation layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct WrapperPath(AbsolutePath);
 
@@ -633,10 +619,8 @@ impl ExecutableRef {
         Ok(Self::Named(value.to_owned()))
     }
 
-    /// Expand home vars at adapter boundary.
-    ///
-    /// If `value` starts with `~` or `$HOME`, it is expanded and treated as
-    /// absolute. Otherwise the same rules as [`Self::new`] apply.
+    /// Expand home vars at adapter boundary; a `~`/`$HOME` prefix becomes
+    /// absolute, otherwise the rules of [`Self::new`] apply.
     pub fn expand_home(value: &str, home: &Path) -> Result<Self, CoreError> {
         validate_not_empty("ExecutableRef", value)?;
         if value.contains('\0') {
@@ -748,10 +732,8 @@ impl<'de> Deserialize<'de> for ExecutableRef {
 mod tests {
     use super::*;
 
-    /// Platform-absolute literal for posix-style test strings: `C:\a\b` on
-    /// Windows, `/a/b` elsewhere. `/a/b` alone is not absolute on Windows
-    /// (no drive), so assertions like "join rejects an absolute segment"
-    /// must use this helper.
+    /// `/a/b` is not absolute on Windows (no drive), so tests needing an
+    /// absolute literal must go through this helper.
     fn abs(s: &str) -> String {
         if cfg!(windows) {
             format!("C:\\{}", s.replace('/', "\\"))
@@ -780,11 +762,9 @@ mod tests {
     fn absolute_path_normalizes_dot_and_slash() {
         let base = crate::test_util::tmp_abs_str("home/user");
         let p = AbsolutePath::new(&format!("{base}//.claude/./x/")).unwrap();
-        // Normalized should not contain // or /./
         assert_eq!(p.as_path(), Path::new(&format!("{base}/.claude/x")));
         let p2 = AbsolutePath::new(&format!("{base}/b/./c")).unwrap();
         assert_eq!(p2.as_path(), Path::new(&format!("{base}/b/c")));
-        // Root stays root (`/` on Unix, `C:\` on Windows)
         let root_str = if cfg!(windows) { "C:\\" } else { "/" };
         let root = AbsolutePath::new(root_str).unwrap();
         assert_eq!(root.as_path(), Path::new(root_str));
@@ -872,11 +852,10 @@ mod tests {
 
     #[test]
     fn absolute_path_does_not_follow_symlinks() {
-        // No canonicalization: path is stored as given, not resolved
         let link_path = crate::test_util::tmp_abs_str("link/to/file");
         let p = AbsolutePath::new(&link_path).unwrap();
         assert_eq!(p.as_path(), Path::new(&link_path));
-        // Even if symlink does not exist, we succeed (no canonicalize)
+        // No canonicalize: construction succeeds even when parents do not exist.
         let nonexistent = crate::test_util::tmp_abs_str("nonexistent-parent") + "/path/to/file";
         let p2 = AbsolutePath::new(&nonexistent).unwrap();
         assert_eq!(p2.as_path(), Path::new(&nonexistent));
@@ -892,7 +871,6 @@ mod tests {
         assert_eq!(json, serde_json::to_string(&fixture).unwrap());
         let decoded: AbsolutePath = serde_json::from_str(&json).unwrap();
         assert_eq!(p, decoded);
-        // Invalid deserialize
         let bad = "\"../etc\"";
         let res: Result<AbsolutePath, _> = serde_json::from_str(bad);
         res.unwrap_err();
@@ -998,7 +976,6 @@ mod tests {
         ))
         .unwrap_err();
         ExecutableRef::new(&format!("{}\0b", crate::test_util::tmp_abs_str("nul-e"))).unwrap_err();
-        // Traversal in absolute
         ExecutableRef::new("/a/../b").unwrap_err();
     }
 
@@ -1014,7 +991,6 @@ mod tests {
         let e2 = ExecutableRef::expand_home("claude", &home).unwrap();
         assert!(e2.is_named());
         assert_eq!(e2.as_name(), Some("claude"));
-        // Traversal after expand should fail
         ExecutableRef::expand_home("~/../etc", &home).unwrap_err();
         ExecutableRef::expand_home("", &home).unwrap_err();
     }
@@ -1024,8 +1000,6 @@ mod tests {
         // Path types alone do not resolve symlinks; they store the lexical path.
         let link = crate::test_util::tmp_abs_str("mylink");
         let p = AbsolutePath::new(&link).unwrap();
-        // No filesystem check, so this succeeds even if mylink is a symlink
-        // or does not exist.
         assert_eq!(p.as_path(), Path::new(&link));
         let wrapper = crate::test_util::tmp_abs_str("local/bin/my-wrapper");
         let w = WrapperPath::new(&wrapper).unwrap();
@@ -1042,7 +1016,6 @@ mod tests {
             ConfigSurfacePath::new(c).unwrap_err();
             WrapperPath::new(c).unwrap_err();
         }
-        // ExecutableRef name cases
         ExecutableRef::new("").unwrap_err();
         ExecutableRef::new("a\0b").unwrap_err();
         ExecutableRef::new("a/b").unwrap_err();
@@ -1061,7 +1034,6 @@ mod tests {
         let back: ExecutableRef = serde_json::from_str(&json).unwrap();
         assert_eq!(abs, back);
 
-        // Invalid deserialize
         let bad = "\"a/b\"";
         let res: Result<ExecutableRef, _> = serde_json::from_str(bad);
         res.unwrap_err();

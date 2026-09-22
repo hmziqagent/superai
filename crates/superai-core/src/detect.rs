@@ -1,11 +1,5 @@
-//! Install detection: collects all harness matches (PKG-03).
-//!
-//! Probes, in order: `PATH` resolution (in `PATH` order, reporting shadowed
-//! duplicates), configured binary path (`SUPERAI_CONFIGURED_BINARY_<HARNESS>`
-//! or registry `AbsolutePath`), mise shims and `mise where`, Homebrew, npm,
-//! cargo, pipx/uv/dpkg metadata, and desktop app bundles. `detect_all` never
-//! picks silently: it returns all matches and leaves selection to the caller.
-//! All subprocesses run through [`crate::process`] (argv tokens, no shell).
+//! Install detection: collects all harness matches (PKG-03); every hit is
+//! returned and selection is left to the caller, never done silently.
 
 #![expect(
     clippy::excessive_nesting,
@@ -44,8 +38,7 @@ pub enum DetectionSource {
     /// Found via desktop app bundle at a filesystem path.
     AppBundle,
     /// Found via system/Python package metadata: `pipx list --json`,
-    /// `uv tool list`, or `dpkg -s <package>` (PKG-03). The evidence lines
-    /// name which manager answered.
+    /// `uv tool list`, or `dpkg -s <package>`; evidence names which manager.
     SystemPackage,
 }
 
@@ -104,9 +97,8 @@ pub struct Detection {
     pub source: DetectionSource,
     /// Confidence in the detection.
     pub confidence: DetectionConfidence,
-    /// Zero-based index in PATH order when source is `Path` (duplicates are
-    /// ordered by PATH precedence; rank 0 is the winning entry). `None` for
-    /// non-PATH sources.
+    /// Zero-based index in PATH order when source is `Path` (rank 0 is the
+    /// winning entry); `None` for non-PATH sources.
     pub path_rank: Option<usize>,
     /// Whether the binary's architecture mismatches the host (stub: checks
     /// `file` output when available; false if probe unavailable).
@@ -149,10 +141,8 @@ impl Detection {
     clippy::struct_excessive_bools,
     reason = "probe flags are independent booleans"
 )]
-/// Inputs for detection. In production `DetectOptions::from_env()` reads
-/// `PATH`, `HOME`, and mise/homebrew probes from the real environment and
-/// filesystem. In tests a fake options struct can be injected with a temp
-/// `PATH` and temp `HOME`.
+/// Inputs for detection: `from_env()` reads the real environment and
+/// filesystem; tests inject a fake struct with temp PATH and HOME.
 #[derive(Debug, Clone)]
 pub struct DetectOptions {
     /// Ordered PATH directories (split from `$PATH`). If `None`, read from
@@ -239,15 +229,11 @@ fn ambient_path_dirs() -> Vec<PathBuf> {
 }
 
 fn dirs_home_fallback() -> Option<PathBuf> {
-    // Avoid extra dependency on `dirs` crate if not already present; try
-    // standard env first, then give up. Callers handle None gracefully.
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Detect all installations of `harness` using ambient environment and the
-/// embedded catalog. Returns all hits in PATH-probe order (PATH hits are
-/// ordered by `PATH` precedence; shim/app/package hits follow). Never picks
-/// silently when multiple versions affect instances; all are returned.
+/// Detect all installations of `harness` using the ambient environment.
+/// Returns all hits; never picks silently when multiple versions exist.
 pub fn detect_all(harness: &HarnessId) -> Vec<Detection> {
     detect_all_with_options(harness, &DetectOptions::default())
 }
@@ -560,10 +546,8 @@ pub fn detect_all_for_entry(entry: &InstallCatalogEntry, opts: &DetectOptions) -
     detections
 }
 
-/// Scan each PATH dir for an executable file named `exe`.
-///
-/// Returns hits in PATH order (first dir first). Does not check executability
-/// beyond `is_file` to allow detection of broken shims; caller marks broken.
+/// Scan each PATH dir for an executable file named `exe`, in PATH order.
+/// Executability beyond `is_file` is not checked, so broken shims are found.
 fn scan_path_for_executable(exe: &str, path_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut hits = Vec::new();
     for dir in path_dirs {
@@ -643,7 +627,6 @@ fn probe_arch_mismatch(path: &Path, opts: &DetectOptions) -> bool {
     } else {
         "x86_64"
     };
-    // If file says other_arch and not host_arch, flag mismatch.
     text.contains(other_arch)
         && !text.contains(host_arch)
         && (text.contains("executable") || text.contains("mach-o") || text.contains("elf"))
@@ -683,7 +666,6 @@ fn probe_mise_managed(entry: &InstallCatalogEntry, opts: &DetectOptions) -> Opti
     if !version_out.success {
         return None;
     }
-    // Try `mise where <tool>` for each executable's mise package name
     let mise_pkg = entry
         .methods
         .iter()
@@ -1023,9 +1005,7 @@ fn package_probe_opts(opts: &DetectOptions) -> ExecuteOpts {
 }
 
 /// Resolve a package-manager binary to an absolute path from the injected
-/// PATH dirs when possible (tests place fake `pipx`/`uv`/`dpkg` there), else
-/// the bare name for ambient resolution. Absolute invocation pins which PATH
-/// entry the child runs from.
+/// PATH dirs when possible; absolute invocation pins which PATH entry runs.
 fn resolve_manager(path_dirs: &[PathBuf], name: &str) -> String {
     for dir in path_dirs {
         let candidate = dir.join(name);
@@ -1065,12 +1045,8 @@ fn extract_pipx_version(json_text: &str, package: &str) -> Option<String> {
     None
 }
 
-/// pipx metadata probe: `pipx list --json` (PKG-03).
-///
-/// The binary lives under pipx's venv bin dir; the reported path is derived
-/// from HOME (`~/.local/pipx/venvs/<pkg>/bin/<exe>`) and the detection
-/// carries `pipx list` evidence. Absent `pipx` or a missing entry probes
-/// nothing.
+/// pipx metadata probe: `pipx list --json` (PKG-03). The reported path is
+/// derived from HOME; absent pipx or a missing entry probes nothing.
 fn probe_pipx(
     package: &str,
     entry: &InstallCatalogEntry,
@@ -1122,10 +1098,8 @@ fn extract_uv_version(text: &str, package: &str) -> Option<String> {
     None
 }
 
-/// uv tool metadata probe: `uv tool list` (PKG-03).
-///
-/// uv installs tools under `~/.local/share/uv/tools/<pkg>/`; the executable
-/// lands in `~/.local/bin/<exe>` (uv's bin dir on PATH).
+/// uv tool metadata probe: `uv tool list` (PKG-03). Tools live under
+/// `~/.local/share/uv/tools/<pkg>/`, executables in `~/.local/bin/<exe>`.
 fn probe_uv(
     package: &str,
     entry: &InstallCatalogEntry,
@@ -1157,10 +1131,7 @@ fn probe_uv(
 }
 
 /// System package probe: `dpkg -s <package>` on Debian families (PKG-03).
-///
-/// Only answers when `dpkg` exists AND reports the package installed; the
-/// executable path is the system location `/usr/bin/<exe>`. Absent `dpkg`
-/// (macOS/Windows/non-Debian) is not an error; there is simply no evidence.
+/// Absent `dpkg` is not an error; there is simply no evidence.
 fn probe_system_package(
     package: &str,
     entry: &InstallCatalogEntry,
@@ -1288,7 +1259,6 @@ mod tests {
             ..Default::default()
         };
         let hits = detect_all_for_entry(&entry, &opts);
-        // Filter to PATH hits only for this assertion
         let path_hits: Vec<_> = hits
             .iter()
             .filter(|d| d.source == DetectionSource::Path)
@@ -1298,18 +1268,15 @@ mod tests {
             2,
             "both PATH dirs should be found: {path_hits:?}"
         );
-        // Must be in PATH order: tmp1 first, tmp2 second, with shadowed flag on second
         assert_eq!(path_hits[0].path, tmp1.join("claude"));
         assert_eq!(path_hits[1].path, tmp2.join("claude"));
         assert_eq!(path_hits[0].path_rank, Some(0));
         assert_eq!(path_hits[1].path_rank, Some(1));
         assert!(!path_hits[0].shadowed);
         assert!(path_hits[1].shadowed);
-        // Versions should be probed
         assert_eq!(path_hits[0].version.as_deref(), Some("1.2.3"));
         assert_eq!(path_hits[1].version.as_deref(), Some("2.0.0"));
 
-        // Cleanup
         drop(fs::remove_dir_all(&tmp1));
         drop(fs::remove_dir_all(&tmp2));
         drop(fs::remove_dir_all(&home));
@@ -1352,7 +1319,6 @@ mod tests {
         let home = make_temp_dir("home3");
         let shim_dir = home.join(".local/share/mise/shims");
         fs::create_dir_all(&shim_dir).unwrap();
-        // Create a shim that exits non-zero
         let shim_path = shim_dir.join("claude");
         fs::write(&shim_path, "#!/bin/sh\nexit 1\n").unwrap();
         // The exec bit only exists on unix; off unix the spawn itself fails,
@@ -1416,7 +1382,6 @@ mod tests {
             path_hits.len() >= 2,
             "must return all PATH hits, not just first"
         );
-        // Ensure caller can distinguish which would win (rank 0)
         let winner = path_hits.iter().find(|d| d.path_rank == Some(0)).unwrap();
         let shadowed = path_hits.iter().find(|d| d.shadowed).unwrap();
         assert_ne!(winner.path, shadowed.path);
@@ -1448,8 +1413,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn process_fake_wrapper_never_shell_interpolates() {
-        // Directly test that run_command with duct never spawns shell by checking
-        // that an arg containing shell metachars is printed literally.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             ..Default::default()
@@ -1525,15 +1488,12 @@ mod tests {
     fn detect_reports_pipx_uv_and_system_package_sources() {
         let bin_dir = make_temp_dir("pkg03-bins");
         let home = make_temp_dir("pkg03-home");
-        // pipx answers JSON for my-pkg.
         write_fake_manager(
             &bin_dir,
             "pipx",
             "#!/bin/sh\necho '{\"venvs\":{\"my-pkg\":{\"package\":{\"package_name\":\"my-pkg\",\"package_version\":\"1.4.2\"}}}}'\n",
         );
-        // uv answers `my-pkg v1.4.2`.
         write_fake_manager(&bin_dir, "uv", "#!/bin/sh\necho 'my-pkg v1.4.2'\n");
-        // dpkg reports my-pkg installed.
         write_fake_manager(
             &bin_dir,
             "dpkg",
@@ -1586,8 +1546,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn absent_managers_produce_no_system_package_hits() {
-        // No pipx/uv/dpkg in the injected PATH: no SystemPackage detections,
-        // no fabricated hits (PKG-03 honesty).
+        // No manager present: no fabricated hits (PKG-03 honesty).
         let bin_dir = make_temp_dir("pkg03-empty");
         let home = make_temp_dir("pkg03-home-empty");
         let entry = pythonish_entry();

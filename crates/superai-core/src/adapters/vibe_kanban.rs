@@ -1,6 +1,5 @@
 //! Vibe Kanban adapter: orchestrator GUI over ten harnesses with profiles,
 //! env injection, MCP passthrough, and git worktrees; `MigrationOnly`.
-//! Research source: `docs/harness-configs/orchestrators.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,15 +44,10 @@ pub const MIGRATION_TIP: &str = "Vibe Kanban sunsetting as company product, cont
 /// Community maintained flag.
 pub const COMMUNITY_MAINTAINED: &str = "community-maintained OSS (Apache-2.0)";
 
-/// Version-probe budget: the npx entrypoint (bash + npx + node) exceeded the
-/// 2s native-binary budget under disk load (worst observed cold start 0.99s,
-/// direct run proved 0.1.44); 5s covers npx cold start without letting a
-/// hung entrypoint stall detection.
+/// 5s probe budget: the npx entrypoint (bash + npx + node) can exceed the 2s native-binary budget on cold start.
 pub const VERSION_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Concrete adapter for Vibe Kanban (`MigrationOnly`, `project_scope`): an
-/// orchestrator GUI spawning harnesses in worktrees; detect/inspect/backup/
-/// export only, no new instances.
+/// Concrete adapter for Vibe Kanban (`MigrationOnly`, `project_scope`): detect/inspect/backup/export only, no new instances.
 #[derive(Debug, Clone)]
 pub struct VibeKanbanAdapter {
     id: HarnessId,
@@ -81,7 +75,6 @@ impl VibeKanbanAdapter {
         MIGRATION_TIP
     }
 
-    /// Probe `vibe-kanban --version` with a timeout, returning the parsed version string if successful.
     fn probe_version(binary: &Path) -> Option<String> {
         let binary_owned = binary.to_path_buf();
         let (tx, rx) = mpsc::channel();
@@ -111,13 +104,8 @@ impl VibeKanbanAdapter {
         Self::parse_version_output(&combined)
     }
 
-    /// Parse version output like `vibe-kanban 0.1.44` into `0.1.44`.
-    ///
-    /// The npx entrypoint prints an npm-style first token
-    /// (`vibe-kanban/0.1.44 linux-x64 node-v22.23.2`), so every whitespace
-    /// token is also split on `/`: without the split the name segment
-    /// strips to `ibe-kanban/0.1.44` (never digit-started) and the probe
-    /// returns `None`, yielding a bogus `UnknownVersion`.
+    /// The npx entrypoint prints an npm-style first token (`vibe-kanban/0.1.44
+    /// linux-x64 ...`), so tokens are also split on `/`.
     #[expect(
         clippy::excessive_nesting,
         reason = "version parsing branches are explicit"
@@ -165,7 +153,6 @@ impl VibeKanbanAdapter {
         None
     }
 
-    /// Resolve workspaces dir heuristic (repo-local `.vibe-kanban-workspaces` or `~/vibe-kanban-workspaces`).
     fn workspaces_dir() -> Option<PathBuf> {
         let cwd_ws = Path::new(".vibe-kanban-workspaces");
         if cwd_ws.exists() {
@@ -180,7 +167,6 @@ impl VibeKanbanAdapter {
         Some(PathBuf::from(home).join(".vibe-kanban-workspaces"))
     }
 
-    /// Build detection evidence about binary, worktrees, profiles, and MCP.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -501,14 +487,12 @@ impl Adapter for VibeKanbanAdapter {
         Vec::new()
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "per-agent mcpServers are written into each agent own global config by VK itself (harness-managed); VK exposes an MCP server but has no VK-owned MCP dest (orchestrators.md)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (orchestrators.md)")
     }
@@ -533,11 +517,8 @@ mod tests {
         VibeKanbanAdapter::new().unwrap()
     }
 
-    /// The npx entrypoint needs a warmer probe than the uniform 2s
-    /// native-binary budget: observed warm 0.55-0.66s / cold 0.70-0.99s, and
-    /// 2s was exceeded under the driver during batch installs (area-5
-    /// evidence, `.z-workflow/evidence/live/vibe-kanban/detect.out`). 5s
-    /// stays pinned so a regression to 2s fails here.
+    /// The npx entrypoint (observed 0.55-0.99s) exceeds the uniform 2s budget;
+    /// the 5s pin is deliberate, so a regression to 2s fails here.
     #[test]
     fn version_probe_budget_covers_npx_cold_start() {
         assert_eq!(VERSION_PROBE_BUDGET, std::time::Duration::from_secs(5));
@@ -646,12 +627,6 @@ mod tests {
         }
     }
 
-    /// Regression (judge run 3 round 7, `.z-workflow/evidence/live/vibe-kanban/
-    /// vibe-kanban-r7.out`): the real binary prints the npm-style
-    /// `name/version` first token `vibe-kanban/0.1.44 ...`; the old
-    /// leading-'v'-strip mangled it into `ibe-kanban/0.1.44` (never
-    /// digit-started), so detect returned `UnknownVersion` even with the 5s
-    /// probe budget. The exact live output must parse to `0.1.44`.
     #[test]
     fn parse_version_output_handles_real_name_slash_version_token() {
         let real = "vibe-kanban/0.1.44 linux-x64 node-v22.23.2";
@@ -659,7 +634,6 @@ mod tests {
             VibeKanbanAdapter::parse_version_output(real).as_deref(),
             Some("0.1.44")
         );
-        // Bare `name/version` token and newline-terminated output too.
         assert_eq!(
             VibeKanbanAdapter::parse_version_output("vibe-kanban/0.1.44\n").as_deref(),
             Some("0.1.44")

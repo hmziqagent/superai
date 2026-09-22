@@ -28,8 +28,7 @@ fn get_owner_ids(_meta: &std::fs::Metadata) -> Option<(u32, u32)> {
     None
 }
 
-/// Inode change time where the platform exposes it; hint only, never the
-/// sole conflict identity.
+/// Inode change time where exposed; a hint, never the sole conflict identity.
 #[cfg(unix)]
 #[expect(clippy::unnecessary_wraps, reason = "Option needed for non-unix None")]
 fn get_ctime(meta: &std::fs::Metadata) -> Option<SystemTime> {
@@ -43,9 +42,7 @@ fn get_ctime(_meta: &std::fs::Metadata) -> Option<SystemTime> {
     None
 }
 
-/// Fresh snapshot of a filesystem resource, used as a conflict token.
-///
-/// Carries no contents, only digests and metadata. No secrets are stored.
+/// Fresh filesystem snapshot used as a conflict token; no contents, no secrets.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "snapshot needs multiple bool flags"
@@ -89,8 +86,7 @@ impl Snapshot {
     }
 }
 
-/// Take a fresh snapshot of `path`: disk read, no caching. A symlink loop
-/// still reports the link itself with `digest: None`.
+/// Take a fresh snapshot; a symlink loop still reports the link, `digest: None`.
 pub fn snapshot(path: &Path) -> Snapshot {
     let kind = Some(crate::document::DocumentKind::from_path(path));
     let symlink_meta = std::fs::symlink_metadata(path);
@@ -174,9 +170,8 @@ pub fn snapshot(path: &Path) -> Snapshot {
     }
 }
 
-/// Whether `current` differs from `previous` by an external modification:
-/// exists, digest, size, or symlink target (a retarget conflicts even with
-/// identical bytes). Metadata hints never decide.
+/// Whether `current` differs externally: exists, digest, size, or symlink
+/// target (a retarget conflicts even on identical bytes; hints never decide).
 pub fn is_modified(previous: &Snapshot, current: &Snapshot) -> bool {
     if previous.exists != current.exists {
         return true;
@@ -196,9 +191,8 @@ pub fn is_modified(previous: &Snapshot, current: &Snapshot) -> bool {
     false
 }
 
-/// Whether `path` is or resolves through a symlink loop: the OS error when
-/// available, otherwise a chain walk capped at 20 hops (a chain past the cap
-/// is reported as a loop).
+/// Whether `path` is or resolves through a loop: the OS error when
+/// available, else a chain walk capped at 20 hops (past cap = loop).
 pub fn is_symlink_loop(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(_) => {}
@@ -252,8 +246,6 @@ pub fn is_symlink_loop(path: &Path) -> bool {
     }
     true
 }
-
-// tests
 
 #[cfg(test)]
 mod tests {
@@ -447,7 +439,6 @@ mod tests {
         }
     }
 
-    /// `is_missing` reports existence: absent paths are missing.
     #[test]
     fn is_missing_reports_existence() {
         let path = unique_scratch("missing-flag");
@@ -463,8 +454,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// Same-size content changes are detected by the digest; identical
-    /// bytes compare unmodified.
     #[test]
     fn snapshot_detects_same_size_content_changes() {
         let path = unique_scratch("same-size");
@@ -490,7 +479,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The snapshot records the target's permission bits for restores.
     #[cfg(unix)]
     #[test]
     fn snapshot_records_target_permission_bits() {
@@ -508,11 +496,9 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The ctime hint is a plausible recent instant, not a constant.
     #[cfg(unix)]
     #[test]
     fn snapshot_ctime_is_a_plausible_recent_instant() {
-        /// 2020-01-01T00:00:00Z, and one day, in seconds.
         const SECS_AT_2020: u64 = 1_577_836_800;
         const DAY_SECS: u64 = 24 * 60 * 60;
         let path = unique_scratch("ctime-window");
@@ -532,7 +518,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// A missing path is not a symlink loop: absence is not a cycle.
     #[test]
     fn is_symlink_loop_is_false_for_missing_path() {
         let path = unique_scratch("loop-missing");
@@ -540,21 +525,18 @@ mod tests {
         assert!(!is_symlink_loop(&path), "a missing path is not a loop");
     }
 
-    /// A resolvable chain deeper than the 20-hop walk cutoff (but under the
-    /// kernel limits of Linux 40 and macOS 32) is reported as a loop by the
-    /// capped walk; the errno fast-path cannot see it.
+    /// A resolvable chain deeper than the 20-hop cutoff (under the kernel
+    /// limits of Linux 40 and macOS 32) is a loop by the capped walk.
     #[cfg(unix)]
     #[test]
     fn deep_symlink_chain_beyond_walk_cutoff_is_reported_as_a_loop() {
-        /// Over the walk cutoff (20), under the kernel limits (40/32).
         const DEPTH: usize = 25;
         let root = crate::test_util::temp_dir_unique("config-snapshot-deep");
         std::fs::create_dir_all(&root).unwrap();
         let real = root.join("real.txt");
         std::fs::write(&real, b"deep").unwrap();
-        // Relative targets so each hop costs one OS-level traversal: absolute
-        // targets under the macOS temp root re-traverse /var per hop and
-        // would cross MAXSYMLINKS before the 25 hops are done.
+        // Relative targets: absolute ones under the macOS temp root re-traverse
+        // /var per hop and would cross MAXSYMLINKS before 25 hops.
         let mut next_target = std::ffi::OsString::from("real.txt");
         for i in (0..DEPTH).rev() {
             let link_name = format!("link-{i}");

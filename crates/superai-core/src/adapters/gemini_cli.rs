@@ -1,7 +1,5 @@
-//! Gemini CLI adapter: relocated-root via `GEMINI_CLI_HOME`, retired
-//! 2026-06-18, successor `antigravity-cli` (`agy`); `MigrationOnly` support
-//! (detect/inspect/backup/export, no new defaults, no deletion).
-//! Research source: `docs/harness-configs/gemini-cli.md` (last verified 2026-08-25).
+//! Gemini CLI adapter: relocated-root via `GEMINI_CLI_HOME`, retired 2026-06-18, successor `antigravity-cli` (`agy`).
+//! `MigrationOnly` support (detect/inspect/backup/export). Research: `docs/harness-configs/gemini-cli.md` (2026-08-25).
 
 use std::path::PathBuf;
 
@@ -30,8 +28,7 @@ pub const CONFIG_ENV_VAR: &str = "GEMINI_CLI_HOME";
 /// Default config root when `GEMINI_CLI_HOME` is unset.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.gemini";
 
-/// Config root when `GEMINI_CLI_HOME` is set: the CLI creates a `.gemini/`
-/// dir inside the env-var dir (gemini-cli.md:18/:78; live-verified 0.60.0).
+/// With `GEMINI_CLI_HOME` set, the CLI creates a `.gemini/` dir inside it (live-verified 0.60.0).
 pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GEMINI_CLI_HOME/.gemini";
 
 /// Research document link.
@@ -55,8 +52,7 @@ pub const SUCCESSOR_EXECUTABLE: &str = "agy";
 /// Tip shown for migration.
 pub const MIGRATION_TIP: &str = "Gemini CLI consumer tiers retired 2026-06-18; migrate to Antigravity CLI (agy) via `agy plugin import gemini`: skills .gemini/skills/ -> .gemini/antigravity-cli/skills/, mcpServers url/httpUrl -> serverUrl in mcp_config.json";
 
-/// Concrete adapter for Gemini CLI (`MigrationOnly`): detect/inspect/backup/
-/// export only; every mutating attempt returns the successor tip.
+/// `MigrationOnly`: detect/inspect/backup/export; every mutating attempt returns the successor tip.
 #[derive(Debug, Clone)]
 pub struct GeminiCliAdapter {
     id: HarnessId,
@@ -89,7 +85,6 @@ impl GeminiCliAdapter {
         MIGRATION_TIP
     }
 
-    /// Resolve the default config root: `$GEMINI_CLI_HOME/.gemini` or `~/.gemini`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -107,7 +102,6 @@ impl GeminiCliAdapter {
         Some(PathBuf::from(home).join(".gemini"))
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -399,7 +393,7 @@ impl Adapter for GeminiCliAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (gemini-cli.md MCP servers: `mcpServers` in settings.json; httpUrl > url > command precedence)
+    /// Server address precedence inside a `mcpServers` entry: `httpUrl` > `url` > `command`.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -415,7 +409,6 @@ impl Adapter for GeminiCliAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions dir documented (extension.toml under ~/.gemini/extensions/) but the harness is MigrationOnly; successor converts them to plugins (gemini-cli.md 7)",
@@ -589,9 +582,8 @@ mod tests {
 
     #[test]
     fn env_relocated_surface_hints_nest_gemini_segment() {
-        // Real gemini nests `.gemini/` inside $GEMINI_CLI_HOME
-        // (live-verified 0.60.0); a hint without that segment targets a file
-        // the CLI never reads.
+        // Real gemini nests `.gemini/` inside $GEMINI_CLI_HOME (live 0.60.0);
+        // a hint without that segment targets a file the CLI never reads.
         let a = adapter();
         let env_prefix = format!("{ISOLATED_CONFIG_ROOT_HINT}/");
         let win_prefix = "%GEMINI_CLI_HOME%\\.gemini\\";

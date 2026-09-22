@@ -1,19 +1,5 @@
-//! Parser fuzz scaffolding (QAL-04).
-//!
-//! Deterministic quick-loop fuzz for every config codec, no `cargo-fuzz` or
-//! `libFuzzer` required. Each test loops 100 iterations over truncated,
-//! huge, nested, deep, and random inputs seeded from harness fixtures, and
-//! asserts:
-//!
-//! - no panic, hang, or unbounded allocation
-//! - no path escape outside the per-test temp dir
-//! - re-parse succeeds when input is accepted
-//! - rejected input causes **no** filesystem mutation
-//!
-//! The seed corpus comes from `crates/superai-core/fixtures/**` at runtime
-//! (via `CARGO_MANIFEST_DIR`) with a hardcoded fallback. Coverage-guided
-//! fuzzing can be layered on locally with `cargo-fuzz` before a release
-//! (QAL-04 exit gate); these loops are the CI-friendly baseline.
+//! Deterministic quick-loop fuzz for every codec (QAL-04): no panic, no
+//! unbounded allocation, no path escape, no mutation on rejected input.
 
 #![expect(
     clippy::case_sensitive_file_extension_comparisons,
@@ -97,18 +83,16 @@ impl Prng {
     }
 }
 
-const MAX_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB hard cap (QAL-04: no unbounded allocation)
-const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const HUGE_JSON_KEYS: usize = 1500;
 const DEEP_DEPTH: usize = 300;
 
-/// Collect seed corpus bytes from fixtures at runtime, with hardcoded fallback.
-/// The corpus is intentionally small and deterministic; fuzz variants mutate it.
+/// Seed corpus from fixtures at runtime, hardcoded fallback; small and deterministic.
 #[cfg(test)]
 fn seed_corpus() -> Vec<Vec<u8>> {
     let mut corpus: Vec<Vec<u8>> = Vec::new();
 
-    // Try to locate fixtures relative to CARGO_MANIFEST_DIR (superai-config)
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures = manifest.join("../superai-core/fixtures");
     if fixtures.is_dir() {
@@ -123,10 +107,8 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         }
     }
 
-    // Hardcoded minimal corpus, always present even if fixtures are missing
     corpus.extend(hardcoded_corpus());
 
-    // Cap corpus size to avoid huge input in fallback (ensure deterministic)
     if corpus.len() > 200 {
         corpus.truncate(200);
     }
@@ -155,10 +137,8 @@ fn collect_fixtures_recursive(dir: &Path, out: &mut Vec<Vec<u8>>) {
                     || lower.ends_with(".env")
                     || lower == "registry_old.json"
                     || lower == "registry_v1.json";
-                // Include a subset to keep corpus small (skip wrapper.sh etc.)
                 if is_config {
                     if let Ok(bytes) = std::fs::read(&path) {
-                        // Truncate huge fixtures to MAX_INPUT_BYTES to avoid OOM in seed
                         if bytes.len() <= MAX_INPUT_BYTES {
                             out.push(bytes);
                         } else {
@@ -179,21 +159,20 @@ fn hardcoded_corpus() -> Vec<Vec<u8>> {
         br#"{}"#.to_vec(),
         b"".to_vec(),
         b"   \n".to_vec(),
-        br#"{"a":1,}"#.to_vec(), // trailing comma
+        br#"{"a":1,}"#.to_vec(),
         b"// comment\n{\"a\":1}\n".to_vec(),
-        b"a = 1\nb = \"hello\"\n".to_vec(), // toml
+        b"a = 1\nb = \"hello\"\n".to_vec(),
         b"[table]\nkey = 1\n".to_vec(),
-        b"a: 1\nb:\n  - 1\n  - 2\n".to_vec(), // yaml
-        b"FOO=bar\nBAZ=qux\n".to_vec(),       // env
+        b"a: 1\nb:\n  - 1\n  - 2\n".to_vec(),
+        b"FOO=bar\nBAZ=qux\n".to_vec(),
         b"export FOO='bar baz'\n".to_vec(),
         br#"{"instances":[{"name":"work","harness":"claude-code","config_dir":"/tmp/legacy"}]}"#
             .to_vec(),
         br#"{"schema_version":1,"instances":[]}"#.to_vec(),
-        // malformed seeds
         b"{ invalid json".to_vec(),
         b"a = [\n".to_vec(),
         b"a: [unclosed\n".to_vec(),
-        b"FOO\n".to_vec(), // invalid env
+        b"FOO\n".to_vec(),
         vec![0xff, 0xfe, 0xfd],
         "key: value: dup\nkey: 2\n".as_bytes().to_vec(),
     ]
@@ -211,7 +190,6 @@ fn gen_truncated(prng: &mut Prng, base: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 fn gen_huge_json(prng: &mut Prng) -> Vec<u8> {
-    // Generate huge JSON object with HUGE_JSON_KEYS entries (~500KB)
     let n = HUGE_JSON_KEYS;
     let mut s = String::with_capacity(600_000);
     s.push('{');
@@ -220,7 +198,6 @@ fn gen_huge_json(prng: &mut Prng) -> Vec<u8> {
             s.push(',');
         }
         s.push_str(&format!("\"k{i}\":\"v"));
-        // Random value suffix length 0..20
         let suffix_len = prng.gen_range(0, 21);
         for _ in 0..suffix_len {
             let c = (prng.gen_range(97, 123) as u8) as char;
@@ -229,7 +206,6 @@ fn gen_huge_json(prng: &mut Prng) -> Vec<u8> {
         s.push('"');
     }
     s.push('}');
-    // Cap to MAX_INPUT_BYTES
     let mut b = s.into_bytes();
     if b.len() > MAX_INPUT_BYTES {
         b.truncate(MAX_INPUT_BYTES);
@@ -370,23 +346,19 @@ fn gen_random_malformed(prng: &mut Prng, max_len: usize) -> Vec<u8> {
 
 #[cfg(test)]
 fn gen_random_text_with_bom_and_control(prng: &mut Prng) -> Vec<u8> {
-    // Mix valid and invalid UTF-8, control chars, BOM
     let len = prng.gen_range(0, 2048);
     let mut b = prng.gen_bytes(len);
-    // Occasionally prepend BOM
     if prng.gen_range(0, 8) == 0 {
         let mut with_bom = vec![0xEF, 0xBB, 0xBF];
         with_bom.extend_from_slice(&b);
         b = with_bom;
     }
-    // Occasionally insert invalid UTF-8 sequences
     if prng.gen_range(0, 4) == 0 && !b.is_empty() {
         let pos = prng.gen_range(0, b.len());
         if let Some(byte) = b.get_mut(pos) {
             *byte = 0xFF;
         }
     }
-    // Occasionally insert CRLF mix
     if prng.gen_range(0, 3) == 0 {
         for byte in &mut b {
             if *byte == b'\n' && prng.gen_bool() {
@@ -402,7 +374,6 @@ fn gen_random_text_with_bom_and_control(prng: &mut Prng) -> Vec<u8> {
 
 #[cfg(test)]
 fn assert_bounded_allocation(input: &[u8], output: &[u8], label: &str) {
-    // Output must not be unbounded relative to input (10x or 10MiB cap)
     assert!(
         output.len() <= MAX_OUTPUT_BYTES,
         "{label}: unbounded output {} > {} cap (input {})",
@@ -410,7 +381,6 @@ fn assert_bounded_allocation(input: &[u8], output: &[u8], label: &str) {
         MAX_OUTPUT_BYTES,
         input.len()
     );
-    // Allow empty input to produce small output, but huge input not exploding
     if !input.is_empty() {
         let bound = input
             .len()
@@ -428,14 +398,11 @@ fn assert_bounded_allocation(input: &[u8], output: &[u8], label: &str) {
 
 #[cfg(test)]
 fn assert_no_path_escape(base: &Path, candidate: &Path, label: &str) {
-    // Candidate must not escape base via `..` or absolute outside base
-    // We check lexical: no `..` components and candidate is within base if absolute
     for comp in candidate.components() {
         if let std::path::Component::ParentDir = comp {
             panic!("{label}: path escape detected: {candidate:?} contains `..`");
         }
     }
-    // If candidate is absolute, ensure it starts with base
     if candidate.is_absolute() {
         assert!(
             candidate.starts_with(base),
@@ -522,7 +489,6 @@ mod tests {
             };
             assert!(input.len() <= MAX_INPUT_BYTES, "input exceeds cap");
 
-            // Also every 7th iteration inject invalid UTF-8 control
             let input = if iter % 7 == 0 {
                 gen_random_text_with_bom_and_control(&mut prng)
             } else {
@@ -536,27 +502,22 @@ mod tests {
             let before_snapshot = snapshot_dir(&dir);
             let before_bytes = std::fs::read(&path).unwrap_or_default();
 
-            // Catch panic explicitly
             let load_result = std::panic::catch_unwind(|| crate::json::load_value(&path));
             assert!(load_result.is_ok(), "json load panicked at iter {iter}");
 
             let res = load_result.expect("catch ok");
             match res {
                 Ok(value) => {
-                    // No unbounded allocation: serialized form bounded
                     let serialized =
                         serde_json::to_string(&value).unwrap_or_else(|_| String::new());
                     assert_bounded_allocation(&input, serialized.as_bytes(), "json-load-ok");
-                    // Re-parse succeeds if accepted
                     let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
                     assert!(
                         reparsed.is_ok(),
                         "json re-parse failed at iter {iter}: {reparsed:?} input={input:?}"
                     );
-                    // Also raw re-parse via strict Value check
                     let reparsed_value = reparsed.expect("ok");
                     assert_eq!(value, reparsed_value, "round-trip value mismatch at {iter}");
-                    // No FS mutation from load (read-only)
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(
                         before_bytes, after_bytes,
@@ -568,11 +529,9 @@ mod tests {
                         &after_snapshot,
                         &format!("json-load-ok iter {iter}"),
                     );
-                    // No path escape: path must be inside dir
                     assert_no_path_escape(&dir, &path, "json-load");
                 }
                 Err(_) => {
-                    // Rejected input must cause no FS mutation
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(
                         before_bytes, after_bytes,
@@ -587,7 +546,6 @@ mod tests {
                 }
             }
 
-            // Cleanup
             drop(std::fs::remove_dir_all(&dir));
         }
     }
@@ -604,16 +562,13 @@ mod tests {
             let input: Vec<u8> = match iter % 5 {
                 0 => gen_truncated(&mut prng, &base),
                 1 => {
-                    // Huge JSONC with comments
                     let b = gen_huge_json(&mut prng);
-                    // Inject comments every ~10th entry
                     let s = String::from_utf8_lossy(&b).into_owned();
                     let with_comments = s.replace("\"k10\"", "// comment\n\"k10\"");
                     with_comments.into_bytes()
                 }
                 2 => gen_nested_json(150),
                 3 => {
-                    // Deep with trailing commas + comments
                     let mut s = String::new();
                     for _ in 0..100 {
                         s.push_str("/* block */ { \"a\": [1,2,3,], // trailing\n");
@@ -672,7 +627,6 @@ mod tests {
                 1 => gen_huge_toml(&mut prng),
                 2 => gen_nested_toml(100),
                 3 => {
-                    // Deep inline tables
                     let mut s = String::new();
                     for i in 0..80 {
                         s.push_str(&format!("a{i} = {{ b = {{ c = {i} }} }}\n"));
@@ -697,7 +651,6 @@ mod tests {
                 Ok(doc) => {
                     let serialized = doc.to_string();
                     assert_bounded_allocation(&input, serialized.as_bytes(), "toml-ok");
-                    // Re-parse via toml_edit must succeed if accepted
                     let reparsed: Result<toml_edit::DocumentMut, _> = serialized.parse();
                     assert!(reparsed.is_ok(), "toml re-parse failed at {iter}");
                     let after = snapshot_dir(&dir);
@@ -731,7 +684,6 @@ mod tests {
                 1 => gen_huge_yaml(&mut prng),
                 2 => gen_nested_yaml(120),
                 3 => {
-                    // Deep flow style + anchors/alias attempt
                     let mut s = String::new();
                     for i in 0..80 {
                         s.push_str(&format!("key{i}: &a{i} value{i}\n"));
@@ -739,7 +691,6 @@ mod tests {
                     for i in 0..20 {
                         s.push_str(&format!("alias{i}: *a{}\n", i % 80));
                     }
-                    // Add merge keys
                     s.push_str("merged:\n  <<: *a0\n  extra: 1\n");
                     s.into_bytes()
                 }
@@ -762,11 +713,7 @@ mod tests {
                     let serialized = yaml_serde::to_string(&value).unwrap_or_default();
                     assert_bounded_allocation(&input, serialized.as_bytes(), "yaml-ok");
                     let reparsed: Result<Value, _> = yaml_serde::from_str::<Value>(&serialized)
-                        .map(|v| {
-                            // Convert via json Value roundtrip check
-                            serde_json::to_value(v).unwrap_or(Value::Null)
-                        });
-                    // yaml_serde parse of our serialized should succeed; but we accept either way as long as bounded
+                        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null));
                     assert!(
                         reparsed.is_ok() || serialized.is_empty(),
                         "yaml re-parse failed at {iter}"
@@ -801,7 +748,6 @@ mod tests {
                 0 => gen_truncated(&mut prng, &base),
                 1 => gen_huge_env(&mut prng),
                 2 => {
-                    // Nested-like: many duplicate keys
                     let mut s = String::new();
                     for i in 0..500 {
                         s.push_str(&format!("DUP_KEY=val{i}\n"));
@@ -809,7 +755,6 @@ mod tests {
                     s.into_bytes()
                 }
                 3 => {
-                    // Deep quoting + escapes
                     let mut s = String::new();
                     for i in 0..100 {
                         s.push_str(&format!(
@@ -835,13 +780,11 @@ mod tests {
             let res = result.expect("catch ok");
             match res {
                 Ok(map) => {
-                    // Bounded: map size not unbounded vs input
                     let total_val_len: usize = map.values().map(|v| v.len()).sum();
                     assert!(
                         total_val_len <= MAX_OUTPUT_BYTES,
                         "env map unbounded at {iter}: {total_val_len}"
                     );
-                    // Re-parse: store then load again
                     let tmp_path = dir.join(format!("reparse-{iter}.env"));
                     let store_res = crate::env_file::store(&tmp_path, &map);
                     if let Ok(()) = store_res {
@@ -854,12 +797,9 @@ mod tests {
                         );
                     }
                     let after = snapshot_dir(&dir);
-                    // Filter out reparse file for unchanged check (it is new on success)
-                    // For simplicity, ensure original file untouched
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(before_bytes, after_bytes);
                     assert_no_path_escape(&dir, &path, "env");
-                    // Ensure no file outside dir
                     for (p, _) in &after {
                         assert_no_path_escape(&dir, p, "env-after");
                     }
@@ -879,7 +819,6 @@ mod tests {
     #[test]
     fn fuzz_selector_parse_no_panic_100() {
         let corpus = seed_corpus();
-        // Add selector-specific seeds
         let mut selector_corpus = vec![
             "key:foo".as_bytes().to_vec(),
             "index:0".as_bytes().to_vec(),
@@ -905,7 +844,6 @@ mod tests {
             let input: Vec<u8> = match iter % 5 {
                 0 => gen_truncated(&mut prng, &base),
                 1 => {
-                    // Huge selector string (key with many segments)
                     let mut s = String::from("key:");
                     for i in 0..500 {
                         s.push_str(&format!("seg{i}."));
@@ -913,7 +851,6 @@ mod tests {
                     s.into_bytes()
                 }
                 2 => {
-                    // Deep/nested table path
                     let mut s = String::from("table:");
                     for i in 0..200 {
                         if i > 0 {
@@ -929,7 +866,6 @@ mod tests {
             assert!(input.len() <= MAX_INPUT_BYTES);
             let text = String::from_utf8_lossy(&input).into_owned();
 
-            // No panic on parse
             let result = std::panic::catch_unwind(|| Selector::parse(&text));
             assert!(
                 result.is_ok(),
@@ -937,7 +873,6 @@ mod tests {
             );
 
             if let Ok(Ok(selector)) = result {
-                // If accepted, round-trip via display must be stable
                 let serialized = selector.to_string();
                 assert_bounded_allocation(text.as_bytes(), serialized.as_bytes(), "selector-ok");
                 let reparsed = Selector::parse(&serialized);
@@ -951,33 +886,23 @@ mod tests {
                     "selector round-trip mismatch"
                 );
 
-                // No path escape: selector must not contain `..` that escapes base
-                // We treat Table/ManagedSpan/Key that contains `..` as potential escape
                 let repr = selector.to_typed_string();
                 if repr.contains("..") {
-                    // Should be either rejected or treated as literal, but must not panic
-                    // We verify selector doesn't cause filesystem escape when applied
                     let dir = temp_dir_unique("fuzz-selector-escape");
                     std::fs::create_dir_all(&dir).expect("mkdir");
-                    // Simulate applying via json edit with that selector string
                     let path = dir.join("dummy.json");
                     std::fs::write(&path, b"{\"a\":1}").expect("write");
-                    // Selector application is via Operation, not direct FS path, so no FS escape expected
-                    // Just verify no file outside dir was created
                     let before = snapshot_dir(&dir);
                     let op = crate::document::Operation::new(crate::document::EditOperation::Set {
                         selector: selector.clone(),
                         value: Value::String("x".to_owned()),
                     });
-                    // Validate op creation doesn't panic and selector is inside expected set
                     assert!(!op.selector().to_typed_string().is_empty());
                     let after = snapshot_dir(&dir);
                     assert_dir_unchanged(&before, &after, &format!("selector-escape {iter}"));
                     drop(std::fs::remove_dir_all(&dir));
                 }
             } else {
-                // Rejected: no FS mutation (the parse is pure).
-                // Just ensure input was bounded
                 assert!(text.len() <= MAX_INPUT_BYTES);
             }
         }
@@ -992,14 +917,12 @@ mod tests {
                 .get(prng.gen_range(0, corpus.len()))
                 .cloned()
                 .unwrap_or_else(|| br#"{"a":1}"#.to_vec());
-            // Choose codec by iter
             let (ext, kind) = match iter % 4 {
                 0 => (".json", DocumentKind::StrictJson),
                 1 => (".toml", DocumentKind::Toml),
                 2 => (".yaml", DocumentKind::Yaml),
                 _ => (".env", DocumentKind::Env),
             };
-            // Generate fuzz input for that codec's load path
             let input: Vec<u8> = match (iter % 5, ext) {
                 (0, _) => gen_truncated(&mut prng, &base),
                 (1, ".json") => gen_huge_json(&mut prng),
@@ -1033,13 +956,11 @@ mod tests {
             let dir = temp_dir_unique("fuzz-edit-app");
             std::fs::create_dir_all(&dir).expect("mkdir");
             let path = dir.join(format!("edit-{iter}{ext}"));
-            // Write initial file (may be malformed)
             std::fs::write(&path, &input).expect("write initial");
             let before_snapshot = snapshot_dir(&dir);
             let before_bytes = std::fs::read(&path).unwrap_or_default();
             let before_digest = compute_digest(&before_bytes);
 
-            // Also test raw_editor validate doesn't panic
             let validate_res =
                 std::panic::catch_unwind(|| crate::raw_editor::validate(&input, kind));
             assert!(
@@ -1047,8 +968,6 @@ mod tests {
                 "raw_editor::validate panicked at iter {iter} kind={kind:?}"
             );
 
-            // Attempt to apply edit via codec-specific edit API
-            // We use a random edit closure that inserts/updates a key
             let edit_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ext {
                     ".json" => crate::json::edit(&path, |m| {
@@ -1077,10 +996,7 @@ mod tests {
 
             match edit_res {
                 Ok(()) => {
-                    // Accepted: file was either edited or no-op if input already had that key
-                    // Verify re-parse succeeds
                     let after_bytes = std::fs::read(&path).expect("read after edit");
-                    // Edit output is pretty-printed; deep nesting can expand 40x, so only check absolute cap and a lenient 50x bound
                     assert!(
                         after_bytes.len() <= MAX_OUTPUT_BYTES,
                         "edit-ok {ext} {iter}: output {} exceeds MAX_OUTPUT_BYTES {} (input {})",
@@ -1099,7 +1015,6 @@ mod tests {
                         after_bytes.len(),
                         input.len()
                     );
-                    // Re-parse via appropriate loader must succeed
                     let reparse_ok = match ext {
                         ".json" => crate::json::load_value(&path).is_ok(),
                         ".toml" => crate::toml_file::load(&path).is_ok(),
@@ -1126,7 +1041,6 @@ mod tests {
                             );
                         }
                     }
-                    // Original content backed up? Check backup exists if file was edited
                     if after_bytes != before_bytes {
                         let has_backup = after_snapshot
                             .iter()
@@ -1138,7 +1052,6 @@ mod tests {
                     }
                 }
                 Err(_) => {
-                    // Rejected: ensure no FS mutation (file untouched, no new backup beyond before)
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(
                         before_bytes, after_bytes,
@@ -1150,12 +1063,10 @@ mod tests {
                         &after_snapshot,
                         &format!("edit-rejected {iter} {ext}"),
                     );
-                    // Ensure no path escape on rejected path
                     assert_no_path_escape(&dir, &path, "edit-rejected");
                 }
             }
 
-            // Also test diff doesn't panic
             let len = prng.gen_range(0, 1024);
             let new_content = prng.gen_bytes(len);
             let diff_res =
@@ -1185,7 +1096,6 @@ mod tests {
             let path = std::env::temp_dir().join(format!("fuzz-doc-{iter}.json"));
             let _kind = DocumentKind::from_path(&path);
 
-            // Envelope creation must not panic
             let doc_res = std::panic::catch_unwind(|| {
                 crate::document::SourceDocument::from_bytes(&path, input.clone())
             });
@@ -1199,7 +1109,6 @@ mod tests {
             assert!(doc.verify_digest());
             assert_bounded_allocation(&input, doc.bytes.as_slice(), "doc-envelope");
 
-            // Operation fuzz: random selector string + value
             let selector_text = prng.gen_ascii_string(0, 48);
             let sel_res = std::panic::catch_unwind(|| Selector::parse(&selector_text));
             assert!(sel_res.is_ok(), "selector parse panicked at {iter}");
@@ -1220,7 +1129,6 @@ mod tests {
                 assert_bounded_allocation(selector_text.as_bytes(), repr.as_bytes(), "op-selector");
             }
 
-            // Ensure doc kind detection doesn't panic on weird extensions
             let weird_paths = [
                 std::env::temp_dir().join(format!("weird-{iter}.JSON")),
                 std::env::temp_dir().join(format!("weird-{iter}.Toml")),
@@ -1237,10 +1145,7 @@ mod tests {
 
     #[test]
     fn fuzz_registry_migration_no_panic_100() {
-        // Registry files are JSON with `instances` + `schema_version` + foreign keys
-        // We fuzz the JSON layer that registry migration sits on top of.
         let corpus = seed_corpus();
-        // Add registry-specific seeds
         let mut reg_corpus = vec![
             br#"{"schema_version":1,"instances":[]}"#.to_vec(),
             br#"{"instances":[{"name":"work","harness":"claude-code","config_dir":"/home/user/.claude-work"}]}"#.to_vec(),
@@ -1248,7 +1153,6 @@ mod tests {
             br#"{"schema_version":1,"instances":[{"id":"x","name":"work","harness":"claude-code","config_root":"/tmp/a","isolation":"unknown","origin":"created","ownership":"superai_created","created_at":"2026-01-01T00:00:00Z","adapter_revision":"0.1.0"}]}"#.to_vec(),
             br#"{"instances": "not an array"}"#.to_vec(),
             br#"{"schema_version":"bad"}"#.to_vec(),
-            // Path escape attempts
             br#"{"instances":[{"name":"../escape","harness":"claude-code","config_dir":"/tmp/../etc/passwd"}]}"#.to_vec(),
             br#"{"instances":[{"name":"work","harness":"claude-code","config_dir":"/tmp/work","binary_path":"/tmp/../../etc/passwd"}]}"#.to_vec(),
         ];
@@ -1263,7 +1167,6 @@ mod tests {
             let input: Vec<u8> = match iter % 5 {
                 0 => gen_truncated(&mut prng, &base),
                 1 => {
-                    // Huge registry: many instances
                     let mut s = String::from("{\"schema_version\":1,\"instances\":[");
                     for i in 0..300 {
                         if i > 0 {
@@ -1281,7 +1184,6 @@ mod tests {
                     b
                 }
                 2 => {
-                    // Deep nested registry structure
                     let mut s = String::from(
                         "{\"schema_version\":1,\"instances\":[{\"id\":\"x\",\"name\":\"work\",\"harness\":\"claude-code\",\"config_root\":\"/tmp/a\",\"extra\":",
                     );
@@ -1306,7 +1208,6 @@ mod tests {
             let before_snapshot = snapshot_dir(&dir);
             let before_bytes = std::fs::read(&path).unwrap_or_default();
 
-            // Load via json::load_value, the layer registry's parse layer.
             let load_res = std::panic::catch_unwind(|| crate::json::load_value(&path));
             assert!(
                 load_res.is_ok(),
@@ -1316,11 +1217,9 @@ mod tests {
 
             match res {
                 Ok(value) => {
-                    // Bounded allocation
                     let serialized = serde_json::to_string(&value).unwrap_or_default();
                     assert_bounded_allocation(&input, serialized.as_bytes(), "registry-ok");
 
-                    // If value is object with instances array, check for path escape in config_root
                     if let Value::Object(map) = &value {
                         if let Some(instances) = map.get("instances").and_then(|v| v.as_array()) {
                             for inst in instances {
@@ -1330,28 +1229,22 @@ mod tests {
                                     .or_else(|| inst.get("config_dir").and_then(|v| v.as_str()))
                                 {
                                     let p = Path::new(root);
-                                    // Registry migration must reject path escapes; check lexical detection.
                                     let has_parent = p
                                         .components()
                                         .any(|c| matches!(c, std::path::Component::ParentDir));
                                     if has_parent {
-                                        // Should have been rejected by registry validation; but json load alone accepts it
-                                        // We just assert we detected it and would reject (no FS mutation)
                                         assert!(
                                             has_parent,
                                             "path escape not detected at {iter}: {root:?}"
                                         );
                                     }
-                                    // Ensure candidate path doesn't escape dir if we were to use it
                                     if p.is_absolute() {
-                                        // For fuzz, we don't actually create that path, just verify we wouldn't
                                         assert!(
                                             p.to_string_lossy().len() <= MAX_OUTPUT_BYTES,
                                             "registry path unbounded at {iter}"
                                         );
                                     }
                                 }
-                                // Name/harness must not contain NUL or huge
                                 if let Some(name) = inst.get("name").and_then(|v| v.as_str()) {
                                     assert!(
                                         name.len() <= MAX_OUTPUT_BYTES,
@@ -1366,14 +1259,12 @@ mod tests {
                         }
                     }
 
-                    // Re-parse must succeed
                     let reparsed: Result<Value, _> = serde_json::from_str(&serialized);
                     assert!(
                         reparsed.is_ok(),
                         "registry re-parse failed at iter {iter}: {reparsed:?}"
                     );
 
-                    // No FS mutation from load (read-only)
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(before_bytes, after_bytes);
                     let after_snapshot = snapshot_dir(&dir);
@@ -1385,7 +1276,6 @@ mod tests {
                     assert_no_path_escape(&dir, &path, "registry-ok");
                 }
                 Err(_) => {
-                    // Rejected: no FS mutation
                     let after_bytes = std::fs::read(&path).unwrap_or_default();
                     assert_eq!(
                         before_bytes, after_bytes,
@@ -1397,14 +1287,12 @@ mod tests {
                         &after_snapshot,
                         &format!("registry-rejected {iter}"),
                     );
-                    // Verify no file escaped dir
                     for (p, _) in &after_snapshot {
                         assert_no_path_escape(&dir, p, "registry-rejected");
                     }
                 }
             }
 
-            // Also test raw_editor validate on registry bytes doesn't panic
             let val_res = std::panic::catch_unwind(|| {
                 crate::raw_editor::validate(&input, DocumentKind::StrictJson)
             });
@@ -1428,7 +1316,7 @@ mod tests {
                 .unwrap_or_default();
             let variant = iter % 4;
             let input: Vec<u8> = match variant {
-                0 => gen_truncated(&mut prng, &base), // truncated
+                0 => gen_truncated(&mut prng, &base),
                 1 => {
                     // huge: rotate through the per-codec huge generators
                     match iter % 4 {
@@ -1438,12 +1326,11 @@ mod tests {
                         _ => gen_huge_env(&mut prng),
                     }
                 }
-                2 => gen_nested_json(180), // nested
-                _ => gen_deep_array(250),  // deep
+                2 => gen_nested_json(180),
+                _ => gen_deep_array(250),
             };
             assert!(input.len() <= MAX_INPUT_BYTES);
 
-            // Test all four validators don't panic on same input
             for kind in [
                 DocumentKind::StrictJson,
                 DocumentKind::JsonC,
@@ -1457,7 +1344,6 @@ mod tests {
                     "combined validate panicked at iter {iter} kind={kind:?}"
                 );
                 let diags = res.expect("catch ok");
-                // Diagnostics must be bounded
                 assert!(
                     diags.len() <= 10000,
                     "diagnostics unbounded at iter {iter} kind={kind:?}: {}",
@@ -1478,7 +1364,6 @@ mod tests {
                 );
             }
 
-            // Also test document envelope for each kind
             for kind in [
                 DocumentKind::StrictJson,
                 DocumentKind::Toml,
@@ -1496,12 +1381,10 @@ mod tests {
                 assert_bounded_allocation(&input, &doc.bytes, "combined-doc");
             }
 
-            // FS mutation check via atomic write fuzz (write random bytes, ensure bounded)
             let dir = temp_dir_unique("fuzz-combined-fs");
             std::fs::create_dir_all(&dir).expect("mkdir");
             let path = dir.join(format!("combined-{iter}.json"));
             let before = snapshot_dir(&dir);
-            // Try atomic write with fuzz input (if valid, it will succeed; if invalid, we still test bounded)
             let write_res = std::panic::catch_unwind(|| crate::atomic::atomic_write(&path, &input));
             assert!(write_res.is_ok(), "atomic_write panicked at iter {iter}");
             if let Ok(Ok(())) = write_res {
@@ -1510,15 +1393,12 @@ mod tests {
                 assert_bounded_allocation(&input, &written, "atomic-write");
                 assert_no_path_escape(&dir, &path, "combined-atomic");
                 let after = snapshot_dir(&dir);
-                // After success, snapshot differs by exactly one file (the written one)
                 assert!(
                     after.len() >= before.len(),
                     "snapshot after should not shrink"
                 );
             } else {
-                // Rejected (e.g., dir): no mutation beyond the allowed set
                 let after = snapshot_dir(&dir);
-                // If write failed due to being a directory etc., ensure no new file outside dir
                 for (p, _) in &after {
                     assert_no_path_escape(&dir, p, "combined-rejected");
                 }
@@ -1529,7 +1409,6 @@ mod tests {
 
     #[test]
     fn fuzz_selector_and_path_escape_with_sentinel_no_leak_100() {
-        // QAL-04/10/11: selector fuzz with sentinel injection and path escape must not panic or leak
         const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
         for iter in 0..100 {
             let mut prng = Prng::new(iter as u64 + 0xb5c6_d7e8);
@@ -1555,14 +1434,12 @@ mod tests {
                 let serialized = sel.to_string();
                 assert!(serialized.len() <= MAX_OUTPUT_BYTES);
                 // Serialized selector may legitimately contain sentinel if the selector itself was sentinel (e.g., key:sk-...), that's input, not leak; we only ensure error diagnostics don't leak.
-                // Ensure diagnostics for invalid selectors are bounded and redacted
                 let err = Selector::parse(&format!("key:../{SENTINEL}"));
                 if let Err(e) = err {
                     let msg = format!("{e:?}");
                     assert!(msg.len() <= 4096);
                 }
             }
-            // Path escape check: atomic write with traversal-named file must not escape temp dir
             let dir = temp_dir_unique("fuzz-selector-sentinel");
             std::fs::create_dir_all(&dir).expect("mkdir");
             let traversal_name = format!("../escape-{iter}.json");
@@ -1581,7 +1458,6 @@ mod tests {
 
     #[test]
     fn fuzz_huge_and_deep_and_random_with_secret_scan_and_bom_100() {
-        // QAL-04: huge 5MB-ish, deep 300, random BOM/control, no panic, bounded, no secret leak, no path escape
         const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
         let corpus = seed_corpus();
         for iter in 0..100 {
@@ -1643,7 +1519,6 @@ mod tests {
                     );
                 }
             }
-            // Atomic write bounded check
             let dir = temp_dir_unique("fuzz-huge-secret");
             std::fs::create_dir_all(&dir).expect("mkdir");
             let path = dir.join(format!("huge-{iter}.json"));
@@ -1817,8 +1692,6 @@ mod tests {
         }
     }
 
-    /// Generate a random text with a mix of plain lines, sentinel-ish lines,
-    /// CRLF line endings, and smuggled sentinels.
     fn gen_span_text(prng: &mut Prng, iter: usize) -> String {
         let codec = crate::span_codec::SpanCodec::default();
         let mut text = String::new();
@@ -1856,7 +1729,6 @@ mod tests {
                 )
             };
 
-            // Insert must never panic; success implies the result validates.
             let inserted = std::panic::catch_unwind(|| codec.insert_span(&text, &name, &body));
             assert!(inserted.is_ok(), "insert_span panicked at {iter}");
             let ins = inserted.expect("catch ok");
@@ -1870,9 +1742,8 @@ mod tests {
                     out.starts_with(&text) || out.starts_with(text.trim_end_matches('\n')),
                     "insert preserves the original bytes as a prefix at {iter}"
                 );
-                // Replace then remove must keep every byte outside the span
-                // identical, and removing the inserted span restores the
-                // pre-insert text (canonical newline caveat aside).
+                // Replace and remove must keep every byte outside the span
+                // identical.
                 if let Ok(replaced) = codec.replace_span(out, &name, "replaced body") {
                     assert!(
                         codec.outside_span_bytes(&replaced) == codec.outside_span_bytes(out),
@@ -1886,14 +1757,12 @@ mod tests {
                     );
                 }
             }
-            // Invalid bases (smuggled/dangling sentinels) must fail closed
-            // rather than corrupt: remove on a name that does not exist is a
-            // typed error, never a panic.
+            // Invalid bases fail closed rather than corrupt: remove on a
+            // missing name is a typed error, never a panic.
             let removed = std::panic::catch_unwind(|| codec.remove_span(&text, &name));
             assert!(removed.is_ok(), "remove_span panicked at {iter}");
             drop(removed.expect("catch ok"));
 
-            // validate itself never panics and is bounded.
             let validated = std::panic::catch_unwind(|| codec.validate(&text));
             assert!(validated.is_ok(), "validate panicked at {iter}");
             drop(validated.expect("catch ok"));

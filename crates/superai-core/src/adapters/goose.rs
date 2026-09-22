@@ -1,5 +1,4 @@
-//! Goose adapter: relocated-root via `GOOSE_PATH_ROOT` (goose nests a
-//! `config/` dir inside the relocation root), `config.yaml` (YAML) surface.
+//! Goose adapter: relocated-root via `GOOSE_PATH_ROOT` (goose nests `config/` inside it), `config.yaml` surface.
 //! Research source: `docs/harness-configs/goose.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
@@ -26,9 +25,7 @@ pub const EXECUTABLE: &str = "goose";
 /// Environment variable that relocates the config root.
 pub const CONFIG_ENV_VAR: &str = "GOOSE_PATH_ROOT";
 
-/// Config root when `GOOSE_PATH_ROOT` is set: goose nests a `config/` dir
-/// inside the relocation root (goose.md §1; live-verified 1.51.0 via
-/// `goose info`, which ignores a flat `$GOOSE_PATH_ROOT/config.yaml`).
+/// Under `GOOSE_PATH_ROOT`, goose nests a `config/` dir; a flat `config.yaml` there is ignored (live 1.51.0).
 pub const ISOLATED_CONFIG_ROOT_HINT: &str = "$GOOSE_PATH_ROOT/config";
 
 /// Default config root when `GOOSE_PATH_ROOT` is unset.
@@ -84,7 +81,6 @@ impl GooseAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$GOOSE_PATH_ROOT/config` or `~/.config/goose`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -102,12 +98,10 @@ impl GooseAdapter {
         Some(PathBuf::from(home).join(".config").join("goose"))
     }
 
-    /// Build the config.yaml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.yaml")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -468,7 +462,7 @@ impl Adapter for GooseAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (goose.md 5: `extensions:` map name to stdio/remote config; `enabled_extensions` lists bundled ones)
+    /// `extensions:` maps name to stdio/remote config; `enabled_extensions` lists the bundled ones.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.yaml",
@@ -479,7 +473,6 @@ impl Adapter for GooseAdapter {
         ).with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only; extension secrets belong in secrets.yaml/keyring"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism beyond MCP extensions documented (goose.md)")
     }
@@ -759,9 +752,8 @@ mod tests {
         assert!(candidates.iter().any(|c| c.contains(CONFIG_ENV_VAR)));
     }
 
-    /// Real goose nests `config/` inside `$GOOSE_PATH_ROOT` (live 1.51.0:
-    /// a flat `$GOOSE_PATH_ROOT/config.yaml` is ignored); every config-file
-    /// hint must carry the segment, and the sessions DB lives under `data/`.
+    /// Real goose nests `config/` inside `$GOOSE_PATH_ROOT` (live 1.51.0: a
+    /// flat config.yaml there is ignored); hints must carry the segment.
     #[test]
     fn env_relocated_surface_hints_nest_config_segment() {
         let a = adapter();
@@ -810,7 +802,6 @@ mod tests {
                 surface.id
             );
         }
-        // scan candidates must relocate through the nested root as well
         assert!(
             a.scan_candidates()
                 .iter()

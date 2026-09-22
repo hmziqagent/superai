@@ -1,6 +1,5 @@
 //! SWE-agent adapter: composed YAML via repeatable `--config`, isolation
-//! `explicit-config`; full for config-run instances, batch orchestration aside.
-//! Research source: `docs/harness-configs/swe-agent.md` (last verified 2026-08-25).
+//! `explicit-config`; full for config-run instances.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -63,8 +62,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "environment.deployment",
 ];
 
-/// Concrete adapter for SWE-agent (`explicit-config` via composed `--config`
-/// flags; batch sharding reuses the same composition).
+/// Concrete adapter for SWE-agent (`explicit-config` via composed `--config` flags).
 #[derive(Debug, Clone)]
 pub struct SweAgentAdapter {
     id: HarnessId,
@@ -92,7 +90,6 @@ impl SweAgentAdapter {
         CONFIG_DIR_ENV_VAR
     }
 
-    /// Probe `sweagent --help` / `--version` with a timeout.
     fn probe_version(binary: &Path) -> Option<String> {
         let binary_owned = binary.to_path_buf();
         let (tx, rx) = mpsc::channel();
@@ -134,7 +131,6 @@ impl SweAgentAdapter {
         super::parse_version_output(&combined)
     }
 
-    /// Resolve the default config root (package config dir).
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ROOT_ENV_VAR)
             && !dir.trim().is_empty()
@@ -155,7 +151,6 @@ impl SweAgentAdapter {
         Some(PathBuf::from(home).join(".config").join("swe-agent"))
     }
 
-    /// Collect config evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -289,8 +284,7 @@ impl Adapter for SweAgentAdapter {
             (None, _) => InstallPresence::Absent,
         };
 
-        // Absent forces High, so the Low "config root exists" arm can never
-        // survive.
+        // Absent forces High, so the Low "config root exists" arm can never fire.
         let confidence = match (&binary_path, &version) {
             (Some(_), None) => DetectionConfidence::Medium,
             (Some(_), Some(_)) | (None, _) => DetectionConfidence::High,
@@ -432,8 +426,6 @@ impl Adapter for SweAgentAdapter {
     }
 
     fn supported_operations(&self) -> Vec<(String, AdapterSupport)> {
-        // Full for config-run instances; batch orchestration is out of scope
-        // but reuses this composed-config mechanism.
         vec![
             ("detect".to_owned(), AdapterSupport::Full),
             ("read_config".to_owned(), AdapterSupport::Full),
@@ -534,12 +526,10 @@ impl Adapter for SweAgentAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some("no MCP mechanism documented (swe-agent.md)")
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (swe-agent.md)")
     }
@@ -827,8 +817,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("swe.foreign.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        // codec-honesty (DOC-06): changing YAML writes on existing files are
-        // refused outright, so foreign keys survive because nothing is written.
+        // Changing YAML writes on existing files are refused outright, so
+        // foreign keys survive because nothing is written.
         let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert(
                 "tools".to_owned(),

@@ -48,8 +48,7 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// Research-blocked reason: writes blocked until command API verified.
 pub const BLOCKED_REASON: &str = "crushrc is executable Bash with command-backed mutation (provider add/model add): writes ResearchBlocked until non-interactive command API is verified; project/XDG isolation via CRUSH_GLOBAL_CONFIG";
 
-/// Read-only detection and inspection; env relocation is documented but not
-/// trusted for concurrent wrappers until the command API is verified.
+/// Read-only detection; env relocation is not trusted for concurrent wrappers yet.
 #[derive(Debug, Clone)]
 pub struct CrushAdapter {
     id: HarnessId,
@@ -82,7 +81,6 @@ impl CrushAdapter {
         BLOCKED_REASON
     }
 
-    /// Resolve the default global config path: `$CRUSH_GLOBAL_CONFIG` or XDG/home.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -103,7 +101,6 @@ impl CrushAdapter {
         Some(PathBuf::from(home).join(".config").join("crush"))
     }
 
-    /// Build detection evidence about config presence and surfaces.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -487,8 +484,7 @@ impl Adapter for CrushAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03, read side (writes are ResearchBlocked); the executable
-        // crushrc has no value schema.
+        // Read side only (writes are ResearchBlocked); the executable crushrc has no schema.
         match surface_id {
             "crush.json (global)" | "crush.json (project)" => Some(
                 SurfaceSchema::new()
@@ -503,7 +499,6 @@ impl Adapter for CrushAdapter {
         }
     }
 
-    /// EXT-08/09: MCP destination (crush.md 1.5: legacy crush.json carries the `mcp` map)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "crush.json (global)",
@@ -514,7 +509,6 @@ impl Adapter for CrushAdapter {
         ).with_read_only("research-blocked harness (executable crushrc schema unverified); inspect/diff only"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented beyond MCP/skills extension (crush.md)")
     }

@@ -51,8 +51,7 @@ pub const OWNED_SELECTORS: &[&str] = &[
     "amp.notifications.enabled",
 ];
 
-/// Isolation is `explicit-config` via `AMP_SETTINGS_FILE` / `--settings-file`.
-/// Hosted model dial and the secrets file are never mutated.
+/// `explicit-config` via `AMP_SETTINGS_FILE`; the secrets file and hosted dials are never mutated.
 #[derive(Debug, Clone)]
 pub struct AmpAdapter {
     id: HarnessId,
@@ -80,7 +79,6 @@ impl AmpAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root.
     #[expect(clippy::excessive_nesting, reason = "explicit settings path handling")]
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
@@ -107,12 +105,10 @@ impl AmpAdapter {
         Some(PathBuf::from(home).join(".config").join("amp"))
     }
 
-    /// Build the settings.json path for a given config root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Collect config evidence.
     #[expect(clippy::excessive_nesting, reason = "detection branches are explicit")]
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
@@ -458,7 +454,6 @@ impl Adapter for AmpAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (amp.md: `amp.mcpServers` under the JSONC settings file; `amp mcp add` is the native writer)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "settings.json",
@@ -469,7 +464,6 @@ impl Adapter for AmpAdapter {
         ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06/07: plugin mechanism (amp.md: project `.amp/plugins/`, system `~/.config/amp/plugins/`; no bundle manifest documented)
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::directory_bundle(
             "plugins",
@@ -478,9 +472,7 @@ impl Adapter for AmpAdapter {
         ))
     }
 
-    /// EXT-04: `amp.skills.*` keys inside the JSONC settings file; writes
-    /// honor the JSONC lossy-write gate.
-    /// refuse typed `LossyWrite`).
+    /// `amp.skills.*` lives in the JSONC settings file, so writes hit the lossy-write gate.
     fn skill_config_decl(&self) -> Option<crate::adapter::SkillConfigDecl> {
         Some(
             crate::adapter::SkillConfigDecl::new("settings.json")

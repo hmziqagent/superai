@@ -188,11 +188,8 @@ pub(crate) fn probe_version(binary: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod decl_tests {
-    //! EXT-06/09 declaration coverage: every catalog adapter declares exactly
-    //! one of an MCP destination or a corpus-grounded absence (and likewise
-    //! for plugins), the declarations' dest keys match the corpus-documented
-    //! mechanisms, and every WRITABLE declaration actually round-trips
-    //! foreign-preserving server installs through the MCP lifecycle.
+    //! Every catalog adapter declares exactly one of an MCP destination or a
+    //! corpus-grounded absence (likewise plugins); writable dests round-trip.
 
     use crate::adapter::DocumentKind;
     use crate::harness_catalog;
@@ -288,7 +285,6 @@ mod decl_tests {
         }
     }
 
-    /// Build a nested JSON-family seed value for a dotted `dest_key`.
     fn nested_json_seed(dest_key: &str, inner: &serde_json::Value) -> String {
         let segments: Vec<&str> = dest_key.split('.').filter(|s| !s.is_empty()).collect();
         let (last, parents) = segments
@@ -418,7 +414,6 @@ mod decl_tests {
                 writable += usize::from(!is_read_only);
             }
         }
-        // The exact partition: sums to 51 AND matches the verified counts.
         assert_eq!(
             writable + read_only + absent,
             51,
@@ -436,7 +431,6 @@ mod decl_tests {
             absent, EXPECTED_MCP_ABSENT,
             "explicit-absence count drifted (was {absent}, expected {EXPECTED_MCP_ABSENT})"
         );
-        // Every table row is exercised (no stale expectations).
         assert_eq!(
             writable + read_only,
             MCP_DESTS.len(),
@@ -501,10 +495,8 @@ mod decl_tests {
 
     #[test]
     fn writable_mcp_decls_round_trip_foreign_preserving() {
-        // Every WRITABLE declaration must actually work through the MCP
-        // lifecycle in a temp instance root: install an owned server next to
-        // a foreign one, verify both survive, remove the owned one, verify
-        // the foreign entry is untouched.
+        // Writable dests must survive the full lifecycle: install beside a
+        // foreign server, then remove ours without touching the foreign bytes.
         for adapter in harness_catalog::all_adapters() {
             let Some(decl) = adapter.mcp_decl() else {
                 continue;
@@ -532,7 +524,6 @@ mod decl_tests {
             crate::mcp::install_mcp_server(&path, &decl, &owned)
                 .unwrap_or_else(|e| panic!("{id}: install through declared dest failed: {e}"));
 
-            // Both servers inspectable; foreign survived.
             let inspected = crate::mcp::inspect_servers(&path, &decl)
                 .unwrap_or_else(|e| panic!("{id}: inspect failed: {e}"));
             assert!(
@@ -541,7 +532,6 @@ mod decl_tests {
             );
             assert!(inspected.contains_key(&owned.id), "{id}: owned missing");
 
-            // Removal leaves the foreign entry bytes.
             crate::mcp::remove_mcp_server(&path, &decl, &owned.id)
                 .unwrap_or_else(|e| panic!("{id}: remove failed: {e}"));
             let after = std::fs::read_to_string(&path).unwrap();
@@ -574,7 +564,6 @@ mod decl_tests {
         let path = dir.join(&decl.dest_file);
         seed_empty_container(&path, decl);
         let before = std::fs::read(&path).unwrap();
-        // Refusing writes never blinds reads.
         let inspected = crate::mcp::inspect_servers(&path, decl);
         assert!(
             inspected.is_ok(),
@@ -628,8 +617,8 @@ mod decl_tests {
                 continue;
             }
             let id = adapter.id().as_str().to_owned();
-            // Smoke: the declared destination names a directory under the
-            // instance root and staging through it works end to end.
+            // The declared destination must name a real directory under the
+            // instance root.
             let dir = crate::test_util::temp_dir_unique(&format!("plug-decl-{id}"));
             let instance_root = dir.join("instance");
             let source_dir = dir.join("bundle");

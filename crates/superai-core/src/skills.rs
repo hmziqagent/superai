@@ -1,11 +1,5 @@
-//! Skill registry: acquisition, destination modes, enable/disable, and drift
-//! (EXT-01..05). Registry lives at `~/.superai/skills`; every filesystem
-//! change goes through `superai_config::transaction` with foreign entries
-//! preserved. Sources are staged first (`LocalDir` copy, pinned git clone via
-//! argv tokens, or an HTTPS download that never executes anything), then
-//! boundary/symlink/traversal/device validation runs before anything lands
-//! under the registry root. Copied destinations carry provenance beside the
-//! registry so updates can detect and refuse to clobber local edits.
+//! Skill registry: acquisition, destination modes, enable/disable, drift
+//! (EXT-01..05). Sources stage and validate first; fetched content never runs.
 
 #![expect(
     clippy::assigning_clones,
@@ -331,9 +325,8 @@ fn staging_root(tag: &str) -> PathBuf {
     ))
 }
 
-/// Remove a symlink regardless of whether it points at a directory.
-/// Windows rejects `remove_file` on a directory symlink (Access Denied);
-/// `remove_dir` removes the link itself without touching the target.
+/// Remove a symlink regardless of directory-ness: Windows rejects
+/// `remove_file` on a dir symlink; `remove_dir` removes the link itself.
 fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -408,7 +401,6 @@ pub fn validate_fetch_url(url: &str) -> Result<()> {
                 reason: "file url path must not be empty".to_owned(),
             });
         }
-        // Basic traversal check for file url path: no ".." segment
         for comp in Path::new(path_part).components() {
             if matches!(comp, Component::ParentDir) {
                 return Err(CoreError::Validation {
@@ -498,7 +490,6 @@ fn validate_relative_path(rel: &Path) -> Result<()> {
             reason: format!("path must not be '.' or '..': `{s}`"),
         });
     }
-    // Check that no segment ends with '.' or ' '
     for segment in s.split('/') {
         if segment.ends_with('.') || segment.ends_with(' ') {
             return Err(CoreError::Validation {
@@ -535,7 +526,6 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             value: path.display().to_string(),
             reason: format!("symlink_metadata failed: {e}"),
         })?;
-        // Reject device/FIFO/socket: must be file, dir, or symlink
         let ft = meta.file_type();
         if !(ft.is_file() || ft.is_dir() || ft.is_symlink()) {
             return Err(CoreError::Validation {
@@ -546,13 +536,11 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                 ),
             });
         }
-        // For symlinks, validate target does not escape boundaries
         if ft.is_symlink() {
             let target = std::fs::read_link(&path).map_err(|e| CoreError::Validation {
                 field: "symlink".to_owned(),
                 reason: format!("cannot read symlink `{}`: {e}", path.display()),
             })?;
-            // Disallow absolute symlink targets
             if target.is_absolute() {
                 return Err(CoreError::Validation {
                     field: "symlink".to_owned(),
@@ -563,7 +551,6 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                     ),
                 });
             }
-            // Disallow traversal via symlink
             for comp in target.components() {
                 if matches!(comp, Component::ParentDir) {
                     return Err(CoreError::Validation {
@@ -576,7 +563,6 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                     });
                 }
             }
-            // Detect symlink loops
             if superai_config::snapshot::is_symlink_loop(&path) {
                 return Err(CoreError::Validation {
                     field: "symlink".to_owned(),
@@ -589,7 +575,6 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             continue;
         }
         if meta.is_dir() {
-            // Validate relative boundaries for this dir
             let rel = path
                 .strip_prefix(root)
                 .map_err(|_e| CoreError::Validation {
@@ -656,7 +641,6 @@ pub fn parse_skill_metadata(skill_dir: &Path) -> Result<SkillMetadata> {
             reason: "frontmatter must not be empty".to_owned(),
         });
     }
-    // Parse YAML via yaml_serde (which is yaml-serde crate)
     let value: Value = yaml_serde::from_str(&frontmatter).map_err(|e| CoreError::Parse {
         path: skill_md.clone(),
         kind: "yaml".to_owned(),
@@ -696,7 +680,6 @@ pub fn parse_skill_metadata(skill_dir: &Path) -> Result<SkillMetadata> {
             reason: "description must not be empty".to_owned(),
         });
     }
-    // Validate name as SkillId
     SkillId::new(name).map_err(|e| CoreError::Validation {
         field: "skill_frontmatter.name".to_owned(),
         reason: format!("frontmatter name `{name}` is not a valid SkillId: {e}"),
@@ -935,9 +918,8 @@ impl SkillRegistry {
         Self::load(&root)
     }
 
-    /// Load registry from `root/registry.json`. Missing file yields empty registry.
-    ///
-    /// Validates duplicate normalized names, digests, etc., and preserves foreign keys.
+    /// Load from `root/registry.json`; a missing file yields an empty
+    /// registry. Validates duplicates, preserves foreign keys.
     pub fn load(root: &Path) -> Result<Self> {
         let file = registry_file_for_root(root);
         if !file.exists() {
@@ -1056,9 +1038,8 @@ impl SkillRegistry {
         })
     }
 
-    /// Persist registry to `root/registry.json`, preserving foreign keys and backing up.
-    ///
-    /// Uses `superai_config::json::edit` semantics (fresh read, merge, atomic write, backup).
+    /// Persist to `root/registry.json`, preserving foreign keys and
+    /// backing up first (fresh read, merge, atomic write).
     pub fn store(&self) -> Result<()> {
         for rec in &self.records {
             rec.validate()?;
@@ -1080,9 +1061,8 @@ impl SkillRegistry {
                 field: "schema_version".to_owned(),
                 reason: format!("serialize failed: {e}"),
             })?;
-        // `edit` reads the file fresh and preserves every key we do not
-        // touch; the loop re-adds foreign keys this struct carried in case
-        // the file did not exist yet.
+        // `edit` reads fresh and preserves untouched keys; the loop re-adds
+        // foreign keys this struct carried when the file did not exist yet.
         superai_config::json::edit(&file, |map: &mut Map<String, Value>| {
             map.insert("schema_version".to_owned(), schema_value.clone());
             map.insert("skills".to_owned(), skills_value.clone());
@@ -1119,11 +1099,8 @@ impl SkillRegistry {
             .find(|record| record.name.to_lowercase() == needle)
     }
 
-    /// Install a skill from `source`, optionally validating frontmatter.
-    ///
-    /// Stages to a temp dir, validates the tree, computes digest, checks duplicates,
-    /// previews diff, then atomically copies into `root/<skill_id>` via transaction
-    /// and updates `registry.json`.
+    /// Install from `source`: stage to temp, validate the tree, digest,
+    /// duplicate-check, copy in via transaction, update registry.json.
     #[expect(
         clippy::too_many_lines,
         reason = "install orchestrates staging, validation, duplicate checks and transaction"
@@ -1203,15 +1180,13 @@ impl SkillRegistry {
             let metadata = if validate {
                 validate_skill_tree(&staging_skill_dir)?
             } else {
-                // Even with validation disabled, identity metadata must come from
-                // the staged SKILL.md; an unparseable tree is an explicit error,
-                // never invented metadata in the registry.
+                // Even with validation disabled, identity metadata must come
+                // from the staged SKILL.md, never invented.
                 parse_skill_metadata(&staging_skill_dir)?
             };
             if !validate {
                 // Boundary/traversal/device checks run even with validation
-                // disabled; only the frontmatter/count/size checks are
-                // skipped.
+                // disabled; only frontmatter/count/size are skipped.
                 let mut all = Vec::new();
                 collect_files_recursive(&staging_skill_dir, &mut all)?;
             }
@@ -1347,7 +1322,7 @@ impl SkillRegistry {
 
         let registry_file = registry_file_for_root(&self.root);
         let mut foreign_preserved: Map<String, Value> = self.foreign.clone();
-        // Fresh foreign keys from disk win over stale in-memory ones.
+        // Disk keys missing from the in-memory set are picked up here.
         if registry_file.exists() {
             if let Ok(bytes) = std::fs::read(&registry_file) {
                 if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) {
@@ -1443,12 +1418,8 @@ impl SkillRegistry {
         Ok(record)
     }
 
-    /// Update a skill: fetch to staging, validate, compute digest, detect local edits,
-    /// preview diff, atomic replace, conflict handling.
-    ///
-    /// If `new_source` is `None`, re-fetch from the skill's existing `source_locator`.
-    /// Returns a preview; caller must then call `commit_update` with the same preview
-    /// or use `update_skill` which does preview+commit atomically with conflict detection.
+    /// Preview an update: stage, validate, digest, detect local edits and
+    /// conflicts. A `None` source re-fetches the recorded locator.
     #[expect(
         clippy::too_many_lines,
         reason = "update orchestrates staging and three-way"
@@ -1886,11 +1857,8 @@ impl SkillRegistry {
         self.commit_update(skill_id, new_source, &preview)
     }
 
-    /// Remove skill from registry after reporting consumers.
-    ///
-    /// If `force` is false and consumers exist, returns error with consumer list.
-    /// If `force` is true, removes registry entry and skill directory via transaction,
-    /// but copied destinations are left divergent and reported.
+    /// Remove after reporting consumers: without `force`, existing consumers
+    /// block; with it, the registry entry and skill dir go, copies stay divergent.
     pub fn remove_skill(
         &mut self,
         skill_id: &SkillId,
@@ -1941,7 +1909,6 @@ impl SkillRegistry {
                 drop(std::fs::remove_dir_all(&prov_dir));
             }
         }
-        // Update registry
         let mut new_records = self.records.clone();
         new_records.remove(idx);
         backup_before_write(&registry_file)?;
@@ -2013,13 +1980,8 @@ impl SkillRegistry {
     }
 }
 
-/// Apply a skill destination mode for an instance.
-///
-/// `instance_skills_dir` is the harness-specific skills path (e.g. `<config_root>/skills` or `<config_root>/.claude/skills`).
-/// `selected` is the list of skill ids to link/copy for `LinkSelected`/`CopySelected`.
-/// For `LinkAll`, `selected` is ignored.
-///
-/// Uses `Transaction` and handles Windows link privilege by returning an error that suggests `CopySelected` as explicit alternate, not silent fallback.
+/// Apply a destination mode for an instance. Uses `Transaction`; a Windows
+/// link-privilege failure suggests `CopySelected`, never a silent fallback.
 #[expect(
     clippy::too_many_lines,
     reason = "destination modes handle three distinct flows"
@@ -2031,7 +1993,6 @@ pub fn apply_skill_mode(
     selected: &[SkillId],
     adapter: &dyn Adapter,
 ) -> Result<Vec<CopyProvenance>> {
-    // Check adapter supports the requested mode
     let supported = adapter.supported_skill_modes();
     if !supported.contains(&mode) {
         return Err(CoreError::UnsupportedOperation {
@@ -2044,7 +2005,6 @@ pub fn apply_skill_mode(
             ),
         });
     }
-    // Validate selected skills exist in registry
     for skill_id in selected {
         if registry.get_by_id(skill_id).is_none() {
             return Err(CoreError::Validation {
@@ -2190,9 +2150,8 @@ pub fn apply_skill_mode(
                 steps.push(superai_config::transaction::FileAction::Symlink {
                     link: dest,
                     target: src,
-                    // No explicit owned-target expectation: the default policy
-                    // replaces an existing link only when it still carries the
-                    // target observed at prepare time.
+                    // Default policy: replace an existing link only when it
+                    // still carries the target observed at prepare time.
                     expected_current: None,
                 });
             }
@@ -2275,12 +2234,8 @@ pub fn apply_skill_mode(
                             ),
                         });
                     }
-                    // EXT-05 drift-checked re-copy: when provenance is
-                    // recorded for this destination, a locally-modified copy
-                    // is a previewable conflict; refuse to overwrite
-                    // of silently clobbering the user's edits. Clean copies
-                    // replace; a missing destination falls through to the
-                    // normal copy (reinstall).
+                    // EXT-05 drift-checked re-copy: a locally-modified copy
+                    // is a conflict; clean copies replace, missing reinstalls.
                     if let Some(provenance) =
                         load_provenance(&registry.root, skill_id, instance_skills_dir)
                         && meta.is_dir()
@@ -2294,10 +2249,8 @@ pub fn apply_skill_mode(
                                 actual: compute_skill_digest(&dest_dir)?,
                             });
                         }
-                        // The provenance proves every file under the
-                        // destination is our own copy; clearing it wholesale
-                        // is what keeps files dropped by the new source
-                        // version from lingering as stale skill content.
+                        // Provenance proves every file is our own copy;
+                        // wholesale clearing avoids stale-version leftovers.
                         owned_dest = true;
                     }
                 }
@@ -2374,9 +2327,8 @@ pub fn apply_skill_mode(
                     dest_digest_at_copy,
                     copied_at: now_iso8601(),
                 };
-                // Provenance is keyed by the destination path (name plus a
-                // path hash, so distinct instances sharing a name cannot
-                // collide).
+                // Keyed by destination path (name plus a path hash, so
+                // same-named instances cannot collide).
                 let prov_path = provenance_path_for(&registry.root, skill_id, instance_skills_dir);
                 if let Some(prov_parent) = prov_path.parent() {
                     steps.push(superai_config::transaction::FileAction::CreateDir {
@@ -2425,10 +2377,8 @@ pub fn apply_skill_mode(
     }
 }
 
-/// Create a symlink handling Windows privilege gracefully.
-///
-/// On Unix, uses `std::os::unix::fs::symlink`.
-/// On Windows, tries `symlink_dir` for directories and `symlink_file` for files; if the target is a directory, `symlink_dir` is used.
+/// Create a symlink; Windows picks `symlink_dir`/`symlink_file` by the
+/// target's kind.
 fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -2444,8 +2394,6 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        // On Windows, need to decide file vs dir. For skill dirs, we use symlink_dir.
-        // Try symlink_dir first, fallback to symlink_file.
         let target_is_dir = target.is_dir();
         if target_is_dir {
             std::os::windows::fs::symlink_dir(target, link).map_err(|e| CoreError::InvalidPath {
@@ -2533,11 +2481,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetch HTTPS URL to staging directory (simple GET, handle file:// already covered).
-///
-/// Returns an explicit [`CoreError::SourceFetch`] if the fetch fails; callers
-/// must propagate the error; content is never invented in place of a
-/// successful download.
+/// Fetch an HTTPS URL into staging (single GET). Returns a typed
+/// [`CoreError::SourceFetch`] on failure; content is never invented.
 fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     validate_fetch_url(url)?;
     if url.starts_with("file://") {
@@ -2546,7 +2491,6 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
             reason: "fetch_https_to_staging called with file url".to_owned(),
         });
     }
-    // Use ureq to fetch bytes
     let bytes = fetch_bytes_ureq(url).map_err(|e| CoreError::SourceFetch {
         kind: "skill_source".to_owned(),
         locator: url.to_owned(),
@@ -2569,17 +2513,8 @@ fn fetch_https_to_staging(url: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage `source` into `staging_dir` (EXT-02).
-///
-/// - `LocalDir` copies the directory.
-/// - `GitHub`/`Marketplace` with a pinned revision uses the REAL git binary
-///   through the process module: `git clone --depth 1 --branch <rev>` into
-///   staging (argv tokens, no shell); a full commit sha falls back to
-///   `git fetch --depth 1 origin <sha>` + `checkout FETCH_HEAD`. The resolved
-///   HEAD is verified against the pin and `.git` is removed so the staged
-///   tree is plain skill content.
-/// - `GitHub`/`Marketplace` without a pin uses the documented non-executing
-///   download path (HTTPS GET of the artifact; nothing is ever executed).
+/// Stage `source` (EXT-02): LocalDir copies; a pinned git source clones via
+/// argv tokens (HEAD verified, `.git` dropped); unpinned downloads over HTTPS.
 fn stage_skill_source(source: &SkillSource, staging_dir: &Path) -> Result<()> {
     match source.kind {
         SkillSourceKind::LocalDir => {
@@ -2668,14 +2603,8 @@ fn is_full_sha(rev: &str) -> bool {
     rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Stage a git source at a pinned revision via the `git` binary (EXT-02).
-///
-/// All invocation is argv tokens through the process module, no shell. A
-/// branch/tag pins use a depth-1 clone; a full commit sha uses
-/// `git fetch --depth 1 origin <sha>` (servers may refuse shallow fetch of
-/// arbitrary shas; that refusal is a typed error, never a fallback to HEAD).
-/// The resolved HEAD is verified against the pin when the pin is a full sha,
-/// and `.git` is removed from staging afterward.
+/// Stage a git source at a pinned revision via argv-token `git` (EXT-02):
+/// branch/tag pins clone depth-1; a full sha shallow-fetches and checks out.
 fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
     validate_fetch_url(url)?;
     if rev.contains('\0') || rev.chars().any(char::is_control) || contains_shell_metachars(rev) {
@@ -2818,9 +2747,8 @@ fn stage_git_revision(url: &str, rev: &str, staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a redirect `Location` against the current URL: absolute https
-/// or same-origin absolute-path only; relative paths are refused fail-closed
-/// (no URL library in this workspace). Mirrors `template_fetch`.
+/// Resolve a redirect `Location` against the base: absolute https or
+/// same-origin absolute-path; relative paths refuse fail-closed.
 fn resolve_redirect(base: &str, location: &str) -> std::result::Result<String, String> {
     if location.starts_with("https://") {
         return Ok(location.to_owned());
@@ -2891,9 +2819,8 @@ fn fetch_bytes_ureq(url: &str) -> std::result::Result<Vec<u8>, String> {
     ))
 }
 
-/// Enable a skill for an instance: ensures the destination contains the
-/// skill (`LinkSelected`/`CopySelected`) or that the destination symlink
-/// exists (`LinkAll`).
+/// Enable a skill for an instance: ensure the destination link/copy exists
+/// per the best mode the adapter supports.
 pub fn enable_skill(
     registry: &SkillRegistry,
     instance_skills_dir: &Path,
@@ -2945,10 +2872,8 @@ pub fn enable_skill(
     Ok(())
 }
 
-/// Disable a skill for an instance: removes the owned symlink
-/// (`LinkSelected`) or quarantines the copied directory while keeping its
-/// provenance (`CopySelected`). Under `LinkAll` a single skill cannot be
-/// disabled; the caller must switch modes.
+/// Disable a skill: remove the owned symlink, or quarantine the copied
+/// dir keeping provenance; `LinkAll` cannot disable one skill (switch modes).
 pub fn disable_skill(
     registry: &SkillRegistry,
     instance_skills_dir: &Path,
@@ -3070,19 +2995,8 @@ pub struct SkillConfigOutcome {
     pub notes: Vec<String>,
 }
 
-/// Enable or disable a skill through the adapter-declared harness-config
-/// mechanism (EXT-04).
-///
-/// Writes the adapter-declared allow/deny/search-path keys through the
-/// engine executor with ownership and expected-old conflict detection:
-/// - a deny-LIST key gains/loses the skill name;
-/// - a disable SWITCH flips to true/false (noted as all-or-nothing);
-/// - the search-path key gains/loses the registry root (enable adds the
-///   path so the harness discovers registry skills; disable removes it).
-///
-/// Refuses honestly (typed `UnsupportedOperation`) when the adapter declares
-/// no mechanism, and surfaces the executor's typed errors (ownership,
-/// conflict, LossyWrite for comment-carrying JSONC) unchanged.
+/// Enable/disable via the adapter-declared config mechanism (EXT-04):
+/// deny-list/switch/search-path keys, conflict-checked; refuses when undeclared.
 pub fn set_skill_enabled_via_config(
     config_root: &Path,
     registry: &SkillRegistry,
@@ -3136,7 +3050,7 @@ pub fn set_skill_enabled_via_config(
         Some(node.clone())
     };
 
-    // 1) Disable mechanism.
+    // Disable mechanism.
     if let Some(mechanism) = &decl.disable {
         match mechanism {
             SkillDisableMechanism::DenyList { selector } => {
@@ -3200,7 +3114,7 @@ pub fn set_skill_enabled_via_config(
         }
     }
 
-    // 2) Search path: enable adds the registry root, disable removes it.
+    // Search path: enable adds the registry root, disable removes it.
     if let Some(selector) = &decl.search_path {
         let registry_root = registry.root().to_string_lossy().into_owned();
         let current_value = lookup(&current, selector);
@@ -3325,9 +3239,8 @@ fn apply_config_set(
     Ok(())
 }
 
-/// Find consumers of a skill given a list of instance skills dirs.
-///
-/// Scans each `instance_skills_dir` for links/copies that point to the registry skill.
+/// Find consumers of a skill across instance skills dirs: links pointing
+/// at the registry entry, or copies with provenance/SKILL.md.
 pub fn find_consumers(
     registry: &SkillRegistry,
     skill_id: &SkillId,
@@ -3393,10 +3306,8 @@ pub fn find_consumers(
     consumers
 }
 
-/// Check drift for a copied destination.
-///
-/// Compares the recorded provenance `dest_digest_at_copy` vs the current dest digest fresh,
-/// and the source digest vs registry's current digest, to produce a three-way drift status.
+/// Drift for a copied destination: recorded copy digest vs current dest
+/// digest vs registry digest, classified three-way.
 pub fn check_drift(
     provenance: &CopyProvenance,
     registry: &SkillRegistry,
@@ -3430,9 +3341,8 @@ pub fn check_drift(
     Ok(DriftStatus::LocallyModified)
 }
 
-/// Provenance path for `(skill, destination)`, stored beside the registry,
-/// derived deterministically from the destination (same derivation
-/// `apply_skill_mode` uses when recording provenance).
+/// Provenance path for `(skill, destination)`, derived the same way
+/// `apply_skill_mode` derives it when recording.
 pub fn provenance_path_for(
     registry_root: &Path,
     skill_id: &SkillId,
@@ -3477,12 +3387,8 @@ pub struct CopyUpdatePreview {
     pub reason: Option<String>,
 }
 
-/// Preview the three-way update of copied destinations (EXT-05).
-///
-/// For each selected skill with recorded provenance, the destination digest
-/// is observed FRESH and classified: clean -> replace/update applies,
-/// locally modified -> explicit conflict (refused, caller must resolve),
-/// missing -> reinstall offer, already updated -> no-op.
+/// Preview the three-way update of copied destinations (EXT-05): clean
+/// applies, locally modified conflicts, missing reinstalls, updated no-ops.
 pub fn preview_reapply_copies(
     registry: &SkillRegistry,
     instance_skills_dir: &Path,
@@ -3566,9 +3472,8 @@ pub fn get_skill(root: &Path, id: &str) -> Result<Option<SkillRecord>> {
     Ok(registry.get(id).cloned())
 }
 
-/// Update a skill in the registry at `root`; a `None` source re-fetches
-/// from the recorded locator. Preview and commit run with conflict
-/// detection.
+/// Update a skill at `root`; a `None` source re-fetches the recorded
+/// locator. Preview and commit run with conflict detection.
 pub fn update_skill(
     root: &Path,
     skill_id: &SkillId,
@@ -3665,7 +3570,6 @@ mod tests {
         let src = make_skill_dir(&src_parent, "my-skill");
 
         let source = SkillSource::local_dir(src.to_str().unwrap());
-        // registry via free function
         let rec = install_skill(&root, &source).unwrap();
         assert_eq!(rec.id.as_str(), "my-skill");
         assert_eq!(rec.name, "my-skill");
@@ -3673,27 +3577,21 @@ mod tests {
         assert!(rec.digest.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(rec.installed_at.contains('T'));
 
-        // list via free function
         let listed = list_skills(&root).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id.as_str(), "my-skill");
 
-        // get via free function
         let got = get_skill(&root, "my-skill").unwrap().unwrap();
         assert_eq!(got.id, rec.id);
         assert_eq!(got.digest, rec.digest);
 
-        // also via registry method
         let reg = SkillRegistry::load(&root).unwrap();
         assert_eq!(reg.list().len(), 1);
         assert_eq!(reg.get("my-skill").unwrap().id.as_str(), "my-skill");
         assert!(reg.get_by_id(&rec.id).is_some());
         assert!(reg.get_by_name("my-skill").is_some());
-        // case-insensitive get_by_name
         assert!(reg.get_by_name("MY-SKILL").is_some());
 
-        // update via free function with same source should be no-op conflict-free?
-        // Re-installing same content via update should succeed but return same digest
         let updated = update_skill(&root, &rec.id, None).unwrap();
         assert_eq!(updated.digest, rec.digest);
 
@@ -3712,7 +3610,6 @@ mod tests {
         let src1 = make_skill_dir(&parent, "dup-skill");
         let src2_parent = unique_root("dup2_parent");
         std::fs::create_dir_all(&src2_parent).unwrap();
-        // second skill with same normalized name but different case
         let src2 = src2_parent.join("src-DUP-SKILL");
         std::fs::create_dir_all(&src2).unwrap();
         write_skill_md(&src2, "DUP-SKILL", "duplicate case fold");
@@ -3726,9 +3623,7 @@ mod tests {
             msg.contains("duplicate") || msg.contains("collision") || msg.contains("Skill"),
             "expected duplicate collision, got {msg}"
         );
-        // ensure still only one skill
         assert_eq!(reg.list().len(), 1);
-        // also try same id exact duplicate via free function should also fail
         let err2 = install_skill(&root, &s2).unwrap_err();
         let msg2 = format!("{err2:?}");
         assert!(msg2.contains("duplicate") || msg2.contains("collision"));
@@ -3786,7 +3681,6 @@ mod tests {
         let src = src_parent.join("src-traversal-skill");
         std::fs::create_dir_all(&src).unwrap();
         write_skill_md(&src, "traversal-skill", "test traversal");
-        // create symlink with traversal target
         #[cfg(unix)]
         {
             let evil_link = src.join("evil_link");
@@ -3802,7 +3696,6 @@ mod tests {
             );
             drop(std::fs::remove_file(&evil_link));
         }
-        // absolute symlink target
         #[cfg(unix)]
         {
             let abs_link = src.join("abs_link");
@@ -3817,13 +3710,11 @@ mod tests {
             );
             drop(std::fs::remove_file(&abs_link));
         }
-        // validate fetch url traversal itself
         let bad_url = "https://example.com/../evil";
         let err = validate_fetch_url(bad_url).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("traversal"));
 
-        // clean src and successful install should now work
         let src2 = make_skill_dir(&src_parent, "clean-skill");
         let source2 = SkillSource::local_dir(src2.to_str().unwrap());
         let mut reg2 = SkillRegistry::load(&root).unwrap();
@@ -3850,13 +3741,11 @@ mod tests {
         let adapter = adapter_full();
         let res = apply_skill_mode(&reg, &instance_dir, SkillMode::LinkAll, &[], &adapter).unwrap();
         assert!(res.is_empty());
-        // verify symlink
         let meta = std::fs::symlink_metadata(&instance_dir).unwrap();
         assert!(meta.file_type().is_symlink());
         assert_eq!(std::fs::read_link(&instance_dir).unwrap(), root);
         // idempotent
         apply_skill_mode(&reg, &instance_dir, SkillMode::LinkAll, &[], &adapter).unwrap();
-        // foreign preservation: non-empty dir should error
         let foreign_dir = unique_root("link_all_foreign");
         std::fs::create_dir_all(&foreign_dir).unwrap();
         std::fs::write(foreign_dir.join("foreign.txt"), "keep").unwrap();
@@ -3864,7 +3753,6 @@ mod tests {
             apply_skill_mode(&reg, &foreign_dir, SkillMode::LinkAll, &[], &adapter).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("foreign") || msg.contains("exists") || msg.contains("entries"));
-        // ensure foreign preserved
         assert!(foreign_dir.join("foreign.txt").exists());
 
         drop(std::fs::remove_dir_all(&root));
@@ -3902,7 +3790,6 @@ mod tests {
         let adapter = adapter_full();
         let id_a = SkillId::new("skill-a").unwrap();
         let id_b = SkillId::new("skill-b").unwrap();
-        // link only skill-a
         apply_skill_mode(
             &reg,
             &instance_dir,
@@ -3921,7 +3808,6 @@ mod tests {
         );
         assert_eq!(std::fs::read_link(&link_a).unwrap(), root.join("skill-a"));
         assert!(!instance_dir.join("skill-b").exists());
-        // link skill-b additionally
         apply_skill_mode(
             &reg,
             &instance_dir,
@@ -3931,7 +3817,6 @@ mod tests {
         )
         .unwrap();
         assert!(instance_dir.join("skill-b").exists());
-        // now test foreign preservation: create a regular file where skill-a link would be, should error
         let foreign_instance = unique_root("link_selected_foreign");
         std::fs::create_dir_all(&foreign_instance).unwrap();
         std::fs::write(foreign_instance.join("skill-a"), "foreign file").unwrap();
@@ -3960,7 +3845,6 @@ mod tests {
         let src_parent = unique_root("copy_selected_src");
         std::fs::create_dir_all(&src_parent).unwrap();
         let src = make_skill_dir(&src_parent, "copy-skill");
-        // add extra file
         std::fs::write(src.join("extra.txt"), "extra").unwrap();
         let mut reg = SkillRegistry::load(&root).unwrap();
         let rec = reg
@@ -3982,27 +3866,22 @@ mod tests {
         assert_eq!(provs.len(), 1);
         assert_eq!(provs[0].skill_id, "copy-skill");
         assert_eq!(provs[0].source_digest, rec.digest);
-        // verify dest dir copied
         let dest = instance_dir.join("copy-skill");
         assert!(dest.is_dir());
         assert!(dest.join(SKILL_MD_NAME).exists());
         assert!(dest.join("extra.txt").exists());
         let dest_digest = compute_skill_digest(&dest).unwrap();
         assert_eq!(dest_digest, rec.digest);
-        // verify provenance file exists somewhere under .provenance
         let prov_dir = root.join(PROVENANCE_DIR_NAME).join("copy-skill");
         assert!(prov_dir.exists());
         let entries: Vec<_> = std::fs::read_dir(&prov_dir).unwrap().flatten().collect();
         assert!(!entries.is_empty());
-        // check drift clean
         let prov = &provs[0];
         let drift = check_drift(prov, &reg, &dest).unwrap();
         assert_eq!(drift, DriftStatus::Clean);
-        // modify dest and check drift becomes locally_modified
         std::fs::write(dest.join("extra.txt"), "modified").unwrap();
         let drift2 = check_drift(prov, &reg, &dest).unwrap();
         assert_eq!(drift2, DriftStatus::LocallyModified);
-        // missing case
         drop(std::fs::remove_dir_all(&dest));
         let drift3 = check_drift(prov, &reg, &dest).unwrap();
         assert_eq!(drift3, DriftStatus::Missing);
@@ -4025,7 +3904,6 @@ mod tests {
             .unwrap();
         let id = SkillId::new("disable-skill").unwrap();
         let adapter = adapter_full();
-        // LinkSelected then disable
         let instance_dir = unique_root("disable_instance");
         std::fs::create_dir_all(&instance_dir).unwrap();
         apply_skill_mode(
@@ -4039,10 +3917,8 @@ mod tests {
         assert!(instance_dir.join("disable-skill").exists());
         disable_skill(&reg, &instance_dir, &id, &adapter).unwrap();
         assert!(!instance_dir.join("disable-skill").exists());
-        // disable idempotent when missing
         disable_skill(&reg, &instance_dir, &id, &adapter).unwrap();
 
-        // CopySelected then disable quarantines
         apply_skill_mode(
             &reg,
             &instance_dir,
@@ -4055,8 +3931,6 @@ mod tests {
         disable_skill(&reg, &instance_dir, &id, &adapter).unwrap();
         assert!(!instance_dir.join("disable-skill").exists());
 
-        // Remove with consumers
-        // Re-copy to create consumer
         apply_skill_mode(
             &reg,
             &instance_dir,
@@ -4068,18 +3942,13 @@ mod tests {
         let consumers = find_consumers(&reg, &id, &[instance_dir.clone()]);
         assert!(!consumers.is_empty());
         assert_eq!(consumers[0].mode, "CopySelected");
-        // without force should error
         let err = reg.remove_skill(&id, false, &consumers).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("consumer"));
-        // with force should succeed and leave divergent copy? but our remove quarantines registry skill dir, copy remains? Actually copy dest remains divergent per spec
-        // After force, registry should have 0 skills
-        // Note: consumers were copies, they remain per spec but our find_consumers found them; remove with force should still succeed but not delete dest automatically
-        // In our implementation, remove_skill with force removes registry dir but leaves copy dest (we did not delete dest). So check.
+        // Force removes the registry entry and skill dir; the copy destination stays, divergent per spec.
         let res = reg.remove_skill(&id, true, &consumers).unwrap();
         assert_eq!(res.skill_id, id);
         assert_eq!(reg.list().len(), 0);
-        // copy dest still exists as divergent
         assert!(instance_dir.join("disable-skill").exists());
 
         drop(std::fs::remove_dir_all(&root));
@@ -4113,9 +3982,7 @@ mod tests {
         .unwrap();
         let prov = provs.into_iter().next().unwrap();
         let dest = instance_dir.join("drift-skill");
-        // clean drift
         assert_eq!(check_drift(&prov, &reg, &dest).unwrap(), DriftStatus::Clean);
-        // locally modify dest
         std::fs::write(
             dest.join(SKILL_MD_NAME),
             "---\nname: drift-skill\ndescription: modified\n---\nmodified\n",
@@ -4125,9 +3992,7 @@ mod tests {
             check_drift(&prov, &reg, &dest).unwrap(),
             DriftStatus::LocallyModified
         );
-        // now update source to new version and preview should detect local edits
         let _src2 = make_skill_dir(&src_parent, "drift-skill-v2");
-        // overwrite src's SKILL.md to new content, but we need new locator to simulate update
         let src_updated = src_parent.join("drift-skill-updated");
         drop(std::fs::remove_dir_all(&src_updated));
         std::fs::create_dir_all(&src_updated).unwrap();
@@ -4145,7 +4010,6 @@ mod tests {
                 || !preview.can_auto_apply
                 || preview.diff.iter().any(|d| d.contains("newfile"))
         );
-        // if has_local_edits, commit should fail
         if !preview.can_auto_apply {
             let err = reg
                 .commit_update(&id, Some(&new_source), &preview)
@@ -4156,8 +4020,6 @@ mod tests {
             // if no conflict, it would auto-apply (maybe dest digest already equals new? but we changed dest so should be conflict)
             // This branch is okay
         }
-        // test AlreadyUpdated: make dest equal to new source digest
-        // Clean root for already_updated case
         let root2 = unique_root("drift_already_root");
         std::fs::create_dir_all(&root2).unwrap();
         let src_a = make_skill_dir(&src_parent, "already-skill");
@@ -4174,9 +4036,7 @@ mod tests {
             &adapter,
         )
         .unwrap();
-        // manually set provenance dest digest to match current dest after we overwrite dest with same content as registry? Actually copy already matches, so clean.
-        // To test AlreadyUpdated, we need to modify provenance to old digest and make dest match new source before update.
-        // Simplify: check that missing drift works
+        // The AlreadyUpdated case would need provenance surgery; check the missing case here.
         drop(std::fs::remove_dir_all(&instance_dir.join("already-skill")));
         let prov2 = &provs2[0];
         assert_eq!(
@@ -4199,27 +4059,22 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let src_parent = unique_root("file_limits_src");
         std::fs::create_dir_all(&src_parent).unwrap();
-        // file count limit
         let src_many = src_parent.join("many-files-skill");
         std::fs::create_dir_all(&src_many).unwrap();
         write_skill_md(&src_many, "many-files-skill", "test many files");
         for i in 0..MAX_FILES {
             std::fs::write(src_many.join(format!("file_{i}.txt")), "x").unwrap();
         }
-        // at limit should pass (SKILL.md + MAX_FILES files = MAX_FILES+1? Actually MAX_FILES includes SKILL.md, so MAX_FILES files including SKILL.md => 2000. We created 2000 extra + SKILL.md = 2001 => should fail
-        // So we created exactly MAX_FILES extra files => total 2001 > 2000 should fail
         let source_many = SkillSource::local_dir(src_many.to_str().unwrap());
         let mut reg = SkillRegistry::load(&root).unwrap();
         let err = reg.install_skill(&source_many, true).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("file count") || msg.contains("exceeds") || msg.contains("limit"));
 
-        // single file size limit
         let src_big = src_parent.join("big-file-skill");
         std::fs::create_dir_all(&src_big).unwrap();
         write_skill_md(&src_big, "big-file-skill", "test big file");
         let big_path = src_big.join("big.bin");
-        // create file of size MAX_SINGLE_FILE_BYTES + 1
         let size = (MAX_SINGLE_FILE_BYTES + 1) as usize;
         let big_bytes = vec![b'a'; size];
         std::fs::write(&big_path, &big_bytes).unwrap();
@@ -4228,14 +4083,12 @@ mod tests {
         let msg2 = format!("{err2:?}");
         assert!(msg2.contains("exceeds") || msg2.contains("size") || msg2.contains("single file"));
 
-        // exact limit should pass: create file of exactly MAX_SINGLE_FILE_BYTES
         let src_exact = src_parent.join("exact-file-skill");
         std::fs::create_dir_all(&src_exact).unwrap();
         write_skill_md(&src_exact, "exact-file-skill", "exact");
         let exact_path = src_exact.join("exact.bin");
         let exact_bytes = vec![b'b'; MAX_SINGLE_FILE_BYTES as usize];
         std::fs::write(&exact_path, &exact_bytes).unwrap();
-        // This should succeed (total bytes 5MiB < 50MiB, count 2)
         let source_exact = SkillSource::local_dir(src_exact.to_str().unwrap());
         let rec = reg.install_skill(&source_exact, true).unwrap();
         assert_eq!(rec.id.as_str(), "exact-file-skill");
@@ -4249,7 +4102,6 @@ mod tests {
         let root = unique_root("preserve_foreign_root");
         drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(&root).unwrap();
-        // create registry.json with foreign key manually
         let registry_file = registry_file_for_root(&root);
         let foreign_json = serde_json::json!({
             "schema_version": SKILLS_SCHEMA_VERSION,
@@ -4264,7 +4116,6 @@ mod tests {
         .unwrap();
         let mut reg = SkillRegistry::load(&root).unwrap();
         assert_eq!(reg.list().len(), 0);
-        // install skill and verify foreign preserved
         let src_parent = unique_root("preserve_src");
         std::fs::create_dir_all(&src_parent).unwrap();
         let src = make_skill_dir(&src_parent, "preserve-skill");
@@ -4272,7 +4123,6 @@ mod tests {
             .install_skill(&SkillSource::local_dir(src.to_str().unwrap()), true)
             .unwrap();
         assert_eq!(rec.id.as_str(), "preserve-skill");
-        // reload and check foreign
         let reg2 = SkillRegistry::load(&root).unwrap();
         let bytes = std::fs::read(&registry_file).unwrap();
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -4289,13 +4139,11 @@ mod tests {
                 .unwrap(),
             42
         );
-        // also test copy destination foreign preservation: create instance dir with foreign file, LinkSelected should not delete it
         let instance_dir = unique_root("preserve_instance");
         std::fs::create_dir_all(&instance_dir).unwrap();
         std::fs::write(instance_dir.join("foreign.txt"), "keep").unwrap();
         let adapter = adapter_full();
         let id = SkillId::new("preserve-skill").unwrap();
-        // LinkSelected for preserve-skill should not touch foreign.txt
         apply_skill_mode(
             &reg2,
             &instance_dir,
@@ -4309,7 +4157,6 @@ mod tests {
             std::fs::read_to_string(instance_dir.join("foreign.txt")).unwrap(),
             "keep"
         );
-        // CopySelected also should preserve foreign
         let instance_dir2 = unique_root("preserve_instance2");
         std::fs::create_dir_all(&instance_dir2).unwrap();
         std::fs::write(instance_dir2.join("foreign2.txt"), "keep2").unwrap();
@@ -4405,7 +4252,6 @@ mod tests {
         let instance_dir = unique_root("win_priv_instance");
         std::fs::create_dir_all(&instance_dir).unwrap();
         let single_adapter = adapter_single();
-        // SingleInstance adapter does not support LinkAll
         let err = apply_skill_mode(
             &reg,
             &instance_dir,
@@ -4415,7 +4261,6 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err:?}");
-        // Must mention CopySelected as explicit alternate or unsupported
         assert!(
             msg.contains("CopySelected")
                 || msg.contains("copy_selected")
@@ -4423,7 +4268,6 @@ mod tests {
                 || msg.contains("not support"),
             "expected unsupported LinkAll with CopySelected hint, got {msg}"
         );
-        // Also LinkSelected not supported for SingleInstance
         let id = SkillId::new("win-skill").unwrap();
         let err2 = apply_skill_mode(
             &reg,
@@ -4435,7 +4279,6 @@ mod tests {
         .unwrap_err();
         let msg2 = format!("{err2:?}");
         assert!(msg2.contains("does not support") || msg2.contains("not support"));
-        // CopySelected should succeed for SingleInstance
         apply_skill_mode(
             &reg,
             &instance_dir,
@@ -4446,10 +4289,8 @@ mod tests {
         .unwrap();
         assert!(instance_dir.join("win-skill").exists());
 
-        // Test that privilege error message format would contain "Use CopySelected" if symlink fails
-        // Simulate by checking create_symlink error handling text contains that phrase in apply_skill_mode LinkSelected path
-        // We can't trigger actual Windows privilege on Linux, but we verify the code path string exists
-        // Check the error variant for privilege contains suggestion
+        // Windows privilege cannot be triggered on Linux; pin the hint
+        // text the privilege error must carry.
         let fake_priv_msg = "symlink creation failed due to privilege (Windows): operation not permitted. Use CopySelected as explicit alternate";
         assert!(fake_priv_msg.contains("CopySelected"));
 
@@ -4460,23 +4301,19 @@ mod tests {
 
     #[test]
     fn github_url_validation() {
-        // valid https
         validate_fetch_url("https://github.com/freeoxide/superai").unwrap();
         validate_fetch_url("https://example.com/skill/SKILL.md").unwrap();
-        // file url for tests: a URL is `/`-shaped, so the platform path is
-        // rendered with forward slashes (native backslashes on Windows are
-        // not valid inside a URL).
+        // A URL is `/`-shaped: platform paths render with forward
+        // slashes (backslashes are not valid inside a URL).
         let skill_dir = crate::test_util::tmp_abs("my").join("skill");
         let file_url = format!(
             "file://{}",
             skill_dir.display().to_string().replace('\\', "/")
         );
         validate_fetch_url(&file_url).unwrap();
-        // invalid http
         let err = validate_fetch_url("http://github.com/freeoxide/superai").unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("https"));
-        // shell metachars
         for bad in [
             "https://example.com/`evil`",
             "https://example.com/$(evil)",
@@ -4495,18 +4332,14 @@ mod tests {
                 "bad url {bad:?} should fail, got {m}"
             );
         }
-        // control chars
         let err = validate_fetch_url("https://example.com/evil\n").unwrap_err();
         assert!(format!("{err:?}").contains("control") || format!("{err:?}").contains("NUL"));
-        // traversal
         let err = validate_fetch_url("https://example.com/../evil").unwrap_err();
         assert!(format!("{err:?}").contains("traversal"));
         let err = validate_fetch_url("https://example.com/./evil").unwrap_err();
         assert!(format!("{err:?}").contains("traversal"));
-        // empty
         let err = validate_fetch_url("").unwrap_err();
         assert!(format!("{err:?}").contains("must not be empty"));
-        // file url with traversal
         let err = validate_fetch_url(&format!(
             "file://{}/../evil",
             crate::test_util::tmp_abs("evil-base").display()
@@ -4514,21 +4347,18 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:?}").contains(".."));
 
-        // test GitHub source install via file://
         let root = unique_root("github_url_root");
         drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(&root).unwrap();
         let src_parent = unique_root("github_src_parent");
         std::fs::create_dir_all(&src_parent).unwrap();
         let src = make_skill_dir(&src_parent, "github-skill");
-        // file URLs use forward slashes even on windows.
         let file_url = format!("file://{}", src.display().to_string().replace('\\', "/"));
         let source = SkillSource::github(&file_url, None);
         let rec = install_skill(&root, &source).unwrap();
         assert_eq!(rec.source_kind, SkillSourceKind::GitHub);
         assert!(rec.id.as_str() == "github-skill" || rec.name == "github-skill");
 
-        // invalid github url via install should fail
         let bad_source = SkillSource::github("http://example.com/skill", None);
         let err = install_skill(&root, &bad_source).unwrap_err();
         assert!(format!("{err:?}").contains("https"));
@@ -4539,10 +4369,8 @@ mod tests {
 
     #[test]
     fn install_https_fetch_failure_returns_typed_error_and_writes_nothing() {
-        // A source the transport itself refuses must fail with the typed
-        // fetch error; nothing is written to the registry or disk (no
-        // invented skill). The space makes the URI unparseable, so the
-        // failure is instant and never touches the network.
+        // A transport-refused source fails typed and writes nothing. The
+        // space makes the URI unparseable: instant failure, no network.
         let root = unique_root("install_https_fail_root");
         drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(&root).unwrap();
@@ -4556,9 +4384,7 @@ mod tests {
             }
             other => panic!("expected SourceFetch, got {other:?}"),
         }
-        // Display carries the failing locator so users can see what failed.
         assert!(err.to_string().contains(unreachable));
-        // Registry and disk stay untouched: no record, no skill dir, no file.
         let reloaded = SkillRegistry::load(&root).unwrap();
         assert!(reloaded.records.is_empty());
         assert!(!root.join("demo").exists());
@@ -4567,9 +4393,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A private-host source is refused before any fetch attempt: loopback
-    /// (in any `inet_aton` spelling) is not a skill source superai will
-    /// retrieve from, and nothing is written anywhere.
+    /// A private-host source is refused before any fetch: loopback in any
+    /// `inet_aton` spelling is not a skill source, and nothing is written.
     #[test]
     fn install_private_host_source_is_refused_and_writes_nothing() {
         let root = unique_root("install_private_host_root");
@@ -4584,7 +4409,6 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        // The octal shorthand is refused by the same gate.
         let octal = SkillSource::github("https://0177.0.0.1/skills/demo/SKILL.md", None);
         let err2 = reg.install_skill(&octal, true).unwrap_err();
         assert!(err2.to_string().contains("private"), "err2: {err2}");
@@ -4617,7 +4441,6 @@ mod tests {
             matches!(err, CoreError::SourceFetch { .. }),
             "expected SourceFetch, got {err:?}"
         );
-        // Registry record kept in memory and every file on disk unchanged.
         assert_eq!(reg.records.len(), 1);
         assert_eq!(snapshot_tree(&root), before);
 
@@ -4707,7 +4530,6 @@ mod tests {
 
     #[test]
     fn file_count_and_size_limits_edge() {
-        // ensure compute_skill_digest deterministic and file count helpers work
         let src_parent = unique_root("file_edge_src");
         std::fs::create_dir_all(&src_parent).unwrap();
         let src = make_skill_dir(&src_parent, "edge-skill");
@@ -4717,7 +4539,6 @@ mod tests {
         let d2 = compute_skill_digest(&src).unwrap();
         assert_eq!(d1, d2);
         assert_eq!(d1.len(), 64);
-        // modify file should change digest
         std::fs::write(src.join("a.txt"), "HELLO").unwrap();
         let d3 = compute_skill_digest(&src).unwrap();
         assert_ne!(d1, d3);
@@ -4744,7 +4565,6 @@ mod tests {
             .unwrap()
             .insert("my_foreign".to_owned(), serde_json::json!("kept"));
         std::fs::write(&file, serde_json::to_vec_pretty(&val).unwrap()).unwrap();
-        // next install should preserve foreign
         let src2 = make_skill_dir(&src_parent, "reload-skill-2");
         let mut reg2 = SkillRegistry::load(&root).unwrap();
         assert_eq!(reg2.list().len(), 1);
@@ -4816,10 +4636,8 @@ mod tests {
         let skill_dir = root.join("git-skill");
         let content = std::fs::read_to_string(skill_dir.join(SKILL_MD_NAME)).unwrap();
         assert!(content.contains("skill from git v1"), "{content}");
-        // No repository metadata staged into the registry.
         assert!(!skill_dir.join(".git").exists());
 
-        // Update to v2 changes the content; the record's digest advances.
         let source_v2 = SkillSource {
             pinned_revision: Some("v2".to_owned()),
             ..source.clone()
@@ -4831,7 +4649,6 @@ mod tests {
         let after = std::fs::read_to_string(skill_dir.join(SKILL_MD_NAME)).unwrap();
         assert!(after.contains("skill from git v2"), "{after}");
 
-        // A non-existent revision is a typed SourceFetch; registry unchanged.
         let bad = SkillSource {
             pinned_revision: Some("no-such-tag".to_owned()),
             ..source.clone()
@@ -4855,7 +4672,6 @@ mod tests {
     #[test]
     fn set_skill_enabled_via_config_writes_declared_keys_and_refuses_undeclared() {
         use crate::adapters::amp::AmpAdapter;
-        // Registry with one skill.
         let root = unique_root("cfg-enable-reg");
         drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(&root).unwrap();
@@ -4867,7 +4683,6 @@ mod tests {
             .unwrap();
         let skill_id = SkillId::new("cfg-skill").unwrap();
 
-        // Undeclared adapter -> honest refusal.
         let adapter = adapter_full();
         let err = set_skill_enabled_via_config(
             Path::new(&crate::test_util::tmp_abs_str("tmp")),
@@ -4884,8 +4699,7 @@ mod tests {
             other => panic!("expected UnsupportedOperation, got {other:?}"),
         }
 
-        // Declared adapter (amp): comment-free JSONC settings write through
-        // the engine executor.
+        // Declared adapter (amp): comment-free JSONC writes through the executor.
         let cfg_root = unique_root("cfg-enable-instance");
         drop(std::fs::remove_dir_all(&cfg_root));
         std::fs::create_dir_all(&cfg_root).unwrap();
@@ -4934,7 +4748,6 @@ mod tests {
             "foreign key preserved: {doc}"
         );
 
-        // Disable flips the switch and removes the search path.
         let outcome2 =
             set_skill_enabled_via_config(&cfg_root, &reg, &skill_id, &amp, false).unwrap();
         assert!(!outcome2.changes.is_empty());
@@ -4949,12 +4762,10 @@ mod tests {
             "{doc2}"
         );
 
-        // Idempotence: a second enable with nothing to change reports it.
         let outcome3 =
             set_skill_enabled_via_config(&cfg_root, &reg, &skill_id, &amp, true).unwrap();
         drop(outcome3);
 
-        // JSONC with comments refuses typed LossyWrite (codec honesty).
         let jsonc_root = unique_root("cfg-enable-jsonc");
         drop(std::fs::remove_dir_all(&jsonc_root));
         std::fs::create_dir_all(&jsonc_root).unwrap();
@@ -5005,8 +4816,6 @@ mod tests {
         .unwrap();
         let dest = instance_dir.join("recopy-skill");
 
-        // Locally-modified destination: preview flags the conflict and the
-        // re-copy refuses instead of overwriting the user's edits.
         let modified = "---\nname: recopy-skill\ndescription: edited locally\n---\nlocal edit\n";
         std::fs::write(dest.join(SKILL_MD_NAME), modified).unwrap();
         let previews = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
@@ -5039,7 +4848,6 @@ mod tests {
             "user's local edits must survive the refusal"
         );
 
-        // Clean destination: re-copy replaces (unchanged copy -> update).
         write_skill_md(&dest, "recopy-skill", "description for recopy-skill");
         // (rewrite the canonical content so drift is clean again)
         let canonical = std::fs::read_to_string(src.join(SKILL_MD_NAME)).unwrap();
@@ -5056,8 +4864,6 @@ mod tests {
         )
         .unwrap();
 
-        // Missing destination: preview offers reinstall and the re-copy
-        // reinstalls it.
         drop(std::fs::remove_dir_all(&dest));
         let previews3 = preview_reapply_copies(&reg, &instance_dir, &[id.clone()]).unwrap();
         assert_eq!(previews3[0].drift, DriftStatus::Missing);

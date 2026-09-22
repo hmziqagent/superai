@@ -1,6 +1,5 @@
 //! `ZCode` adapter: fixed path `~/.zcode/v2/config.json`, `SingleInstance`
 //! (no relocation env var; one instance; writes back up then mutate in place).
-//! Research source: `docs/harness-configs/zcode.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -29,9 +28,7 @@ pub const FIXED_CONFIG_PATH: &str = "~/.zcode/v2/config.json";
 /// Fixed config root (parent of versioned file).
 pub const FIXED_CONFIG_ROOT: &str = "~/.zcode/v2";
 
-/// Harness-owned config tree containing every versioned fixed path
-/// (`~/.zcode`). Superai-owned stores (e.g. the saved-profile store, INS-10)
-/// must never live inside this tree.
+/// Harness-owned `~/.zcode` tree; superai-owned stores must never live inside it.
 pub const HARNESS_CONFIG_ROOT: &str = "~/.zcode";
 
 /// Application bundle ID hint (macOS).
@@ -46,9 +43,7 @@ pub const LAST_VERIFIED: &str = "2026-08-25";
 /// Schema version.
 pub const SCHEMA_VERSION_STR: &str = "1";
 
-/// Fixed-path activation layout (INS-10/WRP-06): the single fixed config
-/// file every profile activation swaps, plus the harness-owned tree it lives
-/// in (which superai-owned stores must stay outside of).
+/// Fixed-path activation layout: the config file every profile activation swaps, plus the harness-owned tree bounding it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedPathLayout {
     /// The fixed, versioned config file (`<home>/.zcode/v2/config.json`).
@@ -57,9 +52,7 @@ pub struct FixedPathLayout {
     pub harness_root: PathBuf,
 }
 
-/// Resolve the fixed-path activation layout for `home`: the fixed path is
-/// the activation target; the harness root bounds where a profile store may
-/// never be placed (drives [`crate::activation::FixedPathProfileStore`]).
+/// Fixed path is the activation target; the harness root bounds where a profile store may never live.
 #[must_use]
 pub fn fixed_path_layout(home: &Path) -> FixedPathLayout {
     FixedPathLayout {
@@ -68,8 +61,7 @@ pub fn fixed_path_layout(home: &Path) -> FixedPathLayout {
     }
 }
 
-/// Concrete adapter for `ZCode` (`SingleInstance`): fixed config, no
-/// isolation env, writes mutate the fixed path in place after backup.
+/// Concrete adapter for `ZCode` (`SingleInstance`): writes mutate the fixed path in place after backup.
 #[derive(Debug, Clone)]
 pub struct ZcodeAdapter {
     id: HarnessId,
@@ -97,7 +89,6 @@ impl ZcodeAdapter {
         FIXED_CONFIG_PATH
     }
 
-    /// Resolve fixed config path `~/.zcode/v2/config.json`.
     fn fixed_config_path_buf() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -113,7 +104,6 @@ impl ZcodeAdapter {
         )
     }
 
-    /// Collect evidence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -370,8 +360,8 @@ impl Adapter for ZcodeAdapter {
         instance.validate()?;
         match instance.isolation {
             Isolation::FixedPathSingle | Isolation::Unknown | Isolation::RelocatedRoot => {
-                // HAD-03: config content present under the root must satisfy
-                // the declared root shape (full schema still research-gated).
+                // Config content under the root must satisfy the declared
+                // root shape (full schema still research-gated).
                 crate::adapter::validate_instance_surfaces(self, instance.config_root.as_path())
             }
             other => Err(CoreError::Validation {
@@ -384,8 +374,7 @@ impl Adapter for ZcodeAdapter {
     }
 
     fn surface_schema(&self, surface_id: &str) -> Option<SurfaceSchema> {
-        // HAD-03: only the object root is verified; the research doc marks
-        // the full schema Unverified (SingleInstance research gate).
+        // Only the object root is verified; the full schema is research-gated.
         match surface_id {
             "config.json" => Some(SurfaceSchema::new().with_root_shape(RootShape::Object)),
             _ => None,
@@ -396,12 +385,10 @@ impl Adapter for ZcodeAdapter {
         vec![SkillMode::CopySelected]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some("MCP support is explicitly unverified in the corpus (zcode.md Unverified section)")
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("plugin/skills configuration unverified in the corpus (zcode.md Unverified section)")
     }
@@ -564,7 +551,6 @@ mod tests {
     fn fixed_path_layout_declares_activation_target_and_boundary() {
         let home = crate::test_util::tmp_abs("tester");
         let layout = super::fixed_path_layout(&home);
-        // Target matches the declared fixed config path expansion.
         assert_eq!(
             layout.fixed_config,
             home.join(".zcode").join("v2").join("config.json")
@@ -615,8 +601,6 @@ mod tests {
         let a = adapter();
         let schema = a.surface_schema("config.json").expect("config schema");
         assert_eq!(schema.root_shape, Some(crate::adapter::RootShape::Object));
-        // The research doc marks the full schema Unverified: no owned-key
-        // rules are declared beyond the root shape.
         assert!(schema.owned_key_rules.is_empty());
         assert!(schema.deprecated_keys.is_empty());
         assert!(a.surface_schema("unknown").is_none());
@@ -684,8 +668,6 @@ mod tests {
         }
         let legacy_value: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
         let current_value: serde_json::Value = serde_json::from_slice(&current).unwrap();
-        // Current era: headers recognized in provider options; legacy era:
-        // extra params that the current schema does not accept.
         assert!(
             legacy_value["provider"]["options"]
                 .get("extraParams")

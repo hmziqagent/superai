@@ -1,8 +1,5 @@
-//! Kiro adapter: `relocated-root` via `KIRO_HOME`, surfaces
-//! `settings/cli.json`, `settings/mcp.json`, `settings/permissions.yaml`,
-//! `agents/`/`skills/` dirs; `ReadOnly` until BYO and schema gaps close.
-//! Research source: `docs/harness-configs/kiro.md` (last verified 2026-08-25;
-//! executable name live-verified 2026-09-18).
+//! Kiro adapter: relocated root via `KIRO_HOME` over `settings/cli.json`,
+//! `mcp.json`, `permissions.yaml`; read-only until BYO and schema gaps close.
 
 use std::path::PathBuf;
 
@@ -26,8 +23,7 @@ pub const DISPLAY_NAME: &str = "Kiro CLI/IDE";
 /// (live-verified 2026-09-18; the installer materializes no bare `kiro`).
 pub const EXECUTABLE: &str = "kiro-cli";
 
-/// Alternative executable name: `kiro` exists only where a wrapper or
-/// bridge aliases it.
+/// Alias: bare `kiro` exists only where a wrapper or bridge provides it.
 pub const EXECUTABLE_ALT: &str = "kiro";
 
 /// Environment variable that relocates the config root.
@@ -81,7 +77,6 @@ impl KiroAdapter {
         READONLY_REASON
     }
 
-    /// Resolve default config root `$KIRO_HOME` or `~/.kiro`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -97,7 +92,6 @@ impl KiroAdapter {
         Some(PathBuf::from(home).join(".kiro"))
     }
 
-    /// Collect evidence.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -429,7 +423,6 @@ impl Adapter for KiroAdapter {
         Vec::new()
     }
 
-    /// EXT-08/09: MCP destination (kiro.md: `~/.kiro/settings/mcp.json`; `KIRO_HOME` relocates)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(
             crate::adapter::McpAdapterDecl::new(
@@ -443,7 +436,6 @@ impl Adapter for KiroAdapter {
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (kiro.md)")
     }

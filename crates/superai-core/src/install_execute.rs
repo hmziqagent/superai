@@ -1,12 +1,5 @@
 //! Install execution, verification receipt, update and uninstall (PKG-05..08).
-//!
-//! PKG-05: structured `duct`-backed execution, no shell, explicit argv,
-//! minimal env, bounded capture, 120s timeout, redacted error display.
-//! PKG-06: verification receipt, re-detect, parse and confirm the version,
-//! smoke probe, record a superai-owned receipt without claiming pre-existing
-//! installs. PKG-07: update with compat impact and blocking unless explicitly
-//! accepted. PKG-08: uninstall preflight with ownership checks; config,
-//! instances, wrappers, backups, templates, and assets are never touched.
+//! Structured no-shell execution, receipts for new installs only, update compat blocking, uninstall preserves config.
 
 #![expect(
     clippy::excessive_nesting,
@@ -49,11 +42,8 @@ pub const OUTPUT_LIMIT: usize = MAX_OUTPUT_BYTES;
 /// Smoke probe timeout.
 pub const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Minimal environment for structured execution (PKG-05).
-///
-/// Starts from `clear_env = true` and injects only benign vars required for
-/// execution. Secrets are never injected; callers must pass them explicitly
-/// via `ExecuteOpts::env` when the installer method truly requires a token.
+/// Minimal environment for structured execution (PKG-05): clear base plus
+/// benign vars only; secrets are never injected, callers pass them explicitly.
 pub fn minimal_env_vars() -> Vec<(String, String)> {
     const KEEP: &[&str] = &[
         "PATH",
@@ -79,9 +69,8 @@ pub fn minimal_env_vars() -> Vec<(String, String)> {
             out.push(((*key).to_owned(), val));
         }
     }
-    // Ensure PATH exists even when ambient is empty (tests rely on injected
-    // DetectOptions::path_dirs, but commands like `echo` still need PATH for
-    // resolution when not using an absolute executable).
+    // Ensure PATH exists even when ambient is empty: `echo` and friends need
+    // it for resolution when no absolute executable is used.
     if !out.iter().any(|(k, _)| k == "PATH")
         && let Some(path) = std::env::var_os("PATH")
     {
@@ -119,13 +108,8 @@ pub fn probe_opts(redact: bool) -> ExecuteOpts {
     }
 }
 
-/// Execute a structured command with explicit argv, minimal env, bounded
-/// capture, 120s timeout and redaction (PKG-05).
-///
-/// No shell is ever invoked; `executable` and `args` are passed as argv
-/// tokens directly to `duct`. On non-zero exit an error is returned with a
-/// redacted display; callers that need to inspect non-zero output should call
-/// `run_command` directly with `probe_opts`.
+/// Execute a structured command: explicit argv, minimal env, bounded capture,
+/// 120s timeout, redaction (PKG-05). No shell is ever invoked.
 pub fn run_structured_command(
     executable: &str,
     args: &[String],
@@ -194,10 +178,8 @@ fn method_id(method: &InstallMethodKind) -> &'static str {
     }
 }
 
-/// Superai-owned install receipt (PKG-06).
-///
-/// Recorded only when the install produced a new, verifiable binary that was
-/// not present before execution. Pre-existing installs are never claimed.
+/// Superai-owned install receipt (PKG-06), recorded only when the install
+/// produced a new, verifiable binary. Pre-existing installs are never claimed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallReceipt {
     /// Install method that produced the binary.
@@ -265,13 +247,8 @@ fn receipt_path(home: &Path, harness: &str, method: &InstallMethodKind) -> PathB
     receipts_root(home).join(format!("{harness}-{}.json", method_id(method)))
 }
 
-/// Persist a verified receipt for an explicit `(harness, method)` key
-/// (PKG-06).
-///
-/// Called only after `verify_install` produced a receipt for a NEW install;
-/// pre-existing installs (receipt `None`) never write a file, and failed
-/// installs error before this point. The receipt is written atomically under
-/// superai's own receipts directory, one file per `(harness, method)`.
+/// Persist a verified receipt for an explicit `(harness, method)` key (PKG-06);
+/// called only after `verify_install` claimed a NEW install.
 pub fn persist_receipt(
     home: &Path,
     harness: &HarnessId,
@@ -290,10 +267,8 @@ pub fn persist_receipt(
         field: "receipt".to_owned(),
         reason: format!("serialize receipt failed: {e}"),
     })?;
-    // Plan-02 fold: receipts persist through the config crate's ONE mutation
-    // boundary (snapshot → backup → §4.2 recheck → atomic replace → verify);
-    // the payload is pretty JSON, so the boundary's staged parse-validation
-    // also guards the receipt's syntax before it lands.
+    // Receipts persist through the config crate's ONE mutation boundary; the
+    // pretty-JSON payload gets staged parse-validation before it lands.
     superai_config::transaction::commit_file(
         "persist-receipt",
         &path,
@@ -304,10 +279,8 @@ pub fn persist_receipt(
     Ok(path)
 }
 
-/// Load every persisted receipt under `home` (PKG-06).
-///
-/// Invalid/unparseable receipt files are surfaced as errors (fail closed)
-/// rather than silently skipped.
+/// Load every persisted receipt under `home` (PKG-06); unparseable files are
+/// errors (fail closed), never silently skipped.
 pub fn load_receipts(home: &Path) -> Result<Vec<InstallReceipt>, CoreError> {
     let root = receipts_root(home);
     let entries = match std::fs::read_dir(&root) {
@@ -394,12 +367,8 @@ pub fn find_receipt(
     Ok(None)
 }
 
-/// Whether a version satisfies a requested range/channel.
-///
-/// Channels (`latest`, `stable`, `beta`, `nightly`, `next`, `canary`, `lts`)
-/// always satisfy. Otherwise the requested string is parsed as a `semver`
-/// `VersionReq` (with optional leading `v`) against the detected version.
-/// Exact version strings are also handled as `=version`.
+/// Whether a version satisfies a requested range/channel: channels always
+/// satisfy; otherwise `semver` `VersionReq` against the detected version.
 fn version_satisfies(requested: &str, detected: &str) -> bool {
     const CHANNELS: &[&str] = &[
         "latest", "stable", "beta", "nightly", "next", "canary", "lts",
@@ -417,7 +386,6 @@ fn version_satisfies(requested: &str, detected: &str) -> bool {
         .unwrap_or(detected)
         .trim()
         .to_owned();
-    // Extract semver token from detected string if it contains extra text
     let det_token = extract_version(&det_clean)
         .unwrap_or(det_clean.clone())
         .trim()
@@ -435,7 +403,6 @@ fn version_satisfies(requested: &str, detected: &str) -> bool {
         }
         return false;
     }
-    // Try exact version equality
     if let Ok(req_ver) = semver::Version::parse(req_clean) {
         if let Ok(det_ver) = semver::Version::parse(det_token_clean) {
             return req_ver == det_ver;
@@ -449,10 +416,8 @@ fn version_satisfies(requested: &str, detected: &str) -> bool {
     req_clean == det_token_clean
 }
 
-/// Run a non-mutating smoke probe (`--help` / `--version`) against `path`.
-///
-/// Returns success only when the binary executes and produces output that
-/// looks like help/version. Does not claim ownership.
+/// Run a non-mutating smoke probe (`--help` / `--version`) against `path`;
+/// succeeds only when the binary runs and produces help/version-like output.
 fn smoke_probe(path: &Path) -> Result<(), CoreError> {
     let exe_str = path.to_string_lossy().into_owned();
     // Ordered by likelihood; the first set that yields help/version text wins.
@@ -511,10 +476,8 @@ fn smoke_probe(path: &Path) -> Result<(), CoreError> {
     }))
 }
 
-/// Select the best post-install detection to verify.
-///
-/// Prefers non-broken, non-shadowed `Path` rank 0, then any non-broken hit
-/// ordered by confidence. Returns `None` when no usable detection exists.
+/// Select the best post-install detection: non-broken, non-shadowed `Path`
+/// rank 0 first, then any non-broken hit by confidence.
 fn select_best_detection(detections: &[Detection]) -> Option<&Detection> {
     if let Some(d) = detections
         .iter()
@@ -539,15 +502,8 @@ fn select_best_detection(detections: &[Detection]) -> Option<&Detection> {
     candidates.into_iter().next()
 }
 
-/// Verify an install and build a superai-owned receipt (PKG-06).
-///
-/// - Re-detects the executable via `detect_all_for_entry`
-/// - Parses version with `extract_version` (regex-like semver probe)
-/// - Confirms the requested range/channel via `version_satisfies`
-/// - Runs a smoke probe (`--help`) against the detected path
-/// - Returns `Ok(Some(receipt))` only when the binary is newly present and
-///   all checks pass; `Ok(None)` when pre-existing and not claimed; `Err`
-///   on verification failure (wrong version, smoke failure, missing binary).
+/// Verify an install and build a superai-owned receipt (PKG-06): re-detect,
+/// parse and confirm the version, smoke-probe; `Ok(None)` when pre-existing.
 pub fn verify_install(
     harness: &HarnessId,
     requested_version: Option<&str>,
@@ -577,8 +533,7 @@ pub fn verify_install(
     })?;
 
     // Same canonical path means the same physical binary: an unknown version
-    // on either side is "unknown, not new", never a fresh-install receipt.
-    // A genuine version change falls through to the upgrade logic below.
+    // on either side is "unknown, not new". A real version change upgrades.
     let pre_has_same = pre_detections.iter().any(|pre| {
         let same_path = pre.path == best.path
             || std::fs::canonicalize(&pre.path)
@@ -694,19 +649,8 @@ pub fn verify_install(
     Ok(Some(receipt))
 }
 
-/// Execute an install plan and verify it, returning a receipt on success.
-///
-/// This is the combined PKG-05 (execute) + PKG-06 (verify + persist) flow:
-///
-/// - PKG-10: plans whose method is External/Direct (`plan.external_install`)
-///   refuse with the typed [`CoreError::ExternalInstallRequired`]; no
-///   command is executed for them.
-/// - PKG-07: when the binary already on disk satisfies the request, the
-///   install command is NOT re-run: the plan declines with `Ok(None)` (no
-///   receipt, no execution).
-/// - PKG-06: a verified NEW install persists its receipt under
-///   `<home>/.superai/install_receipts`; failed installs error before any
-///   receipt is written.
+/// Execute an install plan and verify it (PKG-05 + PKG-06). External/Direct
+/// plans refuse typed (PKG-10); a satisfying binary on disk declines (PKG-07).
 pub fn execute_and_verify(
     plan: &InstallPlan,
     detect_opts: &DetectOptions,
@@ -732,8 +676,7 @@ pub fn execute_and_verify(
     let pre = detect_all_for_entry(entry, detect_opts);
 
     // PKG-07 existing-install skip: a non-broken pre-install detection whose
-    // version satisfies the request means the binary already matches, so decline
-    // to re-run the install command (and write no receipt).
+    // version satisfies the request means the binary matches; decline to re-run.
     let requested = plan.version.as_deref().or(plan.channel.as_deref());
     if let Some(best_pre) = select_best_detection(&pre) {
         let already_satisfies = match (requested, best_pre.version.as_deref()) {
@@ -776,7 +719,6 @@ pub fn execute_and_verify(
         });
     }
 
-    // Verify and build receipt; persist it when the install is new (PKG-06).
     let receipt = verify_install(&harness, requested, &plan.method, &pre, detect_opts)?;
     if let Some(receipt) = &receipt {
         persist_receipt(home, &harness, receipt)?;
@@ -837,11 +779,8 @@ impl UpdatePlan {
     }
 }
 
-/// Heuristic adapter compatibility: new version is compatible when its major
-/// equals current major, or when current is unknown and new is >=1.0.0.
-///
-/// Real adapters may have tighter ranges; this provides the blocking signal
-/// required by PKG-07 without hard-coding version matrices.
+/// Heuristic adapter compatibility: same major, or current unknown and new
+/// >=1.0.0; real adapters may be tighter (PKG-07 blocking signal).
 #[expect(clippy::redundant_closure, reason = "String vs &str coercion")]
 fn update_compat_for_versions(current: Option<&str>, available: &str) -> (bool, bool, String) {
     let cur_ver = current
@@ -889,11 +828,8 @@ fn update_compat_for_versions(current: Option<&str>, available: &str) -> (bool, 
     }
 }
 
-/// Fetch the available version for a harness/method.
-///
-/// Runs the package manager's query command with bounded capture and timeout;
-/// `None` when the manager is missing or the query fails. `injected_available`
-/// overrides the network fetch (tests).
+/// Fetch the available version: the manager's query command, bounded; `None`
+/// when missing or failed. `injected_available` overrides (tests).
 fn fetch_available_version(
     entry: &crate::install_catalog::InstallCatalogEntry,
     method: &InstallMethodKind,
@@ -1022,15 +958,8 @@ fn fetch_available_version(
     })
 }
 
-/// Plan an update for `harness` (PKG-07).
-///
-/// Detects the current method/version, fetches the available version,
-/// computes compat impact on adapters/instances via `harness_catalog`,
-/// and returns a preview with the native update command. Does not execute.
-///
-/// When `injected_available` is `Some`, network fetch is skipped (for tests).
-/// When `explicit_accept` is false and the new version is outside the
-/// heuristic adapter range, the plan is marked `blocked`.
+/// Plan an update for `harness` (PKG-07): detect current, fetch available,
+/// compute compat impact, return a preview; never executes.
 pub fn plan_update(
     harness: &HarnessId,
     detect_opts: &DetectOptions,
@@ -1197,10 +1126,8 @@ fn detection_source_to_method(source: &DetectionSource) -> Option<InstallMethodK
     }
 }
 
-/// Injection seam for update-plan command execution, mirroring the area-7
-/// `VersionProbe` seam in `install_plan.rs`: production runs the real package
-/// manager command via [`run_command`]; tests inject a fake so the suite
-/// never shells out to a real `npm`/`brew`/`cargo`.
+/// Injection seam for update-plan command execution: production runs the real
+/// package manager; tests inject a fake, never a real `npm`/`brew`/`cargo`.
 pub trait UpdateCommandRunner {
     /// Run the update command. `executable`/`args` mirror the plan's
     /// `command_preview`; `redact` selects redacted output handling.
@@ -1226,12 +1153,8 @@ impl UpdateCommandRunner for SystemUpdateRunner {
     }
 }
 
-/// Execute an update plan with native method (PKG-07).
-///
-/// Checks `blocked` unless `explicit_accept` is true, refuses external/direct
-/// methods with the typed [`CoreError::ExternalInstallRequired`] (PKG-10),
-/// runs the update command with structured opts, then re-detects and strictly
-/// validates the new version against the expected available version.
+/// Execute an update plan (PKG-07): refuse blocked unless accepted, refuse
+/// external/direct typed (PKG-10), run, then strictly validate the new version.
 pub fn execute_update(
     plan: &UpdatePlan,
     detect_opts: &DetectOptions,
@@ -1316,8 +1239,7 @@ pub fn execute_update_with_runner(
         let post = detect_all_for_entry(entry, detect_opts);
         if let Some(best) = select_best_detection(&post) {
             // PKG-07 strict post-update validation: when the available version
-            // was resolved, the detected version must satisfy it; "any
-            // non-empty string" is not verification.
+            // was resolved, the detected version must satisfy it.
             if let Some(expected) = plan.available_version.as_deref() {
                 match best.version.as_deref() {
                     Some(detected) => {
@@ -1357,11 +1279,8 @@ pub fn execute_update_with_runner(
     Ok(out)
 }
 
-/// Read-only instance revalidation after a binary update (PKG-07).
-///
-/// Re-detects the harness binary fresh and reports, per recorded instance of
-/// the harness, whether the new version keeps it compatible, read-only, no
-/// registry mutation, no config writes.
+/// Read-only instance revalidation after a binary update (PKG-07): per
+/// instance, is it still compatible; no registry mutation, no config writes.
 pub fn revalidate_instances_after_update(
     harness: &HarnessId,
     registry: Option<&Registry>,
@@ -1455,9 +1374,8 @@ pub struct UninstallPlan {
     pub docs: String,
 }
 
-/// Build the list of paths that uninstall must preserve (PKG-08).
-///
-/// Never deletes: config, instances, wrappers, backups, templates, assets.
+/// Build the list of paths that uninstall must preserve (PKG-08): config,
+/// instances, wrappers, backups, templates, assets are never deleted.
 fn preserved_paths_for(registry: Option<&Registry>, harness: &HarnessId) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(reg) = registry {
@@ -1494,20 +1412,8 @@ fn preserved_paths_for(registry: Option<&Registry>, harness: &HarnessId) -> Vec<
     out
 }
 
-/// Plan an uninstall with preflight checks (PKG-08).
-///
-/// - Exact installed package/method/path via detection
-/// - Lists every instance/wrapper referencing the binary
-/// - Checks shared/foreign (multiple PATH hits, foreign ownership)
-/// - PKG-08 package-receipt ownership: a persisted receipt proving superai
-///   installed this `(harness, method)` clears the foreign flag
-/// - Default uninstall is binary-only via native method; config preservation
-///   is enforced
-/// - Manual files not proven owned never auto-delete (`can_auto_delete`)
-///
-/// When `explicit_allow_foreign` is true, foreign/shared blocks are ignored.
-///
-/// `home` scopes the receipts directory (`<home>/.superai/install_receipts`).
+/// Plan an uninstall with preflight (PKG-08): detection, referencing
+/// instances, shared/foreign checks, receipt ownership; config always preserved.
 pub fn plan_uninstall(
     harness: &HarnessId,
     detect_opts: &DetectOptions,
@@ -1659,15 +1565,8 @@ pub fn plan_uninstall(
     })
 }
 
-/// Execute an uninstall plan (PKG-08).
-///
-/// - Honors `blocked` unless `explicit_allow_foreign` is true
-/// - Uninstalls binary only via native method; never deletes config,
-///   instances, wrappers, backups, templates, assets
-/// - Manual files not proven owned never auto-delete (checked via
-///   `can_auto_delete`); caller must provide explicit allow
-/// - Marks affected instances as binary-missing by not deleting them but
-///   returning the list of referencing instances
+/// Execute an uninstall plan (PKG-08): binary-only via the native method;
+/// config/instances/wrappers/backups/templates/assets are never deleted.
 pub fn execute_uninstall(
     plan: &UninstallPlan,
     explicit_allow_foreign: bool,
@@ -1742,15 +1641,8 @@ pub fn execute_uninstall(
     Ok(out)
 }
 
-/// PKG-08: mark every affected instance binary-missing in the registry.
-///
-/// A successful uninstall removes the binary instances depend on. For each
-/// recorded instance of `harness` whose absolute binary pin now dangles, the
-/// stale pin is cleared through the registry's own update path, the same
-/// vocabulary INS-09's repair uses ("binary-missing is marked honestly,
-/// never left pointing at a dead path"). The registry is persisted; the
-/// return lists the instance names that were marked. PATH-named binaries
-/// carry no pin to clear, their absence is detected at repair time.
+/// PKG-08: mark affected instances binary-missing; stale absolute pins are
+/// cleared through the registry's own update path. PATH pins clear at repair.
 pub fn mark_instances_binary_missing(
     registry: &mut Registry,
     registry_path: &Path,
@@ -1782,11 +1674,7 @@ pub fn mark_instances_binary_missing(
 }
 
 /// Execute an uninstall plan and mark affected instances binary-missing
-/// (PKG-08 combined flow).
-///
-/// Runs the native uninstall, then updates the registry so referencing
-/// instances stop pointing at the removed binary. Returns the process output
-/// plus the names of the instances that were marked binary-missing.
+/// (PKG-08 combined flow); returns output plus the marked instance names.
 pub fn execute_uninstall_and_mark(
     plan: &UninstallPlan,
     explicit_allow_foreign: bool,
@@ -1805,8 +1693,6 @@ pub fn execute_uninstall_and_mark(
     Ok((out, marked))
 }
 
-// PKG-09: pin-exact-binary selection
-
 /// A user-selected exact binary pin (PKG-09).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryPin {
@@ -1818,12 +1704,8 @@ pub struct BinaryPin {
     pub shadowed_alternatives: Vec<PathBuf>,
 }
 
-/// Select and pin one exact binary from `detections` (PKG-09).
-///
-/// The selection must be one of the detected paths, an unseen path is a
-/// typed refusal, never an invented pin. Returns the pin plus the
-/// alternatives it shadows so callers can surface the ambiguity that
-/// motivated the explicit selection.
+/// Select and pin one exact binary from `detections` (PKG-09): an unseen
+/// path is a typed refusal, never an invented pin; returns the shadowed alternatives.
 pub fn pin_exact_binary(detections: &[Detection], selected: &Path) -> Result<BinaryPin, CoreError> {
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let selected_canon = canonical(selected);
@@ -1854,10 +1736,8 @@ pub fn pin_exact_binary(detections: &[Detection], selected: &Path) -> Result<Bin
     })
 }
 
-/// Report PATH ambiguity when no explicit selection was made (PKG-09).
-///
-/// `Some(message)` when multiple distinct-version detections exist and the
-/// caller has not pinned one, a PATH-based wrapper would be ambiguous.
+/// Report PATH ambiguity when nothing was pinned (PKG-09): `Some(message)`
+/// when multiple distinct-version detections exist.
 pub fn report_path_ambiguity(detections: &[Detection]) -> Option<String> {
     let distinct_versions: std::collections::BTreeSet<&str> = detections
         .iter()
@@ -1921,8 +1801,7 @@ mod tests {
     }
 
     /// Write a fake harness executable answering `--help` and `--version`.
-    /// The script is a `#!/bin/sh` file, so this (and the tests that probe it)
-    /// run on unix only.
+    /// `#!/bin/sh` file, so this runs on unix only.
     #[cfg(unix)]
     fn write_help_exe(dir: &Path, name: &str) {
         let path = dir.join(name);
@@ -1982,8 +1861,6 @@ mod tests {
             last_verified: "2026-08-26".to_owned(),
         }
     }
-
-    // ---- PKG-05 ----
 
     /// (`echo`-equivalent program, prefix args): unix ships a real `echo`
     /// binary; windows has none in PATH, so route through `cmd /C echo`.
@@ -2086,7 +1963,6 @@ mod tests {
         );
     }
 
-    // ---- PKG-06 ----
     // The receipt/update/uninstall tests below execute `#!/bin/sh` fake
     // harness binaries, so they run on unix only.
 
@@ -2162,8 +2038,7 @@ mod tests {
     #[test]
     fn verify_receipt_same_path_with_unprobed_version_is_not_claimed() {
         // PKG-06: the same canonical path IS the same installation. A version
-        // probe that transiently fails on either side of the install is
-        // "unknown, not new" and must never produce a fresh-install receipt.
+        // probe that transiently fails on either side is "unknown, not new".
         let tmp = make_temp_dir("unknown-ver");
         let home = make_temp_dir("home-unknown-ver");
         let harness = HarnessId::new("claude-code").unwrap();
@@ -2318,14 +2193,11 @@ mod tests {
         assert!(r.validate().is_err());
     }
 
-    // ---- PKG-07 ----
-
     #[cfg(unix)]
     #[test]
     fn update_plan_detects_current_and_shows_compat_and_blocks() {
         let tmp = make_temp_dir("update-cur");
         let home = make_temp_dir("home-update");
-        // Fake codex with version 1.2.3
         fs::write(
             tmp.join("codex"),
             "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"Usage: codex --help\"; exit 0; fi\necho \"1.2.3\"\n",
@@ -2358,11 +2230,9 @@ mod tests {
         );
         assert!(plan.blocked_reason.is_some());
         assert!(!plan.compat_impacts.is_empty());
-        // With explicit accept, not blocked
         let plan2 = plan_update(&harness, &opts, None, true, Some("2.0.0")).unwrap();
         assert!(!plan2.blocked);
 
-        // Compatible minor bump should not block
         let plan3 = plan_update(&harness, &opts, None, false, Some("1.3.0")).unwrap();
         assert!(!plan3.blocked);
 
@@ -2399,11 +2269,8 @@ mod tests {
         assert!(plan.blocked);
         let err =
             execute_update_with_runner(&plan, &opts, false, false, &PanickingRunner).unwrap_err();
-        // Discriminating refusal proof: the error must be the typed blocked
-        // guard carrying the PLAN's own blocked_reason verbatim. The runner
-        // PANICS if it is ever reached, so deleting the guard fails this
-        // test at the panic site, and no runner-produced error can satisfy
-        // the verbatim-reason match.
+        // The error must be the typed blocked guard carrying the PLAN's own
+        // blocked_reason verbatim; the runner PANICS if ever reached.
         let expected_reason = plan.blocked_reason.as_deref();
         assert!(
             matches!(
@@ -2414,11 +2281,8 @@ mod tests {
             "refused update must surface the plan's own blocked_reason as Validation{{field: \"update\"}}, got: {err}"
         );
 
-        // With explicit accept, execution proceeds to the update command.
-        // Hermetic: the injected runner simulates the package manager by
-        // rewriting the fake codex binary to the expected new version, so no
-        // real npm/brew/cargo ever executes and the PKG-07 strict
-        // post-update validation sees exactly the expected 2.0.0.
+        // Explicit accept proceeds to the update command via the injected
+        // runner, which rewrites the fake binary to 2.0.0; hermetic.
         let runner = SimulatedNpmUpdate {
             binary: codex_path.clone(),
         };
@@ -2432,10 +2296,7 @@ mod tests {
     }
 
     /// Runner that must never be reached: the blocked-plan guard refuses
-    /// before any command runs. Panics on invocation so a deleted guard
-    /// fails the test at the panic site, a returned `Err` could
-    /// accidentally satisfy the blocked-arm assertion (test code may panic
-    /// per project rules).
+    /// before any command runs; panics on invocation.
     #[cfg(unix)]
     struct PanickingRunner;
 
@@ -2502,8 +2363,6 @@ mod tests {
         }
     }
 
-    // ---- PKG-08 ----
-
     #[cfg(unix)]
     #[test]
     fn uninstall_preflight_lists_instances_and_preserves_config() {
@@ -2511,7 +2370,6 @@ mod tests {
         let home = make_temp_dir("home-uninstall");
         let harness = HarnessId::new("codex-cli").unwrap();
 
-        // Create fake codex binary in tmp
         fs::write(tmp.join("codex"), "#!/bin/sh\necho \"1.0.0\"\n").unwrap();
         let mut perms = fs::metadata(tmp.join("codex")).unwrap().permissions();
         perms.set_mode(0o755);
@@ -2525,9 +2383,6 @@ mod tests {
 
         // Build a registry with an instance pointing at that config root
         let reg_path = tmp.join("registry.json");
-        // Use registry via load/store
-        // We'll use a helper to create a minimal instance and push via serialization round-trip.
-        // Instead, we will directly craft JSON and load via Registry::load.
         let instance_json = serde_json::json!([{
             "id": "test-id-1",
             "name": "work",
@@ -2576,10 +2431,8 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("instances.json") || p.ends_with(".superai"))
         );
-        // Command preview is npm uninstall, not rm
         assert_ne!(plan.command_preview.executable, "rm");
-        // Simulate execution with a harmless echo instead of actual npm uninstall for test stability
-        // Override the plan's command to echo for execution test
+        // Execute with a harmless echo override instead of real npm uninstall.
         let mut echo_plan = plan;
         echo_plan.command_preview = CommandTokens {
             executable: "echo".to_owned(),
@@ -2737,15 +2590,11 @@ mod tests {
             external_install: None,
             destination_writable: true,
         };
-        // Validation should fail on sh -c
         assert!(plan.command_preview.validate().is_err());
     }
 
-    // PKG-06 persisted receipts / PKG-07 skip / PKG-10 typed external
-
-    /// Build an executable plan whose install command runs `marker_prog`
-    /// (writing a marker file when it runs, so tests can prove the command
-    /// was or was not executed).
+    /// Build an executable plan whose install command runs `marker_prog`,
+    /// writing a marker file so tests can prove whether it ran.
     #[cfg(unix)]
     fn marker_plan(tmp: &Path, marker: &Path) -> InstallPlan {
         InstallPlan {
@@ -2777,15 +2626,12 @@ mod tests {
     }
 
     /// `#!/bin/sh` script that touches a marker file AND installs a fake
-    /// `claude` binary (help + 1.2.3 version) into the target dir, proves
-    /// whether the install command executed and gives post-detection
-    /// something real to find. Unix only.
+    /// `claude` binary (help + 1.2.3) into the target dir. Unix only.
     #[cfg(unix)]
     fn write_marker_prog(dir: &Path) -> PathBuf {
         let path = dir.join("install-cmd");
-        // $1 = marker file, $2 = install dir. Installs a fake `claude` binary
-        // that answers --help and prints 1.2.3, so post-install detection and
-        // verification have something real to find.
+        // $1 = marker file, $2 = install dir; installs a fake `claude` binary
+        // answering --help and 1.2.3 for post-install detection to find.
         let script = concat!(
             "#!/bin/sh\n",
             "printf x >> \"$1\"\n",
@@ -2822,9 +2668,8 @@ mod tests {
             probe_apps: false,
             ..Default::default()
         };
-        // No pre-existing binary: the install command runs, verify claims a
-        // fresh receipt, and the receipt is persisted under
-        // <home>/.superai/install_receipts.
+        // No pre-existing binary: the command runs, verify claims a fresh
+        // receipt, persisted under <home>/.superai/install_receipts.
         let plan = marker_plan(&tmp, &prog);
         let receipt = execute_and_verify(&plan, &opts, false, &home).unwrap();
         assert!(receipt.is_some(), "fresh install must be claimed");
@@ -2963,8 +2808,6 @@ mod tests {
         }
     }
 
-    // PKG-08 receipt ownership + binary-missing marking
-
     #[cfg(unix)]
     #[test]
     fn receipt_ownership_clears_foreign_in_uninstall_preflight() {
@@ -3067,8 +2910,6 @@ mod tests {
         drop(fs::remove_dir_all(&tmp));
         drop(fs::remove_dir_all(&home));
     }
-
-    // PKG-09 pin-exact-binary selection
 
     #[cfg(unix)]
     #[test]

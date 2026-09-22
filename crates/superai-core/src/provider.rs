@@ -1,12 +1,5 @@
-//! Provider definitions: data-driven, no hardcoded provider list.
-//!
-//! A provider is versioned data, not a Rust branch. Adding a provider is a
-//! data-only change: add a JSON/YAML file and no Rust source edit is required.
-//! Definitions are read fresh from disk on every load; nothing is cached.
-//! Health probing validates URL format, bounds timeout, redacts secrets,
-//! classifies auth/rate-limit/TLS via the fake harness (no live network),
-//! and strips auth on cross-host redirects. API keys are ephemeral and only
-//! written to harness-declared sinks.
+//! Provider definitions: data-driven, no hardcoded provider list. Read
+//! fresh from disk every load; probing stays offline and redacts secrets.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -141,10 +134,8 @@ impl std::fmt::Display for Modality {
     }
 }
 
-/// Token limits of a model (PRV-02: context/input/output limits).
-///
-/// All fields are optional; providers document different subsets. Validation
-/// requires every present limit to be positive and consistent.
+/// Token limits of a model (PRV-02). All fields optional; every present
+/// limit must be positive and mutually consistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelLimits {
     /// Total context window in tokens.
@@ -204,10 +195,8 @@ pub struct ProviderDefaults {
     pub default_model: Option<String>,
 }
 
-/// Base-endpoint variant keyed by region or plan (PRV-01).
-///
-/// When a variant is requested but absent, resolution falls back to the
-/// provider's default `base_url`.
+/// Base-endpoint variant keyed by region or plan (PRV-01); a requested
+/// but absent variant falls back to the provider's default `base_url`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointVariant {
     /// Variant key, e.g. `us`, `eu`, `free-tier`, `anthropic-compat`.
@@ -239,12 +228,8 @@ pub struct AuthInputs {
     pub key_prefix: Option<String>,
 }
 
-/// Health probe definition carried in provider data (PRV-06).
-///
-/// Pure data: kind, URL derivation from the base endpoint, method, header and
-/// body templates (with placeholders, never secrets), auth reference, bounds,
-/// accepted-status/body predicates, TLS/private-network policy, and a
-/// rate/cost warning. Execution lives in [`crate::health`].
+/// Health probe definition carried in provider data (PRV-06): pure data,
+/// placeholders only and never secrets; execution lives in [`crate::health`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeDefinition {
     /// Stable probe identifier, unique within the provider.
@@ -292,9 +277,8 @@ pub struct ProbeDefinition {
     pub rate_cost_warning: Option<String>,
 }
 
-/// Server-side/modal capability contribution of a provider (plan 09 CAP-03
-/// source 2). The provider declares what it can satisfy; the harness
-/// transport constraint still gates the final resolution.
+/// Server-side capability contribution (plan 09 CAP-03 source 2); the
+/// harness transport constraint still gates the final resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilityDecl {
     /// Capability this declaration concerns.
@@ -315,11 +299,8 @@ fn default_provider_schema_version() -> u32 {
     PROVIDER_SCHEMA_VERSION
 }
 
-/// Provider definition as stored in a JSON/YAML data file.
-///
-/// No secret values are stored here. Adding a provider means adding a file,
-/// not editing Rust. Fields not modelled survive via serde's ignore on write
-/// Unknown keys are ignored on read.
+/// Provider definition as stored in a JSON/YAML data file. No secret
+/// values live here; adding a provider is adding a file, not editing Rust.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderDefinition {
     /// Stable provider identifier.
@@ -382,10 +363,8 @@ pub struct ProviderDefinition {
 }
 
 impl ProviderDefinition {
-    /// Construct a minimal valid definition (all optional fields defaulted).
-    ///
-    /// Useful for tests and as the base of struct-update expressions; the
-    /// result still needs `model_list`/`defaults` populated to be meaningful.
+    /// Construct a minimal valid definition (optional fields defaulted);
+    /// `model_list`/`defaults` still need populating to be meaningful.
     pub fn new(id: ProviderId, base_url: impl Into<String>) -> Self {
         Self {
             id,
@@ -415,12 +394,8 @@ impl ProviderDefinition {
         reason = "validation covers the full PRV-01/02 field set"
     )]
     #[expect(clippy::excessive_nesting, reason = "field-set validation branches")]
-    /// Validate the definition before use (PRV-01/02): schema version, URL
-    /// syntax and uniqueness for the base and every endpoint variant, unique
-    /// model ids/aliases, an existing non-legacy `default_model`, consistent
-    /// limits and modalities, control-char-free and secret-free header/param
-    /// names, identifier-shaped auth env vars, well-formed probes, and a
-    /// `YYYY-MM-DD` `verified_at`. No network is touched.
+    /// Validate the definition before use (PRV-01/02): URLs, ids/aliases,
+    /// defaults, limits, headers/params, auth inputs, probes. No network.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != PROVIDER_SCHEMA_VERSION {
             return Err(CoreError::Validation {
@@ -469,7 +444,6 @@ impl ProviderDefinition {
         self.validate_auth_inputs()?;
         self.validate_capabilities()?;
         self.validate_probes()?;
-        // Model IDs non-empty and unique.
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut seen_aliases: HashSet<String> = HashSet::new();
         for model in &self.model_list {
@@ -923,10 +897,8 @@ impl ProviderDefinition {
         Ok(())
     }
 
-    /// Resolve the base URL to use (PRV-01: variant with fallback).
-    ///
-    /// A named variant matches case-insensitively; when absent or `None` is
-    /// requested, the default `base_url` is returned.
+    /// Resolve the base URL (PRV-01): a named variant matches
+    /// case-insensitively; absent or `None` falls back to `base_url`.
     pub fn endpoint_for(&self, variant: Option<&str>) -> &str {
         let Some(wanted) = variant else {
             return &self.base_url;
@@ -939,9 +911,8 @@ impl ProviderDefinition {
         &self.base_url
     }
 
-    /// Resolve an endpoint that can serve `protocol` (PRV-03 protocol
-    /// selection): a variant advertising the protocol wins; otherwise the
-    /// default endpoint when the provider's own protocol matches.
+    /// Resolve an endpoint serving `protocol` (PRV-03): a variant
+    /// advertising it wins; else the default when the provider matches.
     pub fn endpoint_for_protocol(&self, protocol: Protocol) -> Option<&str> {
         for candidate in &self.endpoints {
             if candidate
@@ -966,9 +937,8 @@ impl ProviderDefinition {
             .find(|d| d.capability == capability)
     }
 
-    /// Normalized base URL for duplicate detection.
-    ///
-    /// Lowercases scheme/host and trims trailing slashes. Uses character-boundary safe truncation.
+    /// Normalized base URL for duplicate detection: lowercase scheme/host,
+    /// trailing slashes trimmed.
     pub fn normalized_base_url(&self) -> String {
         normalize_endpoint(&self.base_url)
     }
@@ -1015,9 +985,8 @@ fn validate_header_entry(provider: &ProviderId, name: &str, value: &str) -> Resu
     Ok(())
 }
 
-/// Whether `text` contains a secret-shaped value: `sk-` (or `sk-live-`)
-/// followed by a run of at least 16 token characters. Documentation
-/// placeholders like `sk-...` do not match.
+/// Whether `text` contains `sk-` (or `sk-live-`) followed by a run of 16+
+/// token characters; documentation placeholders like `sk-...` do not match.
 #[cfg(test)]
 pub(crate) fn contains_secret_shaped_value(text: &str) -> bool {
     fn is_token_char(c: char) -> bool {
@@ -1074,19 +1043,12 @@ fn is_valid_base_url(url: &str) -> (bool, String) {
     (true, "ok".to_owned())
 }
 
-/// Raw JSON for bundled providers (`GLM`, `MiniMax`, `Anthropic`) as checked in
-/// `crates/superai-core/assets/providers.json`.
-///
-/// The file is the source of truth; no provider is hardcoded in Rust. Adding
-/// a provider is a data-only change: add an entry to the JSON and no Rust
-/// edit is required. The value is embedded via `include_str!` so tests and
-/// runtime both read the same data without filesystem assumptions.
+/// Raw JSON for bundled providers, checked in at
+/// `crates/superai-core/assets/providers.json` and embedded via `include_str!`.
 pub const BUNDLED_PROVIDERS_JSON: &str = include_str!("../assets/providers.json");
 
-/// Load providers from the bundled `assets/providers.json`.
-///
-/// Parses the embedded JSON, validates each definition, and rejects
-/// duplicates. No secret is contained or leaked.
+/// Load providers from the bundled `assets/providers.json`, validating
+/// each definition and rejecting duplicates.
 pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
     let providers: Vec<ProviderDefinition> =
         serde_json::from_str(BUNDLED_PROVIDERS_JSON).map_err(|source| CoreError::Parse {
@@ -1101,10 +1063,8 @@ pub fn load_bundled_providers() -> Result<Vec<ProviderDefinition>> {
     Ok(providers)
 }
 
-/// Load bundled providers plus any additional definitions from `extra_path`.
-///
-/// `extra_path` may be a file or directory. Both sides are validated by
-/// their loaders; duplicates across the two sets are rejected.
+/// Load bundled providers plus definitions from `extra_path` (file or
+/// directory); duplicates across the two sets are rejected.
 pub fn load_bundled_plus_extra(extra_path: &Path) -> Result<Vec<ProviderDefinition>> {
     let mut bundled = load_bundled_providers()?;
     bundled.extend(load_provider_defs(extra_path)?);
@@ -1112,10 +1072,8 @@ pub fn load_bundled_plus_extra(extra_path: &Path) -> Result<Vec<ProviderDefiniti
     Ok(bundled)
 }
 
-/// Result of a health probe: validates URL format, timeout, and classification.
-///
-/// `base_url` is redacted if it contained query secrets (e.g. `api_key=...`).
-/// `reason` never contains raw secrets.
+/// Result of a health probe; `base_url` and `reason` are redacted and
+/// never carry raw secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthProbeResult {
     /// Provider id as string.
@@ -1128,12 +1086,8 @@ pub struct HealthProbeResult {
     pub reason: String,
 }
 
-/// Health probe that validates URL format, timeout bounds, private policy,
-/// and redacts secrets without network.
-///
-/// Delegates to `crate::health` for bounded timeout and classification.
-/// No DNS, TLS, or HTTP request is performed in the default path; mock
-/// network variants are available via `crate::health::health_probe_with_mock`.
+/// Health probe validating URL format, timeout bounds, and private policy;
+/// no network in the default path (mocks via `crate::health`).
 pub fn health_probe(provider: &ProviderDefinition) -> HealthProbeResult {
     let cfg = crate::health::HealthConfig::default();
     let res = crate::health::health_probe(provider, &cfg);
@@ -1145,9 +1099,8 @@ pub fn health_probe(provider: &ProviderDefinition) -> HealthProbeResult {
     }
 }
 
-/// Validate a raw URL string without a provider (useful for preview).
-///
-/// Uses the same bounded, redacted validation as the provider probe.
+/// Validate a raw URL string without a provider; same bounded, redacted
+/// validation as the provider probe.
 pub fn health_probe_url(url: &str) -> HealthProbeResult {
     let cfg = crate::health::HealthConfig::default();
     let res = crate::health::health_probe_url(url, &cfg);
@@ -1212,10 +1165,8 @@ pub struct ApiKeySink {
     pub description: String,
 }
 
-/// Preview of where an ephemeral API key would be written.
-///
-/// Contains no secret, only the destination and auth style, with a
-/// `[REDACTED]` placeholder.
+/// Preview of where an ephemeral API key would be written: destination and
+/// auth style only, with a `[REDACTED]` placeholder, never the key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyPreview {
     /// Sink that would receive the key.
@@ -1228,13 +1179,8 @@ pub struct ApiKeyPreview {
     pub redacted: String,
 }
 
-/// Validate a raw API key value before placement (PRV-04).
-///
-/// - Must be non-empty and not contain control chars or NUL.
-/// - Must fit the 4 KiB cap.
-/// - Prefix check ONLY when the provider documents one via
-///   `auth.key_prefix` (per-provider documented prefix policy); the value
-///   itself is never echoed into the error.
+/// Validate a raw API key (PRV-04): non-empty, no controls/NUL, 4 KiB cap;
+/// prefix checked only when documented; the value never echoes.
 pub fn validate_api_key_value(provider: &ProviderDefinition, key: &str) -> Result<()> {
     if key.trim().is_empty() {
         return Err(CoreError::Validation {
@@ -1277,13 +1223,8 @@ pub fn validate_api_key_value(provider: &ProviderDefinition, key: &str) -> Resul
     Ok(())
 }
 
-/// OAuth/subscription/keychain login requirement (PRV-04).
-///
-/// When a harness's only credential surfaces are external secret stores
-/// (keychain/SSO), an API key cannot be placed by superai: the user must run
-/// the harness's own login command. Returns the typed
-/// [`CoreError::ExternalAuthRequired`] with harness instructions; superai
-/// never proxies or performs the login flow.
+/// OAuth/keychain login requirement (PRV-04): when a harness's only
+/// credential surfaces are external stores, the user must run its login.
 pub fn external_auth_requirement(adapter: &dyn Adapter) -> Option<CoreError> {
     let surfaces = adapter.config_surfaces();
     let has_external_store = surfaces.iter().any(|surface| {
@@ -1311,15 +1252,8 @@ pub fn external_auth_requirement(adapter: &dyn Adapter) -> Option<CoreError> {
     None
 }
 
-/// Resolve the harness-supported sink for `adapter`.
-///
-/// Inspects `adapter.config_surfaces()` and picks the first suitable
-/// `UserEditable` / `Instance` sink whose owned selectors indicate an API key
-/// field. For JSON surfaces the selector is that owned selector; for Env
-/// surfaces it is the env var name derived from the selector.
-///
-/// Never selects registry, logs, or `ExternalSecretStore` / `Sqlite` / `Keychain`
-/// surfaces.
+/// Resolve the harness-supported api-key sink: a writable surface with an
+/// api-key-shaped selector, else an env file; never registry/logs/keychain.
 pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
     let surfaces = adapter.config_surfaces();
     // Prefer a writable document surface with an api-key-shaped owned selector.
@@ -1362,37 +1296,33 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
             }
         }
     }
-    // Second, Env file under isolated root.
+    // Second, an env file under the isolated root.
     for surface in &surfaces {
         if surface.kind == DocumentKind::Env
             && matches!(
                 surface.ownership,
                 SurfaceOwnership::UserEditable | SurfaceOwnership::SuperaiCreated
             )
+            && matches!(
+                surface.scope,
+                crate::adapter::ConfigScope::Instance | crate::adapter::ConfigScope::User
+            )
         {
-            // Prefer Instance-scoped env files.
-            if surface.scope == crate::adapter::ConfigScope::Instance
-                || surface.scope == crate::adapter::ConfigScope::User
-            {
-                // Derive selector: first owned selector if any, else conventional var
-                let selector = surface
-                    .owned_selectors
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_owned());
-                return Ok(ApiKeySink {
-                    kind: ApiKeySinkKind::EnvFile,
-                    surface_id: surface.id.clone(),
-                    selector,
-                    description: format!("env file `{}` under isolated root", surface.id),
-                });
-            }
+            let selector = surface
+                .owned_selectors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_owned());
+            return Ok(ApiKeySink {
+                kind: ApiKeySinkKind::EnvFile,
+                surface_id: surface.id.clone(),
+                selector,
+                description: format!("env file `{}` under isolated root", surface.id),
+            });
         }
     }
-    // Third, wrapper env ref is allowed only if the harness explicitly declares
-    // wrapper/env file as credential storage via its surfaces. We do NOT invent
-    // a generic wrapper literal sink. If no config/env sink exists, return
-    // Unsupported with a reason.
+    // No generic wrapper literal sink is invented: without a declared
+    // config/env sink the placement is Unsupported.
     Err(CoreError::UnsupportedOperation {
         harness: adapter.id().to_string(),
         operation: "place_api_key".to_owned(),
@@ -1400,11 +1330,8 @@ pub fn resolve_api_key_sink(adapter: &dyn Adapter) -> Result<ApiKeySink> {
     })
 }
 
-/// Preview where an ephemeral key would be written (redacted).
-///
-/// Validates the key, resolves the harness-declared sink, and returns a
-/// description with `[REDACTED]` placeholder and auth style. The raw key
-/// never appears in the returned value or in logs.
+/// Preview where an ephemeral key would be written (redacted); the raw
+/// key never appears in the returned value or in logs.
 pub fn preview_api_key_placement(
     key: &RedactedString,
     provider: &ProviderDefinition,
@@ -1429,13 +1356,8 @@ pub fn preview_api_key_placement(
     })
 }
 
-/// Write an ephemeral API key only to the harness-supported sink.
-///
-/// Validates the key, resolves the sink, backs up the destination if it
-/// exists, writes through an atomic transaction preserving unmodelled keys,
-/// sets restrictive permissions (0o600 on unix), and drops the raw key
-/// after. The key is never written to instance/registry/provider/template
-/// records, wrapper literals, logs, or journal.
+/// Write an ephemeral key only to the harness-declared sink: backup when
+/// present, atomic write, 0o600 on unix; never registry/logs/wrapper literals.
 pub fn commit_api_key(
     key: &RedactedString,
     provider: &ProviderDefinition,
@@ -1452,7 +1374,6 @@ pub fn commit_api_key(
         destination: dest_path.display().to_string(),
         redacted: RedactedString::placeholder().to_owned(),
     };
-    // Ensure instance root exists.
     std::fs::create_dir_all(instance.config_root.as_path()).map_err(|e| {
         CoreError::InvalidPath {
             kind: "config_root".to_owned(),
@@ -1651,12 +1572,8 @@ fn write_env_file(dest: &Path, var: &str, secret: &str) -> Result<()> {
     Ok(())
 }
 
-/// Load provider definitions from a file or directory.
-///
-/// - If `path` is a file, parse it as JSON or YAML (by extension, fallback to try both).
-/// - If `path` is a directory, read every `*.json`, `*.yaml`, `*.yml` file inside non-recursively
-///   and merge results. Duplicate ids or normalized base URLs are rejected.
-/// - Every loaded definition is validated.
+/// Load definitions from a file (JSON/YAML) or a directory (every
+/// `*.json`/`*.yaml`/`*.yml` inside, non-recursive); all are validated.
 pub fn load_provider_defs(path: &Path) -> Result<Vec<ProviderDefinition>> {
     if !path.exists() {
         return Err(CoreError::InvalidPath {
@@ -1732,11 +1649,9 @@ fn load_from_file(path: &Path) -> Result<Vec<ProviderDefinition>> {
 }
 
 fn parse_json_providers(text: &str, path: &Path) -> Result<Vec<ProviderDefinition>> {
-    // Try vec first.
     if let Ok(vec) = serde_json::from_str::<Vec<ProviderDefinition>>(text) {
         return Ok(vec);
     }
-    // Try single.
     match serde_json::from_str::<ProviderDefinition>(text) {
         Ok(single) => Ok(vec![single]),
         Err(source) => Err(CoreError::Parse {
@@ -1811,9 +1726,8 @@ mod tests {
         crate::test_util::temp_dir_unique(&format!("provider-{name}"))
     }
 
-    /// Write a fake `claude` binary that answers `--version` with a parseable
-    /// version. Keeps the adapter's version gate hermetic: no real `claude`
-    /// install is probed on the host.
+    /// Write a fake `claude` binary answering `--version` parseably, so
+    /// the version gate never probes a real host install.
     fn write_fake_claude(dir: &Path) -> PathBuf {
         #[cfg(unix)]
         {
@@ -1901,7 +1815,6 @@ mod tests {
     #[test]
     fn data_only_adding_provider_requires_no_code_change() {
         let dir = tmp_dir("data-only");
-        // Two providers initially.
         for (id, url) in [
             ("prov-a", "https://a.example.com"),
             ("prov-b", "https://b.example.com"),
@@ -1912,7 +1825,6 @@ mod tests {
         let first = load_provider_defs(&dir).unwrap();
         assert_eq!(first.len(), 2);
 
-        // Add a synthetic third provider; no Rust edit.
         let new_json = single_provider_json("synthetic-new-99", "https://new.example.com");
         std::fs::write(dir.join("synthetic-new-99.json"), new_json).unwrap();
         let second = load_provider_defs(&dir).unwrap();
@@ -2096,7 +2008,6 @@ status: active
 
     #[test]
     fn no_hardcoded_provider_list() {
-        // Loading from an empty dir yields an empty vec; no built-ins inject.
         let dir = tmp_dir("empty");
         let out = load_provider_defs(&dir).unwrap();
         assert!(
@@ -2165,9 +2076,8 @@ status: active
                 p.id
             );
         }
-        // Ensure no secret VALUES in the bundled file. The placeholder/prefix
-        // policy strings legitimately contain `sk-...` shapes; a secret value
-        // is `sk-` followed by a long token run.
+        // Policy strings legitimately contain `sk-...` placeholders; a
+        // secret VALUE is `sk-` plus a long token run.
         let secret_value = |text: &str| contains_secret_shaped_value(text);
         let raw = BUNDLED_PROVIDERS_JSON;
         assert!(
@@ -2199,7 +2109,6 @@ status: active
         let merged = load_bundled_plus_extra(&dir).unwrap();
         assert_eq!(merged.len(), base_len + 1);
         assert!(merged.iter().any(|p| p.id.as_str() == "dummy-provider-999"));
-        // Duplicate across bundled and extra should be rejected (same id)
         let dup_path = dir.join("dup-dummy.json");
         let dup_json = single_provider_json("anthropic", "https://dup.example.com");
         std::fs::write(&dup_path, dup_json).unwrap();
@@ -2215,12 +2124,10 @@ status: active
     #[test]
     fn health_bounded_timeout_and_private_policy() {
         let prov = def("test-health-bounded", "https://api.example.com");
-        // Valid config should be healthy
         let good = crate::health::HealthConfig::default();
         let res = crate::health::health_probe(&prov, &good);
         assert!(res.valid);
         assert_eq!(res.status, crate::failure::HealthStatus::Healthy);
-        // Private host with bearer should fail when deny, succeed when allow
         let local = ProviderDefinition {
             protocol: Protocol::Other,
             ..def("local-bearer", "http://localhost:8080")
@@ -2245,7 +2152,6 @@ status: active
             "private allowed should be valid: {}",
             r_allow.reason
         );
-        // Timeout bounded
         assert!(crate::health::validate_timeout(Duration::from_millis(500)).is_err());
         assert!(crate::health::validate_timeout(Duration::from_secs(5)).is_ok());
         assert!(crate::health::validate_timeout(Duration::from_secs(31)).is_err());
@@ -2267,7 +2173,6 @@ status: active
         assert!(res.base_url_redacted.contains("[REDACTED]"));
         assert!(!res.reason.contains("sk-superai-test-sentinel-12345-fake"));
 
-        // Mock harness classification
         let sentinel = "sk-superai-test-sentinel-12345-fake";
         let body_with_sentinel = format!("rate limit {sentinel}");
         let mock_res =
@@ -2279,13 +2184,11 @@ status: active
             mock_res.reason
         );
 
-        // TLS, auth, etc.
         let tls =
             crate::health::health_probe_with_mock(&prov, &cfg, 200, "tls certificate error", None);
         assert_eq!(tls.status, crate::failure::HealthStatus::TlsError);
         let auth = crate::health::health_probe_with_mock(&prov, &cfg, 401, "unauthorized", None);
         assert_eq!(auth.status, crate::failure::HealthStatus::AuthError);
-        // Oversized
         let big = "x".repeat(cfg.max_bytes + 1);
         let over = crate::health::health_probe_with_mock(&prov, &cfg, 200, &big, None);
         assert_eq!(over.status, crate::failure::HealthStatus::Oversized);
@@ -2325,10 +2228,8 @@ status: active
     fn api_key_placement_only_to_declared_sink_and_redacted() {
         let dir = tmp_dir("api-key-sink");
         let inst = sample_instance(&dir, "work-sink");
-        // Hermetic version gate: `commit_api_key` enforces the adapter's
-        // version resolution, which otherwise probes whatever `claude` happens
-        // to be on PATH (none on CI). Pin a fake binary that answers
-        // `--version` so the gate sees a compatible harness deterministically.
+        // Hermetic version gate: without a pinned fake `claude`, the gate
+        // probes whatever happens to be on PATH (nothing on CI).
         let bin_dir = dir.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake_claude = write_fake_claude(&bin_dir);
@@ -2339,7 +2240,6 @@ status: active
         let sentinel = crate::abuse::SENTINEL;
         let key = RedactedString::new(sentinel);
 
-        // Resolve sink: must be config field for Claude Code
         let sink = resolve_api_key_sink(&adapter).unwrap();
         assert_eq!(sink.kind, ApiKeySinkKind::ConfigField);
         assert!(
@@ -2349,7 +2249,6 @@ status: active
         );
         assert!(!sink.selector.is_empty());
 
-        // Preview must be redacted, never contain sentinel
         let preview = preview_api_key_placement(&key, &provider, &adapter, &inst).unwrap();
         let preview_json = serde_json::to_string(&preview).unwrap();
         let preview_dbg = format!("{preview:?}");
@@ -2365,13 +2264,11 @@ status: active
         assert_eq!(preview.redacted, "[REDACTED]");
         assert!(!preview.destination.contains(sentinel));
 
-        // Commit must write only to sink, not to registry, and must be redacted in preview/result
         let commit_preview = commit_api_key(&key, &provider, &adapter, &inst).unwrap();
         let commit_json = serde_json::to_string(&commit_preview).unwrap();
         assert!(!commit_json.contains(sentinel));
         assert!(!format!("{commit_preview:?}").contains(sentinel));
 
-        // Destination file must contain secret (allowed) but preview/result never does
         let dest_path = inst.config_root.as_path().join(&sink.surface_id);
         assert!(
             dest_path.exists(),
@@ -2384,7 +2281,6 @@ status: active
             "dest should contain sentinel (allowed sink)"
         );
 
-        // But registry must not contain sentinel
         let reg_path = dir.join("registry.json");
         let mut reg = crate::registry::Registry::default();
         reg.insert(inst).unwrap();
@@ -2396,11 +2292,9 @@ status: active
         );
         assert!(!format!("{reg:?}").contains(sentinel));
 
-        // Backup exists and backup catalog does not leak (catalog debug)
         let backups = superai_config::backup::list_backups(&dest_path).unwrap();
         assert!(!format!("{backups:?}").contains(sentinel));
 
-        // Ensure permissions are restrictive on unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -2408,16 +2302,14 @@ status: active
             assert_eq!(perm, 0o600, "dest permissions should be 600, got {perm:o}");
         }
 
-        // ApiKey debug must be redacted
         assert!(!format!("{key:?}").contains(sentinel));
         assert_eq!(format!("{key}"), "[REDACTED]");
 
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// An overwritten sink keeps exactly one backup per commit (the mutation
-    /// boundary's pre-commit backup); duplicate copies would multiply
-    /// secret-bearing files on disk.
+    /// An overwritten sink keeps exactly one backup per commit; duplicates
+    /// would multiply secret-bearing files on disk.
     #[test]
     fn key_commit_takes_exactly_one_backup_per_overwrite() {
         let dir = tmp_dir("api-key-one-backup");
@@ -2518,7 +2410,6 @@ status: active
         reason = "health polish covers data-driven, bounded, redacted, classify, redirect in one test"
     )]
     fn health_polish_covers_data_driven_bounded_redacted_classified_and_redirect_stripping() {
-        // Data-driven: synthetic provider loaded from file, no Rust edit.
         let dir = tmp_dir("health-polish");
         let json = single_provider_json("synthetic-health-polish", "https://api.example.com");
         let path = dir.join("synthetic-health-polish.json");
@@ -2528,7 +2419,6 @@ status: active
         let prov = &loaded[0];
         assert_eq!(prov.id.as_str(), "synthetic-health-polish");
 
-        // Bounded timeout: valid bounds succeed, out-of-bounds fail.
         assert!(
             crate::health::HealthConfig::new(
                 crate::health::HealthProbeKind::HttpStatus,
@@ -2565,7 +2455,6 @@ status: active
         );
         assert_eq!(res.timeout_ms, 5000);
 
-        // Redacted: query secret never appears in result.
         let secret_url =
             "https://api.example.com?api_key=sk-superai-test-sentinel-12345-fake&model=foo";
         let secret_prov = ProviderDefinition {
@@ -2581,7 +2470,6 @@ status: active
         assert!(redacted_res.base_url_redacted.contains("[REDACTED]"));
         assert!(redacted_res.base_url_redacted.contains("model=foo"));
 
-        // Classify auth / rate-limit / TLS via mock harness.
         let ok = crate::health::health_probe_with_mock(prov, &cfg, 200, "all good", None);
         assert_eq!(ok.status, crate::failure::HealthStatus::Healthy);
         assert!(ok.valid);
@@ -2602,7 +2490,6 @@ status: active
         assert_eq!(tls.status, crate::failure::HealthStatus::TlsError);
         assert!(!tls.valid);
 
-        // Cross-host redirect stripping.
         let cross = crate::health::health_probe_with_mock(
             prov,
             &cfg,
@@ -2628,7 +2515,6 @@ status: active
             "https://a.example.com/y"
         ));
 
-        // Sentinel never leaks in reason.
         let sentinel = crate::abuse::SENTINEL;
         let body_with_sentinel = format!("rate limit {sentinel}");
         let leaked =
@@ -2662,7 +2548,6 @@ status: active
             protocols: vec![Protocol::OpenAiChat],
         }];
         def.validate().unwrap();
-        // Named variant resolves; unknown variant falls back to the default.
         assert_eq!(
             def.endpoint_for(Some("EU")),
             "https://eu.api.example.com/v1"
@@ -2672,7 +2557,6 @@ status: active
             "https://api.example.com/v1"
         );
         assert_eq!(def.endpoint_for(None), "https://api.example.com/v1");
-        // Protocol selection picks the variant advertising the protocol.
         assert_eq!(
             def.endpoint_for_protocol(Protocol::OpenAiChat),
             Some("https://eu.api.example.com/v1")
@@ -2684,7 +2568,6 @@ status: active
             Some("https://api.example.com/v1")
         );
 
-        // Duplicate variant names rejected.
         def.endpoints.push(EndpointVariant {
             name: "EU".to_owned(),
             base_url: "https://eu2.api.example.com".to_owned(),
@@ -2697,7 +2580,6 @@ status: active
                 .contains("duplicate endpoint")
         );
 
-        // Duplicate normalized URL vs the default endpoint rejected.
         def.endpoints = vec![EndpointVariant {
             name: "same".to_owned(),
             base_url: "https://api.example.com/v1/".to_owned(),
@@ -2710,7 +2592,6 @@ status: active
                 .contains("duplicate normalized")
         );
 
-        // Invalid variant URL rejected.
         def.endpoints = vec![EndpointVariant {
             name: "bad".to_owned(),
             base_url: "ftp://nope".to_owned(),
@@ -2761,13 +2642,11 @@ status: active
         def.auth.env_var_names = vec!["GOOD_NAME_1".to_owned()];
         def.auth.key_prefix = Some("pk-".to_owned());
         def.validate().unwrap();
-        // Prefix policy enforced at key validation; the key never echoes.
         assert!(validate_api_key_value(&def, "sk-wrongprefix").is_err());
         let err = validate_api_key_value(&def, "sk-wrongprefix-long-value").unwrap_err();
         let msg = format!("{err} {err:?}");
         assert!(!msg.contains("sk-wrongprefix"), "error leaked key: {msg}");
         assert!(validate_api_key_value(&def, "pk-correct").is_ok());
-        // No documented prefix -> no prefix enforcement.
         def.auth.key_prefix = None;
         assert!(validate_api_key_value(&def, "anything-goes").is_ok());
     }
@@ -2796,7 +2675,6 @@ status: active
         }];
         def.validate().unwrap();
 
-        // Duplicate ids.
         def.health_probes.push(def.health_probes[0].clone());
         assert!(
             def.validate()
@@ -2806,7 +2684,6 @@ status: active
         );
         def.health_probes.pop();
 
-        // Bad method.
         def.health_probes[0].method = Some("DELETE".to_owned());
         assert!(
             def.validate()
@@ -2816,7 +2693,6 @@ status: active
         );
         def.health_probes[0].method = None;
 
-        // Path suffix without leading slash.
         def.health_probes[0].path_suffix = "v1/models".to_owned();
         assert!(
             def.validate()
@@ -2833,14 +2709,12 @@ status: active
         );
         def.health_probes[0].path_suffix = "/v1/models".to_owned();
 
-        // Timeout out of bounds.
         def.health_probes[0].timeout_ms = Some(500);
         assert!(def.validate().unwrap_err().to_string().contains("timeout"));
         def.health_probes[0].timeout_ms = Some(30_001);
         assert!(def.validate().unwrap_err().to_string().contains("timeout"));
         def.health_probes[0].timeout_ms = Some(5000);
 
-        // Empty accepted status.
         def.health_probes[0].accepted_status = vec![];
         assert!(
             def.validate()
@@ -2852,7 +2726,6 @@ status: active
         assert!(def.validate().is_err());
         def.health_probes[0].accepted_status = vec![200];
 
-        // Auth reference without an auth style.
         def.auth_style = AuthStyle::None;
         assert!(
             def.validate()

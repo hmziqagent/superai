@@ -77,7 +77,6 @@ impl CopilotCliAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$COPILOT_HOME` or `~/.copilot`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -93,12 +92,10 @@ impl CopilotCliAdapter {
         Some(PathBuf::from(home).join(".copilot"))
     }
 
-    /// Build the settings.json path for a given config root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -496,7 +493,6 @@ impl Adapter for CopilotCliAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (copilot-cli.md 1.2: `~/.copilot/mcp-config.json` with `mcpServers`)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mcp-config.json",
@@ -507,7 +503,6 @@ impl Adapter for CopilotCliAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions/installed-plugins directories documented with mixed ownership; install contract unverified in corpus (copilot-cli.md)",

@@ -1,27 +1,16 @@
 //! QAL-13/QAL-14: goal-sentence and DoD ledgers as TESTED artifacts.
-//!
-//! Every master-plan §9 requirement row and §10 non-UI DoD checkbox must map
-//! to at least one existing test (or an explicit artifact citation). The
-//! check is bidirectional against the plan document (embedded at compile
-//! time), and every cited test name is verified to exist as a `#[test]` in
-//! the cited file, so renamed or deleted tests break the build, not just the
-//! docs. QAL-14 freshness ([`staleness_days`]) enforces the catalog's
-//! `last_verified` discipline against a recorded recheck date.
+//! Every cited test must exist as a `#[test]`, so renamed tests break the build.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Reference date for the freshness ledger (QAL-14). The pre-release recheck
-/// workflow updates this constant after re-verifying the catalog against the
-/// research docs; entries older than [`MAX_ENTRY_AGE_DAYS`] as of this date
-/// fail the freshness test.
+/// Reference date for the freshness ledger (QAL-14); updated by the
+/// pre-release recheck after re-verifying the catalog.
 pub const FRESHNESS_AS_OF: &str = "2026-09-18";
 
 /// Maximum tolerated age of a catalog `last_verified` date, in days, at the
 /// last recorded recheck.
 pub const MAX_ENTRY_AGE_DAYS: i64 = 365;
-
-// Evidence model
 
 /// A piece of evidence backing one ledger row.
 #[derive(Debug, Clone, Copy)]
@@ -63,9 +52,7 @@ fn verify_evidence_src(evidence: &Evidence, src: &str) -> Result<(), String> {
     match evidence {
         Evidence::Test { file, name } => {
             // The cited item must be a TEST, not a production fn sharing the
-            // name: a `#[test]` attribute must sit in the attribute lines
-            // directly above `fn <name>(` (interleaved cfg/expect attributes
-            // are walked over), so citations cannot drift onto non-test fns.
+            // name; the `#[test]` attribute must sit directly above `fn <name>(`.
             let needle = format!("fn {name}(");
             let mut attrs_above: Vec<&str> = Vec::new();
             let mut cited_is_test = false;
@@ -118,8 +105,6 @@ pub fn verify_evidence(evidence: &Evidence) -> Result<(), String> {
     let src = cached_source(evidence.file(), &mut cache)?;
     verify_evidence_src(evidence, &src)
 }
-
-// §9 ledger: goal.md requirement rows → owning tests
 
 /// One master-plan §9 row: the goal requirement sentence (must match the
 /// plan's table text exactly), plus its evidence.
@@ -351,8 +336,6 @@ pub const GOAL_ROWS: &[GoalRow] = &[
     },
 ];
 
-// §10 ledger: non-UI DoD checkboxes → owning tests
-
 /// One master-plan §10 checkbox: the 1-based checkbox number plus evidence.
 #[derive(Debug)]
 pub struct DodItem {
@@ -498,10 +481,8 @@ pub const DOD_ITEMS: &[DodItem] = &[
                 file: "src/skills.rs",
                 name: "copy_selected",
             },
-            // update is covered end-to-end by the git-pinned revision test;
-            // disable/remove by the distinction test. The production fn names
-            // (update_skill/disable_skill/remove_skill) are not tests and
-            // verify_evidence rejects them.
+            // update/disable/remove are covered end-to-end by the git-pinned
+            // and distinction tests; the production fn names are not tests.
             Evidence::Test {
                 file: "src/skills.rs",
                 name: "git_source_pins_revision_and_checkout_is_verified",
@@ -624,8 +605,6 @@ pub const DOD_ITEMS: &[DodItem] = &[
     },
 ];
 
-// §9/§10 document parsing (provenance of the rows themselves)
-
 /// Extract the §9 requirement sentences (first column of the goal-coverage
 /// table), skipping the header and separator rows.
 pub fn section9_requirements(plan: &str) -> Vec<String> {
@@ -677,8 +656,6 @@ pub fn section10_items(plan: &str) -> Vec<String> {
     items
 }
 
-// QAL-14: freshness helpers
-
 /// Parse `YYYY-MM-DD` into `(year, month, day)`.
 pub fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let mut parts = s.trim().split('-');
@@ -725,9 +702,8 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// The §9 ledger covers EXACTLY the plan's requirement rows, every plan
-    /// row has an entry, and no ledger entry is orphaned. Rewording a plan
-    /// row or deleting its tests fails here (`DoD` #1).
+    /// The §9 ledger covers exactly the plan's rows, no orphans, no missing;
+    /// rewording a row or deleting its tests fails here.
     #[test]
     fn goal_ledger_covers_every_section9_row() {
         let plan_rows = section9_requirements(MASTER_PLAN);
@@ -809,10 +785,8 @@ mod tests {
         }
     }
 
-    /// Layering is data-checkable: superai-config depends on nothing in this
-    /// workspace, superai-core depends only on superai-config, and only the
-    /// L3 CLI depends upward. No interface crate exists below L3 (`DoD` #14,
-    /// §9 layering rows).
+    /// Layering: config depends on nothing, core only on config, and only
+    /// the CLI depends upward; no interface crate exists below L3.
     #[test]
     fn dependency_direction_is_config_core_cli() {
         let config_toml =
@@ -853,9 +827,8 @@ mod tests {
         }
     }
 
-    /// `DoD` #15 / `§9` no-proxy-no-vault rows: the forbidden runtime concepts
-    /// appear in no crate source. Tokens are assembled from halves at runtime
-    /// so this guard file never contains the verbatim strings it scans for.
+    /// The forbidden runtime concepts appear in no crate source. Tokens are
+    /// assembled from halves so this file never contains what it scans for.
     #[test]
     fn no_proxy_vault_oauth_or_chat_runtime_tokens_in_sources() {
         let forbidden: Vec<String> = [
@@ -908,8 +881,6 @@ mod tests {
         }
     }
 
-    // ---- QAL-14: freshness ----
-
     #[test]
     fn ymd_parsing_and_civil_days() {
         assert_eq!(parse_ymd("2026-08-25"), Some((2026, 8, 25)));
@@ -917,7 +888,6 @@ mod tests {
         assert_eq!(parse_ymd("2026-00-10"), None);
         assert_eq!(parse_ymd("not-a-date"), None);
         assert_eq!(parse_ymd("2026-08"), None);
-        // Epoch and known offsets.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(
             days_from_civil(2026, 1, 1),
@@ -933,11 +903,8 @@ mod tests {
         assert_eq!(staleness_days("bogus", "2026-09-01"), None);
     }
 
-    /// QAL-13 ledger completeness in the research direction: every harness
-    /// research document under `docs/harness-configs/` (the README ledger
-    /// itself excepted) must be claimed by at least one catalog entry's
-    /// `research_doc`, a new research file without a ledger entry fails
-    /// here instead of silently shipping unresearched.
+    /// QAL-13 ledger completeness in the research direction: every research
+    /// doc under `docs/harness-configs/` must be claimed by a catalog entry.
     #[test]
     fn research_files_have_ledger_entries() {
         let docs = manifest_root().join("../../docs/harness-configs");
@@ -969,11 +936,8 @@ mod tests {
         );
     }
 
-    /// QAL-14 freshness gate: every catalog entry carries a parseable
-    /// `last_verified` that is neither in the future nor older than
-    /// [`MAX_ENTRY_AGE_DAYS`] as of the recorded recheck date, and its
-    /// research document exists. The pre-release recheck workflow updates
-    /// [`FRESHNESS_AS_OF`] and re-runs this test.
+    /// QAL-14 freshness gate: every entry's `last_verified` parses, is not
+    /// future-dated, and is within [`MAX_ENTRY_AGE_DAYS`] of [`FRESHNESS_AS_OF`].
     #[test]
     fn catalog_freshness_within_policy_window() {
         for entry in crate::harness_catalog::ENTRIES {

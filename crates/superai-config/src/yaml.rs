@@ -1,15 +1,5 @@
-//! YAML configs: anchors, merge keys, scalars, flow style, duplicate handling.
-//!
-//! Preservation contract (DOC-06): a `serde`-based writer normalizes
-//! comments, anchors, tags, scalar style, and document markers, and lexical
-//! detection of that cannot be made hole-free, so every changing write to
-//! an existing YAML file is refused with
-//! [`ConfigError::LossyWrite`](crate::error::ConfigError::LossyWrite);
-//! only creating a missing file is allowed. No-op edits never write, so
-//! byte identity is preserved. The `serde` layer resolves aliases (anchor
-//! names are lost), so alias-aware mutation is rejected. Duplicate keys
-//! are rejected strict; merge keys (`<<: *anchor`) stay an ordinary `<<`
-//! key and are not expanded.
+//! Strict YAML reads; every changing write to an existing file is refused
+//! with `LossyWrite` (DOC-06): the writer cannot preserve lexical content.
 
 use std::path::Path;
 
@@ -138,13 +128,8 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{FEFF}').unwrap_or(text)
 }
 
-/// Refuse every changing write to an existing YAML file (DOC-06).
-///
-/// The normalized writer cannot preserve comments, anchors, aliases, tags,
-/// scalar style, or document markers, and scanner-based detection of that
-/// material keeps growing blind spots (plain-scalar quotes; non-`\n` line
-/// breaks libyaml honors), so the gate is unconditional: existing YAML files
-/// are read-only until a lexically preserving codec exists.
+/// Existing YAML is read-only (DOC-06): the writer drops comments, anchors,
+/// tags, scalar style, and markers, and lexical detection cannot be hole-free.
 fn ensure_lossless_write(path: &Path) -> Result<()> {
     match std::fs::read_to_string(path) {
         Ok(_) => Err(ConfigError::lossy_write(path, "yaml")),
@@ -153,9 +138,8 @@ fn ensure_lossless_write(path: &Path) -> Result<()> {
     }
 }
 
-/// Parse `text` strictly as YAML: reject duplicate keys via `StrictValue`.
-///
-/// Multiple documents and tags that do not map to `Value` are errors.
+/// Strict parse: duplicate keys rejected; multiple documents and
+/// non-`Value`-mappable tags are errors.
 pub(crate) fn parse_strict_raw(text: &str) -> std::result::Result<Value, yaml_serde::Error> {
     yaml_serde::from_str::<StrictValue>(strip_bom(text)).map(|v| v.0)
 }
@@ -167,12 +151,8 @@ fn parse_strict(text: &str, path: &Path) -> Result<Value> {
     })
 }
 
-/// Read a YAML config fresh from disk. A missing file reads as an empty object.
-///
-/// Strict: duplicate keys rejected, key order preserved. The root must be an
-/// object; use [`load_value`] for arbitrary roots. Comments, anchors, aliases,
-/// and tags are accepted on read but never written back; multiple documents
-/// are rejected.
+/// Read fresh; strict, key order preserved, root must be an object
+/// (use [`load_value`] for other roots); multiple documents rejected.
 pub fn load(path: &Path) -> Result<Map<String, Value>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -193,11 +173,8 @@ pub fn load(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
-/// Read a YAML config fresh from disk, preserving an arbitrary root type.
-///
-/// Strict duplicate-key handling as in [`load`]. A missing file reads as an
-/// empty object (to keep `load`/`load_value` consistent); callers that need
-/// to distinguish missing from empty should check `path.exists()` before calling.
+/// Read fresh preserving any root; missing reads as an empty object, so
+/// distinguish missing via `path.exists()`.
 pub fn load_value(path: &Path) -> Result<Value> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -212,13 +189,8 @@ pub fn load_value(path: &Path) -> Result<Value> {
     parse_strict(&text, path)
 }
 
-/// Write `config` to `path` as normalized YAML, creating parent directories
-/// as needed.
-///
-/// DOC-06 write policy: every changing write to an existing YAML file is
-/// refused with [`ConfigError::LossyWrite`]; only creating a missing file is
-/// allowed, and the gate runs before any disk mutation. No-op edits should go
-/// through [`edit`], which never writes.
+/// Write normalized YAML; every changing write to an existing file is
+/// refused with `LossyWrite` before any disk mutation (DOC-06).
 pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     ensure_lossless_write(path)?;
 
@@ -239,10 +211,7 @@ pub fn store(path: &Path, config: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-/// Write an arbitrary YAML `value` to `path` as normalized YAML.
-///
-/// Same gate as [`store`] (the target must be missing) and the same mutation
-/// boundary; this entry point preserves a non-object root for raw-editor use.
+/// [`store`] for any root; same gate and boundary.
 pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     ensure_lossless_write(path)?;
 
@@ -263,11 +232,8 @@ pub fn store_value(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Read fresh, apply `edit`, write back only if the value changed.
-///
-/// No-op edits leave the file byte-identical. Every changing edit on an
-/// existing file is refused with [`ConfigError::LossyWrite`]; a missing file
-/// is created.
+/// Read fresh, apply `edit`, write back only if changed; changing edits on
+/// existing files are refused, missing files are created.
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Map<String, Value>),
@@ -281,11 +247,7 @@ where
     store(path, &config)
 }
 
-/// Read fresh as [`Value`], apply `edit`, write back only if changed.
-///
-/// Preserves an arbitrary root type. No-op edits leave the file
-/// byte-identical; changing edits on an existing file are refused (see
-/// [`edit`]).
+/// [`edit`] over [`Value`]; no-ops stay byte-identical, changes refused.
 pub fn edit_value<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Value),
@@ -360,7 +322,6 @@ mod tests {
             Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
             other => panic!("expected LossyWrite, got {other:?}"),
         }
-        // Refusal leaves the file, comments included, byte-identical.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
     }
 
@@ -390,10 +351,7 @@ mod tests {
 
     #[test]
     fn plain_scalar_quotes_do_not_hide_comments() {
-        // Judge round-1 finding: apostrophes inside plain scalars used to open
-        // phantom quote state and swallow a following real comment. Exercised
-        // through `store` so every case reaches the gate regardless of
-        // whether the bytes also parse.
+        // Apostrophes are legal inside plain scalars; every case must reach the gate.
         let cases = [
             "title: it's fine\n# real comment\nb: 2\n",
             "x: don't\n# between\ny: can't\n",
@@ -419,9 +377,7 @@ mod tests {
 
     #[test]
     fn plain_scalar_apostrophe_edit_refuses_and_keeps_comments() {
-        // The primary judge case, end to end through `edit`: the file parses
-        // (apostrophes are legal in plain scalars), so only the write gate
-        // stands between the comments and destruction.
+        // The file parses, so only the write gate stands between the comments and destruction.
         let yaml = "title: it's fine\n# real comment\nb: 2\n";
         let path = scratch("apostrophe.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -441,8 +397,6 @@ mod tests {
 
     #[test]
     fn quoted_scalars_refuse_changing_writes() {
-        // Quoted scalar style is normalized away by the writer, so quoted
-        // files refuse like every other existing YAML target.
         let yaml = "a: \"quoted\"\nb: 2\n";
         let path = scratch("quoted.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -472,11 +426,8 @@ mod tests {
 
     #[test]
     fn store_refuses_any_existing_target() {
-        // The gate is unconditional: comment-bearing, plain, and
-        // line-break-variant files alike refuse. Line breaks CR, NEL (U+0085),
-        // LS (U+2028), and PS (U+2029) are valid YAML breaks for libyaml and
-        // defeated the round-2 scanner; under the unconditional policy they
-        // are covered by construction.
+        // CR, NEL (U+0085), LS (U+2028), and PS (U+2029) are valid YAML line
+        // breaks for libyaml; the unconditional gate covers them by construction.
         let cases = [
             "# top comment\na: 1\n",
             "a: 1\nb: 2\n",
@@ -494,7 +445,6 @@ mod tests {
                 Err(ConfigError::LossyWrite { format, .. }) => assert_eq!(format, "yaml"),
                 other => panic!("expected LossyWrite for {original:?}, got {other:?}"),
             }
-            // Refusal is total: no file changes, no backup.
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
                 original,
@@ -507,9 +457,8 @@ mod tests {
 
     #[test]
     fn lone_cr_comment_file_refuses_changing_edit() {
-        // Judge round-2 repro, end to end through `edit`: libyaml accepts lone
-        // CR as a line break, so this file loads fine, and the changing edit
-        // must still refuse rather than destroy the CR-delimited comment.
+        // libyaml accepts lone CR as a line break, so this file loads fine;
+        // the edit must still refuse rather than destroy the comment.
         let yaml = "a: 1\r# real user comment\rb: 2\r";
         let path = scratch("lone_cr.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -548,7 +497,6 @@ mod tests {
 
     #[test]
     fn store_allows_missing_target() {
-        // Creation: there is no prior content to destroy.
         let path = scratch("created.yaml");
         let mut map = Map::new();
         map.insert("a".into(), Value::Number(1.into()));
@@ -576,7 +524,6 @@ mod tests {
         // yaml_serde treats << as ordinary key with duplicated map value, not merged
         // This matches "do not expand anchors" policy.
         let dev = &v["development"];
-        // Should have << key with adapter/host inside, not merged at top level
         assert!(dev.get("<<").is_some() || dev.get("adapter").is_some());
         if let Some(merged) = dev.get("<<") {
             assert_eq!(merged["adapter"], Value::String("postgres".into()));
@@ -617,7 +564,6 @@ mod tests {
     fn multiple_documents_are_rejected() {
         let yaml = "a: 1\n---\nb: 2\n";
         let err = parse_strict_raw(yaml).unwrap_err();
-        // yaml_serde error for multiple documents
         assert!(
             err.to_string().contains("more than one document")
                 || err.to_string().contains("document"),
@@ -634,7 +580,6 @@ mod tests {
         assert_eq!(v["a"], Value::String("123".into()));
         assert_eq!(v["b"], Value::Number(123.into()));
         assert_eq!(v["c"], Value::String("123".into()));
-        // Round-trip keeps distinction via quoting
         let path = scratch("quoted.yaml");
         std::fs::write(&path, "a: \"123\"\nb: 123\n").unwrap();
         let map = load(&path).unwrap();
@@ -649,7 +594,6 @@ mod tests {
         // yaml_serde errors on tags when deserializing to Value
         // serde-saphyr would strip tag; we accept either but must not silently mis-parse
         if let Ok(v) = res {
-            // If parser stripped tag, value should still be "hello"
             assert_eq!(v["value"], Value::String("hello".into()));
         } else {
             let err = res.unwrap_err();
@@ -659,9 +603,7 @@ mod tests {
 
     #[test]
     fn changing_edit_refused_but_unmodelled_keys_still_readable() {
-        // Under the read-only policy the edit refuses, so preservation of
-        // unmodelled keys is expressed the only honest way: nothing is lost,
-        // because nothing is written.
+        // Preservation is expressed the only honest way: nothing is written.
         let path = scratch("roundtrip.yaml");
         let original = "zzz: 1\nmodel: opus\naaa:\n  nested: true\n";
         std::fs::write(&path, original).unwrap();
@@ -689,7 +631,6 @@ mod tests {
         edit(&path, |_| {}).unwrap();
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after, "no-op must be byte identical");
-        // Ensure no backup created for no-op
         let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(std::result::Result::ok)
@@ -736,8 +677,6 @@ mod tests {
 
     #[test]
     fn refused_write_leaves_no_backup() {
-        // With changing writes refused, no backup may appear either: the gate
-        // runs before any disk mutation.
         let path = scratch("backed.yaml");
         let original = "model: opus\n";
         std::fs::write(&path, original).unwrap();

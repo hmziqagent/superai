@@ -1,6 +1,5 @@
 //! Qwen Code adapter: relocated-root via `QWEN_HOME`/`QWEN_CODE_*`; layered
 //! JSON settings, env, and MCP surfaces under the config root.
-//! Research source: `docs/harness-configs/qwen-code.md` (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -86,7 +85,6 @@ impl QwenCodeAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$QWEN_HOME` or `~/.qwen`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -102,12 +100,10 @@ impl QwenCodeAdapter {
         Some(PathBuf::from(home).join(".qwen"))
     }
 
-    /// Build the settings.json path for a given config root.
     fn settings_path_for_root(root: &Path) -> PathBuf {
         root.join("settings.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -521,7 +517,6 @@ impl Adapter for QwenCodeAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (qwen-code.md 5: `mcpServers` in settings.json; `qwen mcp add --scope project` writes the project tier; httpUrl > url > command)
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "settings.json",
@@ -532,7 +527,6 @@ impl Adapter for QwenCodeAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (qwen-code.md)")
     }

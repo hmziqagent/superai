@@ -1,6 +1,5 @@
-//! `MiMo` adapter: relocated-root via `MIMOCODE_HOME`, primary writable
-//! surface `mimocode.jsonc` (JSONC) with inline `plugin`/`mcp`.
-//! Research source: `docs/harness-configs/mimo-code.md` (last verified 2026-08-25).
+//! `MiMo` adapter: relocated root via `MIMOCODE_HOME`, writable
+//! `mimocode.jsonc` with inline `plugin`/`mcp`.
 
 use std::path::{Path, PathBuf};
 
@@ -77,7 +76,6 @@ impl MimoAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$MIMOCODE_HOME` or `~/.config/mimocode`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -93,17 +91,14 @@ impl MimoAdapter {
         Some(PathBuf::from(home).join(".config").join("mimocode"))
     }
 
-    /// Build the mimocode.jsonc path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("mimocode.jsonc")
     }
 
-    /// Build the mimocode.json fallback path.
     fn config_json_path_for_root(root: &Path) -> PathBuf {
         root.join("mimocode.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -516,7 +511,7 @@ impl Adapter for MimoAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (mimo-code.md: `mcp` record of Local/Remote/disabled in mimocode.jsonc)
+    /// `mcp` record (Local/Remote/disabled) inside mimocode.jsonc.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "mimocode.jsonc",
@@ -527,7 +522,6 @@ impl Adapter for MimoAdapter {
         ).with_read_only("jsonc writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "plugin Spec[] key documented in mimocode.jsonc (npm/URL/local) but writes to the JSONC config refuse and plugin state is opaque (mimo-code.md)",
@@ -923,9 +917,8 @@ mod tests {
 
     #[test]
     fn fixture_changing_edit_refused_and_bytes_preserved() {
-        // codec-honesty (DOC-05): the fixture carries comments and trailing
-        // commas, so a changing edit is refused instead of normalizing the
-        // file; the on-disk bytes (foreign keys included) survive verbatim.
+        // The fixture carries comments and trailing commas, so a changing
+        // edit is refused; the on-disk bytes survive verbatim.
         let path = fixture_path("mimocode.foreign.jsonc");
         assert!(path.exists(), "fixture missing: {}", path.display());
         let original = superai_config::jsonc::load(&path).unwrap();

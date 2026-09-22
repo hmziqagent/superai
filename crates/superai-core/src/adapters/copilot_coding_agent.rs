@@ -1,6 +1,5 @@
-//! Copilot Coding Agent adapter: `Unsupported`, cloud-owned (distinct from
-//! Copilot CLI). Research source: `docs/harness-configs/copilot-cli.md` annex
-//! (last verified 2026-08-25).
+//! Copilot Coding Agent adapter: `Unsupported`, cloud-owned (distinct from Copilot CLI).
+//! Research source: `docs/harness-configs/copilot-cli.md` annex (last verified 2026-08-25).
 
 use std::path::{Path, PathBuf};
 
@@ -38,8 +37,7 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// Unsupported reason: cloud-owned.
 pub const UNSUPPORTED_REASON: &str = "cloud-owned repo/org settings (github.com settings → Copilot → Coding agent, AGENTS.md/copilot-instructions.md, copilot-setup-steps.yml Actions workflow, org policy), no local mutation, no relocatable root, no MCP/skills local: use Copilot CLI (`copilot-cli`) for local isolation";
 
-/// Cloud-owned: every operation except `detect`/`scan_candidates` returns
-/// `UnsupportedOperation`; detection probes `gh` plus repo cloud hints only.
+/// Cloud-owned: all ops but `detect`/`scan_candidates` return `UnsupportedOperation`.
 #[derive(Debug, Clone)]
 pub struct CopilotCodingAgentAdapter {
     id: HarnessId,
@@ -67,7 +65,6 @@ impl CopilotCodingAgentAdapter {
         UNSUPPORTED_REASON
     }
 
-    /// Build detection evidence about cloud-owned repo/org settings and local hints.
     #[expect(clippy::unused_self, reason = "uses adapter constants via Self")]
     fn collect_config_evidence(&self, evidence: &mut Vec<String>) {
         evidence.push(format!("unsupported: {UNSUPPORTED_REASON}"));
@@ -346,12 +343,10 @@ impl Adapter for CopilotCodingAgentAdapter {
         Vec::new()
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some("cloud-only harness; no local MCP configuration surface (Unsupported ledger state)")
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("cloud-only harness; no local plugin mechanism (Unsupported ledger state)")
     }

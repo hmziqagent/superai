@@ -1,8 +1,5 @@
-//! Core raw editor: harness-aware wrapper over `superai_config::raw_editor`.
-//!
-//! Provides interface-neutral read/validate/diff/commit that enforces
-//! harness version and surface ownership policies before delegating to the
-//! config-layer backend. No interface types are introduced.
+//! Core raw editor: harness-aware wrapper over `superai_config::raw_editor`,
+//! enforcing version and surface-ownership policy before delegating.
 
 use std::path::{Path, PathBuf};
 
@@ -14,12 +11,8 @@ use crate::error::{CoreError, Result};
 
 use superai_config::raw_editor::validate;
 
-/// Interface-agnostic raw editor service for core.
-///
-/// Wraps the config-layer `RawEditor`, enforcing harness version and
-/// surface-ownership policies before delegating. Disk is the truth on every
-/// `open`; `validate` never touches disk; `commit` validates, checks
-/// conflict, backs up, atomically replaces, and verifies.
+/// Interface-agnostic raw editor service wrapping the config layer; disk
+/// is truth on every `open`, `commit` backs up and atomically replaces.
 #[derive(Debug, Clone, Default)]
 pub struct RawEditor {
     inner: superai_config::raw_editor::RawEditor,
@@ -33,9 +26,7 @@ impl RawEditor {
         }
     }
 
-    /// Open `path` fresh from disk, detecting kind via `DocumentKind::from_path`.
-    ///
-    /// Returns a neutral `SourceDocument` envelope. Missing file is an error.
+    /// Open `path` fresh from disk; a missing file is an error.
     pub fn open(&self, path: &Path) -> Result<superai_config::document::SourceDocument> {
         self.inner.open(path).map_err(CoreError::Config)
     }
@@ -111,24 +102,18 @@ impl RawEditor {
     }
 }
 
-/// Read a document fresh from disk, detecting kind via extension.
-///
-/// Delegates to `superai_config::raw_editor::read` and maps errors to
-/// `CoreError`.
+/// Read a document fresh from disk, detecting kind via extension; errors
+/// map to `CoreError`.
 pub fn read(path: &Path) -> Result<RawDocument> {
     superai_config::raw_editor::read(path).map_err(CoreError::Config)
 }
 
-/// Produce semantic ops, lexical diff, and redaction spans for `old` vs `new`.
-///
-/// Delegates to `superai_config::raw_editor::diff`.
+/// Semantic ops, lexical diff, and redaction spans for `old` vs `new`.
 pub fn diff(old: &[u8], new: &[u8], kind: ConfigKind) -> DiffResult {
     superai_config::raw_editor::diff(old, new, kind)
 }
 
 /// Commit `new_content` to `path` after validation and conflict check.
-///
-/// Delegates to `superai_config::raw_editor::commit`.
 pub fn commit(
     path: &Path,
     new_content: &[u8],
@@ -148,11 +133,8 @@ pub fn commit_with_snapshot(
         .map_err(CoreError::Config)
 }
 
-/// Find the adapter surface whose id or fallback hint appears in `path`.
-///
-/// Mirrors the matching used by [`commit_for_adapter`]: the most specific
-/// surface whose id (case-insensitive) is contained in the path, or whose
-/// non-empty path-resolver fallback is contained in it.
+/// The adapter surface whose id (case-insensitive) or non-empty fallback
+/// hint appears in `path`; mirrors the matching in [`commit_for_adapter`].
 pub fn surface_for_path(
     adapter: &dyn Adapter,
     path: &Path,
@@ -172,13 +154,8 @@ pub fn surface_for_path(
     None
 }
 
-/// Validate `content` for `path` against the surface schema the adapter
-/// declares for the matching surface (HAD-03).
-///
-/// Syntax + semantic + deprecation diagnostics, each attributed to the
-/// harness and surface. When no surface matches, or the matching surface
-/// declares no schema, plain syntax diagnostics for the detected kind are
-/// returned. Never touches disk.
+/// Validate `content` against the surface schema the adapter declares for
+/// `path` (HAD-03); falls back to plain syntax diagnostics; never touches disk.
 pub fn validate_for_adapter(
     adapter: &dyn Adapter,
     path: &Path,
@@ -193,11 +170,8 @@ pub fn validate_for_adapter(
     }
 }
 
-/// Commit that also enforces harness version and surface ownership.
-///
-/// Checks `adapter.version_resolution().compatible` and the target surface's
-/// kind/ownership before delegating to the config backend. Wrong version and
-/// read-only internal/keychain surfaces are blocked without touching disk.
+/// Commit enforcing harness version and surface ownership: wrong version
+/// and read-only internal/keychain surfaces are blocked before disk.
 pub fn commit_for_adapter(
     path: &Path,
     new_content: &[u8],
@@ -279,9 +253,8 @@ pub fn commit_for_adapter(
     commit(path, new_content, expected_digest)
 }
 
-/// Era-conflict and semantic-schema gates shared by the adapter-aware commit
-/// (HAD-05 step 5 + HAD-03). Both refuse before any disk mutation, with
-/// adapter-attributed diagnostics.
+/// Era-conflict and semantic-schema gates (HAD-05 step 5 + HAD-03); both
+/// refuse before any disk mutation with adapter-attributed diagnostics.
 fn surface_gates_for_adapter(
     path: &Path,
     new_content: &[u8],
@@ -352,17 +325,8 @@ pub struct RawOpenReport {
 }
 
 impl RawEditor {
-    /// Open `path` through the adapter's surface identity and policy
-    /// (RAW-01).
-    ///
-    /// - The path must resolve to one of the adapter's declared surfaces;
-    ///   arbitrary paths outside the harness's surfaces are refused.
-    /// - Internal stores (SQLite/keychain/executable/opaque, external secret
-    ///   stores, harness-managed files) open with a read-only reason and NO
-    ///   content.
-    /// - The caller's `expected_version` input is compared against the
-    ///   adapter's resolution and surfaced as a mismatch diagnostic (it does
-    ///   not block the read).
+    /// Open through the adapter's surface identity and policy (RAW-01):
+    /// undeclared paths refuse; internal stores open read-only, NO content.
     pub fn open_for_adapter(
         &self,
         adapter: &dyn Adapter,
@@ -372,9 +336,8 @@ impl RawEditor {
         open_for_adapter(adapter, path, expected_version)
     }
 
-    /// Open an explicit path for advanced local editing after path-policy
-    /// validation (RAW-01): absolute, normalized, and not an internal
-    /// db/keychain/opaque store. No adapter surface is required.
+    /// Open an explicit path after path-policy validation (RAW-01):
+    /// absolute, normalized, not an internal store.
     pub fn open_explicit(&self, path: &Path) -> Result<RawDocument> {
         open_explicit(path)
     }
@@ -498,9 +461,7 @@ pub struct DraftValidation {
 
 impl RawEditor {
     /// Validate a draft against the adapter's surface schema and version
-    /// gate (RAW-02): size + encoding + syntax + adapter semantic schema +
-    /// deprecated/owned-key identification + root/type constraints, plus the
-    /// harness version gate, all at VALIDATE time, never touching disk.
+    /// gate (RAW-02), all at VALIDATE time, never touching disk.
     pub fn validate_draft(
         &self,
         adapter: &dyn Adapter,
@@ -556,18 +517,13 @@ pub struct AdapterDiffResult {
     /// Scope/precedence warning: other surfaces may override this file.
     pub scope_warning: Option<String>,
     /// Template-owned fields the draft diverges on (reported, never
-    /// forbidden; disk is authoritative and users may intentionally
-    /// diverge).
+    /// forbidden; users may intentionally diverge).
     pub template_owned_changes: Vec<superai_config::raw_editor::SemanticOp>,
 }
 
 impl RawEditor {
-    /// Diff `old` vs `new` with the adapter's surface context (RAW-03).
-    ///
-    /// `template_owned` lists the selector prefixes a template wrote (from
-    /// the instance's template patches); changed selectors inside them are
-    /// marked as template-owned divergence. `None` marks no template
-    /// ownership knowledge.
+    /// Diff with the adapter's surface context (RAW-03); selectors inside
+    /// `template_owned` prefixes mark template-owned divergence.
     pub fn diff_for_adapter(
         &self,
         adapter: &dyn Adapter,
@@ -619,9 +575,8 @@ pub fn diff_for_adapter(
             adapter.id()
         )
     });
-    // Template-owned divergence: semantic ops touching selectors the
-    // template owns (or, without template knowledge, the adapter's owned
-    // selectors as the managed-field proxy).
+    // Template-owned divergence: ops touching selectors the template owns,
+    // or the adapter's owned selectors when template knowledge is absent.
     let template_owned_changes: Vec<_> = base
         .semantic_ops
         .iter()
@@ -679,10 +634,7 @@ impl RawEditor {
     }
 
     /// Create a missing config file with rollback (RAW-05): validates the
-    /// initial document (including the format's empty-document rule),
-    /// refuses when the adapter does not permit creating the surface, and
-    /// stages the creation through the compensated transaction so a failure
-    /// removes only the created file and empty owned parents.
+    /// initial document and refuses surfaces the adapter does not permit.
     pub fn create_file_for_adapter(
         &self,
         adapter: &dyn Adapter,
@@ -795,12 +747,8 @@ pub struct RebaseReport {
 }
 
 impl RawEditor {
-    /// Reopen `path` under the adapter's CURRENT schema resolution and mark
-    /// the draft's affected keys/spans for MANUAL rebase (RAW-07).
-    ///
-    /// The draft text is never auto-applied under the new schema: the report
-    /// carries the semantic deltas between the draft and the fresh on-disk
-    /// document, plus a lexical diff, and the caller decides the merge.
+    /// Reopen under the adapter's CURRENT schema resolution and mark the
+    /// draft's affected keys for MANUAL rebase (RAW-07); nothing auto-applies.
     pub fn reopen_rebase(
         &self,
         adapter: &dyn Adapter,
@@ -1019,7 +967,6 @@ mod tests {
             CoreError::UnsupportedVersion { .. } => {}
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
-        // File untouched
         let after = std::fs::read(&path).unwrap();
         assert_eq!(after, br#"{"a":1}"#);
         drop(std::fs::remove_file(&path));
@@ -1046,7 +993,6 @@ mod tests {
         let path = unique_scratch("adapter-ok", ".json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let adapter = ReadOnlyAdapter; // this adapter has keychain surface, not json, so json path is allowed
-        // Use a path that does not match keychain surface, should succeed
         let json_path = unique_scratch("adapter-ok-json", ".json");
         std::fs::write(&json_path, br#"{"a":1}"#).unwrap();
         let res = commit_for_adapter(&json_path, br#"{"a":2}"#, None, &adapter);
@@ -1064,9 +1010,8 @@ mod tests {
 
     #[test]
     fn jsonc_and_yaml_commits_are_byte_verbatim() {
-        // codec-honesty (DOC-05/DOC-06): the raw byte committer never
-        // re-serializes, so JSONC/YAML commits preserve caller bytes exactly;
-        // the lossy-write refusal lives in the value codecs, not here.
+        // The raw byte committer never re-serializes: JSONC/YAML commits
+        // preserve caller bytes exactly; lossy refusal lives in value codecs.
         let jsonc_path = unique_scratch("verbatim", ".jsonc");
         let new_jsonc: &[u8] = b"{\"a\":1, // keep\n}";
         let report = commit(&jsonc_path, new_jsonc, None).unwrap();
@@ -1085,9 +1030,8 @@ mod tests {
 
     use crate::adapter::{RootShape, SurfaceSchema};
 
-    /// Adapter with a compatible version, writable TOML + JSON surfaces, a
-    /// table-root schema with typed owned keys, and a profile-era conflict
-    /// detector (mirrors the codex-cli declaration).
+    /// Adapter with a compatible version, writable TOML + JSON surfaces,
+    /// a table-root schema, and a profile-era conflict detector.
     #[derive(Debug)]
     struct SchemaEraAdapter;
 
@@ -1223,7 +1167,6 @@ mod tests {
         let path = surface_scratch("schema-root", "settings.json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let adapter = SchemaEraAdapter;
-        // A JSON array root violates the declared object root shape.
         let err = commit_for_adapter(&path, b"[1, 2]", None, &adapter).unwrap_err();
         match err {
             CoreError::SchemaValidation { details, .. } => {
@@ -1250,7 +1193,6 @@ mod tests {
         let original: &[u8] = b"model = \"gpt-5\"\n";
         std::fs::write(&path, original).unwrap();
         let adapter = SchemaEraAdapter;
-        // Legacy-era inline profiles conflict with the resolved >=0.134 era.
         let legacy = b"model = \"gpt-4\"\n[profiles.o3]\nmodel = \"o3\"\n";
         let err = commit_for_adapter(&path, legacy, None, &adapter).unwrap_err();
         match err {
@@ -1397,7 +1339,6 @@ mod tests {
         assert!(report.document.is_some());
         assert!(report.read_only_reason.is_none());
         assert!(report.version_compatible);
-        // Expected-version mismatch is surfaced, not fatal.
         let mismatch = report.expected_version_mismatch.as_deref().unwrap();
         assert!(
             mismatch.contains("2.0.0") && mismatch.contains("2.1.0"),
@@ -1449,8 +1390,6 @@ mod tests {
     fn validate_draft_runs_schema_and_version_gate_without_disk() {
         let editor = RawEditor::new();
         let path = surface_scratch("raw02", "config.toml");
-        // Schema-invalid draft (model must be a string) has blocking
-        // diagnostics attributed to the surface.
         let validation = editor.validate_draft(&SchemaEraAdapter, &path, b"model = 5\n");
         assert_eq!(validation.surface_id.as_deref(), Some("config.toml"));
         assert!(
@@ -1460,7 +1399,6 @@ mod tests {
             "{:?}",
             validation.diagnostics
         );
-        // Version gate: an incompatible adapter surfaces the refusal text.
         let gated = editor.validate_draft(&IncompatibleAdapter, &path, b"model = \"gpt-5\"\n");
         assert!(
             gated
@@ -1496,13 +1434,11 @@ mod tests {
             Some(crate::adapter::ConfigScope::ProjectWorkspace)
         );
         assert_eq!(result.precedence, Some(0));
-        // Higher-precedence surface exists -> scope warning.
         let warning = result.scope_warning.as_deref().unwrap();
         assert!(
             warning.contains("precedence 0") && warning.contains("may override"),
             "{warning}"
         );
-        // Restart requirement surfaced.
         assert!(
             result
                 .restart_requirement
@@ -1511,7 +1447,6 @@ mod tests {
             "{:?}",
             result.restart_requirement
         );
-        // Template-owned divergence reported, not forbidden.
         assert!(
             result
                 .template_owned_changes
@@ -1611,7 +1546,6 @@ mod tests {
         assert_eq!(report.draft_version, "2.0.0");
         assert_eq!(report.new_version.as_deref(), Some("2.1.0"));
         assert!(report.new_version_compatible);
-        // Affected keys include the changed server and the added one.
         assert!(
             report.affected.iter().any(|op| op.selector.contains('a')),
             "{:?}",
@@ -1622,7 +1556,6 @@ mod tests {
             "{:?}",
             report.affected
         );
-        // Guidance demands manual rebase; nothing was auto-applied.
         assert!(
             report.guidance.contains("MANUAL rebase"),
             "{}",

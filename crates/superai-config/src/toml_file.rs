@@ -4,12 +4,8 @@ use toml_edit::DocumentMut;
 
 use crate::error::{ConfigError, Result};
 
-/// Read a TOML config fresh from disk. A missing file reads as an empty document.
-///
-/// `toml_edit` keeps comments, key order, whitespace, and table layout, so
-/// writing back only touches what superai actually changed (DOC-04). Dotted
-/// keys, quoted keys, arrays of tables, and inline tables are preserved where
-/// untouched. Each call reads fresh: disk is the truth.
+/// Read fresh; `toml_edit` keeps comments, order, whitespace, and layout,
+/// so writes touch only what changed (DOC-04).
 pub fn load(path: &Path) -> Result<DocumentMut> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -24,11 +20,7 @@ pub fn load(path: &Path) -> Result<DocumentMut> {
         })
 }
 
-/// Back up, then write `doc` to `path`, creating parent directories as needed.
-///
-/// The write goes through the crate's one mutation boundary
-/// ([`crate::transaction::commit_file`]). `toml_edit` serialization
-/// preserves comments and formatting for unchanged regions; no typed struct
+/// Back up, then write through the one mutation boundary; no typed struct
 /// is ever serialized over the source document (DOC-04).
 pub fn store(path: &Path, doc: &DocumentMut) -> Result<()> {
     let text = doc.to_string();
@@ -41,10 +33,8 @@ pub fn store(path: &Path, doc: &DocumentMut) -> Result<()> {
     Ok(())
 }
 
-/// Read fresh, apply `edit`, write back only if the document changed.
-///
-/// No-op edits keep the original bytes, including CRLF and a missing final
-/// newline; changing writes normalize CRLF to LF (documented limitation).
+/// Read fresh, apply `edit`, write back only if changed; no-ops keep the
+/// original bytes, changing writes normalize CRLF to LF.
 pub fn edit<F>(path: &Path, edit: F) -> Result<()>
 where
     F: FnOnce(&mut DocumentMut),
@@ -59,12 +49,8 @@ where
     store(path, &doc)
 }
 
-/// DOC-10: disclosure when a changing write must reformat surrounding layout.
-///
-/// `toml_edit` preserves untouched decor, but changing writes normalize CRLF
-/// to LF. Returns the warning when `text` carries CRLF or cannot round-trip
-/// through the serializer unchanged; `None` when the layout already matches
-/// (unparsable `text` is left to syntax diagnostics).
+/// DOC-10 disclosure: changing writes normalize CRLF to LF and may not
+/// round-trip decor byte-identically; `None` when layout already matches.
 pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
     if text.trim().is_empty() {
         return None;
@@ -200,7 +186,6 @@ mod tests {
         std::fs::write(&path, "model = \"opus\"\r\nother = 1\r\n").unwrap();
         let doc = load(&path).unwrap();
         assert_eq!(doc["model"].as_str(), Some("opus"));
-        // Edit should succeed even though original was CRLF.
         edit(&path, |d| {
             d["model"] = toml_edit::value("sonnet");
         })

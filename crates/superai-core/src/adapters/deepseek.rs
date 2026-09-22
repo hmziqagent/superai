@@ -43,8 +43,7 @@ pub const SCHEMA_VERSION_STR: &str = "1";
 /// Research-blocked reason: provider catalog + plugin incomplete, dev preview.
 pub const BLOCKED_REASON: &str = "DeepSeek Harness developer preview (2026-08-13): provider catalog pi-ai compat switches, plugin contracts, profile boot, AGENTS.md/skills, sandbox runner unverified: relocated-root via DSH_HOME verified but writes blocked";
 
-/// `ResearchBlocked`: detection works (`dsh --version`, harness home), but
-/// the provider `compat` catalog and plugin system are not stable to mutate.
+/// `ResearchBlocked`: detection works, but the provider `compat` catalog and plugin system are not stable to mutate.
 #[derive(Debug, Clone)]
 pub struct DeepSeekAdapter {
     id: HarnessId,
@@ -77,7 +76,6 @@ impl DeepSeekAdapter {
         BLOCKED_REASON
     }
 
-    /// Resolve the default harness home: `$DSH_HOME` or `~/.dsh`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -93,7 +91,6 @@ impl DeepSeekAdapter {
         Some(PathBuf::from(home).join(".dsh"))
     }
 
-    /// Build detection evidence about harness home and provider config.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -118,7 +115,7 @@ impl DeepSeekAdapter {
                     } else {
                         evidence.push(format!("AGENTS.md missing at {}", agents_md.display()));
                     }
-                    // May be plugin-scoped; exact filename unverified.
+                    // Config filename unverified; may be plugin-scoped.
                     let config_candidates =
                         ["config.json", "config.yaml", "dsh.json", "settings.json"];
                     let mut found_config = false;
@@ -448,14 +445,12 @@ impl Adapter for DeepSeekAdapter {
         Vec::new()
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some(
             "developer preview; the plugin/MCP contracts are explicitly not traced in the corpus (deepseek-harness.md)",
         )
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "Everything is a Plugin per upstream, but the plugin contract is not traced in the corpus (deepseek-harness.md)",

@@ -1,14 +1,5 @@
-//! Env files: `KEY=value`, `export KEY=value`, quoting, comments, duplicates.
-//!
-//! No existing crate round-trips env files losslessly (dotenvy and friends
-//! are loaders: they drop comments, blank lines, export prefixes, quoting
-//! style, and duplicates on write), so this module implements its own
-//! line-preserving parser (DOC-07). Comments, blank lines, `export`
-//! prefixes, quoting style, spacing around `=`, and newline style survive
-//! untouched; duplicate keys are preserved with the last occurrence
-//! effective, and edits update the last occurrence without deduplicating.
-//! Double quotes honor `\"` `\\` `\n` `\r` `\t`, single quotes `\'` `\\`,
-//! unquoted `\#`; values stay literal (no `$VAR` expansion).
+//! Line-preserving env parser (DOC-07): comments, blank lines, export
+//! prefixes, quoting, spacing, and duplicates survive; last write wins.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -79,7 +70,6 @@ fn requires_quotes(value: &str) -> bool {
     if value.is_empty() {
         return true;
     }
-    // Leading/trailing whitespace requires quotes.
     if value.chars().next().is_some_and(char::is_whitespace)
         || value.chars().last().is_some_and(char::is_whitespace)
     {
@@ -94,7 +84,6 @@ fn requires_quotes(value: &str) -> bool {
             return true;
         }
     }
-    // If value contains spaces, it needs quotes to preserve them.
     if value.contains(' ') {
         return true;
     }
@@ -236,10 +225,7 @@ fn decode_single(inner: &str) -> String {
     out
 }
 
-/// Parse a single raw line (without trailing newline) into a `ParsedLine`.
-///
-/// Returns an error message if the line is neither blank, comment, nor a
-/// valid entry. The byte offsets `value_start`/`value_end` are valid char
+/// Parse one raw line; `value_start`/`value_end` are valid char
 /// boundaries for slicing `raw`.
 #[expect(
     clippy::too_many_lines,
@@ -247,7 +233,6 @@ fn decode_single(inner: &str) -> String {
 )]
 #[expect(clippy::excessive_nesting, reason = "env parsing needs nested checks")]
 fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
-    // Blank
     if raw.trim().is_empty() {
         return Ok(ParsedLine {
             raw: raw.to_owned(),
@@ -255,13 +240,11 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
         });
     }
 
-    // Find first non-whitespace byte index
     let first_non_ws = raw
         .char_indices()
         .find(|(_, c)| !c.is_whitespace())
         .map_or(0, |(idx, _)| idx);
 
-    // Comment line
     if let Some(slice) = raw.get(first_non_ws..)
         && slice.starts_with('#')
     {
@@ -271,17 +254,14 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
         });
     }
 
-    // Entry: find '='
     let eq_pos = raw.find('=');
     let Some(eq_idx) = eq_pos else {
         return Err(format!("invalid env line (no '='): {raw}"));
     };
 
-    // Split left/right
     let left = raw.get(0..eq_idx).unwrap_or_default();
     let right = raw.get(eq_idx + 1..).unwrap_or_default();
 
-    // Parse left for export and key
     let left_trimmed = left.trim();
     let mut export = false;
     let key: String;
@@ -321,13 +301,11 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
         .find(|(_, c)| !c.is_whitespace())
         .map_or(right.len(), |(idx, _)| idx);
 
-    // value_start byte offset in raw = eq_idx + 1 + right_ws_len
     let value_start = eq_idx + 1 + right_ws_len;
 
     let value_part = raw.get(value_start..).unwrap_or_default();
     let first_char = value_part.chars().next().unwrap_or('\0');
     let (decoded, quoting, value_end) = if first_char == '"' {
-        // Double quoted
         let mut end_idx: Option<usize> = None;
         let mut escaped = false;
         for (i, c) in value_part.char_indices().skip(1) {
@@ -345,10 +323,8 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
             }
         }
         if let Some(end_offset) = end_idx {
-            // end_offset is byte index of closing quote within value_part
             let inner = value_part.get(1..end_offset).unwrap_or_default();
             let decoded = decode_double(inner);
-            // value_end in raw = value_start + end_offset + 1 (include closing quote)
             let closing_quote_len = '"'.len_utf8();
             let ve = value_start + end_offset + closing_quote_len;
             (decoded, Quoting::Double, ve)
@@ -356,7 +332,6 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
             return Err(format!("unterminated double quote in line: {raw}"));
         }
     } else if first_char == '\'' {
-        // Single quoted
         let mut end_idx: Option<usize> = None;
         let mut escaped = false;
         for (i, c) in value_part.char_indices().skip(1) {
@@ -447,9 +422,7 @@ fn parse_line(raw: &str) -> std::result::Result<ParsedLine, String> {
     })
 }
 
-/// Parse full text into lines and effective map.
-///
-/// Returns the lines in order and a map of effective (last) values.
+/// Parse text into ordered lines plus the effective (last-wins) map.
 fn parse_env_text(
     text: &str,
 ) -> std::result::Result<(Vec<ParsedLine>, BTreeMap<String, String>), String> {
@@ -474,12 +447,7 @@ fn parse_env_text(
     Ok((lines, map))
 }
 
-/// Read an env file fresh from disk. A missing file reads as an empty map.
-///
-/// Supports `KEY=value` and `export KEY=value`, single/double/unquoted values,
-/// comments (`#`), blank lines, and duplicate keys (last wins). Each call
-/// reads the file fresh (disk is the truth). Blank and comment lines are
-/// validated but not included in the returned map.
+/// Read an env file fresh; a missing file reads as an empty map (last duplicate wins).
 pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -500,11 +468,7 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(map)
 }
 
-/// Back up, then write `vars` to `path`, creating parent directories as needed.
-///
-/// Written as normalized `KEY=value` lines, quoted only when required, with
-/// LF newlines and a trailing newline. `export` prefixes, comments, and
-/// blank lines survive only through [`edit`] on existing files.
+/// Back up, then write `vars` as normalized `KEY=value` lines with a trailing newline.
 pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
     let mut text = String::new();
     for (k, v) in vars {
@@ -524,12 +488,8 @@ pub fn store(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// Read fresh, apply `edit`, write back only if the effective map changed.
-///
-/// Changed keys update their last occurrence in place; new keys are appended;
-/// removed keys lose every occurrence. Comments, blank lines, `export`
-/// prefixes, quoting, spacing, duplicates, and CRLF/LF are preserved where
-/// untouched. A no-op edit performs no write and no backup.
+/// Read fresh, apply `edit`, write back only if the effective map changed;
+/// comments, quoting, spacing, duplicates, and CRLF/LF survive untouched.
 pub fn edit<F>(path: &Path, edit_fn: F) -> Result<()>
 where
     F: FnOnce(&mut BTreeMap<String, String>),
@@ -553,7 +513,6 @@ where
         message: format!("invalid utf-8: {e}"),
     })?;
 
-    // Empty file case
     if text.trim().is_empty() {
         let mut map = BTreeMap::new();
         edit_fn(&mut map);
@@ -574,8 +533,6 @@ where
         return Ok(());
     }
 
-    // Reconcile lines with new map
-    // 1. Handle removed keys: delete all occurrences
     let removed_keys: Vec<String> = original_map
         .keys()
         .filter(|k| !map.contains_key(*k))
@@ -588,10 +545,8 @@ where
         });
     }
 
-    // 2. Handle changed or new keys
     for (key, new_value) in &map {
         let Some(old_value) = original_map.get(key) else {
-            // New key: append
             lines.push(new_entry_line(key, new_value));
             continue;
         };
@@ -709,7 +664,6 @@ mod tests {
         assert!(after.contains("# header comment"));
         assert!(after.contains("# middle"));
         assert!(after.contains("FOO=new"));
-        // Blank line preserved (two newlines in a row)
         assert!(after.contains("\n\n"));
         assert!(after.contains("BAZ=qux"));
     }
@@ -729,7 +683,6 @@ mod tests {
         assert_eq!(map["A"], "value # not comment");
         assert_eq!(map["B"], "unquoted");
         assert_eq!(map["C"], "single # not comment");
-        // Ensure trailing comment is preserved in raw
         let first = &lines[0];
         assert!(first.raw.contains("# real comment") || first.raw.contains("real comment"));
     }
@@ -746,16 +699,13 @@ mod tests {
         })
         .unwrap();
         let after_text = std::fs::read_to_string(&path).unwrap();
-        // Should preserve both lines but last updated
         let lines: Vec<&str> = after_text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("first"));
         assert!(lines[1].contains("third"));
-        // Effective value is third
         let map2 = load(&path).unwrap();
         assert_eq!(map2["FOO"], "third");
 
-        // Check no silent dedup: still two FOO lines
         let foo_count = after_text.matches("FOO=").count();
         assert_eq!(foo_count, 2);
     }
@@ -824,7 +774,6 @@ mod tests {
         map.insert("B".into(), "simple".into());
         store(&path, &map).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
-        // hello world requires quotes
         assert!(after.contains("A=\"hello world\"") || after.contains("A='hello world'"));
         assert!(after.contains("B=simple"));
     }
@@ -840,7 +789,6 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("export"));
         assert!(after.contains("FOO="));
-        // Should preserve single vs double? Original single, new value has space, contains no single quote, so keep single or double both ok but export preserved
         assert!(after.contains("FOO=") && after.contains("new value"));
     }
 
@@ -884,7 +832,6 @@ mod tests {
     fn unquoted_value_trimming_and_comment() {
         let (_, map) = parse_env_text("A=hello   # comment\nB=  spaced  \n").unwrap();
         assert_eq!(map["A"], "hello");
-        // B's value "spaced" trimmed
         assert_eq!(map["B"], "spaced");
     }
 }

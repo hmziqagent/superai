@@ -1,6 +1,5 @@
 //! Plandex adapter: env-driven providers plus the v2 custom-models JSON
 //! (`~/.plandex-home-v2`), `Constrained` provider/server scoped.
-//! Research source: `docs/harness-configs/plandex.md` (last verified 2026-08-25).
 
 use std::path::PathBuf;
 
@@ -44,13 +43,10 @@ pub const SERVER_BASE_DIR_ENV_VAR: &str = "PLANDEX_BASE_DIR";
 /// Database URL (self-host).
 pub const DATABASE_URL_ENV_VAR: &str = "DATABASE_URL";
 
-/// Per-user home the v2 CLI keeps its state in. Live cli/v2.2.1 has no
-/// relocation env and no `.config/plandex` or `~/.plandex` path (area-5
-/// live evidence).
+/// Per-user v2 home; live cli/v2.2.1 exposes no relocation env or legacy paths.
 pub const V2_HOME_DIR_HINT: &str = "~/.plandex-home-v2";
 
-/// Custom models JSON file inside the v2 home (created/edited by
-/// `plandex models custom`; schema `models-input.schema.json`).
+/// Custom models JSON inside the v2 home (via `plandex models custom`).
 pub const CUSTOM_MODELS_FILE: &str = "custom-models.json";
 
 /// Research document link.
@@ -116,8 +112,6 @@ impl PlandexAdapter {
         CONSTRAINED_NOTE
     }
 
-    /// Resolve `~/.plandex-home-v2/custom-models.json` (live v2 layout; the
-    /// binary carries no `.config/plandex` or `~/.plandex/models.json` path).
     fn custom_models_path() -> Option<PathBuf> {
         let home = std::env::var("HOME")
             .ok()
@@ -132,7 +126,6 @@ impl PlandexAdapter {
         )
     }
 
-    /// Build detection evidence about env, custom models, and server config.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -518,12 +511,10 @@ impl Adapter for PlandexAdapter {
         ]
     }
 
-    /// EXT-09: explicit MCP absence (corpus-grounded).
     fn mcp_absence_reason(&self) -> Option<&'static str> {
         Some("no MCP mechanism documented (plandex.md)")
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (plandex.md)")
     }
@@ -647,8 +638,6 @@ mod tests {
     fn config_surfaces_include_env_and_custom_models() {
         let a = adapter();
         let surfaces = a.config_surfaces();
-        // Four surfaces; the legacy `~/.plandex/models.json` surface is gone
-        // (the live v2 binary contains no such path).
         assert_eq!(surfaces.len(), 4);
         let env = surfaces
             .iter()
@@ -682,8 +671,7 @@ mod tests {
         assert_eq!(server.scope, ConfigScope::SystemManaged);
     }
 
-    /// Custom models live in the real v2 home `~/.plandex-home-v2/` (live
-    /// cli/v2.2.1; area-5 evidence); no surface may reference legacy paths.
+    /// No surface may reference the legacy `.config/plandex` or `~/.plandex` paths.
     #[test]
     fn custom_models_surface_pins_v2_home_layout() {
         let a = adapter();
@@ -789,8 +777,7 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == API_HOST_ENV_VAR && v.contains("localhost"))
         );
-        // Isolation relocates HOME (no relocation env exists in the v2
-        // binary), so custom models land at <root>/.plandex-home-v2/.
+        // v2 has no relocation env; relocating HOME is the isolation.
         assert!(
             plan.env_vars
                 .iter()

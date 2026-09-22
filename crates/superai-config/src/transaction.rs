@@ -1,10 +1,5 @@
-//! Multi-file compensated transaction (MUT-05 / MUT-06).
-//!
-//! No filesystem-wide atomicity is claimed. Foreign files are backed up
-//! before the first commit, staged outputs are parse-validated, commits run
-//! in deterministic order, verification reads fresh from disk, and a
-//! failure restores committed files in reverse order with verified
-//! rollback and explicit residual reporting.
+//! Multi-file compensated transaction (MUT-05/06): foreign files are backed
+//! up before the first commit; failure restores in reverse, residuals reported.
 
 #![expect(
     clippy::excessive_nesting,
@@ -26,15 +21,12 @@ use crate::injector::{Injector, Point};
 use crate::journal::{CrashJournal, JournalBackup, JournalPhase};
 use crate::snapshot::{Snapshot, is_modified, snapshot};
 
-/// Stable identifier for a transaction operation, used for quarantine and
-/// backup linkage.
+/// Stable operation identifier for quarantine and backup linkage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OperationId(String);
 
 impl OperationId {
-    /// Create a new operation id.
-    ///
-    /// Rejects empty values and values containing path separators or NUL.
+    /// Rejects empty ids and ids with path separators or NUL.
     pub fn new(id: &str) -> Result<Self> {
         if id.is_empty() {
             return Err(ConfigError::io(
@@ -74,8 +66,7 @@ impl std::fmt::Display for OperationId {
     }
 }
 
-/// Intent of a removal. Each variant carries different safety rules and
-/// quarantine requirements.
+/// Removal intent; each variant carries its own safety rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RemoveKind {
     /// Remove one entry from a shared file; the file itself survives.
@@ -127,9 +118,8 @@ impl RemovePlan {
     }
 }
 
-/// Validate a removal target per [`RemoveKind`] policy: broad roots,
-/// unresolved variables, globs, traversal, and home are refused. Best
-/// effort at the config layer; adapter ownership checks still apply.
+/// Refuse broad roots, unresolved variables, globs, traversal, and home;
+/// adapter ownership checks still apply on top.
 pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
     let display = path.to_string_lossy();
     let s = display.as_ref();
@@ -186,8 +176,7 @@ pub fn validate_remove_target(path: &Path, kind: RemoveKind) -> Result<()> {
     Ok(())
 }
 
-/// Reject broad roots and home for any removal: unix broad roots,
-/// Windows-shaped broad roots, and home with platform case rules.
+/// Refuse broad and home roots with platform case rules.
 fn reject_broad_or_home_roots(path: &Path, s: &str) -> Result<()> {
     if s == "/" || s == "/home" || s == "/tmp" || s == "/usr" || s == "/etc" {
         return Err(ConfigError::io(
@@ -260,8 +249,7 @@ fn home_dir() -> Option<PathBuf> {
     None
 }
 
-/// Whether `s` looks like a Windows path (drive prefix or UNC root),
-/// regardless of host platform.
+/// Whether `s` looks like a Windows path (drive or UNC), regardless of host.
 fn looks_windows_shaped(s: &str) -> bool {
     s.starts_with("\\\\")
         || s.starts_with("//")
@@ -269,15 +257,13 @@ fn looks_windows_shaped(s: &str) -> bool {
             && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
 }
 
-/// Backslashes to slashes plus ASCII lowercase, for Windows-style
-/// case-insensitive comparison.
+/// Backslashes to slashes plus ASCII lowercase for folded comparison.
 fn normalize_windows_style(s: &str) -> String {
     s.replace('\\', "/").to_ascii_lowercase()
 }
 
-/// Whether `path` is a Windows-shaped broad root (drive and UNC roots, and
-/// the first-level system directories). Matching is anchored, folded, and
-/// separator-agnostic; unix-shaped paths never match.
+/// Windows-shaped broad root (drive/UNC roots, first-level system dirs);
+/// matching is anchored, folded, separator-agnostic; unix paths never match.
 pub(crate) fn windows_shaped_broad_root(path: &Path) -> bool {
     let normalized = normalize_windows_style(&path.to_string_lossy());
     let trimmed = normalized.trim_end_matches('/');
@@ -321,9 +307,8 @@ pub(crate) fn windows_shaped_broad_root(path: &Path) -> bool {
     unc_shaped && trimmed.matches('/').count() <= 3
 }
 
-/// Whether the final component is a Windows reserved device name (`CON`,
-/// `PRN`, `AUX`, `NUL`, `COM1`-`9`, `LPT1`-`9`, `CONIN$`, `CONOUT$`),
-/// stem-matched and case-folded, so `CON.txt` is a device too (QAL-09).
+/// Whether the final component is a Windows reserved device name (CON, PRN,
+/// AUX, NUL, COM1-9, LPT1-9, CONIN$, CONOUT$), stem-matched, case-folded.
 pub(crate) fn windows_reserved_device_name(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -350,8 +335,7 @@ pub(crate) fn windows_reserved_device_name(path: &Path) -> bool {
     false
 }
 
-/// Path equality with platform case rules: byte equality, or folded
-/// comparison when either side is windows-shaped.
+/// Byte equality, or folded comparison when either side is windows-shaped.
 pub(crate) fn paths_equal_platform_folded(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -365,8 +349,7 @@ pub(crate) fn paths_equal_platform_folded(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// One auditable filesystem action; the transaction validates, backs up,
-/// stages, commits in order, and verifies each of them.
+/// One auditable filesystem action the transaction validates and commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAction {
     /// Atomically write `content` to `path` with the given document kind.
@@ -383,9 +366,8 @@ pub enum FileAction {
         /// Absolute directory path.
         path: PathBuf,
     },
-    /// Create a symlink at `link`. `expected_current` is the MUT-02/MUT-06
-    /// owned-target rule: `None` replaces a link still matching its
-    /// prepare-time snapshot, `Some(target)` only one pointing there now.
+    /// Create a symlink; `expected_current` is the owned-target rule:
+    /// `None` matches the prepare-time snapshot, `Some` only that target.
     Symlink {
         /// Absolute link path.
         link: PathBuf,
@@ -447,9 +429,8 @@ fn generate_temp_path(target: &Path) -> Result<PathBuf> {
     Ok(parent.join(tmp_name))
 }
 
-/// Unix (device, inode) identity, following symlinks first so paths
-/// converging through links count as one target; used to catch hard-link
-/// aliases (MUT-02).
+/// Unix (device, inode) identity following links first, so paths converging
+/// through links count as one target (MUT-02).
 #[cfg(unix)]
 fn inode_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -464,8 +445,7 @@ fn inode_identity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// `nlink` of an existing path: above 1, the atomic replacement would split
-/// the link group, so the caller gets a warning instead of silence.
+/// `nlink` above 1: replacement would split the link group, so warn.
 #[cfg(unix)]
 fn hardlink_count(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -478,9 +458,8 @@ fn hardlink_count(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Stage `content` into a same-directory exclusive temp for `target`:
-/// safe permissions before any bytes, then write, flush, sync. The
-/// production primitive shared by [`Transaction`] and the failure matrix.
+/// Stage `content` into a same-directory exclusive temp: safe permissions
+/// before bytes, then write, flush, sync.
 pub fn stage_temp_file(
     target: &Path,
     content: &[u8],
@@ -494,9 +473,8 @@ pub fn stage_temp_file(
     if let Some(injector) = injector {
         injector.inject(Point::TempCreate)?;
     }
-    // The temp is always created exclusively and the handle is kept open until
-    // the bytes are durable: nothing (a pre-planted symlink included) can make
-    // staging truncate a file we did not create.
+    // Exclusive create with the handle held open until durable: a pre-planted
+    // symlink cannot make staging truncate a file we did not create.
     let mut final_temp = PathBuf::new();
     let mut file: Option<std::fs::File> = None;
     for _ in 0..5 {
@@ -524,10 +502,8 @@ pub fn stage_temp_file(
             ),
         ));
     };
-    // Safe permissions land while the file is still empty, so staged bytes are
-    // never group/world readable regardless of the process umask. The chmod
-    // goes through the held fd: it lands on the inode we created even if the
-    // temp name is swapped.
+    // Permissions land while empty (umask cannot widen them) through the held
+    // fd, so a swapped name cannot misdirect the chmod.
     if let Err(e) = apply_mode(&f, &final_temp, resolve_final_mode(target, None)) {
         drop(std::fs::remove_file(&final_temp));
         return Err(e);
@@ -556,9 +532,8 @@ pub fn stage_temp_file(
     Ok(final_temp)
 }
 
-/// Commit a staged temp over `target` (the production commit primitive).
-/// With `expected`, the target is re-read fresh just before the rename;
-/// any foreign change aborts with `ConcurrentModification` (§4.2).
+/// Commit a staged temp over `target`; with `expected`, the target is re-read
+/// fresh just before the rename and a foreign change aborts (§4.2).
 pub fn commit_staged_file(
     target: &Path,
     staged: &Path,
@@ -653,16 +628,14 @@ pub fn commit_staged_file(
 /// Report from a single-file commit through the mutation boundary.
 #[derive(Debug, Clone)]
 pub struct FileCommitReport {
-    /// Backup of the previous contents taken before the replacement landed
-    /// (`None` when the commit created a new file).
+    /// Backup of the previous contents; `None` for a creation.
     pub backup: Option<BackupEntry>,
     /// Hex digest of the committed bytes (read back and verified on disk).
     pub digest: String,
 }
 
-/// Detect a case-insensitive sibling collision for `target` (QAL-09): on
-/// case-insensitive filesystems the write would silently land over the
-/// sibling, so the risk is surfaced everywhere.
+/// Detect a case-insensitive sibling (QAL-09): on such filesystems the write
+/// would silently land over the sibling, so the risk surfaces everywhere.
 pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
     let dir = target.parent()?;
     let target_name = target.file_name()?.to_string_lossy().into_owned();
@@ -686,12 +659,8 @@ pub(crate) fn case_fold_collision_in_dir(target: &Path) -> Option<PathBuf> {
     best
 }
 
-/// Commit `content` to `target` through the crate's single mutation
-/// boundary: a one-step [`Transaction`] with the full discipline (snapshot,
-/// backup, staged parse-check, §4.2 recheck, atomic replace, read-back
-/// verify). Codec stores and every superai-core write route here or through
-/// [`stage_temp_file`] + [`commit_staged_file`]. A failed commit leaves the
-/// target untouched.
+/// The single mutation boundary: a one-step [`Transaction`] with the full
+/// discipline; a failed commit leaves the target untouched.
 pub fn commit_file(
     id: &str,
     target: &Path,
@@ -701,9 +670,8 @@ pub fn commit_file(
     commit_file_expecting(id, target, content, kind, None)
 }
 
-/// [`commit_file`] with a caller-supplied conflict token: a snapshot taken
-/// when the caller read the document. Any foreign change since that read,
-/// not just since prepare, aborts with `ConcurrentModification`.
+/// [`commit_file`] with a caller-supplied conflict token: any foreign change
+/// since that read aborts with `ConcurrentModification`.
 pub fn commit_file_expecting(
     id: &str,
     target: &Path,
@@ -714,9 +682,8 @@ pub fn commit_file_expecting(
     commit_file_expecting_with_roots(id, target, content, kind, expected, &[])
 }
 
-/// [`commit_file_expecting`] with the MUT-02 adapter-allowed follow roots.
-/// An allowed symlink target is followed and preserved (the referent is
-/// mutated); the caller's token guards the link it actually read.
+/// [`commit_file_expecting`] with the MUT-02 follow roots: an allowed link
+/// target is followed and preserved, the token guards the link.
 pub fn commit_file_expecting_with_roots(
     id: &str,
     target: &Path,
@@ -761,20 +728,16 @@ pub fn commit_file_expecting_with_roots(
         cleanup_staged_temps(&transaction.staged_temps);
         return Err(e);
     }
-    // The caller's token guards the full read-to-commit window.
     let effective_target = transaction.steps.first().map_or_else(
         || target.to_path_buf(),
         |step| step.primary_path().to_path_buf(),
     );
     if effective_target != target {
-        // MUT-02 follow-and-preserve: the caller read through the LINK, so
-        // its token is checked against the link's current state: a retarget
-        // or content change since the read aborts before the referent is
-        // mutated.
+        // MUT-02: the caller read through the link, so its token is checked
+        // against the link's state; a retarget aborts before mutating.
         if let Some(expected) = expected
             && is_modified(expected, &snapshot(target))
         {
-            // The link was retargeted or its bytes changed since the read.
             cleanup_staged_temps(&transaction.staged_temps);
             return Err(ConfigError::concurrent_modification(
                 target,
@@ -806,8 +769,6 @@ pub fn commit_file_expecting_with_roots(
     let verification = transaction.verify()?;
     if let Some(failed) = verification.iter().find(|v| !v.digest_ok || !v.parse_ok) {
         let message = failed.message.clone();
-        // The caller sees the verification error; the rollback's own
-        // outcome is not observable here.
         drop(transaction.rollback());
         cleanup_staged_temps(&transaction.staged_temps);
         return Err(ConfigError::verification(target, message));
@@ -831,17 +792,13 @@ fn cleanup_staged_temps(temps: &[PathBuf]) {
 /// How symlinks are treated during a recursive copy (MUT-06).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SymlinkPolicy {
-    /// Skip links entirely; nothing follows a link out of the tree.
-    /// Default.
+    /// Skip links entirely; nothing follows a link out of the tree. Default.
     #[default]
     Skip,
-    /// Recreate the link itself at the destination pointing at the same
-    /// target (relative targets are copied verbatim; absolute targets stay
-    /// absolute).
+    /// Recreate the link at the destination pointing at the same target.
     PreserveLink,
-    /// Copy the referent's bytes as a regular file. A broken or looping
-    /// link is an error: silently copying nothing would lie about what
-    /// was copied.
+    /// Copy the referent's bytes; a broken or looping link is an error:
+    /// silently copying nothing would lie about what was copied.
     FollowCopyContent,
 }
 
@@ -850,8 +807,7 @@ pub enum SymlinkPolicy {
 pub struct CopyTreeOptions {
     /// Name patterns to include (glob syntax: `*`, `?`). Empty = everything.
     pub include: Vec<String>,
-    /// Name patterns to exclude; a name matching exclude is never copied
-    /// even when it matches include.
+    /// Excluded names are never copied even when matching include.
     pub exclude: Vec<String>,
     /// Symlink policy for encountered links.
     pub symlink_policy: SymlinkPolicy,
@@ -888,8 +844,7 @@ pub struct CopyTreeReport {
     pub bytes: u64,
 }
 
-/// Tiny glob matcher: `*` is any run except `/`, `?` one character. No
-/// regex engine is pulled in for this.
+/// Tiny glob: `*` any run except `/`, `?` one char; no regex engine.
 fn name_matches(pattern: &str, name: &str) -> bool {
     fn inner(pat: &[u8], name: &[u8]) -> bool {
         match (pat.split_first(), name.split_first()) {
@@ -909,8 +864,7 @@ fn name_matches(pattern: &str, name: &str) -> bool {
     inner(pattern.as_bytes(), name.as_bytes())
 }
 
-/// Whether a FILE name passes the filters. `exclude` always prunes;
-/// `include` (when non-empty) selects which files are copied.
+/// FILE filter: `exclude` prunes, `include` selects.
 fn file_allowed(name: &str, opts: &CopyTreeOptions) -> bool {
     if opts.exclude.iter().any(|p| name_matches(p, name)) {
         return false;
@@ -921,16 +875,13 @@ fn file_allowed(name: &str, opts: &CopyTreeOptions) -> bool {
     opts.include.iter().any(|p| name_matches(p, name))
 }
 
-/// Whether a directory name passes the filters: only `exclude` prunes;
-/// `include` selects files, never structure.
+/// Directory filter: only `exclude` prunes; `include` never selects structure.
 fn dir_allowed(name: &str, opts: &CopyTreeOptions) -> bool {
     !opts.exclude.iter().any(|p| name_matches(p, name))
 }
 
-/// Recursively copy `from` to `to` with filters and a symlink policy
-/// (MUT-06). Permission bits are preserved where possible, the run is
-/// bounded by `max_entries`/`max_bytes`, and each copied file's digest
-/// is verified against its source.
+/// Recursive copy with filters, symlink policy, bounds, and per-file digest
+/// verification; permission bits preserved where possible (MUT-06).
 pub fn copy_tree(from: &Path, to: &Path, opts: &CopyTreeOptions) -> Result<CopyTreeReport> {
     // Refuse copying a tree into itself: recursion would nest until the
     // entry bound trips.
@@ -994,9 +945,8 @@ fn copy_tree_inner(
     Ok(())
 }
 
-/// Apply the symlink policy for one link entry: `Ok(true)` when fully
-/// handled, `Ok(false)` when `FollowCopyContent` continues with the
-/// referent's bytes.
+/// Apply the symlink policy for one link: `Ok(true)` fully handled,
+/// `Ok(false)` continues with the referent's bytes.
 fn handle_symlink_entry(
     src: &Path,
     dest: &Path,
@@ -1029,8 +979,6 @@ fn handle_symlink_entry(
             Ok(true)
         }
         SymlinkPolicy::FollowCopyContent => {
-            // A referent that is not a readable regular file fails the
-            // copy honestly.
             let target_meta = std::fs::metadata(src).map_err(|e| ConfigError::io(src, e))?;
             if !target_meta.is_file() {
                 return Err(ConfigError::unsupported_copy(
@@ -1049,8 +997,8 @@ fn handle_symlink_entry(
     }
 }
 
-/// Copy one file entry with bounds and digest verification. Under
-/// `FollowCopyContent` both the bound and the copy read through the link.
+/// Copy one file with bounds and digest verification; both read through the
+/// link under `FollowCopyContent`.
 fn copy_file_entry(
     src: &Path,
     dest: &Path,
@@ -1091,9 +1039,8 @@ fn copy_file_entry(
     Ok(())
 }
 
-/// Remove a superai-owned empty directory (MUT-06). Broad roots are
-/// refused like `InstanceRoot` removal; non-empty directories are a typed
-/// refusal (quarantine instead).
+/// Remove a superai-owned empty directory (MUT-06); non-empty is a typed
+/// refusal (quarantine instead), broad roots refused like `InstanceRoot`.
 pub fn remove_owned_empty_dir(path: &Path) -> Result<()> {
     validate_remove_target(path, RemoveKind::InstanceRoot)?;
     match std::fs::symlink_metadata(path) {
@@ -1120,9 +1067,8 @@ pub fn remove_owned_empty_dir(path: &Path) -> Result<()> {
     }
 }
 
-/// Validate a path for safe mutation: no NUL, globs, unresolved variables,
-/// traversal, Windows reserved names, or special files. Case-fold
-/// collisions live in [`Transaction::validate_plan`].
+/// Refuse NUL, globs, unresolved variables, traversal, Windows reserved
+/// names, and special files; case-fold collisions live in `validate_plan`.
 fn validate_path_safety(path: &Path) -> Result<()> {
     let s = path.to_string_lossy();
     let raw = s.as_ref();
@@ -1236,8 +1182,8 @@ pub struct TransactionOutcome {
     pub diagnostics_redacted: Vec<String>,
 }
 
-/// Compensated multi-file transaction (MUT-05): on failure, committed
-/// files are restored in reverse order and residuals reported explicitly.
+/// Compensated multi-file transaction (MUT-05): failure restores in reverse,
+/// residuals reported.
 #[derive(Debug)]
 pub struct Transaction {
     /// Stable operation identifier.
@@ -1248,23 +1194,17 @@ pub struct Transaction {
     pub backups: Vec<BackupEntry>,
     /// Temporary files staged during prepare.
     pub staged_temps: Vec<PathBuf>,
-    /// Rollback [`Transaction::commit`] performed internally when a step
-    /// failed after others committed. `residuals` are the paths it could
-    /// not undo; they remain on disk and must reach the caller.
+    /// Rollback `commit` performed internally when a step failed after
+    /// others committed; its residuals remain on disk for the caller.
     pub partial_rollback: Option<RollbackOutcome>,
-    /// Prepare-time snapshots per step path: the §4.2 conflict tokens every
-    /// commit step rechecks immediately before its mutation.
+    /// Prepare-time §4.2 tokens every commit step rechecks before mutating.
     expected_states: HashMap<PathBuf, Snapshot>,
-    /// Optional failure injector threaded through the real staging, rename,
-    /// backup, and rollback boundaries (QAL-06).
+    /// Optional failure injector through the real boundaries (QAL-06).
     injector: Option<Arc<dyn Injector>>,
-    /// Adapter-allowed roots for the MUT-02 link policy: a `Write` onto a
-    /// symlink follows it only inside this set (else
-    /// [`ConfigError::SymlinkFollowRefused`]); non-empty, it also
-    /// constrains `Symlink` step targets.
+    /// MUT-02 roots: a `Write` onto a symlink follows it only inside this
+    /// set; non-empty, it also constrains `Symlink` step targets.
     symlink_follow_roots: Vec<PathBuf>,
-    /// (link, referent) pairs followed during prepare; commit aborts if a
-    /// link no longer points at its recorded referent (MUT-02).
+    /// (link, referent) pairs followed at prepare; commit re-verifies each (MUT-02).
     symlink_followed: Vec<(PathBuf, PathBuf)>,
     /// Journal directory (MUT-09); `None` disables journaling.
     journal_root: Option<PathBuf>,
@@ -1296,24 +1236,21 @@ impl Transaction {
         }
     }
 
-    /// Builder: attach a failure injector (QAL-06) observing the production
-    /// boundaries from staging through journal transitions.
+    /// Attach a failure injector observing the production boundaries (QAL-06).
     #[must_use = "the injector is only attached to the returned transaction"]
     pub fn with_injector(mut self, injector: Arc<dyn Injector>) -> Self {
         self.injector = Some(injector);
         self
     }
 
-    /// Builder: journal under `journal_root` (MUT-09), removed only after
-    /// verified completion; [`crate::journal::recover_pending`] recovers.
+    /// Journal under `journal_root` (MUT-09), removed only after verified completion.
     #[must_use = "journaling is only enabled on the returned transaction"]
     pub fn with_journal(mut self, journal_root: PathBuf) -> Self {
         self.journal_root = Some(journal_root);
         self
     }
 
-    /// Builder: declare the MUT-02 follow roots. Roots are canonicalized
-    /// when they exist so linked roots compare equal to their referents.
+    /// Declare the MUT-02 roots, canonicalized when they exist.
     #[must_use = "the policy is only enabled on the returned transaction"]
     pub fn with_symlink_follow_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.symlink_follow_roots = roots
@@ -1323,8 +1260,7 @@ impl Transaction {
         self
     }
 
-    /// Whether `resolved` lies inside one of the declared follow roots
-    /// (equality counts; canonical comparison on both sides).
+    /// Whether `resolved` lies inside a declared root (equality counts).
     fn resolves_within_follow_roots(&self, resolved: &Path) -> bool {
         let canonical = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
         self.symlink_follow_roots.iter().any(|root| {
@@ -1334,9 +1270,8 @@ impl Transaction {
         })
     }
 
-    /// Follow-and-preserve resolution (MUT-02): not a symlink is `Ok(None)`;
-    /// a link inside the roots yields the referent; anything else is a
-    /// typed [`ConfigError::SymlinkFollowRefused`].
+    /// Not a symlink: `Ok(None)`; a link inside the roots: its referent;
+    /// anything else: typed `SymlinkFollowRefused`.
     fn symlink_follow_target(&self, path: &Path) -> Result<Option<PathBuf>> {
         let Ok(meta) = std::fs::symlink_metadata(path) else {
             return Ok(None);
@@ -1369,9 +1304,8 @@ impl Transaction {
         }
     }
 
-    /// Best-effort absolute resolution of a `Symlink` step target for the
-    /// containment check: relative against the link's parent, canonicalized
-    /// when it exists.
+    /// Best-effort absolute resolution of a `Symlink` target for containment:
+    /// relative against the link's parent, canonicalized when it exists.
     fn resolve_symlink_step_target(link: &Path, target: &Path) -> PathBuf {
         let absolute = if target.is_absolute() {
             target.to_path_buf()
@@ -1414,9 +1348,8 @@ impl Transaction {
         &self.warnings
     }
 
-    /// Write the journal entry for `phase`; no-op when journaling is off.
-    /// The injector's journal-phase point fires after the write so crash
-    /// simulation leaves the journal at exactly this phase.
+    /// Write the journal entry for `phase`; the injector point fires after
+    /// the write so crash simulation leaves the journal at this phase.
     fn write_journal(&mut self, phase: JournalPhase) -> Result<()> {
         let Some(root) = self.journal_root.clone() else {
             return Ok(());
@@ -1471,10 +1404,8 @@ impl Transaction {
         self.journal_state = None;
     }
 
-    /// Validate the plan without touching disk beyond snapshots: path
-    /// safety, symlink loops, duplicate and case-fold collisions, hard-link
-    /// aliases ([`ConfigError::HardlinkConflict`]), and follow-root policy
-    /// for `Write` and `Symlink` targets.
+    /// Path safety, symlink loops, duplicate and case-fold collisions, hard-link
+    /// aliases, and follow-root policy, without touching disk beyond snapshots.
     pub fn validate_plan(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_folded: HashSet<String> = HashSet::new();
@@ -1526,8 +1457,6 @@ impl Transaction {
             }
             let folded = key.to_ascii_lowercase();
             if !seen_folded.insert(folded.clone()) {
-                // A collision on case-insensitive platforms; surfaced as a
-                // risk on every platform.
                 return Err(ConfigError::io(
                     path,
                     std::io::Error::new(
@@ -1559,9 +1488,8 @@ impl Transaction {
         self.steps.sort_by_key(FileAction::sort_key);
     }
 
-    /// Prepare: back up foreign files, stage and parse-validate temps,
-    /// record §4.2 tokens, and retarget `Write` steps on allowed symlinks
-    /// to their referents (MUT-02), re-verified at commit.
+    /// Back up foreign files, stage and parse-validate temps, record §4.2
+    /// tokens, and retarget allowed-symlink Writes to their referents (MUT-02).
     pub fn prepare(&mut self) -> Result<()> {
         self.validate_plan()?;
         self.sort_steps();
@@ -1576,9 +1504,8 @@ impl Transaction {
         let staged_map = self.stage_all_writes()?;
         self.write_journal(JournalPhase::StageTemp)?;
 
-        // Tokens are recorded after staging, so parents the staging itself
-        // created are expected to exist; the window guarded runs from here
-        // to each step's pre-mutation recheck.
+        // Tokens are recorded after staging, so staging-created parents are
+        // expected to exist; the window runs to each step's recheck.
         self.expected_states.clear();
         for step in &self.steps {
             let path = step.primary_path().to_path_buf();
@@ -1630,9 +1557,8 @@ impl Transaction {
         snapshots
     }
 
-    /// Record a warning for write targets with `nlink > 1`: replacement
-    /// splits the link group. Alias pairs are rejected in
-    /// [`Self::validate_plan`].
+    /// Warn for write targets with `nlink > 1`: replacement splits the group;
+    /// alias pairs are rejected in [`Self::validate_plan`].
     fn record_hardlink_warnings(&mut self) {
         for step in &self.steps {
             if matches!(step, FileAction::Write { .. })
@@ -1687,8 +1613,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Stage temps for every Write action and parse-validate them. Returns
-    /// (target, temp) pairs for staged-digest verification.
+    /// Stage temps for every Write, parse-validating each; returns (target, temp) pairs.
     fn stage_all_writes(&mut self) -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut staged: Vec<PathBuf> = Vec::new();
         let mut staged_map: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, temp)
@@ -1735,8 +1660,7 @@ impl Transaction {
     }
 
     /// Retarget `Write` steps on allowed symlinks to their referents (MUT-02)
-    /// and record the pairs the commit phase re-verifies. The policy is
-    /// re-derived here; errors propagate, never swallowed.
+    /// and record the pairs the commit phase re-verifies.
     fn apply_symlink_follow_retargeting(&mut self) -> Result<()> {
         let mut retargets: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
         for (idx, step) in self.steps.iter().enumerate() {
@@ -1758,9 +1682,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// Every link followed during prepare must still point at its recorded
-    /// referent, or the step aborts before the rename lands on a file the
-    /// caller no longer reaches.
+    /// Every followed link must still point at its recorded referent, or the
+    /// step aborts before the rename lands on an unreachable file.
     fn recheck_followed_symlinks(&self) -> Result<()> {
         for (link, referent) in &self.symlink_followed {
             let current = std::fs::canonicalize(link).map_err(|e| {
@@ -1781,9 +1704,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// Commit in dependency order, assuming [`Self::prepare`] ran. Each step
-    /// rechecks its prepare-time snapshot immediately before mutating
-    /// (§4.2); a foreign change aborts before any overwrite.
+    /// Commit in dependency order; each step rechecks its prepare-time snapshot
+    /// immediately before mutating (§4.2), aborting on foreign change.
     pub fn commit(&mut self) -> Result<CommitOutcome> {
         let mut committed: Vec<PathBuf> = Vec::new();
         let mut write_index = 0usize;
@@ -1792,9 +1714,8 @@ impl Transaction {
         self.write_journal(JournalPhase::Commit)?;
 
         for step_index in 0..self.steps.len() {
-            // Intent journaling (MUT-09): the step is recorded as
-            // about-to-commit BEFORE mutating, so a crash between the rename
-            // and the journal update is still attributable at recovery.
+            // MUT-09: record the step as about-to-commit BEFORE mutating, so
+            // a crash right after the rename is attributable at recovery.
             let Some(primary) = self
                 .steps
                 .get(step_index)
@@ -1806,10 +1727,8 @@ impl Transaction {
             self.write_journal(JournalPhase::Commit)?;
             let res = self.commit_step(step_index, &mut write_index);
             if let Err(e) = res {
-                // Compensate the already committed steps in reverse order and
-                // retain the outcome: any path the rollback could not undo is
-                // a residual that must reach the caller. The original commit
-                // error stays the surfaced error; nothing is masked.
+                // Compensate committed steps in reverse and retain the
+                // outcome: residuals reach the caller; the commit error wins.
                 let rollback = self.rollback_partial(&committed);
                 self.partial_rollback = Some(rollback);
                 return Err(e);
@@ -1829,9 +1748,8 @@ impl Transaction {
         })
     }
 
-    /// Commit one step by index. Prelude injections (QAL-06: the second/third
-    /// file boundaries) feed the same error path as the step itself so the
-    /// compensation in `commit` still runs when they fire.
+    /// Commit one step; prelude injections (QAL-06 second/third file) feed the
+    /// same error path so compensation still runs when they fire.
     fn commit_step(&self, step_index: usize, write_index: &mut usize) -> Result<()> {
         let prelude = if step_index == 1 {
             self.inject(Point::SecondFile)
@@ -2069,7 +1987,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Verify after commit: fresh read plus parse per Write step.
+    /// Fresh read plus parse per Write step.
     #[expect(
         clippy::excessive_nesting,
         reason = "verify checks digest and parse per file"
@@ -2145,7 +2063,6 @@ impl Transaction {
     fn rollback_with_filter(&self, committed: &[PathBuf]) -> RollbackOutcome {
         let mut rolled_back: Vec<PathBuf> = Vec::new();
         let mut residuals: Vec<PathBuf> = Vec::new();
-        // Path to backup entry for quick lookup.
         let backup_map: HashMap<PathBuf, &BackupEntry> = self
             .backups
             .iter()
@@ -2165,7 +2082,6 @@ impl Transaction {
                             residuals.push(path.clone());
                             continue;
                         }
-                        // Verify rollback
                         match std::fs::read(path) {
                             Ok(bytes) => {
                                 let d = compute_digest(&bytes);
@@ -2220,9 +2136,8 @@ impl Transaction {
         }
     }
 
-    /// Execute the full transaction: prepare, commit, verify, automatic
-    /// rollback on failure. The journal is removed only after verified
-    /// completion or verified rollback (MUT-09).
+    /// Prepare, commit, verify, automatic rollback on failure; the journal
+    /// is removed only after verified completion or rollback (MUT-09).
     #[expect(
         clippy::too_many_lines,
         reason = "execute is the orchestrator: prepare/commit/verify/rollback in one place"
@@ -2243,8 +2158,6 @@ impl Transaction {
         let commit_outcome = match self.commit() {
             Ok(c) => c,
             Err(e) => {
-                // `commit` already compensated; its recorded outcome,
-                // residuals included, is what the caller sees.
                 let mut diagnostics_redacted = vec![format!("[commit failed] {e}")];
                 if let Some(rollback) = &self.partial_rollback
                     && !rollback.residuals.is_empty()
@@ -2337,8 +2250,6 @@ impl Transaction {
         })
     }
 }
-
-// tests
 
 #[cfg(test)]
 #[expect(
@@ -2435,7 +2346,6 @@ mod tests {
             ],
         );
         txn.sort_steps();
-        // CreateDir should come first, then Writes sorted by path
         assert!(matches!(txn.steps[0], FileAction::CreateDir { .. }));
         if let FileAction::Write { path, .. } = &txn.steps[1] {
             assert_eq!(path, &base.join("a.json"));
@@ -2502,9 +2412,6 @@ mod tests {
         assert!(ok2.unwrap().requires_quarantine);
     }
 
-    /// QAL-09/11 platform case: windows-shaped broad roots are recognized on
-    /// every host (pure string semantics: drive roots, UNC roots, first-level
-    /// system directories, case-folded, both separators).
     #[test]
     fn windows_shaped_broad_roots_are_detected_cross_platform() {
         let broad = [
@@ -2527,9 +2434,8 @@ mod tests {
                 "windows-shaped broad root must be detected: {p}"
             );
         }
-        // Forward-slash UNC text is only a UNC root on Windows itself; on
-        // unix `//x` is an ordinary (if unusual) absolute path and must not
-        // be flagged, so unix removal/quarantine semantics are unchanged.
+        // Forward-slash UNC counts only on Windows; unix `//x` is an ordinary
+        // path and must not be flagged.
         if cfg!(windows) {
             assert!(windows_shaped_broad_root(Path::new("//server/share/")));
         } else {
@@ -2544,9 +2450,8 @@ mod tests {
             "/home",
             "/",
             "relative/path",
-            // A drive prefix needs BOTH an alphabetic first char and ':' as
-            // the second: `1:` is not windows-shaped (kills the `&&`->`||`
-            // mutant in the drive-prefix check, which would flag it broad).
+            // A drive prefix needs an alphabetic first char AND ':' second:
+            // `1:` is not windows-shaped (kills the `&&`->`||` mutant).
             "1:",
         ];
         for p in specific {
@@ -2569,9 +2474,8 @@ mod tests {
             Path::new("/tmp/a"),
             Path::new("/tmp/a")
         ));
-        // Unix paths stay case-sensitive: differing case is NOT equal.
-        // The drive-less literals are deliberate: a real temp path is
-        // windows-shaped on Windows and would fold this pair to equal.
+        // Deliberately drive-less literals: a real temp path is windows-
+        // shaped on Windows and would fold this pair to equal.
         assert!(!paths_equal_platform_folded(
             Path::new("/tmp/A"),
             Path::new("/tmp/a")
@@ -2625,13 +2529,12 @@ mod tests {
             id,
             vec![FileAction::Write {
                 path: target.clone(),
-                content: b"not json".to_vec(), // invalid json, but prepare validates, so this will fail at prepare
+                content: b"not json".to_vec(),
                 kind: DocumentKind::StrictJson,
             }],
         );
         let res = txn.prepare();
         assert!(res.is_err(), "prepare should reject invalid json");
-        // Ensure original remains
         let cur = std::fs::read(&target).unwrap();
         assert_eq!(cur, b"{\"x\":1}");
         drop(std::fs::remove_file(&target));
@@ -2683,10 +2586,6 @@ mod tests {
 
     #[test]
     fn transaction_no_fs_wide_atomicity_is_documented() {
-        // This test documents the compensated transaction contract: a failure
-        // in the second file does not atomically revert the first at the
-        // filesystem level without explicit rollback.
-        // We verify that rollback is explicit and residuals are reported.
         let root = tmp_root();
         let a = root.join("a.json");
         let b = root.join("b.json");
@@ -2719,13 +2618,7 @@ mod tests {
             commit_res.is_err(),
             "second commit should fail due to missing staged temp"
         );
-        // After failure, at least one file should be rolled back or reported as residual
-        // The transaction's rollback should have been attempted for the first file.
-        // We verify original content is either restored or residual is reported.
-        // In this test harness, we don't check exact residual, just that the transaction
-        // surface reports it via rollback.
         let still_a = std::fs::read(&a).unwrap();
-        // a should be either original or new, but not corrupted truncation
         assert!(still_a == b"{\"a\":1}" || still_a == b"{\"a\":2}");
         drop(std::fs::remove_file(&a));
         drop(std::fs::remove_file(&b));
@@ -2877,8 +2770,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // MUT-05: §4.2 conflict window: foreign edits between prepare and commit abort with ConcurrentModification and are never overwritten.
-
     #[test]
     fn foreign_edit_between_prepare_and_commit_aborts_write() {
         let root = tmp_root();
@@ -2905,7 +2796,6 @@ mod tests {
             matches!(err, ConfigError::ConcurrentModification { .. }),
             "expected ConcurrentModification, got {err:?}"
         );
-        // The foreign bytes survive, never overwritten, not even partially.
         assert_eq!(std::fs::read(&target).unwrap(), b"{\"a\":\"foreign edit\"}");
         drop(std::fs::remove_dir_all(&root));
     }
@@ -2916,7 +2806,6 @@ mod tests {
         reason = "one scenario per step kind keeps the §4.2 coverage auditable together"
     )]
     fn foreign_edit_between_prepare_and_commit_aborts_every_step_kind() {
-        // Write
         {
             let root = tmp_root();
             let target = root.join("w.json");
@@ -3076,8 +2965,7 @@ mod tests {
             );
         } else {
             // The tampered bytes committed: verification must catch them, so
-            // the read-back == staged == planned invariant is enforced either
-            // at commit or at verify.
+            // read-back == staged == planned holds at commit or verify.
             let bytes = std::fs::read(&target).unwrap();
             assert!(
                 bytes == b"v1" || bytes == b"tampered",
@@ -3113,8 +3001,6 @@ mod tests {
         }
     }
 
-    /// Staged bytes tampered with after staging abort prepare: the temp must
-    /// still carry exactly its planned bytes at the recheck.
     #[test]
     fn prepare_rejects_staged_bytes_tampered_after_staging() {
         let root = tmp_root();
@@ -3145,8 +3031,6 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&root));
     }
-
-    // MUT-02: hard links and symlink target changes
 
     #[cfg(unix)]
     #[test]
@@ -3239,12 +3123,10 @@ mod tests {
             }],
         );
         txn.prepare().unwrap();
-        // Foreign retarget of the existing link between prepare and commit.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&target_b, &link).unwrap();
         let err = txn.commit().unwrap_err();
         assert!(matches!(err, ConfigError::ConcurrentModification { .. }));
-        // The foreign link is untouched.
         assert_eq!(std::fs::read_link(&link).unwrap(), target_b);
         drop(std::fs::remove_dir_all(&root));
     }
@@ -3325,8 +3207,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    // MUT-02 default link policy: follow-and-preserve within roots
-
     #[cfg(unix)]
     #[test]
     fn write_onto_symlink_refused_outside_follow_roots() {
@@ -3338,9 +3218,8 @@ mod tests {
         let link = root.join("allowed").join("cfg.json");
         std::os::unix::fs::symlink(&referent, &link).unwrap();
 
-        // No roots declared: the default policy refuses to follow at all.
-        // `execute` records the prepare failure as an unsuccessful outcome
-        // (no commit was ever attempted).
+        // No roots: the default policy refuses to follow; `execute` records
+        // the prepare failure without ever attempting a commit.
         let id = OperationId::new("op-follow-none").unwrap();
         let mut txn = Transaction::new(
             id,
@@ -3361,7 +3240,6 @@ mod tests {
             "diagnostics must name the refusal: {:?}",
             outcome.diagnostics_redacted
         );
-        // Nothing was mutated and the link structure survived.
         assert_eq!(std::fs::read_link(&link).unwrap(), referent);
         assert_eq!(std::fs::read(&referent).unwrap(), br#"{"foreign":true}"#);
 
@@ -3419,9 +3297,7 @@ mod tests {
             "the link must survive the mutation"
         );
         assert_eq!(std::fs::read_link(&link).unwrap(), referent);
-        // The REFERENT carries the new bytes.
         assert_eq!(std::fs::read(&referent).unwrap(), br#"{"owned":true}"#);
-        // The foreign referent was backed up before the follow landed.
         let backups = outcome
             .commit
             .map(|commit| commit.backups)
@@ -3499,7 +3375,6 @@ mod tests {
             "expected SymlinkFollowRefused, got {err:?}"
         );
 
-        // The same step inside the declared roots validates.
         let id2 = OperationId::new("op-link-inside").unwrap();
         let txn2 = Transaction::new(
             id2,
@@ -3513,8 +3388,6 @@ mod tests {
         assert!(txn2.validate_plan().is_ok());
         drop(std::fs::remove_dir_all(&root));
     }
-
-    // MUT-06: copy_tree + remove_owned_empty_dir
 
     #[test]
     fn copy_tree_respects_include_exclude_filters() {
@@ -3653,24 +3526,19 @@ mod tests {
     fn remove_owned_empty_dir_refuses_non_empty_and_broad_roots() {
         let root = tmp_root();
         std::fs::create_dir_all(&root).unwrap();
-        // Non-empty: typed refusal.
         let dir = root.join("nonempty");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("x.txt"), b"x").unwrap();
         let err = remove_owned_empty_dir(&dir).unwrap_err();
         assert!(matches!(err, ConfigError::Io { .. }), "got {err:?}");
         assert!(dir.exists(), "non-empty dir must survive");
-        // Empty: removed.
         let empty = root.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         remove_owned_empty_dir(&empty).unwrap();
         assert!(!empty.exists());
-        // Broad root: refused by removal validation.
         assert!(remove_owned_empty_dir(Path::new("/tmp")).is_err());
         drop(std::fs::remove_dir_all(&root));
     }
-
-    // MUT-09 + QAL-06: journal + injector on REAL paths
 
     #[test]
     fn journal_written_for_multi_file_commit_and_removed_after_success() {
@@ -3716,14 +3584,12 @@ mod tests {
             "journal must not contain file contents"
         );
 
-        // Recovery restores both files and removes the journal.
         let report = recover_pending(&root).unwrap();
         assert!(report.all_recovered(), "leftover: {:?}", report.journals);
         assert_eq!(std::fs::read(&a).unwrap(), b"{\"a\":1}");
         assert_eq!(std::fs::read(&b).unwrap(), b"{\"b\":1}");
         assert!(!jpath.exists(), "journal removed after verified recovery");
 
-        // A clean run removes the journal after verified completion.
         let id2 = OperationId::new("op-journal-clean").unwrap();
         let mut txn2 = Transaction::new(
             id2,
@@ -3894,9 +3760,8 @@ mod tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"{\"b\":1}");
         drop(std::fs::remove_dir_all(&root));
 
-        // RollbackVerify failure leaves a reported residual on the REAL path:
-        // the second file's commit fails AND the compensation's verification
-        // of the first restore is injected to fail.
+        // RollbackVerify failure leaves a residual: the second commit fails
+        // and the first restore's verification is injected to fail.
         let root2 = tmp_root();
         let c = root2.join("c.json");
         let d = root2.join("d.json");
@@ -3931,8 +3796,6 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&root2));
     }
-
-    // Plan-02 fold: the single-file mutation boundary
 
     fn boundary_scratch(tag: &str) -> PathBuf {
         let dir = crate::test_util::temp_dir_unique(&format!("tx-boundary-{tag}"));
@@ -4043,7 +3906,6 @@ mod tests {
             br#"{"a":1}"#,
             "the existing file is untouched"
         );
-        // The exact-name overwrite keeps working through the same boundary.
         commit_file(
             "case-exact",
             &lower,
@@ -4098,8 +3960,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // Plan-02 fold: structural source guarantees
-
     fn crate_src(name: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -4119,9 +3979,7 @@ mod tests {
         }
     }
 
-    /// The raw atomic primitive must not be a public write entrypoint: the
-    /// boundary (`commit_file` / `Transaction`) is the only public way to
-    /// mutate a file through this crate.
+    /// The atomic primitive stays crate-internal; the boundary is the only public write.
     #[test]
     fn plan02_atomic_write_family_is_crate_internal() {
         let src = crate_src("atomic.rs");
@@ -4135,8 +3993,6 @@ mod tests {
         );
     }
 
-    /// Every codec store commits through the boundary; the raw editor
-    /// commits through the shared stage+commit core.
     #[test]
     fn plan02_codec_stores_share_the_boundary() {
         for name in [
@@ -4167,8 +4023,6 @@ mod tests {
         );
     }
 
-    /// No superai-core / superai-cli source bypasses the boundary with a
-    /// direct atomic write.
     #[test]
     fn plan02_core_and_cli_have_no_direct_atomic_writes() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -4190,10 +4044,6 @@ mod tests {
         }
     }
 
-    // Plan-13 / QAL-09 platform-adversarial cases (executed by the windows and macos CI runners; compiled out elsewhere)
-
-    /// A target held open the way a running harness holds its config must
-    /// surface a typed error, never corruption or a leaked temp.
     #[cfg(windows)]
     #[test]
     fn windows_locked_target_commit_is_typed_error_never_corrupting() {
@@ -4234,8 +4084,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// Windows reserved device names are refused as write targets on the
-    /// real platform (the pure helper table above runs on every host).
     #[cfg(windows)]
     #[test]
     fn windows_reserved_device_paths_rejected_live() {
@@ -4257,9 +4105,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// A path deeper than `MAX_PATH` either commits with verified read-back
-    /// (long-path-aware system) or fails with a typed error, never a panic
-    /// or a partial file.
     #[cfg(windows)]
     #[test]
     fn windows_long_path_commit_is_verified_or_typed_never_partial() {
@@ -4289,8 +4134,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// QAL-09 on case-insensitive APFS: `Settings.json` next to
-    /// `settings.json` is refused, never silently landed over.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_case_insensitive_collision_write_is_typed_never_corrupting() {
@@ -4328,9 +4171,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// QAL-09 macOS application paths: `~/Library/Application Support/...`
-    /// shaped config locations (capitals and the embedded space) commit
-    /// through the boundary with verified read-back.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_application_support_paths_commit_through_the_boundary() {
@@ -4371,11 +4211,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // Behaviour tests for the mutation-testing gate (area C)
-
-    /// Whether chmod 0o333 actually denies opening this directory for
-    /// reading for this process. Root bypasses permission checks; callers
-    /// skip the denial-dependent assertions when it does not.
+    /// Whether the chmod actually denies this process (root bypasses).
     #[cfg(unix)]
     fn perm_denies_dir_read_probe(dir: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -4391,17 +4227,13 @@ mod tests {
         denied
     }
 
-    /// What to do with the target's parent directory when the commit's
-    /// `ParentSync` boundary fires (after the rename landed, right before
-    /// the parent fsync).
+    /// What to do with the parent when `ParentSync` fires (rename landed,
+    /// right before the parent fsync).
     #[cfg(unix)]
     #[derive(Debug, Clone, Copy)]
     enum ParentSabotage {
-        /// Replace the parent with a self-referential symlink loop (ELOOP).
         Loop,
-        /// Make the parent unreadable (EACCES on open).
         DenyRead,
-        /// Remove the parent entirely (ENOENT).
         Vanish,
     }
 
@@ -4513,7 +4345,6 @@ mod tests {
                 "broad root {root} must be refused"
             );
         }
-        // A specific target outside the broad-root set stays allowed.
         assert!(
             validate_remove_target(Path::new("/opt/superai-thing"), RemoveKind::WrapperFile)
                 .is_ok()
@@ -4540,7 +4371,6 @@ mod tests {
                 "binary removal onto a config root must be refused: {bad}"
             );
         }
-        // Real binaries (no dot-prefixed config-root component) stay allowed.
         assert!(
             validate_remove_target(Path::new("/usr/local/bin/superai"), RemoveKind::Binary).is_ok()
         );
@@ -4561,7 +4391,6 @@ mod tests {
 
     #[test]
     fn paths_equal_folded_requires_real_windows_shape_on_both_sides() {
-        // UNC text folds case-insensitively (both sides windows-shaped).
         assert!(paths_equal_platform_folded(
             Path::new("\\\\Srv\\Share"),
             Path::new("\\\\srv\\share")
@@ -4574,8 +4403,6 @@ mod tests {
         ));
     }
 
-    /// The staged temp name embeds a current epoch-millis value and a compact
-    /// four-hex-char random suffix: the collision-avoidance contract.
     #[test]
     fn staged_temp_name_carries_recent_millis_and_compact_hex_suffix() {
         let root = tmp_root();
@@ -4615,21 +4442,17 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Staged temps are created 0o600 for new targets, inherit the target's
-    /// mode for existing targets, and never land mode 0.
     #[cfg(unix)]
     #[test]
     fn staged_temp_permissions_are_hardened_or_inherited() {
         use std::os::unix::fs::PermissionsExt;
         let root = tmp_root();
 
-        // New target: hardened 0o600.
         let fresh = root.join("fresh.cfg");
         let temp = stage_temp_file(&fresh, b"x", None).unwrap();
         let mode = std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a fresh target's temp must be 0o600");
 
-        // Existing 0o644 target: the temp inherits the same mode.
         let kept = root.join("kept.cfg");
         std::fs::write(&kept, b"old").unwrap();
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -4649,8 +4472,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// An unclassifiable error opening the parent (ELOOP) surfaces from the
-    /// commit against the PARENT path: the sync is not silently swallowed.
     #[cfg(unix)]
     #[test]
     fn commit_surfaces_parent_open_errors_against_the_parent_path() {
@@ -4679,12 +4500,8 @@ mod tests {
         match err {
             ConfigError::Io { path, source } => {
                 assert_eq!(path, root, "the error must be attributed to the parent");
-                // ELOOP has no stable ErrorKind on this toolchain and its
-                // raw errno is platform-specific (40 on Linux, 62 on macOS);
-                // mirror the atomic.rs sync-parent precedent: require an OS
-                // error so a plain permission/not-found mixup cannot pass,
-                // and pin the exact errno on Linux where the mutation
-                // suite runs.
+                // ELOOP has no stable ErrorKind (errno 40 Linux, 62 macOS):
+                // require an OS error; pin errno 40 on Linux.
                 assert!(
                     source.raw_os_error().is_some(),
                     "the surfaced error is an OS error, got {source}"
@@ -4702,8 +4519,6 @@ mod tests {
         drop(std::fs::remove_file(&root));
     }
 
-    /// An EACCES opening the parent (Windows-shaped denial) is tolerated:
-    /// the commit still succeeds and the content is readable back.
     #[cfg(unix)]
     #[test]
     fn commit_tolerates_unreadable_parent_at_sync() {
@@ -4738,8 +4553,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A parent that vanishes at sync time is tolerated; the loss surfaces
-    /// at the read-back against the FILE path, never the parent.
     #[cfg(unix)]
     #[test]
     fn commit_reports_vanished_parent_against_the_target_not_parent() {
@@ -4777,8 +4590,6 @@ mod tests {
         }
     }
 
-    /// The commit creates missing target parent directories: a staged temp
-    /// committed into a not-yet-existing nested path lands successfully.
     #[test]
     fn commit_staged_file_creates_missing_target_parents() {
         let root = tmp_root();
@@ -4796,9 +4607,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A staged temp on another device (tmpfs) commits through the copy
-    /// fallback: EXDEV is not a dead end (unix; dev-id guard skips hosts
-    /// without a separate `/dev/shm`).
+    /// EXDEV is not a dead end: the copy fallback lands (unix; skips hosts
+    /// without a separate /dev/shm).
     #[cfg(unix)]
     #[test]
     fn commit_staged_file_falls_back_to_copy_across_devices() {
@@ -4829,9 +4639,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Every ASCII case variant of `config.json` (the probed name is not a
-    /// sibling), staged non-minimum first so even creation-ordered readdir
-    /// starts with the minimum interior.
+    /// Every case variant of `config.json` (probed name excluded), staged
+    /// non-minimum first so creation-ordered readdir starts interior.
     fn case_variant_pool() -> Vec<String> {
         let base = b"config.json";
         let cased: Vec<usize> = (0..base.len())
@@ -4854,9 +4663,8 @@ mod tests {
         pool
     }
 
-    /// The case-variant siblings of `config.json` currently staged in `dir`,
-    /// in the directory's own readdir order, the same order
-    /// `case_fold_collision_in_dir` iterates.
+    /// Case-variant siblings in the directory's own readdir order, the same
+    /// order `case_fold_collision_in_dir` iterates.
     fn case_variants_in_readdir_order(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .expect("the scratch directory must be readable")
@@ -4866,12 +4674,8 @@ mod tests {
             .collect()
     }
 
-    /// Stage a scratch dir of case-variant siblings until the directory's
-    /// own readdir order puts the lexicographic minimum strictly interior.
-    /// Order-independence is the point: `best`-update mutants return the
-    /// first or last readdir entry, and ext4/overlayfs hash order is fixed
-    /// per name-set, so only an interior minimum kills them on any host.
-    /// `None` on case-insensitive filesystems, where variants collapse.
+    /// Stage siblings until readdir puts the minimum strictly interior; only
+    /// that kills `best`-update mutants on any host (None on case-insensitive fs).
     fn discriminating_case_variant_fixture(tag: &str) -> Option<(PathBuf, String)> {
         let dir = boundary_scratch(tag);
         std::fs::write(dir.join("case-probe-a"), b"{}").unwrap();
@@ -4898,17 +4702,11 @@ mod tests {
                 return Some((dir, min));
             }
         }
-        // No mainstream filesystem sorts readdir output, so the loop finds
-        // an interior minimum long before the pool runs out (hash order: a
-        // handful of inserts; creation order: immediately). Fall through
-        // with the full pool regardless; the suite must never fail over an
-        // iteration order, only the kill strength would suffer.
+        // No mainstream fs sorts readdir output, so an interior minimum shows
+        // up early; fall through regardless rather than fail on order.
         Some((dir, min))
     }
 
-    /// With several case-variant siblings the collision report names the
-    /// lexicographically first variant deterministically, whatever order the
-    /// filesystem reports the directory in.
     #[test]
     fn case_fold_collision_reports_the_first_variant() {
         let Some((dir, min)) = discriminating_case_variant_fixture("case-min") else {
@@ -4944,23 +4742,14 @@ mod tests {
     #[test]
     fn strip_jsonc_comments_matches_the_expected_output_table() {
         let cases: &[(&str, &str)] = &[
-            // Line comment to end of line.
             (r#"{"a":1}// tail"#, r#"{"a":1}"#),
-            // Line comment stops at the newline.
             ("A//c\nB", "A\nB"),
-            // Block comment removed entirely.
             ("x/* hidden */y", "xy"),
-            // Unclosed block comment consumes the rest.
             ("a/* never", "a"),
-            // `**/` closes the block.
             ("a/* **/ b", "a b"),
-            // `//` inside a string is data.
             (r#"{"u":"http://x"}"#, r#"{"u":"http://x"}"#),
-            // An escaped quote keeps the string open past a marker.
             (r#"{"k":"a\"//b"}"#, r#"{"k":"a\"//b"}"#),
-            // An escaped backslash does not escape the closing quote.
             ("{\"k\":\"a\\\\\"}// c", "{\"k\":\"a\\\\\"}"),
-            // A lone slash is ordinary data.
             ("a/b", "a/b"),
         ];
         for (input, expected) in cases {
@@ -4972,7 +4761,6 @@ mod tests {
         }
     }
 
-    /// `?` matches exactly one character and never a path separator.
     #[test]
     fn name_matches_question_mark_never_matches_a_separator() {
         assert!(name_matches("*.md", "keep.md"));
@@ -4984,7 +4772,6 @@ mod tests {
         assert!(name_matches("exact.md", "exact.md"));
     }
 
-    /// Exclude patterns prune whole directories, not just files.
     #[test]
     fn copy_tree_excludes_directories_by_name() {
         let root = tmp_root();
@@ -5009,7 +4796,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// The entry bound counts directories as well as files.
     #[test]
     fn copy_tree_entry_bound_counts_directories_too() {
         let root = tmp_root();
@@ -5027,7 +4813,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// The byte bound is strict: a file of exactly `max_bytes` still copies.
     #[test]
     fn copy_tree_byte_bound_is_strict() {
         let root = tmp_root();
@@ -5048,7 +4833,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// The report accounts for every copied byte.
     #[test]
     fn copy_tree_reports_the_sum_of_copied_bytes() {
         let root = tmp_root();
@@ -5062,7 +4846,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Removing a directory that is already absent is a success (idempotent).
     #[test]
     fn remove_owned_empty_dir_treats_missing_as_success() {
         let root = tmp_root();
@@ -5072,8 +4855,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A stat error other than `NotFound` (EACCES on the parent) surfaces as
-    /// an error instead of being masked as success.
     #[cfg(unix)]
     #[test]
     fn remove_owned_empty_dir_surfaces_stat_errors() {
@@ -5096,7 +4877,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Plan validation rejects each glob character on its own.
     #[test]
     fn validate_plan_rejects_each_glob_character_alone() {
         for path in [
@@ -5135,7 +4915,6 @@ mod tests {
         let declared = alias.join("allowed");
         let id = OperationId::new("op-alias-root").unwrap();
         let mut txn = Transaction::new(id, Vec::new()).with_symlink_follow_roots(vec![declared]);
-        // Build the tree the plan will mutate through the link.
         let allowed = real.join("allowed");
         std::fs::create_dir_all(&allowed).unwrap();
         let referent = allowed.join("cfg.json");
@@ -5158,7 +4937,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A write onto a plain single-link file records no hard-link warning.
     #[test]
     fn plain_writes_never_record_a_hard_link_warning() {
         let root = tmp_root();
@@ -5187,8 +4965,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A Write planned onto an existing directory is not a backup candidate:
-    /// prepare succeeds and the failure surfaces at the rename.
     #[test]
     fn write_onto_an_existing_directory_prepares_cleanly_and_fails_at_rename() {
         let root = tmp_root();
@@ -5213,8 +4989,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A failure at the third file compensates the two files that already
-    /// committed: unrestorable ones are reported as residuals.
     #[test]
     fn third_file_failure_compensates_the_earlier_files() {
         let root = tmp_root();
@@ -5248,9 +5022,8 @@ mod tests {
         )
         .with_injector(FailAtPoint::new(Point::ThirdFile, 1));
         txn.prepare().unwrap();
-        // Corrupt the FIRST file's backup: its restore must be refused and
-        // reported as a residual, proving the first two steps committed
-        // before the third-file boundary failed.
+        // Corrupt the first backup: its refused restore proves the first two
+        // steps committed before the third-file boundary failed.
         let a1_backup = txn
             .backups
             .iter()
@@ -5276,8 +5049,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// When directory creation fails, the error names the uncreatable
-    /// PARENT component (created first), not the full leaf path.
     #[test]
     fn create_dir_failure_names_the_uncreatable_parent() {
         let root = tmp_root();
@@ -5298,7 +5069,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A Symlink step creates its missing parent directories.
     #[cfg(unix)]
     #[test]
     fn symlink_steps_create_missing_parent_directories() {
@@ -5383,7 +5153,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A `RemoveFile` step removes a broken symlink (the link itself).
     #[cfg(unix)]
     #[test]
     fn remove_file_steps_remove_broken_symlinks() {
@@ -5402,7 +5171,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A `RemoveFile` step on a missing target is a success (idempotent).
     #[test]
     fn remove_file_steps_treat_missing_targets_as_success() {
         let root = tmp_root();
@@ -5424,8 +5192,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Foreign content drift in the commit→verify window fails verification,
-    /// names the digest mismatch, and rolls the target back.
     #[test]
     fn verify_digest_drift_rolls_back_and_names_the_digest() {
         let root = tmp_root();
@@ -5469,8 +5235,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Rollback removes a created BROKEN symlink (lstat-visible though
-    /// `exists()` is false).
     #[cfg(unix)]
     #[test]
     fn rollback_removes_created_broken_symlinks() {
@@ -5511,8 +5275,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// An aborted follow-and-preserve commit (caller token invalidated by a
-    /// link retarget) leaves no staged temp behind.
     #[cfg(unix)]
     #[test]
     fn follow_token_abort_cleans_staged_temps() {
@@ -5554,9 +5316,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// Forward-slash UNC text is windows-shaped on every host: the folded
-    /// comparison in `paths_equal_platform_folded` relies on the `//` prefix
-    /// alone (a host cannot see `\\`-only text from a windows caller).
+    /// Forward-slash UNC counts on every host: the folded comparison relies
+    /// on the `//` prefix alone.
     #[test]
     fn looks_windows_shaped_accepts_forward_slash_unc_text() {
         assert!(looks_windows_shaped("//server/share"));
@@ -5568,8 +5329,6 @@ mod tests {
         assert!(!looks_windows_shaped(""));
     }
 
-    /// Two suffixes drawn within the same millisecond must differ: the
-    /// process-id + counter mix keeps same-millis temp names collision-free.
     #[test]
     fn random_suffixes_stay_distinct_within_the_same_millisecond() {
         let a = generate_random_suffix(1_700_000_000_123);
@@ -5586,9 +5345,6 @@ mod tests {
         assert_ne!(a, b, "the counter must keep same-millis suffixes distinct");
     }
 
-    /// With several variant siblings the report names the lexicographically
-    /// first one, independent of the filesystem's iteration order (the
-    /// fixture guarantees the minimum is interior to it).
     #[test]
     fn case_fold_collision_picks_the_lexicographically_first_variant() {
         let Some((dir, min)) = discriminating_case_variant_fixture("fold-order") else {

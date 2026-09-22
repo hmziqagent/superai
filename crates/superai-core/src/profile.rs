@@ -1,16 +1,5 @@
-//! Symlink-swap profiles over fixed config paths.
-//!
-//! Fixed-path harnesses (the declared [`Isolation::FixedPathSingle`] case)
-//! honor no relocation env var, so an instance is a managed profile tree
-//! swapped into the fixed path by an atomic symlink flip: create marks the
-//! root, activate backs pre-existing content up and links the path at it,
-//! deactivate removes the link and restores the backup digest-verified.
-//! State (manifest, ownership markers, active-swap records, locks, and
-//! quarantine backups) lives under the caller-chosen base; the fixed path
-//! is always a parameter, so nothing here resolves or writes the real user
-//! home. Switch profiles only while the app is quit: Electron `Singleton*`
-//! locks sit in the swapped tree, and Windows MSIX virtualizes AppData.
-//! Concurrent activations serialize through the WRP-06 activation lock.
+//! Symlink-swap profiles over fixed config paths: activate backs up real
+//! content and flips an atomic symlink; deactivate restores it verified.
 
 use std::path::{Path, PathBuf};
 
@@ -45,9 +34,8 @@ const ACTIVE_DIR_NAME: &str = "profile-active";
 /// Activation lock directory (one lockfile per harness).
 const LOCK_DIR_NAME: &str = "profile-locks";
 
-/// Request to create a profile: a harness and a name. The managed tree the
-/// fixed path will point at is created fresh; seeding harness config into it
-/// is the caller's business (through the adapter-declared write paths).
+/// Request to create a profile: a harness and a name. Seeding harness
+/// config into the fresh tree is the caller's business.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSpec {
     /// Harness whose fixed config path the profile swaps.
@@ -68,11 +56,8 @@ impl ProfileSpec {
     }
 }
 
-/// A recorded profile in the on-disk manifest.
-///
-/// Forbidden fields (never serialized): model/provider data and api keys; a
-/// profile is a config tree whose effective content lives in the harness's
-/// own files inside `root`, read fresh.
+/// A recorded profile in the on-disk manifest. Model/provider data and
+/// api keys are never serialized into it; content lives in the harness files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileRecord {
     /// Harness the profile swaps for.
@@ -276,19 +261,13 @@ pub fn active_profile(base_dir: &Path, harness: &HarnessId) -> Result<Option<Str
     Ok(load_active_swap(base_dir, harness)?.map(|swap| swap.profile))
 }
 
-/// Create a symlink `link` pointing at `target`.
-///
-/// Windows needs the symlink kind to match the target's kind, so the kind
-/// comes from the target's metadata; a missing target falls through to
-/// `symlink_file`, whose error is mapped below. Creating directory symlinks
-/// may need privileges on Windows; failures map to the typed error.
+/// Create a symlink `link` -> `target`. Windows picks the kind from the
+/// target's metadata; a missing target falls through to `symlink_file`.
 fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
     let result = {
-        // Follow to the target's real kind; a missing target falls through
-        // to `symlink_file`, whose error is mapped below.
         if std::fs::metadata(target).is_ok_and(|meta| meta.is_dir()) {
             std::os::windows::fs::symlink_dir(target, link)
         } else {
@@ -306,10 +285,8 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     })
 }
 
-/// Remove a symlink regardless of whether it points at a directory.
-/// Windows rejects `remove_file` on a directory symlink (Access Denied);
-/// `remove_dir` removes the link itself without touching the target.
-/// Same pattern as `skills::remove_symlink_any` (commits b1ab4a7/cabe192).
+/// Remove a symlink regardless of directory-ness: Windows rejects
+/// `remove_file` on a directory symlink; `remove_dir` removes the link itself.
 fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -323,9 +300,8 @@ fn remove_symlink_any(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// Resolve what `path` currently is: a symlink (payload = resolved target),
-/// real content (carrying the lstat, so later steps can re-verify they act on
-/// the same inode), or absent.
+/// What `path` currently is: a symlink (payload = resolved target), real
+/// content (with its lstat for later re-verification), or absent.
 enum FixedPathState {
     /// Symlink; the caller decides managed vs foreign against the recorded
     /// profile roots.
@@ -365,9 +341,8 @@ fn classify_fixed_path(path: &Path) -> Result<FixedPathState> {
     }
 }
 
-/// A symlink target is MANAGED only when it is a recorded profile root under
-/// the profile base; anything else (including unrecorded paths under the
-/// base) is foreign and must not be swapped over.
+/// A symlink target is MANAGED only when it is a recorded profile root
+/// under the profile base; anything else is foreign.
 fn is_managed_target(target: &Path, base_dir: &Path, harness: &HarnessId) -> Result<bool> {
     if !target.starts_with(base_dir) {
         return Ok(false);
@@ -388,12 +363,8 @@ enum VerifiedRead {
     Unreadable,
 }
 
-/// Read the file at `path` proving it is still what `expect` described: on
-/// unix the opened fd's dev/ino AND length must match. Length matters because
-/// filesystems recycle inode numbers, so a replacement created after the
-/// classified inode was freed can wear the same ino; a length pin catches it
-/// without resting on allocator behaviour. Other platforms have no std file
-/// identity and pin length only (the documented Windows residual).
+/// Read the file at `path` proving it is still the classified inode: unix
+/// pins dev/ino AND length (filesystems recycle inode numbers; length catches it).
 fn read_real_file_verified(path: &Path, expect: &std::fs::Metadata) -> VerifiedRead {
     #[cfg(unix)]
     {
@@ -426,9 +397,8 @@ fn read_real_file_verified(path: &Path, expect: &std::fs::Metadata) -> VerifiedR
     }
 }
 
-/// Whether `path` still names the inode `expect` described; a length
-/// mismatch also fails, since a recycled inode number with different content
-/// is not the classified object (unix only; other platforms always "match").
+/// Whether `path` still names the classified inode (unix; length is pinned
+/// too because inode numbers recycle). Other platforms always match.
 fn still_same_inode(path: &Path, expect: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -447,9 +417,8 @@ fn still_same_inode(path: &Path, expect: &std::fs::Metadata) -> bool {
     }
 }
 
-/// Read the restored content at `fixed_path` without following a swap-in:
-/// on unix the lstat'd inode must be the inode opened, so verification reads
-/// the file that was restored, never a symlink planted after the rename.
+/// Read the restored content without following a swap-in: unix requires
+/// the opened inode to be the lstat'd one, so a planted symlink refuses.
 fn read_restored_bytes(fixed_path: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
@@ -507,8 +476,7 @@ fn read_restored_bytes(fixed_path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Create a profile: a fresh managed tree under the base, marked with the
-/// ownership marker. Refuses case-fold name collisions and pre-existing
-/// roots before any write, exactly like the alias core.
+/// ownership marker; refuses case-fold collisions and existing roots.
 pub fn create_profile(base_dir: &Path, spec: &ProfileSpec) -> Result<ProfileRecord> {
     let root = profile_root(base_dir, &spec.harness, &spec.name)?;
     for record in load_manifest(base_dir)? {
@@ -580,9 +548,8 @@ pub fn get_profile(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<P
         })
 }
 
-/// Verify the profile marker names this harness and profile (case-folded on
-/// the name). A missing or mismatched marker means the tree is not a managed
-/// profile root and must not be touched.
+/// Verify the marker names this harness and profile (case-folded name);
+/// missing or mismatched means the tree is foreign and must not be touched.
 fn verify_profile_marker(root: &Path, harness: &HarnessId, name: &str) -> Result<()> {
     let marker_path = root.join(PROFILE_MARKER_FILE);
     let text = std::fs::read_to_string(&marker_path).map_err(|e| CoreError::ForeignOwnership {
@@ -601,18 +568,8 @@ fn verify_profile_marker(root: &Path, harness: &HarnessId, name: &str) -> Result
     }
 }
 
-/// Validate and prepare the fixed path for the swap: refuse a foreign
-/// symlink, back pre-existing REAL content up under the base (files also
-/// record a digest so the restore is provably byte-identical; directories
-/// are moved untouched), and pass a managed symlink through.
-///
-/// The recorded `backup_path`/`preexisting_digest` pair is ONE canonical
-/// slot per fixed path, written only by the first activation that displaces
-/// real content. A same-path switch carries the slot forward unchanged, so
-/// a later deactivate restores the ORIGINAL pre-activation content, not the
-/// intermediate profile. Real content at the path while a swap is recorded
-/// means the managed symlink was displaced, and the switch is refused
-/// rather than orphaning the original backup.
+/// Refuse a foreign symlink, back real content up (files digested), and
+/// carry the canonical backup slot so deactivate restores the original.
 fn prepare_fixed_path_for_swap(
     base: &Path,
     base_dir: &Path,
@@ -672,9 +629,8 @@ fn prepare_fixed_path_for_swap(
                         .to_owned(),
                 });
             }
-            // Same-filesystem moves preserve the inode: if the quarantined
-            // entry is not the classified inode, a writer swapped the path
-            // mid-move and the quarantine holds the wrong object.
+            // Same-filesystem moves preserve the inode: a mismatch means a
+            // writer swapped the path mid-move and quarantine got the wrong object.
             if entry.same_filesystem && !still_same_inode(&quarantine_path, &meta) {
                 let owner = format!(
                     "fixed path was swapped during the backup move; {} holds the \
@@ -693,8 +649,7 @@ fn prepare_fixed_path_for_swap(
 }
 
 /// The canonical backup slot carried unchanged across a same-path switch:
-/// whatever the first activation recorded stays the content a later
-/// deactivate restores (None stays None when nothing was ever displaced).
+/// deactivate restores whatever the first activation recorded.
 fn carried_backup_slot(prior: Option<&ActiveSwap>) -> (Option<PathBuf>, Option<String>) {
     (
         prior.and_then(|swap| swap.backup_path.as_deref().map(PathBuf::from)),
@@ -702,15 +657,8 @@ fn carried_backup_slot(prior: Option<&ActiveSwap>) -> (Option<PathBuf>, Option<S
     )
 }
 
-/// Activate profile `name` at `fixed_path`: point the path at the managed
-/// root via an atomic symlink swap.
-///
-/// Pre-existing REAL content is backed up first (digest recorded for the
-/// byte-identical restore); a FOREIGN symlink is refused; a MANAGED symlink
-/// is swapped in place. Activating at a second path while another swap is
-/// recorded is refused (deactivate first); a same-path switch preserves the
-/// canonical backup slot (see [`prepare_fixed_path_for_swap`]). Concurrent
-/// activations serialize through the WRP-06 activation lock.
+/// Activate `name` at `fixed_path` via an atomic symlink swap; real content
+/// is backed up first, foreign symlinks refused, WRP-06 lock serializes.
 pub fn activate_profile(
     base_dir: &Path,
     harness: &HarnessId,
@@ -742,9 +690,8 @@ pub fn activate_profile(
         .join(harness.as_str());
     let _lock = ActivationLock::acquire(&lock_dir, harness.as_str())?;
 
-    // Loaded once under the lock: when a swap is recorded the check above
-    // guarantees it is at THIS fixed path, so `prior` (when present) is the
-    // same-path switch whose canonical backup slot must survive.
+    // Loaded under the lock: a recorded swap is at THIS path (checked
+    // above), so `prior` is a same-path switch whose backup slot survives.
     let prior = load_active_swap(base_dir, harness)?;
     if let Some(active) = &prior
         && active.fixed_path != fixed_path.display().to_string()
@@ -766,10 +713,8 @@ pub fn activate_profile(
         prior.as_ref(),
     )?;
 
-    // Atomic swap: create the symlink under a temporary sibling name, then
-    // rename(2) it onto the fixed path. rename replaces an existing symlink
-    // atomically; real content was moved away above (rename cannot replace a
-    // directory with a symlink).
+    // Atomic swap: build the link at a temp sibling, then rename(2) it onto
+    // the fixed path; real content was already moved away above.
     let parent = fixed_path.parent().ok_or_else(|| CoreError::InvalidPath {
         kind: "fixed_path".to_owned(),
         value: fixed_path.display().to_string(),
@@ -822,11 +767,8 @@ pub fn activate_profile(
     })
 }
 
-/// Move the backup entry back to `fixed_path`. A same-volume rename
-/// preserves the inode (returned true, so callers can re-verify it); a
-/// cross-volume restore copies the tree without following links (a
-/// junction inside the backup must not be copied through) and then drops
-/// the backup copy.
+/// Move the backup back: a same-volume rename preserves the inode (true);
+/// cross-volume copies the tree without following inner links (false).
 fn restore_backup_entry(entry: &Path, fixed_path: &Path) -> Result<bool> {
     match std::fs::rename(entry, fixed_path) {
         Ok(()) => Ok(true),
@@ -877,14 +819,8 @@ fn restore_backup_entry(entry: &Path, fixed_path: &Path) -> Result<bool> {
     }
 }
 
-/// Deactivate the active profile at `fixed_path`: remove the managed symlink
-/// and restore the backed-up pre-existing content byte-identically.
-///
-/// Refuses when no swap is recorded for the harness, when the recorded path
-/// differs, when the path is no longer one of our symlinks (replaced
-/// content is foreign and must not be touched), or when the recorded backup
-/// entry has been replaced by a symlink (restoring through it would hand
-/// the fixed path to whatever the link points at).
+/// Deactivate the swap at `fixed_path`: remove the managed symlink and
+/// restore the backup byte-identically; refuses any foreign replacement.
 pub fn deactivate_profile(
     base_dir: &Path,
     harness: &HarnessId,
@@ -930,11 +866,8 @@ pub fn deactivate_profile(
             });
         }
     }
-    // The quarantine entry is the moved pre-existing content (file or
-    // directory tree). Validate it before touching the live link: a symlink
-    // planted at the entry path must refuse the restore outright. The lstat
-    // is kept: after the restore rename the fixed path must still name this
-    // inode (unix), or a writer swapped the entry mid-restore.
+    // Validate the quarantine entry before touching the live link; the
+    // lstat is kept to re-verify the restore rename landed the same inode.
     let mut backup_meta: Option<std::fs::Metadata> = None;
     if let Some(backup) = swap.backup_path.as_deref() {
         let entry = PathBuf::from(backup);
@@ -998,13 +931,8 @@ pub fn deactivate_profile(
     })
 }
 
-/// Remove a profile: its managed root is moved to quarantine (recoverable,
-/// never a blind delete) and its manifest entry dropped.
-///
-/// Refuses the currently-active profile (deactivate first), roots outside
-/// the profile base, and roots without a matching ownership marker. Holds
-/// the activation lock so a concurrent activation cannot link the fixed
-/// path at a root that is mid-quarantine.
+/// Remove a profile: the root is quarantined (recoverable) and the manifest
+/// entry dropped; refuses active, unmarked, or outside-base roots.
 pub fn remove_profile(base_dir: &Path, harness: &HarnessId, name: &str) -> Result<ProfileRecord> {
     let base = AbsolutePath::from_path(base_dir)?;
     let lock_dir = base
@@ -1085,14 +1013,11 @@ mod tests {
         // Directory backups carry no digest (files do); the content itself
         // is the proof below.
         assert!(activation.preexisting_digest.is_none());
-        // The fixed path is now a symlink at the managed root, and the
-        // profile's content is visible THROUGH the fixed path.
         assert!(fixed.is_symlink(), "fixed path must be a symlink");
         assert_eq!(
             std::fs::read(fixed.join("claude_desktop_config.json")).unwrap(),
             br#"{"mcpServers": {}}"#.to_vec()
         );
-        // The backup holds the pre-existing bytes, recoverable under the base.
         let backup = activation.backup_path.unwrap();
         assert!(backup.starts_with(b.join(".superai").join("quarantine")));
         // The quarantine entry path IS the moved tree (its last component
@@ -1130,7 +1055,6 @@ mod tests {
             None,
             "swap state must be cleared"
         );
-        // Deactivating again refuses: no swap recorded.
         drop(deactivate_profile(&b, &harness("claude-desktop"), &fixed).unwrap_err());
         drop(record);
     }
@@ -1171,9 +1095,8 @@ mod tests {
         );
     }
 
-    /// Real content at the fixed path, activate A, same-path switch to B,
-    /// deactivate: the ORIGINAL content must come back byte-identical and
-    /// nothing may stay stranded in quarantine.
+    /// Real content, activate A, same-path switch to B, deactivate: the
+    /// ORIGINAL content must return byte-identical, nothing stranded.
     #[test]
     fn switch_then_deactivate_restores_the_original_content() {
         let b = base("switch-restore");
@@ -1206,7 +1129,6 @@ mod tests {
         assert!(first.backup_path.is_some(), "original backed up");
         let original_backup = first.backup_path.unwrap();
 
-        // Same-path switch: the canonical backup slot must survive.
         let switch = activate_profile(&b, &harness("claude-desktop"), "personal", &fixed).unwrap();
         assert_eq!(
             switch.backup_path.as_deref(),
@@ -1252,8 +1174,7 @@ mod tests {
     }
 
     /// The FILE-at-fixed-path variant: the recorded digest rides across a
-    /// same-path switch too, so the deactivate restore is still provably
-    /// byte-identical.
+    /// same-path switch, keeping the restore provably byte-identical.
     #[test]
     fn switch_carries_the_file_backup_digest_until_deactivate() {
         let b = base("switch-digest");
@@ -1286,10 +1207,8 @@ mod tests {
         assert_eq!(std::fs::read(&fixed).unwrap(), original.to_vec());
     }
 
-    /// Real content showing up at the fixed path WHILE a swap is recorded
-    /// means the managed symlink was displaced; a switch must refuse rather
-    /// than quarantine that content into (or strand it beside) the original
-    /// backup slot.
+    /// Real content appearing mid-swap means the managed symlink was
+    /// displaced; a switch must refuse rather than strand the original backup.
     #[test]
     fn switch_refuses_real_content_displacing_the_managed_symlink() {
         let b = base("switch-displaced");
@@ -1308,9 +1227,8 @@ mod tests {
         std::fs::write(fixed.join("claude_desktop_config.json"), b"original").unwrap();
         let first = activate_profile(&b, &harness("claude-desktop"), "one", &fixed).unwrap();
 
-        // Someone replaces our symlink with real content mid-swap
-        // (kind-correct removal: the managed link is a directory symlink
-        // on Windows, where plain `remove_file` is Access-Denied).
+        // Someone replaces our symlink with real content mid-swap (kind-
+        // correct removal: the link is a directory symlink on Windows).
         remove_symlink_any(&fixed).unwrap();
         std::fs::create_dir_all(&fixed).unwrap();
         std::fs::write(fixed.join("alien.txt"), b"alien").unwrap();
@@ -1321,8 +1239,6 @@ mod tests {
             }
             other => panic!("expected ForeignOwnership, got {other:?}"),
         }
-        // The displaced content is untouched, the original backup and the
-        // active pointer are exactly as the first activation left them.
         assert_eq!(
             std::fs::read(fixed.join("alien.txt")).unwrap(),
             b"alien".to_vec()
@@ -1352,9 +1268,8 @@ mod tests {
         }
     }
 
-    // Unix-only: the premise is a foreign symlink at the fixed path, created
-    // with `std::os::unix::fs::symlink`; Windows directory symlinks need
-    // privileges (and the swap mechanism itself is documented Linux/macOS).
+    // Unix-only: the fixture creates a foreign symlink with
+    // `std::os::unix::fs::symlink`; Windows symlinks need privileges.
     #[cfg(unix)]
     #[test]
     fn foreign_symlink_target_is_refused_without_touching_it() {
@@ -1373,7 +1288,6 @@ mod tests {
             }
             other => panic!("expected ForeignOwnership, got {other:?}"),
         }
-        // The foreign symlink is untouched and still points where it pointed.
         assert_eq!(std::fs::read_link(&fixed).unwrap(), elsewhere);
         assert!(
             active_profile(&b, &harness("claude-desktop"))
@@ -1474,8 +1388,6 @@ mod tests {
             }
             other => panic!("expected ForeignOwnership, got {other:?}"),
         }
-        // Refusal left everything as it was: managed link still in place,
-        // swap state still recorded, attacker content untouched.
         assert!(
             fixed.is_symlink(),
             "managed symlink must survive the refusal"
@@ -1492,9 +1404,8 @@ mod tests {
         );
     }
 
-    /// A scratch dir on another filesystem when one is available
-    /// (/dev/shm tmpfs vs the temp base's filesystem); `tag` keeps
-    /// parallel tests off each other's scratch trees.
+    /// A scratch dir on another filesystem when one exists (/dev/shm tmpfs
+    /// vs the temp base); `tag` keeps parallel tests apart.
     #[cfg(unix)]
     fn cross_device_scratch(tag: &str) -> Option<PathBuf> {
         use std::os::unix::fs::MetadataExt;
@@ -1515,9 +1426,8 @@ mod tests {
         Some(scratch)
     }
 
-    /// Deactivate restores a cross-volume backup by copying the tree back
-    /// without following links: an inner link is recreated, never read
-    /// through. Unix-only fixture (/dev/shm vs the temp base).
+    /// A cross-volume dir backup restores by copying without following
+    /// links: an inner link is recreated, never read through.
     #[cfg(unix)]
     #[test]
     fn deactivate_restores_cross_device_dir_backups_without_following_links() {
@@ -1606,7 +1516,6 @@ mod tests {
         }
         deactivate_profile(&b, &harness("claude-desktop"), &fixed).unwrap();
 
-        // Tampered marker: foreign, untouched.
         std::fs::write(
             record.root.join(PROFILE_MARKER_FILE).unwrap().as_path(),
             b"claude-desktop\nother\n",
@@ -1618,7 +1527,6 @@ mod tests {
         }
         assert!(record.root.as_path().exists(), "unmarked root untouched");
 
-        // Outside-base root recorded in the manifest: refused.
         let outside = crate::test_util::temp_dir_unique("profile-outside");
         std::fs::create_dir_all(&outside).unwrap();
         let manifest = serde_json::json!({
@@ -1741,8 +1649,7 @@ mod tests {
         ));
 
         // A same-length replacement renamed over the path is caught by the
-        // dev/ino check: its inode was allocated while the classified inode
-        // was still live, so no allocator order can collide the two.
+        // dev/ino check; no allocator order can collide two live inodes.
         let swap = dir.join("intruder");
         std::fs::write(&swap, b"replaced bytes!!").unwrap();
         std::fs::rename(&swap, &target).unwrap();
@@ -1752,8 +1659,7 @@ mod tests {
         ));
 
         // A symlink planted at the path is detected even when the victim
-        // file recycled the freed classified inode number: the replacement
-        // is shorter, so detection never rests on inode allocation alone.
+        // recycled the freed inode number: it is shorter, so the length pin catches it.
         let victim = dir.join("victim");
         std::fs::write(&victim, b"victim bytes").unwrap();
         std::fs::remove_file(&target).unwrap();

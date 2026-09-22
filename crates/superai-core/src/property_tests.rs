@@ -1,7 +1,5 @@
-//! Property tests for QAL-03: manual loops with a deterministic RNG, no external dep.
-//!
-//! Covers: registry no forbidden fields, preview deterministic,
-//! restore exact, collision-safe normalization, capability complete.
+//! Property tests for QAL-03: manual loops with a deterministic RNG, no
+//! external dep.
 
 #![expect(
     clippy::cast_possible_truncation,
@@ -202,7 +200,6 @@ mod tests {
         dir.join(format!("registry-{iter}.json"))
     }
 
-    // 1. Registry no forbidden fields
     #[test]
     fn property_registry_no_forbidden_fields() {
         let forbidden = [
@@ -225,7 +222,6 @@ mod tests {
                 // Ignore collision errors: generate fresh unique names/paths, collisions should be rare.
                 drop(reg.insert(inst));
             }
-            // Store to temp file and read raw JSON.
             let path = scratch_registry_path("prop-reg-forbidden", iter);
             reg.store(&path).unwrap();
             let raw = std::fs::read_to_string(&path).unwrap();
@@ -236,7 +232,6 @@ mod tests {
                     "forbidden field {field} found at iter {iter}: {raw}"
                 );
             }
-            // Also check deserialized map keys explicitly.
             let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
             if let serde_json::Value::Object(map) = &v {
                 if let Some(instances) = map.get("instances") {
@@ -253,11 +248,8 @@ mod tests {
         }
     }
 
-    // 2. Preview deterministic: install plan and capability resolver
-    /// Deterministic, offline availability probe (judge round-1 finding 1):
-    /// property tests must never reach a live package registry. The fake
-    /// answers deterministically so the preview property covers availability
-    /// end-to-end without spawning `npm`/`cargo`/`mise`.
+    /// Deterministic, offline availability probe: property tests must
+    /// never reach a live registry or spawn `npm`/`cargo`/`mise`.
     #[derive(Debug, Clone, Copy)]
     struct OfflineProbe;
 
@@ -297,7 +289,6 @@ mod tests {
             let method_idx = rng.gen_range(0, entry.methods.len());
             let method = entry.methods[method_idx].kind.clone();
 
-            // Random version: sometimes valid semver, sometimes None.
             let version = if rng.gen_bool() {
                 let major = rng.gen_range(1, 5);
                 let minor = rng.gen_range(0, 10);
@@ -315,8 +306,6 @@ mod tests {
                 destination: None,
             };
 
-            // Injected probe: deterministic AND offline, no live registry
-            // round-trips in the default suite.
             let plan1 = crate::install_plan::plan_install_for_entry_with_probe(
                 &req, entry, "linux", "x64", &probe,
             );
@@ -341,7 +330,6 @@ mod tests {
                     );
                 }
                 (Err(e1), Err(e2)) => {
-                    // Both should fail same way.
                     assert_eq!(
                         format!("{e1}"),
                         format!("{e2}"),
@@ -375,10 +363,7 @@ mod tests {
                 random_case_variation(rng.gen_range(0, 2) == 0, provider.as_str(), &mut rng);
             let h_varied_id = HarnessId::new(&harness_varied.to_lowercase()).unwrap();
             let p_varied_id = ProviderId::new(&provider_varied.to_lowercase()).unwrap();
-            // Resolve with canonical lower should equal resolve with varied case (if we normalize).
             let _r_varied = resolve(&h_varied_id, &p_varied_id, cap);
-            // Since we lowercased for id creation, it should be same as original's lower.
-            // Directly test case-fold equality: harness.eq_case_fold_str should work.
             let h2 = HarnessId::new(&harness_varied).unwrap_or(harness.clone());
             let p2 = ProviderId::new(&provider_varied).unwrap_or(provider.clone());
             let r3 = resolve(&h2, &p2, cap);
@@ -412,7 +397,6 @@ mod tests {
         out
     }
 
-    // 3. Restore exact: registry file backup/restore
     #[test]
     fn property_restore_exact_registry() {
         for iter in 0..50 {
@@ -441,7 +425,6 @@ mod tests {
                 "mutation should change file at {iter}"
             );
 
-            // Restore.
             superai_config::backup::restore_entry(&entry).unwrap();
             let restored = std::fs::read(&path).unwrap();
             assert_eq!(
@@ -451,7 +434,6 @@ mod tests {
                 before_bytes.len(),
                 restored.len()
             );
-            // Verify backup.
             assert!(
                 superai_config::backup::verify_backup(&entry).unwrap(),
                 "verify backup failed at {iter}"
@@ -461,13 +443,11 @@ mod tests {
         }
     }
 
-    // 4. Collision-safe normalization, ids
     #[test]
     fn property_collision_safe_normalization_ids() {
         for iter in 0..100 {
             let mut rng = Prng::new(iter as u64 + 0x5555);
             let base = random_valid_name(&mut rng, "base-");
-            // Generate two case variations.
             let var1 = random_case_variation(true, &base, &mut rng);
             let var2 = random_case_variation(true, &base, &mut rng);
 
@@ -487,7 +467,6 @@ mod tests {
                     "eq_case_fold_str true at {iter}"
                 );
 
-                // Registry should reject collision.
                 let mut reg = Registry::default();
                 let harness = HarnessId::new("claude-code").unwrap();
                 let coll_base = crate::test_util::tmp_abs(&format!("coll-{iter}"));
@@ -534,7 +513,6 @@ mod tests {
                 }
             }
 
-            // Distinct bases should not collide.
             let other_base = format!("{}-x", base);
             if let (Ok(a), Ok(b)) = (InstanceName::new(&base), InstanceName::new(&other_base)) {
                 if a.normalized() != b.normalized() {
@@ -544,7 +522,6 @@ mod tests {
         }
     }
 
-    // 5. Collision-safe normalization, paths
     #[test]
     fn property_collision_safe_normalization_paths() {
         for iter in 0..100 {
@@ -554,7 +531,6 @@ mod tests {
                 crate::test_util::tmp_abs_str("prop-base"),
                 rng.gen_string(3, 8, SIMPLE_CHARSET)
             );
-            // Generate noisy variations that should normalize to same.
             let noisy1 = format!("{base}//./sub//./dir");
             let noisy2 = format!("{base}/sub/dir");
             let noisy3 = format!("{base}/sub/./dir/");
@@ -572,16 +548,13 @@ mod tests {
                 "path normalization failed at {iter}: {noisy2} vs {noisy3}"
             );
 
-            // Normalizing twice is idempotent.
             let p1_again = AbsolutePath::new(&p1.to_string()).unwrap();
             assert_eq!(p1, p1_again, "idempotent path normalization at {iter}");
 
-            // Distinct paths should not collide.
             let other = format!("{base}/other-{}", rng.gen_string(3, 6, SIMPLE_CHARSET));
             let po = AbsolutePath::new(&other).unwrap();
             assert_ne!(p1, po, "distinct paths should not collide at {iter}");
 
-            // Registry config_root collision check: same normalized path should be rejected.
             let mut reg = Registry::default();
             let harness = HarnessId::new("claude-code").unwrap();
             let name1 = InstanceName::new(&random_valid_name(&mut rng, "n1-")).unwrap();
@@ -628,15 +601,12 @@ mod tests {
         }
     }
 
-    // 6. Capability complete
     #[test]
     fn property_capability_complete() {
-        // Static matrix must be complete.
         validate_matrix_completeness().unwrap();
 
         for iter in 0..50 {
             let mut rng = Prng::new(iter as u64 + 0x7777);
-            // For each active pair, resolve_all must return all capabilities.
             for (harness_str, provider_str) in ACTIVE_PAIRS {
                 let harness = HarnessId::new(harness_str).unwrap();
                 let provider = ProviderId::new(provider_str).unwrap();
@@ -677,7 +647,6 @@ mod tests {
                 }
             }
 
-            // Random unknown harness/provider should return Absent/Unknown.
             let unknown_harness =
                 HarnessId::new(&random_valid_name(&mut rng, "unknown-h-")).unwrap();
             let unknown_provider =
@@ -701,7 +670,6 @@ mod tests {
                 );
             }
 
-            // Validate no duplicate rows in static MATRIX.
             let mut seen_matrix = HashSet::new();
             for e in MATRIX {
                 let key = (
@@ -717,7 +685,6 @@ mod tests {
         }
     }
 
-    // 7. Unrelated survive, registry
     #[test]
     fn property_registry_unrelated_survive() {
         for iter in 0..50 {
@@ -737,7 +704,6 @@ mod tests {
             }
             let before_instances: Vec<Instance> = reg.instances().to_vec();
 
-            // Insert one more unrelated instance.
             let extra = random_instance(&mut rng, iter + 500, 999);
             let extra_id = extra.id.clone();
             let extra_name = extra.name.clone();
@@ -745,7 +711,6 @@ mod tests {
                 continue;
             }
 
-            // Verify unrelated survive exactly.
             for before in &before_instances {
                 let after = reg
                     .get_by_id(before.id.as_str())
@@ -756,7 +721,6 @@ mod tests {
                     before.id
                 );
             }
-            // New one present.
             assert!(
                 reg.get_by_id(extra_id.as_str()).is_some(),
                 "extra not found at {iter}"
@@ -766,7 +730,6 @@ mod tests {
                 "extra name not found at {iter}"
             );
 
-            // Remove extra and verify unrelated still survive.
             reg.remove(extra_name.as_str());
             for before in &before_instances {
                 let after = reg.get_by_id(before.id.as_str()).unwrap();
@@ -775,7 +738,6 @@ mod tests {
         }
     }
 
-    // 8. No-op byte identity: raw_editor is_noop equals byte equality
     #[test]
     fn property_no_op_byte_identity_raw_editor() {
         for iter in 0..80 {
@@ -798,7 +760,6 @@ mod tests {
             let raw = superai_config::raw_editor::read(&path).unwrap();
             let digest = raw.digest.clone();
 
-            // Preview diff of same content should be noop.
             let diff = superai_config::raw_editor::diff(
                 &bytes,
                 &bytes,
@@ -810,7 +771,6 @@ mod tests {
                 "noop lexical diff should be empty at {iter}"
             );
 
-            // Commit with same bytes should be noop (no backup, byte identity).
             let report = superai_config::raw_editor::commit(&path, &bytes, Some(&digest)).unwrap();
             assert!(
                 report.is_noop,
@@ -823,7 +783,6 @@ mod tests {
         }
     }
 
-    // 9. raw_editor diff and validate are deterministic for random bytes.
     #[test]
     fn property_preview_deterministic_raw_editor_commit() {
         for iter in 0..50 {
@@ -882,7 +841,6 @@ mod tests {
                     "registry must not contain forbidden {forbidden:?} at {iter}: {json:.200}"
                 );
             }
-            // Simulate template patch with sentinel must be rejected
             let sentinel = "sk-superai-test-sentinel-12345-fake";
             let patch = crate::template::OwnedPatch {
                 selector: "key:model".to_owned(),
@@ -933,7 +891,6 @@ mod tests {
             selector: "key:model".to_owned(),
             value: serde_json::Value::String("b".to_owned()),
         };
-        // local overrides model to "local"
         let mut local = Map::new();
         local.insert(
             "model".to_owned(),
@@ -960,7 +917,6 @@ mod tests {
         let mut new_eq_base = old_tmpl.clone();
         new_eq_base.version = "1.1.0".to_owned(); // same patches as old
         let preview2 = template_update::preview_three_way(&old_tmpl, &new_eq_base, &local);
-        // Should preserve local model "local" and not report conflict
         let has_model_conflict = preview2
             .conflicts
             .iter()
@@ -1010,7 +966,6 @@ mod tests {
         // Mutant-killer: wrapper collision must be case-insensitive; removing to_lowercase would let mutant slip
         let dir = temp_dir_unique("mutant-wrapper-collision");
         std::fs::create_dir_all(&dir).unwrap();
-        // Prepare registry with MyTool
         let mut reg = Registry::default();
         let h = HarnessId::new("claude-code").unwrap();
         let n1 = InstanceName::new("MyWork").unwrap();
@@ -1036,7 +991,6 @@ mod tests {
             adapter_revision: "0.1.0".to_owned(),
         };
         reg.insert(inst1).unwrap();
-        // Attempt to insert case-fold collision should be rejected
         let collision = crate::wrapper::check_wrapper_collisions(
             &WrapperPath::from_path(&crate::test_util::tmp_abs("bin").join("MYWORK")).unwrap(),
             &InstanceName::new("MYWORK").unwrap(),

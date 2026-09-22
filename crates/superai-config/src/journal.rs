@@ -1,15 +1,5 @@
-//! Operation journal and crash recovery (MUT-09).
-//!
-//! A journal is written before mutations and at every phase transition, and
-//! removed only after verified completion. Startup recovery inspects the real
-//! filesystem state and restores each resource from its recorded backup; it
-//! never replays stale staged content. Journals hold paths, backup ids,
-//! phase, and redacted diagnostics only: no contents, no secrets.
-//! Backups and digests are integrity-checked, not authenticated: they are
-//! unkeyed and recomputable, so a writer with access to the journal and
-//! resource directories can forge records that recovery will act on.
-//! Closing that boundary needs a keyed digest and a key store superai
-//! does not have.
+//! Operation journal and crash recovery (MUT-09): restores from recorded
+//! backups, never replays staged content; digests are unkeyed and forgeable.
 
 use std::path::{Path, PathBuf};
 
@@ -106,8 +96,7 @@ impl CrashJournal {
         }
     }
 
-    /// Serialize and atomically write the journal to `path`, so an
-    /// interrupted write can never leave a half-written file.
+    /// Atomically write the journal; an interrupted write cannot leave it half-written.
     pub fn write_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -182,10 +171,8 @@ impl RecoveryReport {
     }
 }
 
-/// Startup recovery for `home` (MUT-09): remove stale temps, restore
-/// resources that differ from their recorded backup (backing up current
-/// bytes first), remove committed creations, drop the journal only when
-/// nothing residual remains. Stale planned content is never written.
+/// Startup recovery (MUT-09): remove stale temps, restore from recorded
+/// backups, remove committed creations; planned content is never written.
 pub fn recover_pending(home: &Path) -> Result<RecoveryReport> {
     let dir = journal_dir(home);
     let entries = match std::fs::read_dir(&dir) {
@@ -208,10 +195,8 @@ pub fn recover_pending(home: &Path) -> Result<RecoveryReport> {
     Ok(RecoveryReport { journals })
 }
 
-/// Recover one journal file (see [`recover_pending`]). A journal that
-/// cannot be read or parsed is quarantined beside itself (renamed
-/// `.corrupt`) and reported as its own outcome, so it never aborts the
-/// recovery of the remaining journals.
+/// Recover one journal; an unreadable one is quarantined beside itself and
+/// reported, so it never aborts the remaining journals.
 pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
     let journal = match CrashJournal::load_from(journal_path) {
         Ok(Some(journal)) => journal,
@@ -270,10 +255,8 @@ pub fn recover_journal_file(journal_path: &Path) -> Result<JournalRecovery> {
     })
 }
 
-/// Set one unreadable or unparseable journal aside beside itself so the
-/// scan can continue without it; the renamed file no longer matches the
-/// `.journal.json` suffix, so later runs leave it for inspection. A rename
-/// failure keeps the journal in place and reports it as a residual.
+/// Rename an unreadable journal aside so the scan can continue; the renamed
+/// file no longer matches the suffix, so later runs leave it for inspection.
 fn quarantine_corrupt_journal(journal_path: &Path, cause: &ConfigError) -> JournalRecovery {
     let operation_id = journal_path
         .file_stem()
@@ -311,10 +294,8 @@ fn quarantine_corrupt_journal(journal_path: &Path, cause: &ConfigError) -> Journ
     }
 }
 
-/// Rename the journal aside under a fresh `.corrupt.<millis>.<4hex>` name
-/// (the backup naming idiom), so a repeat corruption of the same journal
-/// name never overwrites prior quarantined evidence. Refuses after
-/// repeated name collisions rather than clobber anything.
+/// Fresh `.corrupt.<millis>.<4hex>` aside name so repeat corruption never
+/// overwrites evidence; refuses after repeated collisions rather than clobber.
 fn quarantine_aside(journal_path: &Path) -> std::io::Result<PathBuf> {
     for _ in 0..5 {
         let millis = crate::atomic::timestamp_millis_now();
@@ -333,11 +314,8 @@ fn quarantine_aside(journal_path: &Path) -> std::io::Result<PathBuf> {
     ))
 }
 
-/// Remove stale staged temps: the recorded ones plus unrecorded siblings
-/// next to each resource that match superai's own temp naming
-/// (`.tmp.<resource file name>.` from `atomic::generate_temp_path`).
-/// Foreign `.tmp.*` files from other tools are never touched. Returns
-/// (removed, residuals).
+/// Remove recorded temps plus unrecorded `.tmp.<name>.` siblings of each
+/// resource; foreign `.tmp.*` files are never touched. Returns (removed, residuals).
 fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -385,8 +363,7 @@ fn remove_stale_temps(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (removed, residuals)
 }
 
-/// Restore each resource whose current bytes differ from its recorded
-/// pre-transaction backup. Returns (restored, residuals).
+/// Restore resources whose bytes differ from their recorded backup.
 fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut restored = Vec::new();
     let mut residuals = Vec::new();
@@ -410,7 +387,6 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
             .as_deref()
             .is_some_and(|d| d == entry.digest.as_str());
         if current_matches_pre {
-            // Already at pre-transaction bytes: nothing to do.
             continue;
         }
         match restore_verified(&entry) {
@@ -421,8 +397,7 @@ fn restore_recorded_backups(journal: &CrashJournal) -> Result<(Vec<PathBuf>, Vec
     Ok((restored, residuals))
 }
 
-/// Remove committed creations (resources without a backup that the journal
-/// shows as committed); uncommitted paths are left untouched.
+/// Remove committed creations (no backup); uncommitted paths stay untouched.
 fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut removed = Vec::new();
     let mut residuals = Vec::new();
@@ -442,8 +417,6 @@ fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<Path
     }
     (removed, residuals)
 }
-
-// tests
 
 #[cfg(test)]
 mod tests {
@@ -486,7 +459,6 @@ mod tests {
         assert_eq!(loaded, journal);
         CrashJournal::remove(&path).unwrap();
         assert!(CrashJournal::load_from(&path).unwrap().is_none());
-        // Removing twice is fine (NotFound = success).
         CrashJournal::remove(&path).unwrap();
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -533,8 +505,8 @@ mod tests {
     #[test]
     fn recovery_never_removes_uncommitted_foreign_files() {
         let home = home_dir();
-        // A journal claims a creation that was never committed, but the path
-        // exists (someone else put it there): recovery must not delete it.
+        // The journal never committed this creation, but the path exists
+        // (someone else put it there): recovery must not delete it.
         let foreign = home.join("foreign-new.json");
         std::fs::write(&foreign, b"foreign").unwrap();
         let jroot = journal_dir(&home);
@@ -596,9 +568,7 @@ mod tests {
         let home = home_dir();
         let resource = home.join("settings.json");
         std::fs::write(&resource, b"original").unwrap();
-        // Production backup of the pre-op state.
         let entry = crate::backup::backup(&resource).unwrap().unwrap();
-        // The operation committed new bytes before the crash.
         std::fs::write(&resource, b"committed-new").unwrap();
 
         let jroot = journal_dir(&home);
@@ -636,7 +606,7 @@ mod tests {
         let resource = home.join("edited.json");
         std::fs::write(&resource, b"original").unwrap();
         let entry = crate::backup::backup(&resource).unwrap().unwrap();
-        // Committed bytes, then a foreign edit AFTER the crash.
+        // Committed bytes, then a foreign edit after the crash.
         std::fs::write(&resource, b"post-crash-foreign-edit").unwrap();
 
         let jroot = journal_dir(&home);
@@ -656,9 +626,7 @@ mod tests {
 
         let report = recover_pending(&home).unwrap();
         assert!(report.all_recovered());
-        // Deterministic rollback restored the pre-op bytes...
         assert_eq!(std::fs::read(&resource).unwrap(), b"original");
-        // The post-crash edit is recoverable: restore_verified backed it up.
         let backups = crate::backup::list_backups(&resource).unwrap();
         assert!(
             backups.iter().any(|b| b.digest != entry.digest),
@@ -710,8 +678,6 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&home));
     }
-
-    // mutation-hardening behaviour tests
 
     #[test]
     fn journal_phase_display_matches_the_recorded_names() {
@@ -819,8 +785,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// One corrupt journal must not abort the scan: it is set aside with its
-    /// bytes intact while the remaining journals recover normally.
     #[test]
     fn one_corrupt_journal_does_not_abort_recovery_of_the_rest() {
         let home = home_dir();
@@ -879,9 +843,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&home));
     }
 
-    /// An unreadable journal is quarantined exactly like an unparseable one:
-    /// the bytes are unverifiable either way. The chmod-000 variant needs
-    /// the permissions to actually bind (root reads through them).
+    /// Unreadable quarantines like unparseable; the chmod must actually bind (root reads through).
     #[cfg(unix)]
     #[test]
     fn an_unreadable_journal_is_quarantined_and_kept_for_inspection() {
@@ -909,9 +871,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&home));
     }
 
-    /// Corrupting the same journal name twice must keep both evidence
-    /// files: the aside name carries millis and hex, so a repeat quarantine
-    /// never overwrites the earlier copy.
     #[test]
     fn repeat_corruption_of_the_same_journal_name_keeps_both_evidence_files() {
         let home = home_dir();
@@ -944,8 +903,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&home));
     }
 
-    /// Quarantine evidence files in `dir` whose name starts with `prefix`,
-    /// sorted by name.
     fn quarantined_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
         let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
             .unwrap()
@@ -960,8 +917,6 @@ mod tests {
         found
     }
 
-    /// When the quarantine rename itself fails, the journal stays in place
-    /// and is reported as a residual instead of being silently dropped.
     #[cfg(unix)]
     #[test]
     fn a_corrupt_journal_that_cannot_be_renamed_is_reported_as_a_residual() {

@@ -1,7 +1,5 @@
-//! Nanocoder adapter: relocated/explicit isolation via
-//! `NANOCODER_CONFIG_DIR`/`NANOCODER_PROVIDERS_FILE`, primary writable surface
-//! `agents.config.json` (JSON).
-//! Research source: `docs/harness-configs/nanocoder.md` (last verified 2026-08-25).
+//! Nanocoder adapter: relocated root via `NANOCODER_CONFIG_DIR`, explicit
+//! file overrides via `NANOCODER_PROVIDERS_FILE`/`NANOCODER_MCPSERVERS_FILE`.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +31,7 @@ pub const PROVIDERS_ENV_VAR: &str = "NANOCODER_PROVIDERS_FILE";
 /// Explicit MCP servers file override.
 pub const MCPSERVERS_ENV_VAR: &str = "NANOCODER_MCPSERVERS_FILE";
 
-/// Default config root when `PI_CODING_AGENT_DIR` is unset.
+/// Default config root when `NANOCODER_CONFIG_DIR` is unset.
 pub const DEFAULT_CONFIG_ROOT_FALLBACK: &str = "~/.config/nanocoder";
 
 /// Research document link.
@@ -84,7 +82,6 @@ impl NanocoderAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$PI_CODING_AGENT_DIR` or `~/.pi/agent`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -100,22 +97,18 @@ impl NanocoderAdapter {
         Some(PathBuf::from(home).join(".config").join("nanocoder"))
     }
 
-    /// Build the agents.config.json path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("agents.config.json")
     }
 
-    /// Build the .mcp.json path for a given config root.
     fn mcp_path_for_root(root: &Path) -> PathBuf {
         root.join(".mcp.json")
     }
 
-    /// Build the nanocoder-preferences.json path for a given config root.
     fn prefs_path_for_root(root: &Path) -> PathBuf {
         root.join("nanocoder-preferences.json")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -180,7 +173,6 @@ impl NanocoderAdapter {
         {
             evidence.push(format!("{MCPSERVERS_ENV_VAR} set to {dir}"));
         }
-        // Project ./agents.config.json
         let project_cfg = Path::new("agents.config.json");
         if project_cfg.exists() {
             evidence.push(format!(
@@ -527,7 +519,7 @@ impl Adapter for NanocoderAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (nanocoder.md 5: home-dir `.mcp.json`; `NANOCODER_MCPSERVERS`[_FILE] env overrides)
+    /// Home-dir `.mcp.json`, overridable via the `NANOCODER_MCPSERVERS` env vars.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             ".mcp.json",
@@ -538,7 +530,6 @@ impl Adapter for NanocoderAdapter {
         ))
     }
 
-    /// EXT-06: explicit plugin-mechanism absence (corpus-grounded).
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "no plugin mechanism documented; custom tools are files under tools/, not plugins (nanocoder.md)",

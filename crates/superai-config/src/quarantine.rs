@@ -1,10 +1,5 @@
-//! Quarantine for recoverable deletion (MUT-08).
-//!
-//! A validated target is moved into a quarantine area (default
-//! `~/.superai/quarantine/<operation_id>/`) and the move reports
-//! recoverability. Operations owning a relocated superai root use the
-//! `*_under` functions so recovery state lands under that root, never in
-//! the real home.
+//! Recoverable deletion (MUT-08): a validated target moves into
+//! `~/.superai/quarantine/<operation_id>/`; `*_under` keeps relocated roots' state out of home.
 
 use std::path::{Path, PathBuf};
 
@@ -27,9 +22,8 @@ fn home_dir() -> Option<PathBuf> {
     None
 }
 
-/// Whether `path` is a broad root that must never be quarantined: unix
-/// broad roots plus Windows-shaped ones (drive, UNC, first-level system
-/// directories), which are inert on unix hosts.
+/// Broad roots never quarantined: unix roots plus Windows-shaped ones
+/// (drive, UNC, first-level system dirs), inert on unix hosts.
 fn is_broad_root(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let raw = s.as_ref();
@@ -56,8 +50,7 @@ fn has_glob(path: &Path) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
 
-/// Base quarantine directory: `~/.superai/quarantine`. Operations with
-/// their own relocated root must use [`quarantine_base_under`].
+/// `~/.superai/quarantine`; relocated roots use [`quarantine_base_under`].
 pub fn quarantine_base() -> Result<PathBuf> {
     let home = home_dir().ok_or_else(|| {
         ConfigError::io(
@@ -71,8 +64,7 @@ pub fn quarantine_base() -> Result<PathBuf> {
     Ok(home.join(".superai").join("quarantine"))
 }
 
-/// Base quarantine directory under an explicit superai-owned root
-/// (`<root>/.superai/quarantine`); the root must be absolute.
+/// `<root>/.superai/quarantine`; the root must be absolute.
 pub fn quarantine_base_under(root: &Path) -> Result<PathBuf> {
     if !root.is_absolute() {
         return Err(ConfigError::io(
@@ -86,8 +78,7 @@ pub fn quarantine_base_under(root: &Path) -> Result<PathBuf> {
     Ok(root.join(".superai").join("quarantine"))
 }
 
-/// Operation quarantine directory inside `base`; the id must be a single
-/// path component.
+/// Operation dir inside `base`; the id must be a single path component.
 fn quarantine_dir_in_base(base: &Path, operation_id: &str) -> Result<PathBuf> {
     if operation_id.is_empty() {
         return Err(ConfigError::io(
@@ -110,14 +101,12 @@ fn quarantine_dir_in_base(base: &Path, operation_id: &str) -> Result<PathBuf> {
     Ok(base.join(operation_id))
 }
 
-/// Returns the quarantine directory for a given operation id:
 /// `~/.superai/quarantine/<operation_id>/`.
 pub fn quarantine_dir(operation_id: &str) -> Result<PathBuf> {
     quarantine_dir_in_base(&quarantine_base()?, operation_id)
 }
 
-/// Returns the quarantine directory for a given operation id under an
-/// explicit superai-owned root: `<root>/.superai/quarantine/<operation_id>/`.
+/// `<root>/.superai/quarantine/<operation_id>/`.
 pub fn quarantine_dir_under(root: &Path, operation_id: &str) -> Result<PathBuf> {
     quarantine_dir_in_base(&quarantine_base_under(root)?, operation_id)
 }
@@ -161,9 +150,8 @@ impl QuarantineEntry {
     }
 }
 
-/// Validate that `path` is a safe quarantine source: absolute, with no
-/// traversal, globs, unresolved variables, broad roots, home, or quarantine
-/// base among its targets.
+/// Validate a quarantine source: absolute, no traversal/globs/variables,
+/// no broad roots, home, or quarantine base.
 pub fn validate_quarantine_target(path: &Path) -> Result<()> {
     let display = path.to_string_lossy();
     let s = display.as_ref();
@@ -234,7 +222,6 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
                 ),
             ));
         }
-        // Also reject the quarantine base itself or its parent.
         let base = home.join(".superai").join("quarantine");
         if crate::transaction::paths_equal_platform_folded(path, &base) {
             return Err(ConfigError::io(
@@ -246,7 +233,6 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
             ));
         }
     }
-    // Require that the path exists and is a file or directory (not FIFO/socket/device)
     let meta = std::fs::symlink_metadata(path).map_err(|e| ConfigError::io(path, e))?;
     let ft = meta.file_type();
     if !(ft.is_file() || ft.is_dir() || ft.is_symlink()) {
@@ -261,15 +247,13 @@ pub fn validate_quarantine_target(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Move `path` into the quarantine directory for `operation_id`: validate,
-/// create the owner-only quarantine dir, rename (or copy-then-delete
-/// across filesystems), verify the digest, report recoverability.
+/// Validate, create the owner-only quarantine dir, rename (or copy across
+/// filesystems), verify the digest, report recoverability.
 pub fn move_to_quarantine(path: &Path, operation_id: &str) -> Result<QuarantineEntry> {
     move_to_quarantine_in_base(&quarantine_base()?, path, operation_id)
 }
 
-/// [`move_to_quarantine`] rooted at `<root>/.superai/quarantine` so
-/// relocated operations keep recovery state out of the user's home.
+/// [`move_to_quarantine`] rooted at `<root>/.superai/quarantine`.
 pub fn move_to_quarantine_under(
     root: &Path,
     path: &Path,
@@ -278,8 +262,7 @@ pub fn move_to_quarantine_under(
     move_to_quarantine_in_base(&quarantine_base_under(root)?, path, operation_id)
 }
 
-/// Core of [`move_to_quarantine`]/[`move_to_quarantine_under`] against an
-/// already-resolved quarantine `base`.
+/// Core of the `move_to_quarantine` family against a resolved `base`.
 fn move_to_quarantine_in_base(
     base: &Path,
     path: &Path,
@@ -299,9 +282,8 @@ fn move_to_quarantine_in_base(
     move_to_quarantine_with_dest_in_base(base, path, &dest, operation_id)
 }
 
-/// Move `path` to an explicit `dest` inside quarantine, validating `path`.
-///
-/// `dest` must be inside the quarantine directory for `operation_id`.
+/// Move `path` to an explicit `dest` inside the quarantine dir for
+/// `operation_id`, validating `path` first.
 pub fn move_to_quarantine_with_dest(
     path: &Path,
     dest: &Path,
@@ -310,8 +292,7 @@ pub fn move_to_quarantine_with_dest(
     move_to_quarantine_with_dest_in_base(&quarantine_base()?, path, dest, operation_id)
 }
 
-/// Core of [`move_to_quarantine_with_dest`] against an already-resolved
-/// quarantine `base`.
+/// Core of [`move_to_quarantine_with_dest`] against a resolved `base`.
 #[expect(
     clippy::too_many_lines,
     reason = "quarantine move validates, copies, and verifies"
@@ -445,8 +426,7 @@ fn move_to_quarantine_with_dest_in_base(
     })
 }
 
-/// How a copy step must treat an entry, decided only from its own
-/// unfollowed file type.
+/// How a copy step treats an entry, from its own unfollowed file type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyEntryKind {
     Directory,
@@ -454,8 +434,7 @@ enum CopyEntryKind {
     File,
 }
 
-/// Link before directory: a Windows junction or directory symlink carries
-/// the directory attribute too, and only the link reading is safe to act on.
+/// Link before directory: a junction carries the directory bit too.
 fn classify_copy_entry(is_symlink: bool, is_dir: bool) -> CopyEntryKind {
     if is_symlink {
         CopyEntryKind::Link
@@ -466,8 +445,7 @@ fn classify_copy_entry(is_symlink: bool, is_dir: bool) -> CopyEntryKind {
     }
 }
 
-/// Recreate the link at `from` as a new link at `to`, never following it:
-/// a copy would land the referent's bytes or fail on a dangling link.
+/// Recreate the link at `to`, never following it (copying lands referent bytes).
 fn recreate_link(from: &Path, to: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -490,8 +468,7 @@ fn recreate_link(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
-/// Remove the link itself: Windows refuses `remove_file` on a
-/// directory-flavoured link, and `remove_dir` removes only the link.
+/// Remove the link itself; Windows wants `remove_dir` on a dir-flavoured link.
 fn remove_link_at(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
@@ -504,10 +481,8 @@ fn remove_link_at(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// Copy the tree `from` to `to` recursively, recreating link entries
-/// (junctions included on Windows) as links instead of reading through
-/// them, so a link cycle cannot hang the copy and a dangling link cannot
-/// abort it. A mid-copy failure leaves the partial destination in place.
+/// Recursive copy recreating links as links (junctions included) so a link
+/// cycle cannot hang it and a dangling link cannot abort it.
 pub fn copy_tree_preserving_links(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).map_err(|e| ConfigError::io(to, e))?;
     let entries = std::fs::read_dir(from).map_err(|e| ConfigError::io(from, e))?;
@@ -516,9 +491,8 @@ pub fn copy_tree_preserving_links(from: &Path, to: &Path) -> Result<()> {
         let src = ent.path();
         let file_name = ent.file_name();
         let dest = to.join(file_name);
-        // lstat, never the followed metadata: a link entry must reach the
-        // link branch, or a link-to-directory would recurse into itself
-        // forever and a dangling link would abort the whole copy.
+        // lstat, never followed metadata: a link-to-directory would recurse
+        // into itself forever and a dangling link would abort the copy.
         let meta = std::fs::symlink_metadata(&src).map_err(|e| ConfigError::io(&src, e))?;
         match classify_copy_entry(meta.file_type().is_symlink(), meta.is_dir()) {
             CopyEntryKind::Link => recreate_link(&src, &dest)?,
@@ -621,8 +595,6 @@ pub fn list_quarantine(operation_id: &str) -> Result<Vec<QuarantineEntry>> {
     Ok(entries)
 }
 
-// tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,8 +616,6 @@ mod tests {
         assert!(dir.ends_with(&op));
     }
 
-    /// Relocated operations resolve `<root>/.superai/quarantine`, with the
-    /// same id shape rules as the home-based family.
     #[test]
     fn quarantine_base_under_nests_the_state_root() {
         let dir = crate::test_util::temp_dir_unique("quarantine-under-base");
@@ -669,8 +639,6 @@ mod tests {
         );
     }
 
-    /// Quarantining the base or an ancestor is refused before any
-    /// filesystem work.
     #[test]
     fn quarantine_refuses_targets_containing_the_quarantine_base() {
         let dir = crate::test_util::temp_dir_unique("quarantine-self");
@@ -678,14 +646,12 @@ mod tests {
         let base = dir.join("owned-base");
         std::fs::create_dir_all(&base).unwrap();
 
-        // The base itself.
         let err = move_to_quarantine_under(&base, &base, &op).unwrap_err();
         assert!(
             err.to_string().contains("containing the quarantine base"),
             "quarantining the base must be refused: {err}"
         );
 
-        // An ancestor of the base (not a broad root, exists on disk).
         let err = move_to_quarantine_under(&base, &dir, &op).unwrap_err();
         assert!(
             err.to_string().contains("containing the quarantine base"),
@@ -698,8 +664,6 @@ mod tests {
         assert!(base.exists(), "the victim is untouched");
     }
 
-    /// A relocated operation never touches the real-home quarantine tree,
-    /// and recovery round-trips from the relocated base.
     #[test]
     fn move_to_quarantine_under_keeps_recovery_state_out_of_the_user_home() {
         let dir = crate::test_util::temp_dir_unique("quarantine-under-move");
@@ -823,7 +787,6 @@ mod tests {
         let report = entry.recoverability_report();
         assert!(report.contains(&op));
         assert!(report.contains(entry.quarantine_path.to_string_lossy().as_ref()));
-        // Retention: quarantine entry remains after move until explicitly removed
         assert!(entry.quarantine_path.exists());
         restore_from_quarantine(&entry).unwrap();
         drop(std::fs::remove_file(&src));
@@ -831,10 +794,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&qdir));
     }
 
-    // mutation-hardening behaviour tests
-
-    /// Whether chmod still denies the owner; root bypasses and callers
-    /// self-skip.
+    /// Whether chmod still denies the owner; root bypasses.
     #[cfg(unix)]
     fn permissions_are_enforced() -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -856,8 +816,6 @@ mod tests {
         std::fs::metadata(path).ok().map(|m| m.dev())
     }
 
-    /// A scratch dir on another filesystem when one is available
-    /// (/dev/shm tmpfs vs the home filesystem).
     #[cfg(unix)]
     fn cross_device_scratch() -> Option<PathBuf> {
         let shm = PathBuf::from("/dev/shm");
@@ -866,7 +824,8 @@ mod tests {
         }
         let home = home_dir()?;
         if dev_of(&shm)? == dev_of(&home)? {
-            return None; // same filesystem: rename would succeed, nothing to probe
+            // Same filesystem: rename would succeed, nothing to probe.
+            return None;
         }
         let scratch = shm.join(format!("superai-quarantine-exdev-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).ok()?;
@@ -953,7 +912,6 @@ mod tests {
         );
         assert_eq!(entry_a.size, Some(23));
 
-        // Same bytes quarantine to the same digest; different bytes differ.
         let op_b = unique_op("digest-bc");
         let src_b = dir.join("digest-b");
         std::fs::write(&src_b, b"quarantine digest probe").unwrap();
@@ -964,7 +922,6 @@ mod tests {
         assert_eq!(entry_b.digest, entry_a.digest);
         assert_ne!(entry_c.digest, entry_a.digest);
 
-        // The listing recomputes the same digest for the landed files.
         let listed = list_quarantine(&op_b).unwrap();
         let find = |name: &str| {
             listed
@@ -1048,7 +1005,6 @@ mod tests {
         );
         assert!(entry.recoverable);
 
-        // Restoring crosses devices too: the copy-back path must return it.
         restore_from_quarantine(&entry).unwrap();
         assert_eq!(std::fs::read(&src).unwrap(), b"cross-device content");
         assert!(!entry.quarantine_path.exists());
@@ -1192,7 +1148,6 @@ mod tests {
         std::fs::write(&src, b"first life").unwrap();
         let entry = move_to_quarantine(&src, &op).unwrap();
 
-        // A regular file re-created at the original path blocks the restore.
         std::fs::write(&src, b"second life").unwrap();
         let err = restore_from_quarantine(&entry).unwrap_err();
         assert!(
@@ -1251,9 +1206,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&qdir));
     }
 
-    /// A dir-flavoured link (a Windows junction or directory symlink
-    /// carries the directory attribute too) classifies as a link, so the
-    /// directory bit can never route a copy into the referent.
     #[test]
     fn copy_entry_classifier_puts_links_before_directories() {
         assert_eq!(classify_copy_entry(true, true), CopyEntryKind::Link);
@@ -1262,9 +1214,6 @@ mod tests {
         assert_eq!(classify_copy_entry(false, false), CopyEntryKind::File);
     }
 
-    /// A tree with a symlink cycle and a dangling link copies to completion:
-    /// links are recreated as links (lstat), so the cycle cannot recurse
-    /// forever and the dangling link cannot abort the copy.
     #[cfg(unix)]
     #[test]
     fn copy_tree_preserving_links_survives_link_cycles() {
@@ -1297,8 +1246,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// A quarantined dangling symlink lists and reports recoverable: the
-    /// entry is present in quarantine even though its referent is gone.
     #[cfg(unix)]
     #[test]
     fn list_quarantine_handles_a_dangling_symlink_entry() {
@@ -1330,8 +1277,6 @@ mod tests {
         drop(std::fs::remove_dir_all(quarantine_dir(&op).unwrap()));
     }
 
-    /// The move's own recoverability verdict must see a quarantined dangling
-    /// link: `exists()` follows the link and cannot, the lstat fallback can.
     #[cfg(unix)]
     #[test]
     fn quarantined_dangling_link_move_reports_recoverable() {
@@ -1356,7 +1301,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// Removal takes the link itself; the referent stays untouched.
     #[cfg(unix)]
     #[test]
     fn remove_link_at_removes_the_link_not_the_referent() {

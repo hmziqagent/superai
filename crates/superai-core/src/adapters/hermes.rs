@@ -1,6 +1,5 @@
-//! Hermes adapter: relocated-root/profile via `HERMES_HOME` + `--profile`
-//! (or `HERMES_PROFILE`), primary writable surface `config.yaml` (YAML).
-//! Research source: `docs/harness-configs/hermes-agent.md` (last verified 2026-08-25).
+//! Hermes adapter: relocated root/profile via `HERMES_HOME` + `--profile`
+//! (or `HERMES_PROFILE`), writable surface `config.yaml`.
 
 use std::path::{Path, PathBuf};
 
@@ -81,7 +80,6 @@ impl HermesAdapter {
         CONFIG_ENV_VAR
     }
 
-    /// Resolve the default config root: `$HERMES_HOME` or `~/.hermes`.
     fn default_config_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var(CONFIG_ENV_VAR)
             && !dir.trim().is_empty()
@@ -97,17 +95,14 @@ impl HermesAdapter {
         Some(PathBuf::from(home).join(".hermes"))
     }
 
-    /// Build the config.yaml path for a given config root.
     fn config_path_for_root(root: &Path) -> PathBuf {
         root.join("config.yaml")
     }
 
-    /// Build the .env path for a given config root.
     fn env_path_for_root(root: &Path) -> PathBuf {
         root.join(".env")
     }
 
-    /// Build detection evidence about config root and settings.
     #[expect(
         clippy::excessive_nesting,
         reason = "detection branches are explicit for evidence"
@@ -526,7 +521,7 @@ impl Adapter for HermesAdapter {
         ]
     }
 
-    /// EXT-08/09: MCP destination (hermes-agent.md 1.5: `mcp_servers:` map; `hermes mcp add/remove/list/test`)
+    /// `mcp_servers:` map in config.yaml, managed via `hermes mcp add/remove/list/test`.
     fn mcp_decl(&self) -> Option<crate::adapter::McpAdapterDecl> {
         Some(crate::adapter::McpAdapterDecl::new(
             "config.yaml",
@@ -537,7 +532,7 @@ impl Adapter for HermesAdapter {
         ).with_read_only("yaml writes refuse (LossyWrite) until a preserving codec exists; inspect/diff only"))
     }
 
-    /// EXT-06/07: plugin mechanism (hermes-agent.md 5: `hermes plugins install/remove`; user plugins install into ~/.hermes/plugins/)
+    /// Plugins install via `hermes plugins install` into `~/.hermes/plugins/`.
     fn plugin_decl(&self) -> Option<crate::adapter::PluginAdapterDecl> {
         Some(crate::adapter::PluginAdapterDecl::requires_execution(
             "hermes plugins install",
@@ -929,8 +924,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("config.foreign.yaml.copy.yaml");
         std::fs::copy(&path, &tmp).unwrap();
-        // codec-honesty (DOC-06): changing YAML writes on existing files are
-        // refused outright, so foreign keys survive because nothing is written.
+        // Changing YAML writes are refused outright, so foreign keys survive
+        // because nothing is written.
         let before = std::fs::read(&tmp).unwrap();
         let result = superai_config::yaml::edit(&tmp, |map| {
             map.insert(

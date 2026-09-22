@@ -1,7 +1,5 @@
-//! Verification harness for plan 13 gates: fixture loading, secret-free checks, platform gates.
-//!
-//! Interface-neutral, no GPUI types. Every check reads fresh from disk and
-//! preserves unmodelled keys. Helpers are deterministic and parallel-safe.
+//! Verification harness for plan 13 gates: fixtures, secret-free checks,
+//! platform gates; fresh reads, deterministic and parallel-safe helpers.
 
 use std::path::{Path, PathBuf};
 
@@ -34,12 +32,8 @@ fn contains_fake_marker(value: &str) -> bool {
         .any(|m| lower.contains(&m.to_ascii_lowercase()))
 }
 
-/// Whether `text` contains a real-looking secret value.
-///
-/// Scans via `find_redaction_spans`; a span is considered real only when the
-/// extracted value does not contain any `FAKE_MARKERS`. Binary or empty is
-/// considered secret-free. Case-insensitive key detection is delegated to the
-/// raw editor's redaction logic.
+/// Whether `text` contains a real-looking secret: a redaction span whose
+/// value carries no `FAKE_MARKERS`; binary/empty counts as secret-free.
 #[expect(clippy::manual_let_else, reason = "explicit match clearer")]
 pub fn contains_real_secret(content: &[u8], kind: DocumentKind) -> bool {
     let spans = find_redaction_spans(content, kind);
@@ -342,13 +336,8 @@ pub fn catalog_platform_gates() -> Vec<PlatformGate> {
     gates
 }
 
-/// Whether every harness entry has a fixture directory (best-effort check).
-///
-/// Fixture dirs follow adapter module names: the catalog id with `-`
-/// replaced by `_` (`roo-code` -> `roo_code`), with the product-suffix
-/// variants (`-cli`, `-agent`, `-code`) also tried stripped (`junie-cli` ->
-/// `junie`, `kilo-code` -> `kilo`), matching the adapters' own
-/// `fixtures/<module>` references.
+/// Whether every harness entry has a fixture dir: the catalog id
+/// underscored (`roo_code`), raw, or product-suffix-stripped (`junie`).
 pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
     let mut coverage = Vec::new();
     for entry in harness_catalog::ENTRIES {
@@ -368,11 +357,8 @@ pub fn ledger_fixture_coverage(fixtures_root: &Path) -> Vec<(String, bool)> {
     coverage
 }
 
-/// Required `FailurePoint` variants for the QAL-06 matrix.
-///
-/// The matrix covers every boundary in subplan 02 that must be injectable
-/// via `FailureInjector` (Real vs `TestInjector` at Nth call). This list is
-/// intentionally exhaustive; CI fails if `failure.rs` drops a variant.
+/// Required `FailurePoint` variants for the QAL-06 matrix; the list is
+/// intentionally exhaustive, CI fails if `failure.rs` drops one.
 pub fn required_failure_points() -> Vec<crate::failure::FailurePoint> {
     use crate::failure::FailurePoint;
     vec![
@@ -408,12 +394,8 @@ pub struct FailureMatrixReport {
     pub complete: bool,
 }
 
-/// Build the QAL-06 failure matrix report.
-///
-/// Surfaces per spec: single-file config, multi-file instance creation,
-/// template update, bulk skill/MCP, wrapper replace, daemon start via process
-/// fixtures. Each surface must have at least one test that injects a failure
-/// at a distinct boundary and asserts recovery/rollback.
+/// QAL-06 matrix report: each of the six surfaces must have at least one
+/// failure-injection test asserting recovery or rollback.
 pub fn failure_matrix_report() -> FailureMatrixReport {
     let required = required_failure_points();
     let surfaces = vec![
@@ -447,11 +429,8 @@ pub struct FakeHarnessReport {
     pub complete: bool,
 }
 
-/// Build the QAL-07 fake harness coverage report.
-///
-/// Version fixtures are delegated to `failure::version_output_fixtures`;
-/// network fixtures to `failure::FakeNetworkHarness::with_github_matrix`;
-/// health / redirect cases are enumerated here for CI ledger completeness.
+/// QAL-07 fake harness coverage; version/network fixtures delegate to
+/// `failure`, health/redirect cases enumerated for the CI ledger.
 pub fn fake_harness_report() -> FakeHarnessReport {
     let version_fixtures = crate::failure::version_output_fixtures()
         .into_iter()
@@ -571,8 +550,6 @@ mod tests {
         }
     }
 
-    // ---- secret-free ----
-
     #[test]
     fn fake_credentials_are_secret_free() {
         let content = br#"{"api_key":"sk-test-fake-12345","model":"opus"}"#;
@@ -613,8 +590,6 @@ mod tests {
         let content = b"api_key: fake-test-value\nmodel: opus\n";
         assert!(is_secret_free_content(content, DocumentKind::Yaml));
     }
-
-    // ---- fixture loading ----
 
     #[test]
     fn fixture_minimal_json_loads_and_is_valid() {
@@ -702,8 +677,6 @@ mod tests {
         assert!(!doc.has_diagnostics());
     }
 
-    // ---- platform gates ----
-
     #[test]
     fn current_platform_is_deterministic() {
         let a = current_platform();
@@ -763,8 +736,6 @@ mod tests {
         );
     }
 
-    // ---- ledger coverage ----
-
     #[test]
     fn ledger_coverage_has_known_harnesses() {
         let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
@@ -782,8 +753,6 @@ mod tests {
         );
     }
 
-    // ---- QAL-02: default-vs-isolated path-layout fixture kind ----
-
     /// Read a `key=value` line from a layout fixture file.
     fn layout_value(dir: &Path, file: &str, key: &str) -> Option<String> {
         let text = std::fs::read_to_string(dir.join(file)).ok()?;
@@ -792,14 +761,8 @@ mod tests {
             .map(ToOwned::to_owned)
     }
 
-    /// The default-vs-isolated layout dimension of the fixture corpus: the
-    /// three flagship relocated-root adapters carry BOTH layout variants, and
-    /// each variant is machine-checked against the adapter's own code, the
-    /// default layout root must equal `DEFAULT_CONFIG_ROOT_FALLBACK` and the
-    /// isolated layout env must equal `CONFIG_ENV_VAR`. The isolated root is
-    /// the env-var dir itself, EXCEPT for harnesses whose CLI nests its state
-    /// dir inside the relocation root (gemini-cli creates `.gemini/` inside
-    /// `GEMINI_CLI_HOME`). A drift in either direction fails here.
+    /// The flagship relocated-root adapters carry BOTH layout variants,
+    /// machine-checked against the adapter's own constants; drift fails here.
     #[test]
     fn fixture_layout_variants_match_adapter_constants() {
         let fixtures_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
@@ -856,8 +819,6 @@ mod tests {
         }
     }
 
-    // ---- corpus-less surface corpora (HAD-06 / QAL-02) ----
-
     /// Whether any file in `dir` carries the `.<variant>.` name segment.
     fn dir_has_variant(dir: &Path, variant: &str) -> bool {
         let needle = format!(".{variant}.");
@@ -868,8 +829,8 @@ mod tests {
         })
     }
 
-    /// The 13 surfaces that had no on-disk corpus before this area; each dir
-    /// must carry the standard variant set and pass fixture validation.
+    /// Corpus-less surfaces; each dir must carry the standard variant set
+    /// and pass fixture validation.
     #[test]
     fn corpus_less_surfaces_have_validating_fixture_corpora() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
@@ -929,8 +890,6 @@ mod tests {
         }
     }
 
-    // ---- raw_editor kind helpers via verification ----
-
     #[test]
     fn validate_each_kind_via_raw_editor() {
         let cases: Vec<(&[u8], DocumentKind, bool)> = vec![
@@ -989,21 +948,16 @@ mod tests {
 
     #[test]
     fn redaction_is_kind_aware() {
-        // Env
         let env = b"SECRET_TOKEN=realvalue\n";
         let spans = find_redaction_spans(env, DocumentKind::Env);
         assert!(!spans.is_empty());
-        // Toml
         let toml = b"api_key = \"secret123\"\n";
         let spans_t = find_redaction_spans(toml, DocumentKind::Toml);
         assert!(!spans_t.is_empty());
-        // Yaml
         let yaml = b"password: mysecret\n";
         let spans_y = find_redaction_spans(yaml, DocumentKind::Yaml);
         assert!(!spans_y.is_empty());
     }
-
-    // ---- QAL-06/07 matrix ----
 
     #[test]
     fn qal_06_failure_matrix_is_complete() {
@@ -1014,7 +968,6 @@ mod tests {
         );
         assert_eq!(report.required.len(), 18);
         assert_eq!(report.surfaces.len(), 6);
-        // Each required point must be distinct
         let mut distinct = BTreeSet::new();
         for p in &report.required {
             assert!(distinct.insert(*p), "duplicate point {p:?}");
@@ -1028,7 +981,6 @@ mod tests {
             report.complete,
             "fake harness report must be complete: {report:?}"
         );
-        // Version fixtures cover the required variants
         let lower: Vec<String> = report
             .version_fixtures
             .iter()
@@ -1040,7 +992,6 @@ mod tests {
                 "version fixture missing {needle}: {lower:?}"
             );
         }
-        // Network fixtures cover GitHub matrix
         for needle in [
             "catalog_success",
             "digest_mismatch",
@@ -1057,7 +1008,6 @@ mod tests {
                 report.network_fixtures
             );
         }
-        // Health cases
         assert_eq!(report.health_cases.len(), 11);
         assert!(report.cross_host_redirect_covered);
     }
@@ -1151,8 +1101,6 @@ mod tests {
         ));
     }
 
-    // ---- QAL-05 mutant-killing guards ----
-
     #[test]
     fn mutant_backup_guard_aborts_on_failure_and_allows_success() {
         let dir = crate::test_util::temp_dir_unique("mutant-backup");
@@ -1230,7 +1178,6 @@ mod tests {
             superai_config::snapshot::is_modified(&snap_stale, &snap_current),
             "changed content must be detected"
         );
-        // creation/deletion
         let missing = dir.join("missing.json");
         drop(std::fs::remove_file(&missing));
         let snap_missing = superai_config::snapshot::snapshot(&missing);
@@ -1249,7 +1196,6 @@ mod tests {
         let p2 = dir2.join("file.json");
         std::fs::write(&p2, br#"{"v":1}"#).unwrap();
         let snap_before = superai_config::snapshot::snapshot(&p2);
-        // external concurrent modification
         std::fs::write(&p2, br#"{"v":2}"#).unwrap();
         let res_stale = superai_config::raw_editor::commit_with_snapshot(
             &p2,
@@ -1349,7 +1295,6 @@ mod tests {
         let mut txn2 = superai_config::transaction::Transaction::new(op2, steps2);
         txn2.prepare().unwrap();
         txn2.commit().unwrap();
-        // corrupt backup for a
         let backup_a = txn2
             .backups
             .iter()
@@ -1371,9 +1316,8 @@ mod tests {
     #[test]
     fn mutant_validate_quarantine_target_rejects_broad_roots_and_accepts_valid() {
         use std::path::Path;
-        // broad roots must be rejected (mutant that returns Ok would allow disastrous delete).
-        // The filesystem root is broad on every platform (unix `/` string-match,
-        // windows `C:\` via `windows_shaped_broad_root`).
+        // Broad roots must be rejected (a mutant Ok allows disastrous
+        // deletes); the fs root is broad on every platform.
         let fs_root = if cfg!(windows) {
             PathBuf::from("C:\\")
         } else {
@@ -1432,7 +1376,6 @@ mod tests {
     #[test]
     fn mutant_redacted_string_hides_secret_in_all_channels() {
         let secret = "sk-live-super-secret-12345";
-        // core RedactedString
         let r1 = crate::error::RedactedString::new(secret);
         for out in [
             format!("{r1:?}"),

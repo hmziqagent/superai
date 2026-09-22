@@ -41,8 +41,7 @@ fn set_permissions_u32(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Flush + sync the freshly copied backup (MUT-03). Windows needs write
-/// access to flush, so a readonly attribute is cleared and reinstated;
+/// Flush + sync the backup (MUT-03). Windows must clear readonly to flush;
 /// unix fsyncs through a read-only descriptor.
 fn flush_backup_file(target: &Path) -> Result<()> {
     #[cfg(windows)]
@@ -97,10 +96,8 @@ fn generate_backup_path(original: &Path) -> Result<(PathBuf, u128, String)> {
     Ok((target, millis, suffix))
 }
 
-/// Pick a backup name, steering away from names `taken` reports while a
-/// free one appears. The probe is advisory: after 5 collisions the last
-/// candidate is returned and the caller decides (copy over it off unix,
-/// refuse it on unix).
+/// Steer away from taken names; after 5 collisions the last candidate is
+/// returned and the caller decides (overwrite off unix, refuse on unix).
 fn pick_backup_path(
     original: &Path,
     mut taken: impl FnMut(&Path) -> bool,
@@ -118,9 +115,8 @@ fn pick_backup_path(
     }
 }
 
-/// Write `bytes` to `target` iff nothing holds the name (unix):
-/// `create_new` fails with `AlreadyExists` on any occupied name, a planted
-/// symlink included, so the write can never be redirected through a link.
+/// `create_new` write: any occupied name, a planted symlink included, fails
+/// `AlreadyExists`, so the write can never go through a link.
 #[cfg(unix)]
 fn write_backup_exclusive(target: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     use std::io::Write;
@@ -139,9 +135,8 @@ fn write_backup_exclusive(target: &Path, bytes: &[u8], mode: Option<u32>) -> Res
         .map_err(|e| ConfigError::io(target, e))
 }
 
-/// Land the backup bytes (unix): exclusive-create a fresh name, retrying a
-/// bounded number of times if a name is taken between pick and create.
-/// Refuses to overwrite after repeated collisions.
+/// Exclusive-create a fresh name, retrying a bounded number of collisions;
+/// refuses to overwrite after repeated collisions (unix).
 #[cfg(unix)]
 fn write_backup_bytes(
     original: &Path,
@@ -172,9 +167,7 @@ fn write_backup_bytes(
     }
 }
 
-/// Stable identifier for a backup artifact: `<millis>-<4hex>` (e.g.
-/// `1714123456789-a1b2`). Validation is lenient here; core enforces stricter
-/// rules.
+/// Stable backup identifier `<millis>-<4hex>`; validation is lenient here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BackupId(String);
 
@@ -207,8 +200,7 @@ impl From<BackupId> for String {
     }
 }
 
-/// Catalog entry for a single backup: metadata to locate, verify, and
-/// restore it. No contents, no secrets.
+/// Catalog entry for one backup: locate/verify/restore metadata, no contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupEntry {
     /// Stable backup identifier.
@@ -233,9 +225,7 @@ pub struct BackupEntry {
     pub reason: String,
 }
 
-/// Back up `path` beside itself as `<name>.bak.<millis>.<rand4>` before it
-/// is overwritten; `Ok(None)` for a not-yet-existing file. Flushes and
-/// digest-verifies before returning.
+/// Back up `path` beside itself, digest-verified; `Ok(None)` for a missing file.
 pub fn backup(path: &Path) -> Result<Option<BackupEntry>> {
     backup_with_reason(path, "pre-write backup")
 }
@@ -254,8 +244,7 @@ pub fn backup_with_operation(
     backup_inner(path, operation_id, reason, None)
 }
 
-/// [`backup_with_operation`] with a failure injector observing the open,
-/// write, flush, and verify boundaries (QAL-06).
+/// [`backup_with_operation`] with a failure injector at the backup boundaries.
 pub fn backup_with_injector(
     path: &Path,
     operation_id: Option<&str>,
@@ -309,12 +298,8 @@ fn backup_inner(
     let permissions = get_permissions_u32(&meta);
 
     inject(injector, Point::BackupWrite)?;
-    // Unix lands the already-read bytes through exclusive create: a symlink
-    // planted at the backup name between pick and create is refused, never
-    // followed, and the source is read exactly once. Windows keeps fs::copy
-    // because it propagates the readonly attribute (its test-asserted
-    // contract), which costs a second source read and keeps the
-    // probe-to-copy race in the local-writer threat model.
+    // Unix exclusive-creates the backup: a symlink planted at the name is
+    // refused, never followed. Windows fs::copy leaves a probe-to-copy race.
     #[cfg(unix)]
     let (target, millis, suffix) = write_backup_bytes(path, &original_bytes, permissions)?;
     #[cfg(not(unix))]
@@ -370,9 +355,8 @@ fn backup_inner(
     }))
 }
 
-/// Restore a backup over `path` via the atomic write discipline (temp,
-/// sync, rename, read-back verify): interrupted leaves `path` fully old or
-/// fully restored, never truncated.
+/// Restore a backup over `path` through the atomic write discipline:
+/// interrupted leaves `path` fully old or fully restored, never truncated.
 pub fn restore(backup_path: &Path, path: &Path) -> Result<()> {
     let backup_meta =
         std::fs::symlink_metadata(backup_path).map_err(|e| ConfigError::io(backup_path, e))?;
@@ -389,8 +373,7 @@ pub fn restore(backup_path: &Path, path: &Path) -> Result<()> {
     atomic_write_expecting(path, &backup_bytes, WriteExpectation::Any, mode, None)
 }
 
-/// Restore via a [`BackupEntry`]: the backup's digest and size must match
-/// the entry or the target is never touched.
+/// Restore via a [`BackupEntry`]: digest/size must match or the target is untouched.
 pub fn restore_entry(entry: &BackupEntry) -> Result<()> {
     let verified = verify_backup(entry)?;
     if !verified {
@@ -402,9 +385,7 @@ pub fn restore_entry(entry: &BackupEntry) -> Result<()> {
     restore(&entry.backup_path, &entry.original_path)
 }
 
-/// List backups for `original_path` by scanning its parent for
-/// `<file_name>.bak.*`. Retention is caller-controlled. Sorted by
-/// timestamp then suffix.
+/// List `<file_name>.bak.*` siblings sorted by timestamp then suffix.
 pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
     let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = original_path
@@ -474,8 +455,7 @@ pub fn list_backups(original_path: &Path) -> Result<Vec<BackupEntry>> {
     Ok(entries)
 }
 
-/// Whether the backup file matches its entry: `Ok(true)` on digest and
-/// size match, `Ok(false)` on mismatch, `Err` on I/O failure.
+/// Whether the backup file matches its entry: `Ok(false)` on mismatch.
 pub fn verify_backup(entry: &BackupEntry) -> Result<bool> {
     let bytes =
         std::fs::read(&entry.backup_path).map_err(|e| ConfigError::io(&entry.backup_path, e))?;
@@ -484,9 +464,8 @@ pub fn verify_backup(entry: &BackupEntry) -> Result<bool> {
     Ok(digest == entry.digest && size == entry.size)
 }
 
-/// Whether the entry belongs to `target`: same original path and a
-/// properly named sibling backup, so a restore cannot cross
-/// harness/instance identity (MUT-07).
+/// Whether the entry belongs to `target`: same original path and a properly
+/// named sibling backup, so restores cannot cross identities (MUT-07).
 pub fn verify_backup_relation(entry: &BackupEntry, target: &Path) -> Result<bool> {
     if entry.original_path != target {
         return Ok(false);
@@ -516,8 +495,7 @@ pub fn verify_backup_relation(entry: &BackupEntry, target: &Path) -> Result<bool
     verify_backup(entry)
 }
 
-/// Find a backup for `original_path` by stable [`BackupId`] via the
-/// catalog, not a user-built path.
+/// Find a backup by [`BackupId`] via the catalog, never a user-built path.
 pub fn find_backup_by_id(original_path: &Path, id: &BackupId) -> Result<Option<BackupEntry>> {
     let entries = list_backups(original_path)?;
     for entry in entries {
@@ -528,8 +506,7 @@ pub fn find_backup_by_id(original_path: &Path, id: &BackupId) -> Result<Option<B
     Ok(None)
 }
 
-/// Redact the value of any line whose key looks secret-bearing; never
-/// returns raw secret material.
+/// Redact any line whose key looks secret-bearing; never raw secret material.
 fn redact_line(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
     let needs_redact = lower.contains("apikey")
@@ -553,8 +530,7 @@ fn redact_line(line: &str) -> String {
     }
 }
 
-/// Redacted diff preview between `current` and `backup` bytes. Binary
-/// (non-UTF-8) content produces a size/digest summary only.
+/// Redacted diff preview; non-UTF-8 content yields a size/digest summary.
 pub fn redacted_diff_preview(current: &[u8], backup: &[u8]) -> String {
     let current_text = std::str::from_utf8(current);
     let backup_text = std::str::from_utf8(backup);
@@ -626,8 +602,7 @@ pub struct RestoreReport {
     pub restored_entry: BackupEntry,
 }
 
-/// Restore by stable [`BackupId`] with the full MUT-07 discipline. The
-/// backup is resolved by ID, never a user-supplied path.
+/// Restore by [`BackupId`] (MUT-07): resolved by ID, never a user path.
 pub fn restore_by_id(original_path: &Path, backup_id: &BackupId) -> Result<RestoreReport> {
     let entry = find_backup_by_id(original_path, backup_id)?.ok_or_else(|| {
         ConfigError::io(
@@ -638,9 +613,8 @@ pub fn restore_by_id(original_path: &Path, backup_id: &BackupId) -> Result<Resto
     restore_verified(&entry)
 }
 
-/// Restore via a verified [`BackupEntry`] (MUT-07): verify digest and
-/// relation, diff against a fresh read, back up the current bytes, replace
-/// atomically, verify the read-back.
+/// Verify digest and relation, back up the current bytes, replace atomically,
+/// verify the read-back (MUT-07).
 pub fn restore_verified(entry: &BackupEntry) -> Result<RestoreReport> {
     let digest_ok = verify_backup(entry)?;
     if !digest_ok {
@@ -740,8 +714,6 @@ fn infer_kind_for_path(path: &Path) -> Option<crate::document::DocumentKind> {
     }
 }
 
-// tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,8 +784,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// Windows: no mode bits are recorded, and the readonly attribute is
-    /// inherited by the copy and survives the flush.
     #[test]
     #[cfg(windows)]
     fn backup_of_readonly_source_keeps_readonly_attribute_and_flushes() {
@@ -835,14 +805,11 @@ mod tests {
             .permissions()
             .readonly();
         assert!(readonly, "fs::copy propagates the readonly attribute");
-        // And restore over the readonly target works (rename clears the
-        // destination attribute first).
         restore(&entry.backup_path, &path).unwrap();
         let restored = std::fs::read(&path).unwrap();
         assert_eq!(restored, b"readonly source");
 
         let mut clear = std::fs::metadata(&path).unwrap().permissions();
-        // Windows-only test cleanup of the attribute; cannot affect unix modes.
         #[expect(
             clippy::permissions_set_readonly_false,
             reason = "windows-only test cleanup of the readonly attribute"
@@ -892,8 +859,6 @@ mod tests {
         assert_eq!(suffix.len(), 4);
     }
 
-    /// Records every probed candidate and reports the first `busy` of them
-    /// as taken.
     fn busy_prober(
         busy: usize,
     ) -> (
@@ -919,8 +884,6 @@ mod tests {
         assert!(!duplicates, "candidates must differ: {paths:?}");
     }
 
-    /// Busy names steer the pick forward until a free candidate appears; the
-    /// free one is used, not the busy ones.
     #[test]
     fn pick_backup_path_steers_to_the_first_free_name() {
         let path = scratch("steer-busy").with_file_name("cfg.json");
@@ -932,8 +895,6 @@ mod tests {
         assert_eq!(target, candidates[2], "the first free candidate wins");
     }
 
-    /// Five consecutive collisions exhaust the steering: the fifth candidate
-    /// is returned even though it is taken, so the copy overwrites it.
     #[test]
     fn pick_backup_path_gives_up_after_five_busy_candidates() {
         let path = scratch("steer-full").with_file_name("cfg.json");
@@ -948,9 +909,6 @@ mod tests {
         );
     }
 
-    /// Unix: the exclusive create carries at most the recorded permission
-    /// bits. A mode masked to zero must land a zero-mode file, never one
-    /// widened by the create call.
     #[cfg(unix)]
     #[test]
     fn write_backup_exclusive_lands_at_most_the_recorded_mode_bits() {
@@ -962,8 +920,6 @@ mod tests {
         drop(std::fs::remove_file(&path));
     }
 
-    /// The retry loop is for name collisions only; any other create error
-    /// (missing parent) must surface as itself, not the synthetic collision error.
     #[cfg(unix)]
     #[test]
     fn write_backup_bytes_surfaces_non_collision_errors_untouched() {
@@ -1119,9 +1075,8 @@ mod tests {
             "restore must land the backup bytes exactly, with no tail residue"
         );
 
-        // The mechanism: the replacement arrives by rename, not by writing
-        // through the live file. An in-place copy keeps the inode; a rename
-        // over the target replaces it.
+        // The replacement arrives by rename: an in-place copy keeps the inode,
+        // a rename over the target replaces it.
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1147,8 +1102,6 @@ mod tests {
     #[test]
     fn restore_failure_leaves_target_bytes_fully_intact() {
         use std::os::unix::fs::PermissionsExt;
-        // A restore that cannot stage its temp leaves the target exactly at
-        // its previous bytes, never a torn mix.
         let dir = crate::test_util::temp_dir_unique("config-backup-restore-fail");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("target.json");
@@ -1195,8 +1148,6 @@ mod tests {
         assert_eq!(before.digest, compute_digest(b"v2 which is longer than v1"));
         assert_no_temp_litter(path.parent().unwrap());
 
-        // A missing target (failed uncommitted creation) is recreated from the
-        // backup rather than refused.
         drop(std::fs::remove_file(&path));
         drop(std::fs::remove_file(&before.backup_path));
         let second = restore_verified(&entry).unwrap();
@@ -1223,8 +1174,6 @@ mod tests {
         let link = dir.join("link.json");
         std::os::unix::fs::symlink(&referent, &link).unwrap();
 
-        // The backup is taken through the link, so it records the referent's
-        // bytes under the link's path.
         let entry = backup(&link)
             .unwrap()
             .expect("backup through a file symlink");
@@ -1236,8 +1185,8 @@ mod tests {
 
         restore_entry(&entry).unwrap();
 
-        // The link itself is replaced by a regular file carrying the backup
-        // bytes; the restore never writes through to the old referent.
+        // The link itself is replaced by a regular file; the restore never
+        // writes through it.
         let link_meta = std::fs::symlink_metadata(&link).unwrap();
         assert!(
             !link_meta.file_type().is_symlink(),
@@ -1252,8 +1201,6 @@ mod tests {
         );
         assert_no_temp_litter(&dir);
 
-        // The restored file may carry the link-derived mode, so relax it
-        // before cleanup.
         std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o600)).unwrap();
         drop(std::fs::remove_file(&link));
         drop(std::fs::remove_file(&referent));
@@ -1276,8 +1223,6 @@ mod tests {
         let entry = backup(&path).unwrap().expect("backup of a read-only file");
         assert_eq!(entry.permissions.map(|m| m & 0o777), Some(0o400));
 
-        // Change the bytes and leave the target read-only: an in-place write
-        // (the old `std::fs::copy` restore) could not open it at all.
         set_mode(&path, 0o600);
         std::fs::write(&path, b"newer bytes").unwrap();
         set_mode(&path, 0o400);
@@ -1296,10 +1241,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    // behaviour tests for the mutation gate
-
-    /// Every `<name>.bak.*` file sitting next to `path` (used to observe
-    /// which pipeline boundaries leave artifacts behind).
     fn backup_files_next_to(path: &Path) -> Vec<String> {
         let parent = path.parent().unwrap();
         let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -1318,7 +1259,6 @@ mod tests {
         names
     }
 
-    /// Injector failing at exactly one backup boundary.
     #[derive(Debug)]
     struct FailAt(Point);
 
@@ -1335,9 +1275,8 @@ mod tests {
         }
     }
 
-    /// Injector swapping the fresh backup for a symlink to `/dev/null` at
-    /// the flush boundary; only meaningful where that fsync fails EINVAL
-    /// (Linux).
+    /// Swap the fresh backup for a symlink to /dev/null at the flush
+    /// boundary; meaningful only where that fsync fails EINVAL (Linux).
     #[cfg(target_os = "linux")]
     #[derive(Debug)]
     struct SwapBackupForDevNull {
@@ -1351,7 +1290,6 @@ mod tests {
             if point != Point::BackupFlush {
                 return Ok(());
             }
-            // Dropped failures: a missed swap fails the test's assertion.
             let backup_path = std::fs::read_dir(&self.dir)
                 .into_iter()
                 .flatten()
@@ -1369,8 +1307,6 @@ mod tests {
         }
     }
 
-    /// The injector plumbing runs the real production path: with no injector
-    /// the backup lands and is verifiable.
     #[test]
     fn backup_with_injector_runs_the_real_pipeline_and_copies_the_file() {
         let path = unique_scratch("injector-none");
@@ -1387,9 +1323,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// Each backup boundary failure surfaces as an error and never touches
-    /// the original; only the boundaries after the copy leave the copied
-    /// backup file behind.
     #[test]
     fn backup_with_injector_failures_at_each_boundary() {
         for point in [
@@ -1410,12 +1343,10 @@ mod tests {
             );
             let leftovers = backup_files_next_to(&path);
             match point {
-                // These boundaries fire before `fs::copy` starts.
                 Point::BackupOpen | Point::BackupWrite => assert!(
                     leftovers.is_empty(),
                     "{point} fires before the copy; found {leftovers:?}"
                 ),
-                // These fire once the backup file has landed.
                 _ => assert_eq!(
                     leftovers.len(),
                     1,
@@ -1431,14 +1362,12 @@ mod tests {
         }
     }
 
-    /// The flush is real: fsync on `/dev/null` fails EINVAL (Linux only;
-    /// macOS reports ENODEV), so a stubbed flush surfaces the io error
-    /// before digest verification could pass.
+    /// The flush is real: fsync on /dev/null fails EINVAL on Linux, so a
+    /// stubbed flush surfaces before digest verification could pass.
     #[cfg(target_os = "linux")]
     #[test]
     fn backup_surfaces_flush_sync_errors_before_digest_verification() {
         if !Path::new("/dev/null").exists() {
-            // Not every environment provides /dev/null; nothing to assert.
             return;
         }
         let path = unique_scratch("flush-einval");
@@ -1462,7 +1391,6 @@ mod tests {
         drop(std::fs::remove_dir_all(path.parent().unwrap()));
     }
 
-    /// `BackupId` accessors are the catalog's stable identifier surface.
     #[test]
     fn backup_id_accessors_preserve_the_string() {
         let id = BackupId::new("1714123456789-a1b2");
@@ -1472,8 +1400,6 @@ mod tests {
         assert_eq!(String::from(id), "1714123456789-a1b2");
     }
 
-    /// Entry and file names embed recent epoch millis plus a four-hex
-    /// suffix.
     #[test]
     fn backup_entry_and_file_name_embed_recent_millis_and_compact_hex_suffix() {
         let path = unique_scratch("naming");
@@ -1513,7 +1439,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// An unresolvable symlink path is an io error, not "nothing to back up".
     #[cfg(unix)]
     #[test]
     fn backup_reports_io_error_for_symlink_loop() {
@@ -1532,9 +1457,6 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// A file that cannot even be lstat'ed (unsearchable parent) is an io
-    /// error, not "nothing to back up": only a truly missing file maps to
-    /// `Ok(None)`.
     #[cfg(unix)]
     #[test]
     fn backup_reports_io_error_when_parent_directory_is_unsearchable() {
@@ -1565,14 +1487,11 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// Only regular files are backed up; a character device is rejected up
-    /// front with `InvalidInput` instead of being read and copied.
     #[cfg(unix)]
     #[test]
     fn backup_rejects_non_regular_files() {
         let dev_null = Path::new("/dev/null");
         if !dev_null.exists() {
-            // Not every environment provides /dev/null; nothing to assert.
             return;
         }
         match backup(dev_null) {
@@ -1585,7 +1504,6 @@ mod tests {
         }
     }
 
-    /// A parent directory that does not exist lists no backups.
     #[test]
     fn list_backups_returns_empty_for_missing_parent() {
         let root = crate::test_util::temp_dir_unique("config-backup-list-missing");
@@ -1595,8 +1513,6 @@ mod tests {
         drop(std::fs::remove_dir(&root));
     }
 
-    /// A parent directory that cannot be read is an io error, not an empty
-    /// catalog (an unreadable parent could hide existing backups).
     #[cfg(unix)]
     #[test]
     fn list_backups_surfaces_unreadable_parent_errors() {
@@ -1623,8 +1539,6 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// Directory entries that merely look like backups are not listed; the
-    /// real backup file is.
     #[test]
     fn list_backups_lists_only_regular_backup_files() {
         let path = unique_scratch("list-nonfile");
@@ -1644,8 +1558,6 @@ mod tests {
         drop(std::fs::remove_dir(path.parent().unwrap()));
     }
 
-    /// Verification requires BOTH the digest and the size to match; a match
-    /// on one alone must not verify.
     #[test]
     fn verify_backup_requires_both_digest_and_size_to_match() {
         let path = unique_scratch("verify-parts");
@@ -1675,8 +1587,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// The relation check accepts only a backup that is a properly named
-    /// sibling of the very target it claims to belong to.
     #[test]
     fn verify_backup_relation_accepts_only_named_siblings_of_the_target() {
         let dir = crate::test_util::temp_dir_unique("config-backup-relation");
@@ -1685,20 +1595,17 @@ mod tests {
         std::fs::write(&target, b"relation").unwrap();
         let entry = backup(&target).unwrap().expect("backup");
 
-        // The real relation: same original, sibling backup, matching bytes.
         assert!(
             verify_backup_relation(&entry, &target).unwrap(),
             "a fresh backup relates to its target"
         );
 
-        // A different target is refused outright.
         let other = dir.join("other.json");
         assert!(
             !verify_backup_relation(&entry, &other).unwrap(),
             "a backup of cfg.json does not relate to other.json"
         );
 
-        // A backup that lives in a different directory is not a sibling.
         let foreign_dir = crate::test_util::temp_dir_unique("config-backup-relation-foreign");
         std::fs::create_dir_all(&foreign_dir).unwrap();
         let foreign = foreign_dir.join(entry.backup_path.file_name().unwrap());
@@ -1713,8 +1620,6 @@ mod tests {
         );
         drop(std::fs::remove_dir_all(&foreign_dir));
 
-        // A sibling whose name does not start with the target name is
-        // refused even though it carries the marker and matching bytes.
         let misnamed = dir.join("xcfg.json.bak.1.abcd");
         std::fs::copy(&entry.backup_path, &misnamed).unwrap();
         let misnamed_entry = BackupEntry {
@@ -1726,8 +1631,6 @@ mod tests {
             "a backup name must start with the target's file name"
         );
 
-        // A sibling prefixed like the target but missing the `.bak.` marker
-        // is refused.
         let unmarked = dir.join("cfg.json.old");
         std::fs::copy(&entry.backup_path, &unmarked).unwrap();
         let unmarked_entry = BackupEntry {
@@ -1739,9 +1642,6 @@ mod tests {
             "a backup name must carry the .bak. marker"
         );
 
-        // A bare target name (no parent directory component) must not trip
-        // the sibling check: the name checks still apply and the properly
-        // named backup still relates.
         let bare = BackupEntry {
             original_path: PathBuf::from("cfg.json"),
             backup_path: entry.backup_path.clone(),
@@ -1759,7 +1659,6 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// The catalog resolves known ids and refuses unknown ones.
     #[test]
     fn find_backup_by_id_resolves_only_known_ids() {
         let path = unique_scratch("find-by-id");
@@ -1777,8 +1676,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// Every secret-bearing keyword redacts, in both `:` and `=` styles, and
-    /// ordinary lines pass through untouched.
     #[test]
     fn redact_line_redacts_each_secret_keyword_in_both_separator_styles() {
         assert_eq!(redact_line("apikey: sk-123"), "apikey: [REDACTED]");
@@ -1808,8 +1705,6 @@ mod tests {
         }
     }
 
-    /// The preview distinguishes "no changes" from line-level additions and
-    /// removals, and redacts secret values on the way through.
     #[test]
     fn redacted_diff_preview_marks_no_changes_and_line_changes() {
         assert_eq!(redacted_diff_preview(b"same", b"same"), "no changes");
@@ -1817,8 +1712,6 @@ mod tests {
             redacted_diff_preview(b"new line", b"old line"),
             "- old line\n+ new line\n"
         );
-        // An unchanged line inside a changed document produces no pair of
-        // its own: only the differing lines appear in the preview.
         assert_eq!(
             redacted_diff_preview(b"x\nsame\nz", b"a\nsame\nc"),
             "- a\n+ x\n- c\n+ z\n"
@@ -1832,8 +1725,6 @@ mod tests {
         assert!(!small.contains("truncated"));
     }
 
-    /// Binary content (non-UTF-8 on either side) produces the size/digest
-    /// summary instead of a line diff.
     #[test]
     fn redacted_diff_preview_summarizes_binary_content() {
         let summary = redacted_diff_preview(b"plain text", b"\xff\xfe binary");
@@ -1855,9 +1746,8 @@ mod tests {
         );
     }
 
-    /// The 4 KiB preview budget truncates only once the accumulated output
-    /// strictly exceeds it: the first pair below contributes exactly 4096
-    /// bytes, so the second pair must still be included.
+    /// The budget truncates only past 4096 bytes: the first pair below
+    /// contributes exactly 4096, so the second pair must still appear.
     #[test]
     fn redacted_diff_preview_truncates_only_past_the_size_budget() {
         let old_first = "B".repeat(2000);
@@ -1880,9 +1770,6 @@ mod tests {
         );
     }
 
-    /// `validate_bytes_for_kind` is the restore-time semantic check: it must
-    /// reject invalid documents, and blank/comment lines in env files are
-    /// not errors.
     #[test]
     fn validate_bytes_rejects_invalid_documents_and_accepts_valid_ones() {
         use crate::document::DocumentKind;
@@ -1891,21 +1778,15 @@ mod tests {
         validate_bytes_for_kind(b"{}", DocumentKind::StrictJson, p).unwrap();
         assert!(validate_bytes_for_kind(b"not toml ]", DocumentKind::Toml, p).is_err());
         validate_bytes_for_kind(b"a = 1\n", DocumentKind::Toml, p).unwrap();
-        // env: blank lines and comments are skipped; a line without '='
-        // fails; `export ` prefixes are honored.
         validate_bytes_for_kind(b"KEY=1\n\n# comment\nOTHER =2\n", DocumentKind::Env, p).unwrap();
         assert!(validate_bytes_for_kind(b"KEY=1\nNO_EQUALS_HERE\n", DocumentKind::Env, p).is_err());
         validate_bytes_for_kind(b"KEY=1\nexport EXPORTED=3\n", DocumentKind::Env, p).unwrap();
-        // jsonc strips comments before parsing.
         validate_bytes_for_kind(b"{ \"a\": 1 } // tail\n", DocumentKind::JsonC, p).unwrap();
         assert!(validate_bytes_for_kind(b"{ broken // x\n", DocumentKind::JsonC, p).is_err());
-        // yaml round-trips through the core yaml codec.
         validate_bytes_for_kind(b"a: 1\n", DocumentKind::Yaml, p).unwrap();
         assert!(validate_bytes_for_kind(b"a: [1,\n", DocumentKind::Yaml, p).is_err());
     }
 
-    /// Kind inference covers every supported extension, the `.env` family,
-    /// and stays `None` for everything else.
     #[test]
     fn infer_kind_covers_every_supported_extension_and_env_names() {
         use crate::document::DocumentKind;
@@ -1946,8 +1827,6 @@ mod tests {
         assert_eq!(infer_kind_for_path(Path::new(".envx")), None);
     }
 
-    /// Line and block comments are removed outside strings; string contents
-    /// and escapes survive verbatim.
     #[test]
     fn strip_comments_removes_line_and_block_comments_outside_strings() {
         assert_eq!(strip_jsonc_comments("a // tail\nb"), "a \nb");
@@ -1957,14 +1836,10 @@ mod tests {
         assert_eq!(strip_jsonc_comments("plain"), "plain");
         assert_eq!(strip_jsonc_comments(""), "");
         assert_eq!(strip_jsonc_comments("s/**/e"), "se");
-        // A slash that is not a comment marker survives.
         assert_eq!(strip_jsonc_comments("a/b"), "a/b");
         assert_eq!(strip_jsonc_comments("a/"), "a/");
     }
 
-    /// Comment markers inside strings are data; an escaped quote does not
-    /// close the string, so comments after the real closing quote are still
-    /// comments.
     #[test]
     fn strip_comments_preserves_string_contents_and_escapes() {
         assert_eq!(strip_jsonc_comments(r#""a//b""#), r#""a//b""#);
@@ -1986,8 +1861,6 @@ mod tests {
         );
     }
 
-    /// A corrupted backup (same size, different bytes) is refused by the
-    /// digest check and the target stays untouched.
     #[test]
     fn restore_refuses_a_corrupted_backup_and_keeps_the_target() {
         let path = unique_scratch("restore-corrupt");
@@ -2011,8 +1884,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// The MUT-07 restore refuses a backup that does not belong to the
-    /// target instead of writing it over an unrelated file.
     #[test]
     fn restore_verified_refuses_a_backup_from_another_target() {
         let dir = crate::test_util::temp_dir_unique("config-backup-wrong-target");
@@ -2041,8 +1912,6 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// A target that cannot be read for any reason other than being absent
-    /// aborts the restore instead of silently diffing against empty bytes.
     #[cfg(unix)]
     #[test]
     fn restore_verified_aborts_when_the_current_target_cannot_be_read() {
@@ -2078,9 +1947,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// Backing up a symlink: the entry records the LINK's own mode (from
-    /// lstat) while `fs::copy` lands the referent's; the explicit re-apply
-    /// must win.
     #[cfg(unix)]
     #[test]
     fn backup_of_a_symlink_lands_the_link_mode_not_the_referent_mode() {
@@ -2097,9 +1963,8 @@ mod tests {
             .unwrap()
             .expect("backup of a symlink to a regular file must succeed");
 
-        // The link's own mode is platform-given, not a constant: Linux
-        // creates symlinks 0o777, macOS reports 0o755. Derive it from a
-        // fresh lstat; the distinguishing premise only needs link != referent.
+        // The link's own mode is platform-given (Linux 0o777, macOS 0o755):
+        // derive it from a fresh lstat; the premise only needs link != referent.
         let link_mode = std::fs::symlink_metadata(&link)
             .unwrap()
             .permissions()
@@ -2107,9 +1972,7 @@ mod tests {
         let referent_mode = std::fs::metadata(&referent).unwrap().permissions().mode();
         if link_mode & 0o777 == referent_mode & 0o777 {
             // A platform where the link carries the referent's mode: the
-            // premise separating "recorded link mode" from "copied referent
-            // mode" is absent; nothing to distinguish. (Not hit on Linux
-            // 0o777-vs-0o644 or macOS 0o755-vs-0o644.)
+            // distinguishing premise is absent (not hit on Linux or macOS).
             drop(std::fs::remove_file(&link));
             drop(std::fs::remove_file(&entry.backup_path));
             drop(std::fs::remove_file(&referent));
@@ -2136,9 +1999,6 @@ mod tests {
         drop(std::fs::remove_dir(&dir));
     }
 
-    /// A directory that replaced the original surfaces the raw `IsADirectory`
-    /// read error instead of being masked to "missing" (unix; Windows
-    /// reports a different kind).
     #[cfg(unix)]
     #[test]
     fn restore_verified_surfaces_is_a_directory_when_the_original_became_a_directory() {
@@ -2165,9 +2025,6 @@ mod tests {
         drop(std::fs::remove_file(&entry.backup_path));
     }
 
-    /// A name already held by a symlink is refused with `AlreadyExists`:
-    /// exclusive create must never follow a link planted at the backup
-    /// name, so the link's referent keeps its bytes and stays a link.
     #[cfg(unix)]
     #[test]
     fn exclusive_backup_refuses_a_held_backup_name_instead_of_following_it() {
@@ -2197,7 +2054,6 @@ mod tests {
             "following the link would have truncated the referent"
         );
 
-        // A genuinely free name lands the bytes as a fresh regular file.
         let fresh = dir.join("cfg.json.bak.2.abcd");
         write_backup_exclusive(&fresh, b"backup payload", Some(0o600)).unwrap();
         let meta = std::fs::symlink_metadata(&fresh).unwrap();

@@ -1,10 +1,5 @@
-//! Duct-backed process execution wrapper (PKG-01, PKG-05).
-//!
-//! `run_command` spawns with explicit argv (never a shell), composes the
-//! child env before spawn (see [`run_command`] for the guaranteed order),
-//! captures stdout/stderr up to `output_limit` combined bytes, and enforces a
-//! wall-clock timeout that kills the child. Dependency provenance for `duct`
-//! 1.1.x is recorded in `docs/dependency-review.md`.
+//! Duct-backed process execution wrapper (PKG-01, PKG-05): explicit argv,
+//! never a shell; env composed before spawn, bounded capture, timeout kill.
 
 #![expect(
     clippy::excessive_nesting,
@@ -23,10 +18,8 @@ pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Default wall-clock timeout for process execution.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Flags whose following value should be redacted in logs/errors.
-///
-/// Only long-form flags that unambiguously carry secrets; short flags like
-/// `-p` alias to non-secret meanings (port, profile) across tools.
+/// Flags whose following value is redacted; long-form only, since short
+/// flags like `-p` alias to non-secret meanings across tools.
 pub const REDACT_FLAGS: &[&str] = &[
     "--password",
     "--passwd",
@@ -108,11 +101,8 @@ impl Default for ExecuteOpts {
     }
 }
 
-/// Redact sensitive flag values from a slice of args.
-///
-/// Any arg equal to a flag in `flags` causes the following arg to be replaced
-/// with `"***"`. Args of the form `--flag=value` are redacted to
-/// `--flag=***`.
+/// Redact sensitive flag values: a flag in `flags` redacts the following
+/// arg, and `--flag=value` becomes `--flag=***`.
 pub fn redact_args(args: &[String], flags: &[&str]) -> Vec<String> {
     let mut result = Vec::with_capacity(args.len());
     let mut redact_next = false;
@@ -161,11 +151,8 @@ pub fn display_command(executable: &str, args: &[String], redact: bool) -> Strin
     out
 }
 
-/// Scrub secret-bearing content from captured stderr when redaction is on.
-///
-/// Best-effort: if any redact-flag keyword appears in stderr the whole field
-/// is replaced with `[REDACTED]`, so a secret echoed by a failing child never
-/// reaches an error message.
+/// Scrub secret-bearing stderr, best-effort: any redact-flag keyword seen
+/// in the field replaces the whole field with `[REDACTED]`.
 pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     if redact {
         let lower = stderr.to_ascii_lowercase();
@@ -180,9 +167,8 @@ pub fn scrub_stderr(stderr: &str, redact: bool) -> String {
     }
 }
 
-/// Fold ASCII a-z up to A-Z across UTF-16 code units; every other unit
-/// (non-ASCII, surrogates) passes through untouched. Pure so the Windows
-/// fold is compiled and tested on every platform.
+/// Fold ASCII a-z to A-Z across UTF-16 units; every other unit (non-ASCII,
+/// surrogates) passes through. Pure so the Windows fold is tested everywhere.
 #[cfg(any(windows, test))]
 fn fold_wide_ascii_uppercase(units: &[u16]) -> Vec<u16> {
     units
@@ -195,9 +181,8 @@ fn fold_wide_ascii_uppercase(units: &[u16]) -> Vec<u16> {
         .collect()
 }
 
-/// Canonical key for the composed child env map: Windows env names are
-/// ASCII-case-insensitive, so fold them there (duct's wrappers matched the
-/// same way); other platforms match exactly.
+/// Canonical env-map key: Windows env names are ASCII-case-insensitive, so
+/// fold them there; other platforms match exactly.
 #[cfg(windows)]
 fn env_map_key(name: &OsStr) -> OsString {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -229,9 +214,8 @@ fn compose_child_env(opts: &ExecuteOpts) -> BTreeMap<OsString, OsString> {
     env
 }
 
-/// Whether `path` names a file this process could execute (unix also
-/// demands an execute bit; Windows tests existence only, matching the
-/// adapter PATH helpers).
+/// Whether `path` names an executable file (unix demands the execute bit;
+/// Windows tests existence only, matching the adapter PATH helpers).
 fn is_executable_file(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -244,9 +228,8 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// First PATH entry holding an executable file named `name` (`.exe` is also
-/// probed on Windows). Empty entries are skipped: POSIX treats them as the
-/// working directory, and this lookup must never resolve from there.
+/// First PATH entry holding an executable `name` (`.exe` also probed on
+/// Windows). Empty entries are skipped: POSIX reads them as the cwd.
 fn first_path_match(path_var: &OsStr, name: &str) -> Option<PathBuf> {
     for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
@@ -267,15 +250,8 @@ fn first_path_match(path_var: &OsStr, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve `executable` to what will actually be spawned.
-///
-/// Bare names resolve to the first matching executable on the child's PATH
-/// (ambient PATH when inherited, mirroring std's parent-PATH fallback), so
-/// the first-match winner is fixed before spawn instead of being decided by
-/// the platform lookup. Separator-bearing names are used as given (the
-/// caller's explicit choice), except `.`/`..` components, which resolve
-/// relative to the working directory and are refused. Residual risk: PATH
-/// itself is user-controlled, and first match still wins.
+/// Resolve `executable` to what will be spawned: bare names take the first
+/// PATH match from the child's composed PATH; `.`/`..` is refused.
 fn resolve_executable(
     executable: &str,
     child_env: &BTreeMap<OsString, OsString>,
@@ -315,29 +291,8 @@ fn resolve_executable(
     })
 }
 
-/// Run a command with explicit argv (no shell interpolation), bounded capture,
-/// timeout, and optional redaction.
-///
-/// - No shell is ever invoked; `executable` and `args` are passed as argv
-///   tokens directly. Bare names are resolved to an absolute first-PATH-match
-///   before spawn (see [`resolve_executable`]); the working directory is never
-///   searched.
-/// - stdout/stderr are captured up to `output_limit` bytes combined; breach
-///   returns `CoreError::Verification` with output-limit context and the child
-///   is killed.
-/// - Timeout kills the child and returns `CoreError::BinaryDetection` with
-///   timeout context (caller can map to install-specific errors).
-///
-/// # Env composition
-///
-/// The child env is composed up front (see `compose_child_env`) and handed
-/// to duct as one `full_env` map: start from the inherited environment, or
-/// empty when `clear_env` is set; then apply the `env` additions; then
-/// `env_remove`, which wins over an addition on the same key. Additions
-/// therefore survive `clear_env`, and inherited vars reach the child exactly
-/// when `clear_env` is false. (Composing up front replaced duct's env wraps,
-/// which apply in reverse build order and made `clear_env` silently discard
-/// every addition.)
+/// Run a command with explicit argv (no shell), bounded capture, timeout,
+/// redaction. Env: inherited (or empty), additions, then `env_remove` wins.
 pub fn run_command(
     executable: &str,
     args: &[String],
@@ -368,16 +323,14 @@ pub fn run_command(
     let child_env = compose_child_env(opts);
     let resolved = resolve_executable(executable, &child_env)?;
 
-    // Build duct expression with explicit argv, env, cwd, stdin = none.
     let mut cmd = duct::cmd(resolved.as_os_str(), args);
 
     if let Some(cwd) = opts.cwd.as_ref() {
         cmd = cmd.dir(cwd);
     }
 
-    // One composed map is duct's only env input: its wraps apply in reverse
-    // build order, so mixing env/env_remove wraps here would let build order,
-    // not compose_child_env, decide precedence.
+    // Duct's env wraps apply in reverse build order; one composed map is
+    // its only env input so compose_child_env decides precedence.
     cmd = cmd.full_env(child_env);
 
     cmd = cmd.stdout_capture().stderr_capture();
@@ -397,7 +350,6 @@ pub fn run_command(
         // wait_timeout borrows the handle; clone unhooks the captured bytes.
         Ok(Some(output)) => output.clone(),
         Ok(None) => {
-            // Timeout expired; kill and reap.
             let kill_note = handle
                 .kill()
                 .map_or_else(|e| format!(" (kill failed: {e})"), |()| String::new());
@@ -443,11 +395,8 @@ pub fn run_command(
     Ok(ProcessOutput::new(stdout, stderr_scrubbed, exit_code))
 }
 
-/// Convenience helper to run a version probe command and parse the first
-/// semantic-looking token from stdout.
-///
-/// Returns `None` on non-zero exit or empty output; otherwise attempts to
-/// extract a version string.
+/// Run a version probe and parse the first version-like token; `None` on
+/// non-zero exit or empty output.
 pub fn run_version_probe(executable: &str, args: &[String], opts: &ExecuteOpts) -> Option<String> {
     let output = run_command(executable, args, opts).ok()?;
     if !output.success {
@@ -461,10 +410,8 @@ pub fn run_version_probe(executable: &str, args: &[String], opts: &ExecuteOpts) 
     extract_version(&combined)
 }
 
-/// Strip ANSI escape sequences (CSI `ESC[...m`, OSC `ESC]...BEL`, etc.)
-///
-/// Malicious version output may contain escape sequences to hide or inject
-/// content; they must not appear in the extracted version.
+/// Strip ANSI escapes (CSI/OSC): hostile version output must not hide or
+/// inject content in the extracted version.
 fn strip_ansi_escapes(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -503,38 +450,30 @@ fn strip_ansi_escapes(input: &str) -> String {
     out
 }
 
-/// Extract the first version-like token from text.
-///
-/// Looks for `X.Y.Z` or `vX.Y.Z` patterns. Falls back to the first non-empty
-/// line trimmed to 64 chars if no semver pattern is found (still useful for
-/// probes that emit non-semver strings like `claude-code 1.2.3 (build abc)`).
+/// Extract the first `X.Y.Z`/`vX.Y.Z` token; falls back to the first
+/// non-empty line trimmed to 64 chars.
 pub fn extract_version(text: &str) -> Option<String> {
     let stripped = strip_ansi_escapes(text);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Try to find semver-like substring.
     for token in trimmed.split_whitespace() {
         let candidate = token
             .trim_start_matches('v')
             .trim_matches(|c: char| c == ',' || c == ')');
         if candidate.chars().any(|c| c == '.') {
-            // Quick semver-ish check: contains digit and dot
             let has_digit = candidate.chars().any(|c| c.is_ascii_digit());
             let has_dot = candidate.contains('.');
             if has_digit && has_dot {
-                // Strip surrounding punctuation/brackets
                 let cleaned = candidate
                     .trim_matches(|c: char| {
                         !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '+'
                     })
                     .to_owned();
                 if !cleaned.is_empty() {
-                    // Bound length to avoid pathological capture. The bound
-                    // is BYTES (a multi-byte token must not exceed it even
-                    // when it has fewer than 64 chars), truncated at a
-                    // UTF-8 char boundary.
+                    // The 64 bound is BYTES, not chars, and the cut must
+                    // back off to a UTF-8 char boundary.
                     let bounded = if cleaned.len() > 64 {
                         let mut end = 64;
                         while end > 0 && !cleaned.is_char_boundary(end) {
@@ -549,7 +488,6 @@ pub fn extract_version(text: &str) -> Option<String> {
             }
         }
     }
-    // Fallback: first non-empty line, truncated
     for line in trimmed.lines() {
         let l = line.trim();
         if !l.is_empty() {
@@ -584,10 +522,8 @@ mod tests {
         ];
         let redacted = redact_args(&args, REDACT_FLAGS);
         assert_eq!(redacted.get(1).map(String::as_str), Some("***"));
-        // "--api-key= hunter2" has empty inline value, so next arg would be
-        // redacted if we had one; the value itself here is " hunter2" with
-        // leading space, not matched as inline, so it is kept as-is but the
-        // flag form with value is redacted inline
+        // "--api-key= hunter2" has an empty inline value (leading space),
+        // so it is kept as-is; only the filled form redacts inline.
         assert_eq!(redacted.get(4).map(String::as_str), Some("--api-key=***"));
     }
 
@@ -661,13 +597,11 @@ mod tests {
 
     #[test]
     fn run_command_bounded_capture_enforced() {
-        // Use yes-like output via printf to generate large output exceeding tiny limit
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             output_limit: Some(10),
             ..Default::default()
         };
-        // echo with large arg should exceed 10 bytes combined
         let large = "x".repeat(100);
         let err = run_command("echo", &[large], &opts).unwrap_err();
         assert!(format!("{err}").contains("output limit exceeded"));
@@ -675,8 +609,6 @@ mod tests {
 
     #[test]
     fn run_command_no_shell_interpolation() {
-        // argv token containing shell meta-characters must be passed literally
-        // and not expand. `echo` should print the literal token.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             ..Default::default()
@@ -763,11 +695,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_command_env_additions_survive_clear_env() {
-        // End-to-end pin of the composed precedence: additions survive
-        // clear_env and env_remove wins on a same-key addition. A shell
-        // cannot probe PATH (POSIX sh fabricates a default PATH at startup),
-        // so the cleared-base pin uses single-operand printenv, whose
-        // unset-variable behaviour is identical on GNU and BSD.
+        // End-to-end pin: additions survive clear_env, env_remove wins on a
+        // same key. sh fabricates PATH at startup, so the PATH pin uses printenv.
         let opts = ExecuteOpts {
             timeout: Some(Duration::from_secs(5)),
             env: vec![
