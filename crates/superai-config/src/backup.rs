@@ -948,6 +948,39 @@ mod tests {
         );
     }
 
+    /// Unix: the exclusive create carries at most the recorded permission
+    /// bits. A mode masked to zero must land a zero-mode file, never one
+    /// widened by the create call.
+    #[cfg(unix)]
+    #[test]
+    fn write_backup_exclusive_lands_at_most_the_recorded_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_scratch("exclusive-mode");
+        write_backup_exclusive(&path, b"backup bytes", Some(0)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0, "a zero mode must not be widened at create");
+        drop(std::fs::remove_file(&path));
+    }
+
+    /// The retry loop is for name collisions only; any other create error
+    /// (missing parent) must surface as itself, not the synthetic collision error.
+    #[cfg(unix)]
+    #[test]
+    fn write_backup_bytes_surfaces_non_collision_errors_untouched() {
+        let original = crate::test_util::temp_dir_unique("config-backup-no-retry")
+            .join("absent-parent")
+            .join("cfg.json");
+        let err = write_backup_bytes(&original, b"payload", None).unwrap_err();
+        match &err {
+            ConfigError::Io { source, .. } => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::NotFound,
+                "the missing parent must surface, got {err}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     #[test]
     fn list_backups_filters_and_sorts() {
         let path = unique_scratch("list-filter");

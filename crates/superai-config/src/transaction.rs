@@ -3092,6 +3092,60 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
     }
 
+    /// Rewrites every staged temp at the `stage_temp` journal boundary:
+    /// simulates a foreign writer inside the staging-to-recheck window.
+    #[derive(Debug)]
+    struct TamperStagedTempsAtStageJournal {
+        dir: PathBuf,
+        bytes: Vec<u8>,
+    }
+
+    impl Injector for TamperStagedTempsAtStageJournal {
+        fn inject(&self, point: Point) -> Result<()> {
+            if point == Point::JournalStageTemp {
+                for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(".tmp.") {
+                        drop(std::fs::write(entry.path(), &self.bytes));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Staged bytes tampered with after staging abort prepare: the temp must
+    /// still carry exactly its planned bytes at the recheck.
+    #[test]
+    fn prepare_rejects_staged_bytes_tampered_after_staging() {
+        let root = tmp_root();
+        let jroot = root.join(".superai").join("journal");
+        let a = root.join("a.json");
+        std::fs::write(&a, b"pre-op").unwrap();
+        let inj = Arc::new(TamperStagedTempsAtStageJournal {
+            dir: root.clone(),
+            bytes: b"foreign bytes".to_vec(),
+        });
+        let id = OperationId::new("op-staged-tamper").unwrap();
+        let mut txn = Transaction::new(
+            id,
+            vec![FileAction::Write {
+                path: a,
+                content: b"planned".to_vec(),
+                kind: DocumentKind::TextFragment,
+            }],
+        )
+        .with_journal(jroot)
+        .with_injector(inj);
+        let err = txn
+            .prepare()
+            .expect_err("tampered staged bytes must abort prepare");
+        assert!(
+            err.to_string().contains("staged digest mismatch"),
+            "unexpected error: {err}"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
     // MUT-02: hard links and symlink target changes
 
     #[cfg(unix)]

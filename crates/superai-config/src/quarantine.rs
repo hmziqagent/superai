@@ -1329,4 +1329,54 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
         drop(std::fs::remove_dir_all(quarantine_dir(&op).unwrap()));
     }
+
+    /// The move's own recoverability verdict must see a quarantined dangling
+    /// link: `exists()` follows the link and cannot, the lstat fallback can.
+    #[cfg(unix)]
+    #[test]
+    fn quarantined_dangling_link_move_reports_recoverable() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-dangling-move");
+        let op = unique_op("dangling-move");
+        let link = dir.join("victim-link");
+        std::os::unix::fs::symlink("/definitely/not/present", &link).unwrap();
+
+        let entry = move_to_quarantine_under(&dir, &link, &op).unwrap();
+        assert!(entry.same_filesystem, "one rename inside one temp tree");
+        assert!(
+            entry.recoverable,
+            "a dangling link in quarantine is a restorable entry"
+        );
+
+        restore_from_quarantine(&entry).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+            "restore recreates the dangling link itself"
+        );
+        drop(std::fs::remove_file(&link));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Removal takes the link itself; the referent stays untouched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_link_at_removes_the_link_not_the_referent() {
+        let dir = crate::test_util::temp_dir_unique("quarantine-remove-link");
+        let referent = dir.join("real.txt");
+        std::fs::write(&referent, b"kept").unwrap();
+        let link = dir.join("alias");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        remove_link_at(&link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link itself must be gone"
+        );
+        assert_eq!(
+            std::fs::read(&referent).unwrap(),
+            b"kept",
+            "the referent survives link removal"
+        );
+        drop(std::fs::remove_file(&referent));
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }
