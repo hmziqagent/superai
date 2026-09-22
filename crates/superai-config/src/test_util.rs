@@ -75,7 +75,7 @@ pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
     dir
 }
 
-/// Clear the Windows readonly attribute under `root`: remove_dir_all
+/// Clear the Windows readonly attribute under `root`: `remove_dir_all`
 /// cannot delete readonly files, and backups can legitimately carry it.
 #[cfg(windows)]
 fn clear_readonly_recursive(root: &Path) {
