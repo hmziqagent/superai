@@ -102,17 +102,19 @@ fn pick_backup_path(
     original: &Path,
     mut taken: impl FnMut(&Path) -> bool,
 ) -> Result<(PathBuf, u128, String)> {
-    let mut attempts = 0;
-    loop {
-        let candidate = generate_backup_path(original)?;
+    // A fixed range, not a counter, bounds the retries: mutated counter
+    // arithmetic must not be able to spin this into an unbounded loop.
+    let mut candidate = generate_backup_path(original)?;
+    if !taken(&candidate.0) {
+        return Ok(candidate);
+    }
+    for _ in 0..4 {
+        candidate = generate_backup_path(original)?;
         if !taken(&candidate.0) {
             return Ok(candidate);
         }
-        attempts += 1;
-        if attempts >= 5 {
-            return Ok(candidate);
-        }
     }
+    Ok(candidate)
 }
 
 /// `create_new` write: any occupied name, a planted symlink included, fails
