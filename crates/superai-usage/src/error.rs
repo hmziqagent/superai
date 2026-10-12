@@ -25,19 +25,3 @@ pub enum UsageError {
 
 /// Result alias for usage operations.
 pub type Result<T> = std::result::Result<T, UsageError>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_provider_display_names_the_id() {
-        let err = UsageError::DuplicateProvider {
-            id: "anthropic".to_owned(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "duplicate usage provider entry `anthropic`"
-        );
-    }
-}

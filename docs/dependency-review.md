@@ -51,7 +51,7 @@ plus:
 | toride-registry | 0.1 (default-features off) | source model behind toride-apps planning | crates.io `toride-registry` (freeoxide, first-party) | no | no http feature; no network at runtime |
 
 Transitive participants that warrant standing attention (from `Cargo.lock`,
-168 packages total):
+169 packages total):
 
 | Package | Via | Attention |
 |---|---|---|
@@ -100,5 +100,6 @@ yet; `unused_crate_dependencies` stays quiet until each lands):
 
 Review date: 2026-09-01 (area 8, QAL-12); re-reviewed 2026-10-11 for the
 toride participants added by PR #8; re-reviewed 2026-10-12 for the
-superai-usage crate scaffold (USG-02, one path dependency, no new lockfile
-participants). Re-verify on every lockfile diff.
+superai-usage crate scaffold (USG-02, one path dependency, no new external
+lockfile participants; the package count rose by the crate itself). Re-verify
+on every lockfile diff.
