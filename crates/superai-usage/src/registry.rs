@@ -7,8 +7,7 @@ use superai_core::ids::ProviderId;
 
 use crate::error::{Result, UsageError};
 
-/// One provider's usage-truth declaration. Data only: labels, locators,
-/// auth-material kinds, documentation links. Never secret values.
+/// One provider's usage-truth declaration. Data only, never secret values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageProviderEntry {
     /// Provider this entry describes.
