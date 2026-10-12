@@ -20,7 +20,6 @@ repository = "https://github.com/freeoxide/superai"
 [workspace.dependencies]
 superai-config = { path = "crates/superai-config" }
 superai-core = { path = "crates/superai-core" }
-superai-usage = { path = "crates/superai-usage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml_edit = "0.23"

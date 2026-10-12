@@ -65,7 +65,7 @@ Transitive participants that warrant standing attention (from `Cargo.lock`,
 | which | toride-runner | binary discovery for runner defaults; the bridge supplies explicit argv, so this path is not exercised |
 | camino / serde_yaml / unsafe-libyaml | toride-registry | camino is a UTF-8 path wrapper; serde_yaml is upstream-archived, enters only through first-party toride-registry with no network feature, candidate to drop in a toride-side cleanup |
 
-## superai-usage (L3: usage truth)
+## superai-usage (L3 — usage truth)
 
 serde and thiserror as in superai-config (workspace-inherited, reviewed
 above), plus:
@@ -76,7 +76,7 @@ above), plus:
 
 Planned additions from later usage slices, reviewed ahead so the rows exist
 before the code (all verified on crates.io 2026-10-12; none in Cargo.toml
-yet — `unused_crate_dependencies` stays quiet until each lands):
+yet; `unused_crate_dependencies` stays quiet until each lands):
 
 | Dependency | Planned version | Lands in | Owner / maintenance | build.rs | Notes |
 |---|---|---|---|---|---|
@@ -89,7 +89,7 @@ yet — `unused_crate_dependencies` stays quiet until each lands):
 
 | Dependency | Version | Role | Notes |
 |---|---|---|---|
-| superai-core | path (workspace) | L2 layer | the only upward dependency in the workspace; no interface types exist below this crate |
+| superai-core | path (workspace) | L2 layer | an upward dependency, as superai-usage also has; no interface types exist below this crate |
 
 ## Dev/tooling dependencies (not in the shipped graph)
 
