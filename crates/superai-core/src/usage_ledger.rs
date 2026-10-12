@@ -186,7 +186,10 @@ mod tests {
                 "data/muse/sessions/2026/10/12/session/session.jsonl",
                 b"muse session bytes",
             ),
-            ("home/.grok/sessions/g.jsonl", b"grok session bytes"),
+            (
+                "home/.grok/sessions/encoded-cwd-1/session-1/signals.json",
+                b"{\"contextTokensUsed\": 2968}",
+            ),
             ("home/.pi/agent/sessions/pi.jsonl", b"pi session bytes"),
             ("home/.omp/agent/sessions/omp.jsonl", b"omp session bytes"),
             (

@@ -431,6 +431,9 @@ impl ConfigSurface {
 pub enum UsageReaderKind {
     /// Newline-delimited JSON session, rollout, or transcript files.
     TranscriptJsonl,
+    /// Single JSON signals document per session directory (grok's
+    /// `signals.json`); never traversed as JSONL.
+    SessionSignalsJson,
     /// `SQLite` database whose history tables carry token/cost rows.
     HistorySqlite,
     /// `SQLite` key-value cache holding a harness-written usage document.
@@ -441,6 +444,7 @@ impl fmt::Display for UsageReaderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::TranscriptJsonl => "transcript_jsonl",
+            Self::SessionSignalsJson => "session_signals_json",
             Self::HistorySqlite => "history_sqlite",
             Self::PlanCacheSqlite => "plan_cache_sqlite",
         };

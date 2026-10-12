@@ -448,13 +448,13 @@ impl Adapter for GrokBuildAdapter {
     }
     fn usage_surface(&self) -> Option<UsageSurface> {
         Some(
-            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("xai")).with_artifact(
-                "sessions",
+            UsageSurface::new(UsageReaderKind::SessionSignalsJson, Some("xai")).with_artifact(
+                "session-signals",
                 PathResolver::new(
-                    Some("$GROK_HOME/sessions"),
-                    Some("$GROK_HOME/sessions"),
-                    Some("%GROK_HOME%\\sessions"),
-                    "~/.grok/sessions",
+                    Some("$GROK_HOME/sessions/<encoded-cwd>/<session-id>/signals.json"),
+                    Some("$GROK_HOME/sessions/<encoded-cwd>/<session-id>/signals.json"),
+                    Some("%GROK_HOME%\\sessions\\<encoded-cwd>\\<session-id>\\signals.json"),
+                    "~/.grok/sessions/<encoded-cwd>/<session-id>/signals.json",
                 ),
             ),
         )
