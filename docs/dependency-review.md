@@ -65,7 +65,27 @@ Transitive participants that warrant standing attention (from `Cargo.lock`,
 | which | toride-runner | binary discovery for runner defaults; the bridge supplies explicit argv, so this path is not exercised |
 | camino / serde_yaml / unsafe-libyaml | toride-registry | camino is a UTF-8 path wrapper; serde_yaml is upstream-archived, enters only through first-party toride-registry with no network feature, candidate to drop in a toride-side cleanup |
 
-## superai-cli (L3 — the one binary)
+## superai-usage (L3: usage truth)
+
+serde and thiserror as in superai-config (workspace-inherited, reviewed
+above), plus:
+
+| Dependency | Version | Role | Owner / maintenance | build.rs | Notes |
+|---|---|---|---|---|---|
+| superai-core | path (workspace) | L2 layer; `ProviderId` keys the usage registry | in-tree | no | sits between core and cli; consumes ids and adapter declarations, adds no interface types |
+
+Planned additions from later usage slices, reviewed ahead so the rows exist
+before the code (all verified on crates.io 2026-10-12; none in Cargo.toml
+yet — `unused_crate_dependencies` stays quiet until each lands):
+
+| Dependency | Planned version | Lands in | Owner / maintenance | build.rs | Notes |
+|---|---|---|---|---|---|
+| serde_json | 1.x (preserve_order, workspace) | USG-03 readers onward | dtolnay/serde-rs; 1.0.154 released 2026-10-11, active | YES (limbs detection) | parse harness usage artifacts; same codec discipline as superai-config |
+| ureq | 3.x (rustls, gzip; default-features off) | USG-05 models.dev pricing fetch | algesten; 3.4.2 released 2026-09-13, active | no | same bounded-client discipline as core's template_fetch.rs (timeouts, size caps, redirect policy) |
+| jiff | 0.2.x | USG-04/05 windows, resets, cost periods | BurntSushi; 0.2.38 released 2026-10-06, active | no | typed timestamps, zone-aware month-to-date, DST 23/25h days |
+| rusqlite | 0.40.x | USG-03 opencode history reader | rusqlite org (gwenn); 0.40.2 released 2026-08-08, active | YES (bundled SQLite builds C) | opens the foreign db read-only; feature choice belongs to that slice |
+
+## superai-cli (L4 — the one binary)
 
 | Dependency | Version | Role | Notes |
 |---|---|---|---|
@@ -79,4 +99,6 @@ Transitive participants that warrant standing attention (from `Cargo.lock`,
 | cargo-hack / cargo-shear / cargo-deny | CI supply-chain job, `--locked` installs | same discipline; deny.toml policy in-repo |
 
 Review date: 2026-09-01 (area 8, QAL-12); re-reviewed 2026-10-11 for the
-toride participants added by PR #8. Re-verify on every lockfile diff.
+toride participants added by PR #8; re-reviewed 2026-10-12 for the
+superai-usage crate scaffold (USG-02, one path dependency, no new lockfile
+participants). Re-verify on every lockfile diff.

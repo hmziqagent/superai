@@ -1,0 +1,20 @@
+[package]
+name = "superai-usage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+repository.workspace = true
+description = "Layer 3: usage truth. Local readers, window/cost engines, llmproxy client, pollers."
+
+[dependencies]
+superai-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

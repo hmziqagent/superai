@@ -8,7 +8,8 @@
 |---|---|---|
 | `crates/superai-config` | 1: Config | harness config files: read fresh, back up, write back preserving unmodelled keys |
 | `crates/superai-core` | 2: Core | instances, templates, capabilities, skills, install |
-| `crates/superai-cli` | 3: Interface | placeholder CLI; GPUI comes later, nothing below layer 3 knows an interface exists |
+| `crates/superai-usage` | 3: Usage | usage truth: local readers, window/cost engines, llmproxy client, pollers |
+| `crates/superai-cli` | 4: Interface | placeholder CLI; GPUI comes later, nothing below layer 4 knows an interface exists |
 
 Order of work is `docs/goal.md`: filesystem layer until boring, then the rest of
 core, interface last.

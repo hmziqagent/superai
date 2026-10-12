@@ -1,5 +1,11 @@
 [advisories]
 version = 2
+ignore = [
+    # RUSTSEC-2024-0449 unsafe-libyaml (unmaintained) reaches this tree only via
+    # toride-registry -> serde_yaml (deprecated); no safe upgrade exists; drop
+    # when toride's own registry rework lands here.
+    "RUSTSEC-2024-0449",
+]
 
 [bans]
 multiple-versions = "warn"

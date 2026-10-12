@@ -931,6 +931,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "superai-usage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "superai-core",
+ "thiserror",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
