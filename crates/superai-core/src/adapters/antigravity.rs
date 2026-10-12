@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -337,9 +337,36 @@ impl Adapter for AntigravityAdapter {
             "plugin bundles documented (`plugin.json` under ~/.gemini/antigravity-cli/plugins/) but the harness is ResearchBlocked; revisit when research completes (antigravity-cli.md 5)",
         )
     }
-    fn usage_absence_reason(&self) -> Option<&'static str> {
+    fn usage_surface(&self) -> Option<UsageSurface> {
         Some(
-            "usage truth is Google's OAuth usage endpoints; the local agy state carries no usage artifact",
+            UsageSurface::new(UsageReaderKind::HistorySqlite, Some("google"))
+                .with_artifact(
+                    "cli-conversations-db",
+                    PathResolver::new(
+                        Some("$GEMINI_CLI_HOME/antigravity-cli/conversations/*.db"),
+                        Some("$GEMINI_CLI_HOME/antigravity-cli/conversations/*.db"),
+                        Some("%GEMINI_CLI_HOME%\\antigravity-cli\\conversations\\*.db"),
+                        "~/.gemini/antigravity-cli/conversations/*.db",
+                    ),
+                )
+                .with_artifact(
+                    "ide-db",
+                    PathResolver::new(
+                        Some("$GEMINI_CLI_HOME/antigravity/*.db"),
+                        Some("$GEMINI_CLI_HOME/antigravity/*.db"),
+                        Some("%GEMINI_CLI_HOME%\\antigravity\\*.db"),
+                        "~/.gemini/antigravity/*.db",
+                    ),
+                )
+                .with_artifact(
+                    "ide-conversations-db",
+                    PathResolver::new(
+                        Some("$GEMINI_CLI_HOME/antigravity/conversations/*.db"),
+                        Some("$GEMINI_CLI_HOME/antigravity/conversations/*.db"),
+                        Some("%GEMINI_CLI_HOME%\\antigravity\\conversations\\*.db"),
+                        "~/.gemini/antigravity/conversations/*.db",
+                    ),
+                ),
         )
     }
 }

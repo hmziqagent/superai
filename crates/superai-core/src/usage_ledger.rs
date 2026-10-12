@@ -141,6 +141,7 @@ mod tests {
         ("CLAUDE_CONFIG_DIR", "home/.claude"),
         ("CODEX_HOME", "home/.codex"),
         ("GROK_HOME", "home/.grok"),
+        ("GEMINI_CLI_HOME", "home/.gemini"),
         ("PI_CODING_AGENT_DIR", "home/.pi/agent"),
         ("MUSE_SESSIONS_DIR", "data/muse/sessions"),
         ("OPENCODE_DB", "data/opencode/opencode.db"),
@@ -189,6 +190,15 @@ mod tests {
             (
                 "home/.grok/sessions/encoded-cwd-1/session-1/signals.json",
                 b"{\"contextTokensUsed\": 2968}",
+            ),
+            (
+                "home/.gemini/antigravity-cli/conversations/c.db",
+                b"antigravity cli conversations bytes",
+            ),
+            ("home/.gemini/antigravity/a.db", b"antigravity ide bytes"),
+            (
+                "home/.gemini/antigravity/conversations/v.db",
+                b"antigravity ide conversations bytes",
             ),
             ("home/.pi/agent/sessions/pi.jsonl", b"pi session bytes"),
             ("home/.omp/agent/sessions/omp.jsonl", b"omp session bytes"),
@@ -248,7 +258,7 @@ mod tests {
         let before = snapshot_tree(&root);
         assert_eq!(
             before.len(),
-            10,
+            13,
             "bound tree must carry every declared root"
         );
 
