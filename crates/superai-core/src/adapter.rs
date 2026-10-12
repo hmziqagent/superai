@@ -464,7 +464,7 @@ pub struct UsageArtifact {
 /// a [`ConfigSurface`]: usage artifacts are read-only and never backed up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSurface {
-    /// Local artifact locators; every declaration carries at least one.
+    /// Local artifact locators, added by [`UsageSurface::with_artifact`].
     pub artifacts: Vec<UsageArtifact>,
     /// How the artifacts are read.
     pub reader: UsageReaderKind,

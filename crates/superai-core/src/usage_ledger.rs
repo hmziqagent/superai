@@ -133,37 +133,155 @@ mod tests {
         }
     }
 
+    /// Env vars the declared usage roots resolve through, each bound to a
+    /// path inside the observed tree.
+    const TREE_ENV: &[(&str, &str)] = &[
+        ("HOME", "home"),
+        ("XDG_DATA_HOME", "data"),
+        ("CLAUDE_CONFIG_DIR", "home/.claude"),
+        ("CODEX_HOME", "home/.codex"),
+        ("GROK_HOME", "home/.grok"),
+        ("PI_CODING_AGENT_DIR", "home/.pi/agent"),
+        ("MUSE_SESSIONS_DIR", "data/muse/sessions"),
+        ("OPENCODE_DB", "data/opencode/opencode.db"),
+    ];
+
+    const SWEEP_ENV: &str = "SUPERAI_USAGE_LEDGER_SWEEP";
+    const SWEEP_OUT_ENV: &str = "SUPERAI_USAGE_LEDGER_SWEEP_OUT";
+    const NEVER_WRITES_TEST: &str =
+        "usage_ledger::tests::declaring_usage_surfaces_never_writes_disk";
+
+    fn tree_env_for(root: &std::path::Path) -> Vec<(String, String)> {
+        TREE_ENV
+            .iter()
+            .map(|(var, rel)| {
+                (
+                    (*var).to_owned(),
+                    root.join(rel).to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn build_bound_tree(root: &std::path::Path) {
+        let files: &[(&str, &[u8])] = &[
+            (
+                "home/.claude/projects/proj/s.jsonl",
+                b"claude transcript bytes",
+            ),
+            (
+                "home/.config/claude/projects/proj/s.jsonl",
+                b"no-env claude bytes",
+            ),
+            (
+                "home/.codex/sessions/2026/10/12/r.jsonl",
+                b"codex rollout bytes",
+            ),
+            (
+                "home/.codex/archived_sessions/r.jsonl",
+                b"archived rollout bytes",
+            ),
+            ("data/opencode/opencode.db", b"opencode history bytes"),
+            (
+                "data/muse/sessions/2026/10/12/session/session.jsonl",
+                b"muse session bytes",
+            ),
+            ("home/.grok/sessions/g.jsonl", b"grok session bytes"),
+            ("home/.pi/agent/sessions/pi.jsonl", b"pi session bytes"),
+            ("home/.omp/agent/sessions/omp.jsonl", b"omp session bytes"),
+            (
+                "home/Library/Application Support/Windsurf/User/globalStorage/state.vscdb",
+                b"windsurf plan-cache bytes",
+            ),
+        ];
+        for (rel, bytes) in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+    }
+
+    fn walk_tree(dir: &std::path::Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                walk_tree(&entry.path(), out);
+            } else {
+                out.insert(
+                    entry.path().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+
+    fn snapshot_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        walk_tree(root, &mut out);
+        out
+    }
+
     #[test]
     fn declaring_usage_surfaces_never_writes_disk() {
-        let dir = temp_dir_unique("usage-ledger");
-        fs::create_dir_all(dir.join("nested")).unwrap();
-        fs::write(dir.join("nested/sentinel.txt"), b"bytes that must not move").unwrap();
-        fs::write(dir.join("top.txt"), b"top-level bytes").unwrap();
-
-        for id in OVERLAP_HARNESS_IDS {
-            let adapter = overlap_adapter(id);
-            assert!(
-                adapter.usage_surface().is_some() || adapter.usage_absence_reason().is_some(),
-                "{id} declared nothing while the disk state was being read"
-            );
+        if std::env::var_os(SWEEP_ENV).is_some() {
+            let mut swept = 0usize;
+            for id in OVERLAP_HARNESS_IDS {
+                let adapter = overlap_adapter(id);
+                assert!(
+                    adapter.usage_surface().is_some() || adapter.usage_absence_reason().is_some(),
+                    "{id} declared nothing under the bound roots"
+                );
+                swept += 1;
+            }
+            if let Some(out) = std::env::var_os(SWEEP_OUT_ENV) {
+                fs::write(out, swept.to_string()).unwrap();
+            }
+            return;
         }
 
+        let root = temp_dir_unique("usage-never-writes");
+        let proof_root = temp_dir_unique("usage-never-writes-proof");
+        build_bound_tree(&root);
+        let before = snapshot_tree(&root);
         assert_eq!(
-            fs::read(dir.join("nested/sentinel.txt")).unwrap(),
-            b"bytes that must not move"
+            before.len(),
+            10,
+            "bound tree must carry every declared root"
         );
-        assert_eq!(fs::read(dir.join("top.txt")).unwrap(), b"top-level bytes");
-        let mut listed: Vec<String> = fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        listed.sort();
-        assert_eq!(listed, vec!["nested", "top.txt"]);
-        let nested: Vec<String> = fs::read_dir(dir.join("nested"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(nested, vec!["sentinel.txt"]);
-        drop(fs::remove_dir_all(&dir));
+
+        // Env is process-global and sibling tests read HOME, so the sweep
+        // runs in a child process whose env points at the observed tree.
+        let proof = proof_root.join("swept");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(NEVER_WRITES_TEST)
+            .envs(tree_env_for(&root))
+            .env(SWEEP_ENV, "1")
+            .env(SWEEP_OUT_ENV, &proof)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "sweep child failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let swept: usize = fs::read_to_string(&proof)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        assert_eq!(
+            swept,
+            OVERLAP_HARNESS_IDS.len(),
+            "sweep child must have exercised every overlap adapter"
+        );
+
+        let after = snapshot_tree(&root);
+        assert_eq!(
+            after, before,
+            "usage declarations must not write inside the bound roots"
+        );
+        drop(fs::remove_dir_all(&root));
+        drop(fs::remove_dir_all(&proof_root));
     }
 }
