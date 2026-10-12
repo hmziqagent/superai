@@ -14,7 +14,10 @@ description = "Layer 3: usage truth. Local readers, window/cost engines, llmprox
 [dependencies]
 superai-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+jiff = { workspace = true }
+ureq = { workspace = true }
 
 [lints]
 workspace = true
