@@ -422,6 +422,11 @@ impl Adapter for KimiCodeAdapter {
             RestartBehavior::Restart,
         ))
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is Moonshot's weekly quota endpoint (cookie auth); no local usage artifact",
+        )
+    }
 }
 
 #[cfg(test)]

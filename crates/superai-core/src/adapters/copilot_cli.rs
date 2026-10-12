@@ -427,6 +427,9 @@ impl Adapter for CopilotCliAdapter {
             "extensions/installed-plugins directories documented with mixed ownership; install contract unverified in corpus (copilot-cli.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is GitHub's internal usage API; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

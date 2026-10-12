@@ -314,6 +314,9 @@ impl Adapter for CopilotCodingAgentAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("cloud-only harness; no local plugin mechanism (Unsupported ledger state)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is GitHub's internal usage API; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

@@ -402,6 +402,9 @@ impl Adapter for CursorAgentAdapter {
             "a --plugin-dir flag exists but no plugin layout or manifest is published (cursor-agent.md sections 5, 8)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is Cursor's account usage API; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

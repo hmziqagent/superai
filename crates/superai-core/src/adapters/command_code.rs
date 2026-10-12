@@ -265,6 +265,9 @@ impl Adapter for CommandCodeAdapter {
             "no plugin mechanism is documented; BYOK providers live in providers.json and MCP in the three-scope mcp.json files (command-code.md sections 4-5)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is api.commandcode.ai billing (cookie auth); no local usage artifact")
+    }
 }
 
 #[cfg(test)]

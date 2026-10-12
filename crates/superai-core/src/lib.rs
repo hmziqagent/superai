@@ -107,6 +107,10 @@ mod test_util;
 #[cfg(test)]
 mod property_tests;
 
+/// USG-01 overlap ledger: usage declarations on adapters, as tested facts.
+#[cfg(test)]
+mod usage_ledger;
+
 #[cfg(test)]
 mod fuzz;
 

@@ -8,7 +8,7 @@ use superai_config::document::ValueType;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
     PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
-    SurfaceSchema, VersionResolution, WrapperPlan,
+    SurfaceSchema, UsageReaderKind, UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -469,6 +469,24 @@ impl Adapter for ClaudeCodeAdapter {
             None,
             RestartBehavior::Reload,
         ))
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("anthropic"))
+                .with_artifact(
+                    "transcripts",
+                    PathResolver::new(
+                        Some("$CLAUDE_CONFIG_DIR/projects"),
+                        Some("$CLAUDE_CONFIG_DIR/projects"),
+                        Some("%CLAUDE_CONFIG_DIR%\\projects"),
+                        "~/.claude/projects",
+                    ),
+                )
+                .with_artifact(
+                    "transcripts-no-env",
+                    PathResolver::fallback_only("~/.config/claude/projects (no CLAUDE_CONFIG_DIR)"),
+                ),
+        )
     }
 }
 

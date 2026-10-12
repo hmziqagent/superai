@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
     PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
-    SurfaceSchema, VersionResolution, WrapperPlan,
+    SurfaceSchema, UsageReaderKind, UsageSurface, VersionResolution, WrapperPlan,
 };
 use superai_config::document::ValueType;
 
@@ -677,6 +677,20 @@ impl Adapter for OpenCodeAdapter {
             None,
             RestartBehavior::Reload,
         ))
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::HistorySqlite, Some("opencode.ai"))
+                .with_artifact(
+                    "history-db",
+                    PathResolver::new(
+                        Some("$OPENCODE_DB, else $XDG_DATA_HOME/opencode/opencode.db"),
+                        Some("$OPENCODE_DB, else $XDG_DATA_HOME/opencode/opencode.db"),
+                        None,
+                        "~/.local/share/opencode/opencode.db (channel-suffixed on non-default channels)",
+                    ),
+                ),
+        )
     }
 }
 

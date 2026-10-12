@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, SurfaceOwnership, VersionResolution, WrapperPlan,
+    PathResolver, Platform, ProductStatus, SurfaceOwnership, UsageReaderKind, UsageSurface,
+    VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -224,6 +225,29 @@ impl Adapter for OhMyCodexAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "the plugin cache under CODEX_HOME is Codex-owned state; omx adds no plugin mechanism of its own (oh-my-codex.md section 2)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("openai-chatgpt"))
+                .with_artifact(
+                    "rollouts",
+                    PathResolver::new(
+                        Some("$CODEX_HOME/sessions"),
+                        Some("$CODEX_HOME/sessions"),
+                        Some("%CODEX_HOME%\\sessions"),
+                        "~/.codex/sessions",
+                    ),
+                )
+                .with_artifact(
+                    "rollouts-archived",
+                    PathResolver::new(
+                        Some("$CODEX_HOME/archived_sessions"),
+                        Some("$CODEX_HOME/archived_sessions"),
+                        Some("%CODEX_HOME%\\archived_sessions"),
+                        "~/.codex/archived_sessions",
+                    ),
+                ),
         )
     }
 }

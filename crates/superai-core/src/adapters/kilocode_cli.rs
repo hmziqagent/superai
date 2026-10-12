@@ -366,6 +366,11 @@ impl Adapter for KilocodeCliAdapter {
             "a `kilo plugin <module>` subcommand is listed but no plugin layout is documented (kilocode-cli.md sections 4, 7)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is app.kilo.ai's tRPC API; the local auth file holds credentials, not usage",
+        )
+    }
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -430,6 +430,17 @@ impl Adapter for WindsurfAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "plugins managed via the Customize page/Marketplace; no file-staged mechanism documented (windsurf.md)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::PlanCacheSqlite, Some("windsurf")).with_artifact(
+                "plan-cache",
+                PathResolver::fallback_only(
+                    "~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb \
+                         (ItemTable key windsurf.settings.cachedPlanInfo)",
+                ),
+            ),
         )
     }
 }

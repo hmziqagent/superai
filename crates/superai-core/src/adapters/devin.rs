@@ -283,6 +283,11 @@ impl Adapter for DevinAdapter {
             "`devin plugins` is a first-class subcommand but the on-disk plugin layout was not published on fetched pages; no staging path may be invented (devin.md sections 6, 8)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is Devin's quota endpoint over a localStorage session; no readable local usage artifact",
+        )
+    }
 }
 
 #[cfg(test)]

@@ -416,6 +416,9 @@ impl Adapter for ZedAcpAdapter {
             "extensions are Zed addons/extensions managed by the editor, not the ACP agent (zed-acp.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is cloud.zed.dev's billing endpoint; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

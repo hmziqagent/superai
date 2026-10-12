@@ -405,6 +405,9 @@ impl Adapter for FactoryDroidAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (factory-droid.md)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is factory.ai's billing-limits endpoints; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

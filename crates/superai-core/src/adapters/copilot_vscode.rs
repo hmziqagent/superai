@@ -247,6 +247,9 @@ impl Adapter for CopilotVscodeAdapter {
             "extensions install through the VS Code marketplace under the user-data dir; no Copilot-agent plugin file surface exists for superai to stage (copilot-vscode.md section 1)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is GitHub's internal usage API; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

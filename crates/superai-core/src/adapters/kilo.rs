@@ -514,6 +514,11 @@ impl Adapter for KiloAdapter {
             "modes/marketplaces managed through the Settings webview; no file-staged plugin mechanism documented (kilo-code.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is app.kilo.ai's tRPC API; the local auth file holds credentials, not usage",
+        )
+    }
 }
 
 #[cfg(test)]

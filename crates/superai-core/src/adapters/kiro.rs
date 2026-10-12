@@ -382,6 +382,11 @@ impl Adapter for KiroAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (kiro.md)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is the Kiro CLI usage report and GetUsageLimits API; the local kiro-cli sqlite holds auth, not usage",
+        )
+    }
 }
 
 #[cfg(test)]

@@ -333,6 +333,11 @@ impl Adapter for LegacyKimiAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented for the legacy CLI (kimi-cli.md)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is Moonshot's weekly quota endpoint (cookie auth); no local usage artifact",
+        )
+    }
 }
 
 #[cfg(test)]

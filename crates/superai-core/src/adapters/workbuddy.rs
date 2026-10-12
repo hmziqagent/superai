@@ -723,6 +723,11 @@ impl Adapter for WorkBuddyAdapter {
             "no CLI plugin/skill loading path documented and no public skill.yml schema; desktop-app skills are UI-only (workbuddy.md §6/§7)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is the WorkBuddy account API; ~/.workbuddy/projects session history is not read for usage",
+        )
+    }
 }
 
 #[cfg(test)]

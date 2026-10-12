@@ -337,6 +337,11 @@ impl Adapter for AntigravityAdapter {
             "plugin bundles documented (`plugin.json` under ~/.gemini/antigravity-cli/plugins/) but the harness is ResearchBlocked; revisit when research completes (antigravity-cli.md 5)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is Google's OAuth usage endpoints; the local agy state carries no usage artifact",
+        )
+    }
 }
 
 #[cfg(test)]

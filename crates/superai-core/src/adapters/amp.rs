@@ -410,6 +410,9 @@ impl Adapter for AmpAdapter {
                 .with_search_path("amp.skills.path"),
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is the amp CLI/web account; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -367,6 +367,19 @@ impl Adapter for MuseCodeAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "plugin bundles load as a skills source but no plugin path or manifest is documented (muse-code.md section 5)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("meta")).with_artifact(
+                "session-logs",
+                PathResolver::new(
+                    Some("$MUSE_SESSIONS_DIR, else $XDG_DATA_HOME/muse/sessions"),
+                    Some("$MUSE_SESSIONS_DIR, else $XDG_DATA_HOME/muse/sessions"),
+                    None,
+                    "~/.local/share/muse/sessions (YYYY/MM/DD/session/session.jsonl)",
+                ),
+            ),
         )
     }
 }

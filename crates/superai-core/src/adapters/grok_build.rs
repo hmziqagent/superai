@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -445,6 +445,19 @@ impl Adapter for GrokBuildAdapter {
             None,
             RestartBehavior::Reload,
         ))
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("xai")).with_artifact(
+                "sessions",
+                PathResolver::new(
+                    Some("$GROK_HOME/sessions"),
+                    Some("$GROK_HOME/sessions"),
+                    Some("%GROK_HOME%\\sessions"),
+                    "~/.grok/sessions",
+                ),
+            ),
+        )
     }
 }
 

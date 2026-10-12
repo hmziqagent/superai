@@ -629,6 +629,9 @@ impl Adapter for WarpAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented; workflows are YAML commands, not plugins (warp.md)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is app.warp.dev's GetRequestLimitInfo GraphQL; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

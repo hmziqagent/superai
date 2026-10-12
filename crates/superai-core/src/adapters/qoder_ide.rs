@@ -158,6 +158,11 @@ impl Adapter for QoderIdeAdapter {
             "Extension Management (skills, plugins, connectors) is a Desktop settings pane with no documented filesystem surface; skills upload as SKILL.md or ZIP through the UI (qoder-ide.md sections 4-5)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is the qoder.com account dashboards (cookie auth); token-cost history is unsupported",
+        )
+    }
 }
 
 #[cfg(test)]

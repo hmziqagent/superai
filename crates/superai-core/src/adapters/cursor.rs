@@ -504,6 +504,9 @@ impl Adapter for CursorAdapter {
             "plugins managed via the Cursor Marketplace UI; no file-staged mechanism documented (cursor.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is Cursor's account usage API; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

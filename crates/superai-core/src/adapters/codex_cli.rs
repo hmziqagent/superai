@@ -8,7 +8,7 @@ use superai_config::document::ValueType;
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
     PathResolver, Platform, ProductStatus, RestartBehavior, RootShape, SurfaceOwnership,
-    SurfaceSchema, VersionResolution, WrapperPlan,
+    SurfaceSchema, UsageReaderKind, UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -474,6 +474,29 @@ impl Adapter for CodexCliAdapter {
 
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("codex documents no plugin mechanism (codex-cli.md)")
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, Some("openai-chatgpt"))
+                .with_artifact(
+                    "rollouts",
+                    PathResolver::new(
+                        Some("$CODEX_HOME/sessions"),
+                        Some("$CODEX_HOME/sessions"),
+                        Some("%CODEX_HOME%\\sessions"),
+                        "~/.codex/sessions",
+                    ),
+                )
+                .with_artifact(
+                    "rollouts-archived",
+                    PathResolver::new(
+                        Some("$CODEX_HOME/archived_sessions"),
+                        Some("$CODEX_HOME/archived_sessions"),
+                        Some("%CODEX_HOME%\\archived_sessions"),
+                        "~/.codex/archived_sessions",
+                    ),
+                ),
+        )
     }
 }
 

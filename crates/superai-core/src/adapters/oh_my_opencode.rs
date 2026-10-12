@@ -5,7 +5,8 @@
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, SurfaceOwnership, VersionResolution, WrapperPlan,
+    PathResolver, Platform, ProductStatus, SurfaceOwnership, UsageReaderKind, UsageSurface,
+    VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -193,6 +194,20 @@ impl Adapter for OhMyOpencodeAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "the product IS an OpenCode plugin, installed as an entry in OpenCode's plugin array; that mechanism belongs to the opencode adapter and the lineage is retired (oh-my-opencode.md sections 1-2)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::HistorySqlite, Some("opencode.ai"))
+                .with_artifact(
+                    "history-db",
+                    PathResolver::new(
+                        Some("$OPENCODE_DB, else $XDG_DATA_HOME/opencode/opencode.db"),
+                        Some("$OPENCODE_DB, else $XDG_DATA_HOME/opencode/opencode.db"),
+                        None,
+                        "~/.local/share/opencode/opencode.db (channel-suffixed on non-default channels)",
+                    ),
+                ),
         )
     }
 }

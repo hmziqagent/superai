@@ -451,6 +451,11 @@ impl Adapter for MimoAdapter {
             "plugin Spec[] key documented in mimocode.jsonc (npm/URL/local) but writes to the JSONC config refuse and plugin state is opaque (mimo-code.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is platform.xiaomimimo.com; the documented local fallback reads an optional claude-code wrapper's transcripts, not mimo-code state",
+        )
+    }
 }
 
 #[cfg(test)]

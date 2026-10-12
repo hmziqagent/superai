@@ -402,6 +402,11 @@ impl Adapter for QoderCliAdapter {
             RestartBehavior::Reload,
         ))
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is the qoder.com account dashboards (cookie auth); token-cost history is unsupported",
+        )
+    }
 }
 
 #[cfg(test)]

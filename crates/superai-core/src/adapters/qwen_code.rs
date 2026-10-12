@@ -460,6 +460,11 @@ impl Adapter for QwenCodeAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (qwen-code.md)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "usage truth is Qwen's Team/Individual quota endpoints (cookie auth); no local usage artifact",
+        )
+    }
 }
 
 #[cfg(test)]

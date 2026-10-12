@@ -374,6 +374,9 @@ impl Adapter for MiniMaxCodeAdapter {
             RestartBehavior::Reload,
         ))
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is MiniMax's API token endpoints; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

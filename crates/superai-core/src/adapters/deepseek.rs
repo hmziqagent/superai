@@ -402,6 +402,9 @@ impl Adapter for DeepSeekAdapter {
             "Everything is a Plugin per upstream, but the plugin contract is not traced in the corpus (deepseek-harness.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is DeepSeek's API-key balance endpoints; no local usage artifact")
+    }
 }
 
 #[cfg(test)]

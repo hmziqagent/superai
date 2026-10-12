@@ -440,6 +440,9 @@ impl Adapter for MistralVibeAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some("no plugin mechanism documented (mistral-vibe.md)")
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some("usage truth is admin.mistral.ai credits/console endpoints; no local log scan is used")
+    }
 }
 
 #[cfg(test)]

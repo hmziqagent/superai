@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use crate::adapter::{
     ADAPTER_REVISION, Adapter, ConfigScope, ConfigSurface, DetectionResult, DocumentKind,
-    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, VersionResolution,
-    WrapperPlan,
+    PathResolver, Platform, ProductStatus, RestartBehavior, SurfaceOwnership, UsageReaderKind,
+    UsageSurface, VersionResolution, WrapperPlan,
 };
 use crate::error::CoreError;
 use crate::ids::HarnessId;
@@ -256,6 +256,16 @@ impl Adapter for OmpAdapter {
     fn plugin_absence_reason(&self) -> Option<&'static str> {
         Some(
             "extensions load from trusted paths (--trusted-extension allowlist) but no install destination or manifest format is documented (omp.md sections 4, 6)",
+        )
+    }
+    fn usage_surface(&self) -> Option<UsageSurface> {
+        Some(
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, None).with_artifact(
+                "agent-sessions",
+                PathResolver::fallback_only(
+                    "~/.omp/agent session stores (OMP XDG roots; OMP_PROFILE-selected)",
+                ),
+            ),
         )
     }
 }

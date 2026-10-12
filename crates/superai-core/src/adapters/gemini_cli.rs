@@ -391,6 +391,11 @@ impl Adapter for GeminiCliAdapter {
             "extensions dir documented (extension.toml under ~/.gemini/extensions/) but the harness is MigrationOnly; successor converts them to plugins (gemini-cli.md 7)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "quota truth is Google's private quota APIs over the CLI's OAuth creds; no local usage artifact",
+        )
+    }
 }
 
 #[cfg(test)]

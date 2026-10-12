@@ -673,6 +673,11 @@ impl Adapter for ClineAdapter {
             "no plugin mechanism documented; extensions are VS Code-level, not Cline plugins (cline.md)",
         )
     }
+    fn usage_absence_reason(&self) -> Option<&'static str> {
+        Some(
+            "cline quota windows come from the Cline subscription API; the local session file holds auth, not usage",
+        )
+    }
 }
 
 #[cfg(test)]
