@@ -112,7 +112,7 @@ repositories; the copies here are exports.
 | Raw TOML/JSON editors with validation | 12 |
 | No vault and no OAuth | 00, 07, 13 |
 | claude-multi coexistence; no import | 05 |
-| Config → Core → Interface dependency direction | 00, 13 |
+| Config → Core → Usage → Interface dependency direction | 00, 13 |
 | Filesystem first, interface last | roadmap milestones A–H |
 | No proxy/routing implementation | 00, 07, 13 |
 | Rust/local/one binary | 00, 11, 13 |
@@ -136,7 +136,7 @@ repositories; the copies here are exports.
 - [x] Harness install/uninstall never removes user data without separate explicit intent.
 - [x] Raw editor backend rejects invalid content without touching disk.
 - [x] Secret values never appear in records, normal diagnostics, snapshots, or test logs.
-- [x] No interface crate dependency exists below layer 3.
+- [x] No interface crate dependency exists below layer 4.
 - [x] No model proxy, wire translator, chat runtime, OAuth client, or secret vault exists.
 - [x] Formatting, clippy, tests, locked build, feature checks, dependency audit, parser fuzzing,
       mutation tests, and supported-platform tests pass.

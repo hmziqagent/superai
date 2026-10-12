@@ -85,7 +85,8 @@ What superai takes from it is the design: mirror-then-isolate instance creation,
 
 1. **Config** — per-harness, version-aware. Owns each harness's schema, paths, and migrations across breaking changes.
 2. **Core** — instances, templates, capabilities, skills, install, backups, mutation. Exposes capabilities upward, never harness identity.
-3. **Interface** — GPUI first, TUI and CLI after. Pluggable, so no interface types leak below this layer.
+3. **Usage** — usage truth: local readers, window/cost engines, llmproxy client, pollers.
+4. **Interface** — GPUI first, TUI and CLI after. Pluggable, so no interface types leak below this layer.
 
 ## Order of work
 

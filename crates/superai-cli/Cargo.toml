@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 publish = false
 repository.workspace = true
-description = "Layer 3: interface. CLI placeholder until GPUI."
+description = "Layer 4: interface. CLI placeholder until GPUI."
 
 [[bin]]
 name = "superai"

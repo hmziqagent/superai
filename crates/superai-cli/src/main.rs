@@ -1,4 +1,4 @@
-//! Layer 3: interface. Placeholder CLI until the GPUI interface exists;
+//! Layer 4: interface. Placeholder CLI until the GPUI interface exists;
 //! nothing below this crate knows an interface exists.
 
 use std::process::ExitCode;

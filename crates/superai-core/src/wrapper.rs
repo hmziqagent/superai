@@ -1098,7 +1098,7 @@ pub fn verify_wrapper(path: &Path, instance: &Instance, plan: &WrapperPlan) -> R
 }
 
 // WRP-04, bounded diagnostic probe + runtime isolation evidence. Test-only
-// until layer 3 consumes them.
+// until layer 4 consumes them.
 
 /// Outcome of a bounded, no-auth diagnostic launch of a wrapper (WRP-04).
 /// Unix-only: the sole caller execs a `#!/bin/sh` wrapper.

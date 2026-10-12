@@ -277,17 +277,17 @@ const GOAL_ROWS: &[GoalRow] = &[
         }],
     },
     GoalRow {
-        requirement: "Config → Core → Interface dependency direction",
+        requirement: "Config → Core → Usage → Interface dependency direction",
         evidence: &[Evidence::Test {
             file: "src/coverage_ledger.rs",
-            name: "dependency_direction_is_config_core_cli",
+            name: "dependency_direction_matches_layer_table",
         }],
     },
     GoalRow {
         requirement: "Filesystem first, interface last",
         evidence: &[Evidence::Test {
             file: "src/coverage_ledger.rs",
-            name: "dependency_direction_is_config_core_cli",
+            name: "dependency_direction_matches_layer_table",
         }],
     },
     GoalRow {
@@ -524,10 +524,10 @@ const DOD_ITEMS: &[DodItem] = &[
     },
     DodItem {
         number: 14,
-        label: "no interface dependency below L3",
+        label: "no interface dependency below L4",
         evidence: &[Evidence::Test {
             file: "src/coverage_ledger.rs",
-            name: "dependency_direction_is_config_core_cli",
+            name: "dependency_direction_matches_layer_table",
         }],
     },
     DodItem {
@@ -742,10 +742,10 @@ mod tests {
         }
     }
 
-    /// Layering: config depends on nothing, core only on config, and only
-    /// the CLI depends upward; no interface crate exists below L3.
+    /// Layering per the layer table: config depends on nothing, core only
+    /// on config, usage only on core, and the CLI on the layers below it.
     #[test]
-    fn dependency_direction_is_config_core_cli() {
+    fn dependency_direction_matches_layer_table() {
         let config_toml =
             std::fs::read_to_string(manifest_root().join("../superai-config/Cargo.toml"))
                 .expect("config Cargo.toml");
@@ -759,15 +759,22 @@ mod tests {
             core_toml.contains("superai-config") && !core_toml.contains("superai-cli"),
             "L2 superai-core depends only on L1"
         );
+        let usage_toml =
+            std::fs::read_to_string(manifest_root().join("../superai-usage/Cargo.toml"))
+                .expect("usage Cargo.toml");
+        assert!(
+            usage_toml.contains("superai-core") && !usage_toml.contains("superai-cli"),
+            "L3 superai-usage depends on L2 only, never on the interface"
+        );
         let cli_toml = std::fs::read_to_string(manifest_root().join("../superai-cli/Cargo.toml"))
             .expect("cli Cargo.toml");
         assert!(
             cli_toml.contains("superai-core"),
-            "L3 CLI is the only layer that may depend upward"
+            "L4 CLI may depend on the layers below it"
         );
     }
 
-    /// §9 "Rust/local/one binary": exactly one binary target, in the L3 CLI;
+    /// §9 "Rust/local/one binary": exactly one binary target, in the L4 CLI;
     /// the library crates define none.
     #[test]
     fn single_local_binary_and_workspace_layering() {
@@ -775,7 +782,11 @@ mod tests {
             .expect("cli Cargo.toml");
         let bin_count = cli_toml.matches("[[bin]]").count();
         assert_eq!(bin_count, 1, "exactly one binary target in the workspace");
-        for lib in ["Cargo.toml", "../superai-config/Cargo.toml"] {
+        for lib in [
+            "Cargo.toml",
+            "../superai-config/Cargo.toml",
+            "../superai-usage/Cargo.toml",
+        ] {
             let toml = std::fs::read_to_string(manifest_root().join(lib)).unwrap_or_default();
             assert!(
                 !toml.contains("[[bin]]"),
