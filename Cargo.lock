@@ -1045,7 +1045,6 @@ dependencies = [
  "serde_json",
  "superai-core",
  "thiserror",
- "ureq",
 ]
 
 [[package]]

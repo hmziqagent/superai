@@ -10,7 +10,6 @@ mod tests {
     use serde_json as _;
     use superai_core as _;
     use thiserror as _;
-    use ureq as _;
 
     use superai_usage::cost::{CostError, ModelRates, RateTable, Usd};
 

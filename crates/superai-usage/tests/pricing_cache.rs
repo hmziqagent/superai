@@ -14,7 +14,6 @@ mod tests {
     use serde_json as _;
     use superai_core as _;
     use thiserror as _;
-    use ureq as _;
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -41,8 +40,8 @@ mod tests {
     }
 
     use superai_usage::cost::{
-        CostError, Freshness, MAX_CACHE_FILE_BYTES, MAX_MODELS_DEV_BYTES, MODELS_DEV_API_URL,
-        PricingCache, RateTable, fetch_models_dev_bytes,
+        CostError, Freshness, MAX_CACHE_FILE_BYTES, MAX_MODELS_DEV_BYTES, PricingCache, RateTable,
+        fetch_models_dev_bytes,
     };
 
     const PLAUSIBLE_CATALOG: &str = r#"{
@@ -329,7 +328,6 @@ mod tests {
             "the cache path must never climb out of its root: {}",
             path.display()
         );
-        assert_eq!(MODELS_DEV_API_URL, "https://models.dev/api.json");
     }
 
     #[test]

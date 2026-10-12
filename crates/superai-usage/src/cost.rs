@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,10 +13,8 @@ use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use superai_core::template_fetch::{
-    FETCH_TIMEOUT_SECS, MAX_REDIRECTS, USER_AGENT, validate_fetch_url,
+    BoundedFetch, FETCH_TIMEOUT_SECS, TemplateFetchError, fetch_bounded, validate_fetch_url,
 };
-
-use crate::error::UsageError;
 
 /// Seconds a cached models.dev catalog stays fresh.
 pub const CACHE_TTL_SECS: i64 = 24 * 60 * 60;
@@ -69,8 +67,8 @@ pub enum CostError {
         /// Offending text, truncated for display.
         text: String,
     },
-    /// A day count outside 1..=365 reached period arithmetic (a crafted
-    /// deserialize can bypass [`CostPeriod::rolling`]).
+    /// A rolling-window day count outside 1..=365; both the constructor
+    /// and period arithmetic reject it.
     #[error("rolling cost window of {days} days is outside 1..=365")]
     RollingWindowOutOfRange {
         /// Day count that was rejected.
@@ -195,7 +193,10 @@ impl Usd {
             None => 0,
         };
         let frac_len = i64::try_from(frac_digits.map_or(0, str::len)).unwrap_or(i64::MAX);
-        let picos = scaled_picos(mantissa, exponent - frac_len, negative, text)?;
+        let exp10 = exponent
+            .checked_sub(frac_len)
+            .ok_or(CostError::MalformedDecimal { text: echo(text) })?;
+        let picos = scaled_picos(mantissa, exp10, negative, text)?;
         Ok(Self::from_picos(picos))
     }
 
@@ -529,9 +530,9 @@ pub enum CostPeriod {
 
 impl CostPeriod {
     /// Rolling window; USG-05 bounds the day count to 1..=365.
-    pub fn rolling(days: u16) -> Result<Self, UsageError> {
+    pub fn rolling(days: u16) -> CostResult<Self> {
         if days == 0 || days > 365 {
-            return Err(UsageError::RollingWindowOutOfRange { days });
+            return Err(CostError::RollingWindowOutOfRange { days });
         }
         Ok(Self::RollingDays { days })
     }
@@ -1004,10 +1005,9 @@ impl PricingCache {
     }
 }
 
-/// Bounded fetch of the pricing catalog: `https://` only (private hosts,
-/// traversal, and control characters rejected; redirects re-validated per
-/// hop), `file://` for tests. Size-capped, timeout-bounded, same
-/// discipline as core's template fetch.
+/// Bounded fetch of the pricing catalog over core's shared client
+/// (`https://` only, redirects re-validated per hop, size-capped,
+/// timeout-bounded); `file://` reads local bytes for tests.
 pub fn fetch_models_dev_bytes(url: &str) -> CostResult<Vec<u8>> {
     validate_fetch_url(url, "models.dev pricing").map_err(|e| CostError::Fetch {
         reason: echo(&format!("{e}")),
@@ -1023,100 +1023,21 @@ pub fn fetch_models_dev_bytes(url: &str) -> CostResult<Vec<u8>> {
         }
         return Ok(bytes);
     }
-    https_get_bounded(url)
-}
-
-/// Absolute https or same-origin absolute-path redirect; anything else is
-/// refused fail-closed.
-fn resolve_redirect(base: &str, location: &str) -> CostResult<String> {
-    if location.starts_with("https://") {
-        return Ok(location.to_owned());
-    }
-    if !location.starts_with('/') {
-        return Err(CostError::Fetch {
-            reason: format!(
-                "redirect location must be absolute, got `{}`",
-                echo(location)
-            ),
-        });
-    }
-    let rest = base
-        .strip_prefix("https://")
-        .ok_or_else(|| CostError::Fetch {
-            reason: format!("redirect base is not https: `{base}`"),
-        })?;
-    let origin = rest.split('/').next().unwrap_or_default();
-    Ok(format!("https://{origin}{location}"))
-}
-
-fn https_get_bounded(url: &str) -> CostResult<Vec<u8>> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(FETCH_TIMEOUT_SECS)))
-        .https_only(true)
-        // Redirects are followed manually so every hop re-passes validation.
-        .max_redirects(0)
-        .max_redirects_will_error(false)
-        .user_agent(USER_AGENT)
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
-    let mut current = url.to_owned();
-    for _ in 0..=MAX_REDIRECTS {
-        let mut response = agent.get(&current).call().map_err(|e| CostError::Fetch {
-            reason: format!("{}: {e}", echo(&current)),
-        })?;
-        let status = response.status().as_u16();
-        if (300..400).contains(&i32::from(status)) {
-            let location = response
-                .headers()
-                .get("Location")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| CostError::Fetch {
-                    reason: format!("redirect {status} without a valid Location header"),
-                })?;
-            current = resolve_redirect(&current, location)?;
-            validate_fetch_url(&current, "models.dev pricing").map_err(|e| CostError::Fetch {
-                reason: echo(&format!("{e}")),
-            })?;
-            continue;
-        }
-        if status == 404 || status == 429 {
-            return Err(CostError::Fetch {
-                reason: format!("http {status} for `{}`", echo(&current)),
-            });
-        }
-        if !(200..300).contains(&i32::from(status)) {
-            return Err(CostError::Fetch {
-                reason: format!("http {status} for `{}`", echo(&current)),
-            });
-        }
-        if let Some(len) = response
-            .headers()
-            .get("Content-Length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            && len > MAX_MODELS_DEV_BYTES
-        {
-            return Err(CostError::FetchSizeLimit {
-                max_bytes: MAX_MODELS_DEV_BYTES,
-            });
-        }
-        let mut reader = response.body_mut().as_reader();
-        let mut buf = Vec::new();
-        let mut limited = (&mut reader).take((MAX_MODELS_DEV_BYTES + 1) as u64);
-        limited
-            .read_to_end(&mut buf)
-            .map_err(|e| CostError::Fetch {
-                reason: format!("read {}: {e}", echo(&current)),
-            })?;
-        if buf.len() > MAX_MODELS_DEV_BYTES {
-            return Err(CostError::FetchSizeLimit {
-                max_bytes: MAX_MODELS_DEV_BYTES,
-            });
-        }
-        return Ok(buf);
-    }
-    Err(CostError::Fetch {
-        reason: format!("more than {MAX_REDIRECTS} redirects for `{url}`"),
+    fetch_bounded(
+        url,
+        "models.dev pricing",
+        &BoundedFetch {
+            max_bytes: MAX_MODELS_DEV_BYTES,
+            timeout: Duration::from_secs(FETCH_TIMEOUT_SECS),
+        },
+    )
+    .map_err(|e| match e {
+        TemplateFetchError::SizeLimit { .. } => CostError::FetchSizeLimit {
+            max_bytes: MAX_MODELS_DEV_BYTES,
+        },
+        other => CostError::Fetch {
+            reason: echo(&format!("{other}")),
+        },
     })
 }
 
@@ -1129,7 +1050,7 @@ mod tests {
         for days in [0u16, 366, u16::MAX] {
             assert!(matches!(
                 CostPeriod::rolling(days),
-                Err(UsageError::RollingWindowOutOfRange { days: rejected })
+                Err(CostError::RollingWindowOutOfRange { days: rejected })
                     if rejected == days
             ));
         }
@@ -1174,6 +1095,20 @@ mod tests {
             assert!(
                 Usd::parse(text).is_err(),
                 "`{text}` should not parse as a decimal"
+            );
+        }
+    }
+
+    #[test]
+    fn usd_parse_errors_on_extreme_exponents_instead_of_overflowing() {
+        for text in [
+            "0.1e-9223372036854775808",
+            "1e-9223372036854775808",
+            "0.1e9223372036854775807",
+        ] {
+            assert!(
+                matches!(Usd::parse(text), Err(CostError::MalformedDecimal { .. })),
+                "`{text}` must be a MalformedDecimal, not a panic or a wrap"
             );
         }
     }

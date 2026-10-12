@@ -291,7 +291,8 @@ fn resolve_redirect(
 
 /// Tuning for the shared bounded HTTPS fetch. Skill sources take a larger
 /// limit and a shorter timeout than template files.
-pub(crate) struct BoundedFetch {
+#[derive(Debug)]
+pub struct BoundedFetch {
     /// Maximum response size in bytes.
     pub max_bytes: usize,
     /// Whole-request timeout.
@@ -299,8 +300,9 @@ pub(crate) struct BoundedFetch {
 }
 
 /// One bounded HTTPS GET whose redirects are followed manually so every hop
-/// re-passes URL validation; the engine behind template and skill fetches.
-pub(crate) fn fetch_bounded(
+/// re-passes URL validation; the engine behind template, skill, and usage
+/// pricing fetches. Callers validate the initial URL themselves.
+pub fn fetch_bounded(
     url: &str,
     context: &str,
     limits: &BoundedFetch,
