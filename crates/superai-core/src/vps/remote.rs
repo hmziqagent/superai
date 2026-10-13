@@ -2,7 +2,9 @@
 //! backends: `FixtureRemote` (in-memory tree, the in-repo proof) and
 //! `TorideRemote` (typed pending refusals until toride 0.2 publishes).
 
+#[cfg(test)]
 use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::{BTreeMap, VecDeque};
 
 /// Reason every `TorideRemote` verb refuses with; states the external gate.
@@ -308,7 +310,8 @@ impl RemoteHost for TorideRemote {
 /// Facts the fixture host answers probes with; tests mutate them to force
 /// preflight failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FixtureHost {
+#[cfg(test)]
+pub(crate) struct FixtureHost {
     /// Contents served for `/etc/os-release`.
     pub os_release: String,
     /// Version line for `systemctl --version`; `None` means no systemd.
@@ -322,6 +325,7 @@ pub struct FixtureHost {
     pub missing_tools: Vec<String>,
 }
 
+#[cfg(test)]
 impl Default for FixtureHost {
     fn default() -> Self {
         Self {
@@ -335,11 +339,13 @@ impl Default for FixtureHost {
 }
 
 /// Expiry the fixture's `certbot` writes into its certificate PEM.
+#[cfg(test)]
 pub(crate) const FIXTURE_CERT_NOT_AFTER: &str = "May 21 12:00:00 2027 GMT";
 
 /// A fault a test schedules on the next matching verb, to prove rollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fault {
+#[cfg(test)]
+pub(crate) enum Fault {
     /// Fail the next `exec` of this program.
     Exec(String),
     /// Fail the next `upload`.
@@ -357,12 +363,14 @@ pub enum Fault {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum ServiceFlags {
     Inactive,
     Enabled,
     Active,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct FixtureState {
     host: Option<FixtureHost>,
@@ -377,15 +385,37 @@ struct FixtureState {
 /// In-memory remote tree with scripted probe answers. It interprets exactly
 /// the argv the plan emits and refuses anything else, so a new remote command
 /// surfaces as a test failure instead of passing vacuously.
-#[derive(Debug, Clone, Default)]
-pub struct FixtureRemote {
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct FixtureRemote {
     target: String,
     state: RefCell<FixtureState>,
 }
 
+#[cfg(test)]
+impl std::fmt::Debug for FixtureRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.borrow();
+        let mut out = f.debug_struct("FixtureRemote");
+        out.field("target", &self.target);
+        out.field(
+            "files",
+            &state
+                .files
+                .iter()
+                .map(|(path, (bytes, mode))| (path.as_str(), bytes.len(), *mode))
+                .collect::<Vec<_>>(),
+        );
+        out.field("backups", &state.backups.len());
+        out.field("reloads", &state.reloads);
+        out.finish()
+    }
+}
+
+#[cfg(test)]
 impl FixtureRemote {
     /// A Debian/systemd fixture host named `target`.
-    pub fn new(target: &str) -> Self {
+    pub(crate) fn new(target: &str) -> Self {
         Self {
             target: target.to_owned(),
             state: RefCell::new(FixtureState {
@@ -396,12 +426,12 @@ impl FixtureRemote {
     }
 
     /// Replace the probe-answer facts.
-    pub fn set_host(&self, host: FixtureHost) {
+    pub(crate) fn set_host(&self, host: FixtureHost) {
         self.state.borrow_mut().host = Some(host);
     }
 
     /// Seed a pre-existing remote file (foreign content for backup tests).
-    pub fn insert_file(&self, path: &str, bytes: &[u8], mode: u32) {
+    pub(crate) fn insert_file(&self, path: &str, bytes: &[u8], mode: u32) {
         self.state
             .borrow_mut()
             .files
@@ -409,12 +439,12 @@ impl FixtureRemote {
     }
 
     /// Schedule a fault for the next matching verb.
-    pub fn fail_next(&self, fault: Fault) {
+    pub(crate) fn fail_next(&self, fault: Fault) {
         self.state.borrow_mut().faults.push_back(fault);
     }
 
     /// Current bytes at `path`, if any (test assertions).
-    pub fn file(&self, path: &str) -> Option<Vec<u8>> {
+    pub(crate) fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.state
             .borrow()
             .files
@@ -423,27 +453,22 @@ impl FixtureRemote {
     }
 
     /// Mode at `path`, if any (test assertions).
-    pub fn file_mode(&self, path: &str) -> Option<u32> {
+    pub(crate) fn file_mode(&self, path: &str) -> Option<u32> {
         self.state.borrow().files.get(path).map(|(_, mode)| *mode)
     }
 
-    /// Backup paths recorded so far, original path -> backup path.
-    pub fn backups(&self) -> BTreeMap<String, String> {
-        self.state.borrow().backups.clone()
-    }
-
     /// How many `daemon-reload` calls ran.
-    pub fn reload_count(&self) -> usize {
+    pub(crate) fn reload_count(&self) -> usize {
         self.state.borrow().reloads
     }
 
     /// Whether an install backed up a pre-existing unit (backup-first proof).
-    pub fn unit_backup_count(&self) -> usize {
+    pub(crate) fn unit_backup_count(&self) -> usize {
         self.state.borrow().unit_backups
     }
 
     /// Whether `name` is active (test assertions).
-    pub fn service_active(&self, name: &str) -> bool {
+    pub(crate) fn service_active(&self, name: &str) -> bool {
         self.state
             .borrow()
             .services
@@ -509,6 +534,7 @@ impl FixtureRemote {
     }
 }
 
+#[cfg(test)]
 impl RemoteHost for FixtureRemote {
     fn describe(&self) -> String {
         format!("fixture {}", self.target)
@@ -712,8 +738,13 @@ impl RemoteHost for FixtureRemote {
         };
         let body = String::from_utf8_lossy(&text).into_owned();
         let env_text = String::from_utf8_lossy(&env_bytes).into_owned();
-        let substituted = substitute_env_placeholders(&body, &env_text)
-            .map_err(|missing| refused(format!("no value for placeholder `{missing}`")))?;
+        let substituted = substitute_env_placeholders(&body, &env_text).map_err(|missing| {
+            if missing == UNTERMINATED_PLACEHOLDER {
+                refused(missing)
+            } else {
+                refused(format!("no value for placeholder `{missing}`"))
+            }
+        })?;
         state
             .files
             .insert(target.to_owned(), (substituted.into_bytes(), 0o600));
@@ -793,8 +824,12 @@ impl RemoteHost for FixtureRemote {
     }
 }
 
+#[cfg(test)]
+pub(crate) const UNTERMINATED_PLACEHOLDER: &str = "unterminated placeholder";
+
 /// Replace every `${NAME}` in `text` using `NAME=VALUE` lines from `env`;
 /// the error names the first placeholder without a value, never a value.
+#[cfg(test)]
 pub(crate) fn substitute_env_placeholders(text: &str, env: &str) -> Result<String, String> {
     let value_of = |name: &str| -> Option<&str> {
         env.lines()
@@ -806,8 +841,7 @@ pub(crate) fn substitute_env_placeholders(text: &str, env: &str) -> Result<Strin
     while let Some((head, tail)) = rest.split_once("${") {
         out.push_str(head);
         let Some((name, after)) = tail.split_once('}') else {
-            let shown: String = tail.chars().take(40).collect();
-            return Err(shown);
+            return Err(UNTERMINATED_PLACEHOLDER.to_owned());
         };
         if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             match value_of(name) {
@@ -826,6 +860,7 @@ pub(crate) fn substitute_env_placeholders(text: &str, env: &str) -> Result<Strin
 }
 
 /// The `notAfter=` marker line the fixture's certificate PEMs carry.
+#[cfg(test)]
 fn pem_not_after(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
     text.lines()
@@ -834,6 +869,7 @@ fn pem_not_after(bytes: &[u8]) -> Option<String> {
 }
 
 /// Validate a unit name and return its remote unit-file path.
+#[cfg(test)]
 pub(crate) fn unit_path(name: &str) -> Result<String, RemoteError> {
     let valid = !name.is_empty()
         && name.len() <= 200
@@ -1131,6 +1167,48 @@ mod tests {
             .interpolate_env("/etc/x.toml", "/etc/llmproxy/absent.env")
             .unwrap_err();
         assert!(err.to_string().contains("absent.env"), "{err}");
+    }
+
+    #[test]
+    fn every_fault_variant_fires_once_on_its_verb() {
+        let remote = FixtureRemote::new("root@host");
+        let probes: [(Fault, fn(&FixtureRemote) -> Result<(), RemoteError>); 3] = [
+            (Fault::UnitInstall, |r| {
+                r.install_unit("x", "[Unit]").map(|_| ())
+            }),
+            (Fault::Reload, |r| r.daemon_reload()),
+            (Fault::Start, |r| r.service_start("x")),
+        ];
+        for (fault, probe) in probes {
+            remote.fail_next(fault.clone());
+            let first = probe(&remote);
+            assert!(first.is_err(), "{fault:?} must fire");
+            let second = probe(&remote);
+            assert!(second.is_ok(), "{fault:?} fires exactly once");
+        }
+    }
+
+    #[test]
+    fn an_unterminated_placeholder_reports_a_marker_not_file_bytes() {
+        let env = "ANTHROPIC_API_KEY=sk-live\n";
+        let err =
+            substitute_env_placeholders("v = \"${ANTHROPIC_API_KEY says hi", env).unwrap_err();
+        assert_eq!(err, UNTERMINATED_PLACEHOLDER);
+        assert!(!err.contains("sk-live"));
+
+        let remote = FixtureRemote::new("root@host");
+        remote
+            .upload("/etc/llmproxy/llmproxy.env", b"K=v\n", 0o600)
+            .unwrap();
+        remote
+            .upload("/etc/x.toml", b"v = \"${UNTERMINATED TAIL BYTES\n", 0o600)
+            .unwrap();
+        let error = remote
+            .interpolate_env("/etc/x.toml", "/etc/llmproxy/llmproxy.env")
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("unterminated placeholder"), "{text}");
+        assert!(!text.contains("TAIL BYTES"), "{text}");
     }
 
     #[test]

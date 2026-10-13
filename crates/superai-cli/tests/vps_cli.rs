@@ -197,7 +197,7 @@ mod tests {
         let provider = home.join("anthropic.toml");
         fs::write(&provider, "api_key = \"PLACEHOLDER\"\n").unwrap();
         let env_file = home.join("secrets.env");
-        fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=integration-secret\n").unwrap();
+        fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=integration-secret\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\n").unwrap();
 
         let out = superai(
             &home,
@@ -271,7 +271,7 @@ mod tests {
         let binary = home.join("llmproxy-musl");
         fs::write(&binary, b"musl-bytes").unwrap();
         let env_file = home.join("wg.env");
-        fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=x\n").unwrap();
+        fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=x\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\n").unwrap();
         let out = superai(
             &home,
             &[

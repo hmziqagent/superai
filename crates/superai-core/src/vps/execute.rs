@@ -87,7 +87,8 @@ pub fn execute_deploy(
         entries: Vec::new(),
         backups: Vec::new(),
         created: Vec::new(),
-        touched_service: None,
+        started: Vec::new(),
+        restarted: Vec::new(),
         unit_touched: false,
     };
     match commit_all(&plan.steps, remote, &mut run, &owned) {
@@ -207,7 +208,8 @@ struct Run {
     entries: Vec<JournalEntry>,
     backups: Vec<BackupRecord>,
     created: Vec<String>,
-    touched_service: Option<&'static str>,
+    started: Vec<String>,
+    restarted: Vec<String>,
     unit_touched: bool,
 }
 
@@ -291,7 +293,7 @@ fn commit_one(
         }
         (DeployStep::StartService { name }, Payload::Bare) => {
             remote.service_start(name).map_err(fail)?;
-            run.touched_service = Some("start");
+            run.started.push(name.clone());
             run.entries.push(JournalEntry {
                 step: planned.step.clone(),
                 detail: format!("{name} started"),
@@ -299,7 +301,7 @@ fn commit_one(
         }
         (DeployStep::RestartService { name }, Payload::Bare) => {
             remote.service_restart(name).map_err(fail)?;
-            run.touched_service = Some("restart");
+            run.restarted.push(name.clone());
             run.entries.push(JournalEntry {
                 step: planned.step.clone(),
                 detail: format!("{name} restarted"),
@@ -421,16 +423,13 @@ fn rollback(run: &Run, remote: &dyn RemoteHost) -> Result<Vec<String>, VpsError>
         remote.daemon_reload()?;
         notes.push("daemon-reload completed after rollback".to_owned());
     }
-    match run.touched_service {
-        Some("start") => {
-            remote.service_stop(SERVICE_NAME)?;
-            notes.push(format!("{SERVICE_NAME} stopped (started by this run)"));
-        }
-        Some("restart") => {
-            remote.service_restart(SERVICE_NAME)?;
-            notes.push(format!("{SERVICE_NAME} restarted onto the restored binary"));
-        }
-        _ => {}
+    for name in &run.started {
+        remote.service_stop(name)?;
+        notes.push(format!("{name} stopped (started by this run)"));
+    }
+    for name in &run.restarted {
+        remote.service_restart(name)?;
+        notes.push(format!("{name} restarted onto the restored binary"));
     }
     Ok(notes)
 }
@@ -471,7 +470,9 @@ mod tests {
     use crate::abuse;
     use crate::vps::plan::{DeployRequest, IngressMode, ProviderToml, TunnelKind, plan_deploy};
     use crate::vps::remote::{Fault, FixtureHost, FixtureRemote, HostKeyPolicy as Policy};
-    use crate::vps::render::{REMOTE_ENV_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_WG_CONF_PATH};
+    use crate::vps::render::{
+        REMOTE_ENV_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_SERVER_CONF_PATH, REMOTE_WG_CONF_PATH,
+    };
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
@@ -506,7 +507,10 @@ mod tests {
     }
 
     fn sentinel_env() -> String {
-        format!("LLMPROXY_ADMIN_TOKEN={}\n", abuse::SENTINEL)
+        format!(
+            "LLMPROXY_ADMIN_TOKEN={}\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\n",
+            abuse::SENTINEL
+        )
     }
 
     #[test]
@@ -640,6 +644,81 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_deploy_binds_the_proxy_to_the_wireguard_interface_with_auth() {
+        let dir = temp_dir("tunnel-complete");
+        let remote = FixtureRemote::new("root@host");
+        let plan = plan_deploy(&wg_request(&dir), &remote).unwrap();
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.step,
+            DeployStep::EnableService { name } if name == "wg-quick@wg0"
+        )));
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.step,
+            DeployStep::StartService { name } if name == "wg-quick@wg0"
+        )));
+        let journal = execute_deploy(&plan, &remote).unwrap();
+        assert!(journal.rolled_back.is_none(), "{journal:?}");
+        assert!(remote.service_active("wg-quick@wg0"), "the tunnel comes up");
+        assert!(remote.service_active(SERVICE_NAME));
+
+        let conf = remote.file(REMOTE_SERVER_CONF_PATH).unwrap();
+        let text = String::from_utf8(conf).unwrap();
+        assert!(text.contains("bind = \"10.7.0.1:8080\""), "{text}");
+        assert!(text.contains("admin_bind = \"10.7.0.1:8081\""), "{text}");
+        assert!(text.contains("[auth.clients]"), "{text}");
+        assert!(
+            text.contains("\"workstation\" = \"client-secret\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("LLMPROXY_ADMIN_TOKEN=x") || text.contains("fixture-admin"),
+            "{text}"
+        );
+        assert!(!text.contains("auth = \"none\""), "{text}");
+        assert!(
+            !text.contains("${"),
+            "interpolation filled every placeholder: {text}"
+        );
+        abuse::assert_no_sentinel_bytes(format!("{remote:?}").as_bytes(), "fixture backend debug");
+    }
+
+    #[test]
+    fn tls_deploy_configures_client_keys_behind_the_public_site() {
+        let dir = temp_dir("tls-auth");
+        let remote = FixtureRemote::new("root@host");
+        let plan = plan_deploy(&tls_request(&dir, &sentinel_env()), &remote).unwrap();
+        execute_deploy(&plan, &remote).unwrap();
+        let conf = remote.file(REMOTE_SERVER_CONF_PATH).unwrap();
+        let text = String::from_utf8(conf).unwrap();
+        assert!(text.contains("bind = \"127.0.0.1:8080\""), "{text}");
+        assert!(text.contains("admin_bind = \"127.0.0.1:8081\""), "{text}");
+        assert!(text.contains("[auth.clients]"), "{text}");
+        assert!(!text.contains("auth = \"none\""), "{text}");
+        assert!(!text.contains("${"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_env_key_is_named_without_its_value() {
+        let dir = temp_dir("env-keys");
+        let mut request = tls_request(&dir, &sentinel_env());
+        let partial = dir.join("partial.env");
+        std::fs::write(
+            &partial,
+            format!(
+                "LLMPROXY_ADMIN_TOKEN={}\nLLMPROXY_CLIENT_KEY_ID=workstation\n",
+                abuse::SENTINEL
+            ),
+        )
+        .unwrap();
+        request.env_file = Some(partial);
+        let remote = FixtureRemote::new("root@host");
+        let err = plan_deploy(&request, &remote).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("LLMPROXY_CLIENT_KEY_SECRET"), "{text}");
+        assert!(!text.contains(abuse::SENTINEL), "{text}");
+    }
+
+    #[test]
     fn blocked_preflight_refuses_execution_typed() {
         let dir = temp_dir("blocked");
         let remote = FixtureRemote::new("root@host");
@@ -732,18 +811,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wireguard_tunnel_deploy_committed_and_rolls_back_secretly() {
-        let dir = temp_dir("wg");
+    fn wg_request(dir: &Path) -> DeployRequest {
         let binary = dir.join("llmproxy");
         std::fs::write(&binary, b"musl-bytes").unwrap();
         let env_file = dir.join("wg.env");
         std::fs::write(
             &env_file,
-            format!("LLMPROXY_WG_PRIVATE_KEY={}\n", abuse::SENTINEL),
+            format!("LLMPROXY_ADMIN_TOKEN=fixture-admin\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\nLLMPROXY_WG_PRIVATE_KEY={}\n", abuse::SENTINEL),
         )
         .unwrap();
-        let request = DeployRequest {
+        DeployRequest {
             host: "root@203.0.113.10".to_owned(),
             point_instances: Vec::new(),
             ingress: IngressMode::Tunnel(TunnelKind::Wireguard {
@@ -758,7 +835,13 @@ mod tests {
             }],
             env_file: Some(env_file),
             policy: Policy::Strict,
-        };
+        }
+    }
+
+    #[test]
+    fn wireguard_tunnel_deploy_committed_and_rolls_back_secretly() {
+        let dir = temp_dir("wg");
+        let request = wg_request(&dir);
         let remote = FixtureRemote::new("root@host");
         let plan = plan_deploy(&request, &remote).unwrap();
         abuse::assert_no_sentinel_in_debug(&plan, "tunnel plan");
@@ -767,7 +850,7 @@ mod tests {
         abuse::assert_no_sentinel_in_debug(&journal, "tunnel journal");
         let provider = remote.file("/etc/llmproxy/providers/openai.toml").unwrap();
         let text = String::from_utf8(provider).unwrap();
-        assert!(text.contains("socks5://10.7.0.1:3128"), "{text}");
+        assert!(text.contains("socks5h://10.7.0.1:3128"), "{text}");
         let wg = remote.file(REMOTE_WG_CONF_PATH).unwrap();
         let wg_text = String::from_utf8(wg).unwrap();
         assert!(
@@ -808,6 +891,8 @@ mod tests {
             &rotated,
             format!(
                 "LLMPROXY_ADMIN_TOKEN={}
+LLMPROXY_CLIENT_KEY_ID=workstation
+LLMPROXY_CLIENT_KEY_SECRET=client-secret
 ",
                 abuse::SENTINEL
             ),
@@ -850,6 +935,8 @@ mod tests {
             format!(
                 "ANTHROPIC_API_KEY={}
 LLMPROXY_ADMIN_TOKEN=x
+LLMPROXY_CLIENT_KEY_ID=workstation
+LLMPROXY_CLIENT_KEY_SECRET=client-secret
 ",
                 abuse::SENTINEL
             ),
@@ -884,8 +971,8 @@ LLMPROXY_ADMIN_TOKEN=x
         }];
         let err = plan_deploy(&request, &remote).unwrap_err();
         assert!(
-            err.to_string().contains("placeholders"),
-            "placeholders without an env file refuse at plan time: {err}"
+            err.to_string().contains("env file carrying"),
+            "the server config secrets refuse without an env file: {err}"
         );
     }
 

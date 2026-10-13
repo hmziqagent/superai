@@ -21,10 +21,7 @@ pub use plan::{
     validate_host,
 };
 pub use point::{PointOutcome, point_instance_at, point_recorded_instance};
-pub use remote::{
-    ExecOutput, Fault, FixtureHost, FixtureRemote, HostKeyPolicy, RemoteError, RemoteHost,
-    TorideRemote,
-};
+pub use remote::{ExecOutput, HostKeyPolicy, RemoteError, RemoteHost, TorideRemote};
 pub use status::{CertView, ServiceView, VpsStatusReport, remote_status};
 
 /// Errors for the VPS surface; never carries a secret or remote file bytes.

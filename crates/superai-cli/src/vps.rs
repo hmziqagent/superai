@@ -89,16 +89,20 @@ fn finish_deploy(
     registry_path: &Path,
 ) -> Result<(), CliError> {
     if journal.rolled_back.is_some() {
-        if json {
-            write_json(&deploy_report_json(plan, journal, &[]))?;
-        } else {
-            crate::write_stdout(&render_journal(journal))?;
-        }
+        emit_commit(json, plan, journal)?;
         return Err(CliError::Args {
             reason: "deploy failed and rolled back; harness configs were not pointed".to_owned(),
         });
     }
-    let pointing = point_harness_configs(registry_path, plan, request)?;
+    // The commit record reaches output before pointing runs: the remote is
+    // already mutated, and a pointing failure must not hide what happened.
+    let pointing = match point_harness_configs(registry_path, plan, request) {
+        Ok(pointing) => pointing,
+        Err(error) => {
+            emit_commit(json, plan, journal)?;
+            return Err(error);
+        }
+    };
     if json {
         write_json(&deploy_report_json(plan, journal, &pointing))?;
     } else {
@@ -106,6 +110,16 @@ fn finish_deploy(
         render_pointing(&pointing)?;
     }
     Ok(())
+}
+
+/// The stepwise record of a finished run, pointing excluded; both failure
+/// paths emit it before erroring so no committed state goes unreported.
+fn emit_commit(json: bool, plan: &DeployPlan, journal: &DeployJournal) -> Result<(), CliError> {
+    if json {
+        write_json(&deploy_report_json(plan, journal, &[]))
+    } else {
+        crate::write_stdout(&render_journal(journal))
+    }
 }
 
 /// Point every recorded instance the request named at the deployment base.
@@ -554,6 +568,7 @@ struct StatusJson<'a> {
     host: &'a str,
     backend: &'a str,
     service: ServiceJson<'a>,
+    tunnel: Option<ServiceJson<'a>>,
     disk_free_bytes: Option<u64>,
     loadavg: Option<&'a str>,
     mode: Option<&'a str>,
@@ -595,6 +610,10 @@ impl<'a> StatusJson<'a> {
                 name: &report.service.name,
                 active: report.service.active,
             },
+            tunnel: report.tunnel.as_ref().map(|tunnel| ServiceJson {
+                name: &tunnel.name,
+                active: tunnel.active,
+            }),
             disk_free_bytes: report.disk_free_bytes,
             loadavg: report.loadavg.as_deref(),
             mode: report.mode.as_deref(),
@@ -623,8 +642,15 @@ struct LedgerView {
 
 impl LedgerView {
     fn probe(home: &Path) -> Self {
-        let env_url = utf8_env(llmproxy::PROXY_URL_ENV_VAR);
-        let base = match resolve_base_url(None, env_url.as_deref(), &[]) {
+        Self::from_env(
+            home,
+            utf8_env(llmproxy::PROXY_URL_ENV_VAR).as_deref(),
+            utf8_env(llmproxy::ADMIN_TOKEN_ENV_VAR).as_deref(),
+        )
+    }
+
+    fn from_env(home: &Path, env_url: Option<&str>, env_token: Option<&str>) -> Self {
+        let base = match resolve_base_url(None, env_url, &[]) {
             Ok(Some(base)) => base,
             Ok(None) => {
                 return Self::unconfigured();
@@ -639,9 +665,8 @@ impl LedgerView {
                 };
             }
         };
-        let env_token = utf8_env(llmproxy::ADMIN_TOKEN_ENV_VAR);
         let token_file = home.join(".superai").join("llmproxy-admin-token");
-        let token = match load_admin_token(env_token.as_deref(), Some(&token_file)) {
+        let token = match load_admin_token(env_token, Some(&token_file)) {
             Ok(token) => token,
             Err(error) => {
                 return Self {
@@ -1229,46 +1254,138 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    #[test]
-    fn ledger_view_reports_the_summary_through_a_local_mock() {
+    fn write_token_file(home: &Path, token: &str) {
+        let path = home.join(".superai").join("llmproxy-admin-token");
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| panic!("parent")))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        std::fs::write(&path, token).unwrap_or_else(|e| panic!("token file: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|e| panic!("chmod: {e}"));
+        }
+    }
+
+    fn summary_mock(connections: usize) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let thread = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let read = stream.read(&mut buffer).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
-            let body = concat!(
-                r#"{"window":"30d","rows":[{"group":"anthropic","requests":2,"errors":0,"#,
-                r#""input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"#,
-                r#""cache_write_tokens":null,"cost_usd":"0.01"}]}"#
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            drop(stream.write_all(response.as_bytes()));
-            drop(stream.flush());
-            request
+        let addr = listener.local_addr().unwrap();
+        let (requests_sent, requests_seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                serve_summary_page(&listener, &requests_sent);
+            }
         });
-        let base = format!("http://127.0.0.1:{port}");
-        let limits = PollLimits::new(Duration::from_secs(5), 64 * 1024).unwrap();
-        let token = llmproxy::AdminToken::new("fixture-admin-token");
-        let client = LedgerClient::new(&base, &token, limits).unwrap();
-        let summary = client
-            .summary(LLMPROXY_WINDOW, SummaryGroupBy::Provider)
-            .unwrap_or_else(|e| panic!("summary: {e}"));
-        let request = thread.join().unwrap_or_default();
+        (format!("http://{addr}"), requests_seen)
+    }
+
+    fn serve_summary_page(listener: &TcpListener, requests_sent: &std::sync::mpsc::Sender<String>) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = [0u8; 4096];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+        let body = concat!(
+            r#"{"window":"30d","rows":[{"group":"anthropic","requests":2,"errors":0,"#,
+            r#""input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"#,
+            r#""cache_write_tokens":null,"cost_usd":"0.01"}]}"#
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if stream
+            .write_all(response.as_bytes())
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
+            return;
+        }
+        if requests_sent.send(request).is_err() {
+            // The test side hung up first; nothing left to record.
+        }
+    }
+
+    #[test]
+    fn ledger_probe_states_map_env_token_and_reachability() {
+        let home =
+            std::env::temp_dir().join(format!("superai-cli-vps-probe-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&home));
+        std::fs::create_dir_all(&home).unwrap();
+        write_token_file(&home, "file-admin-token");
+
+        let (base, seen) = summary_mock(2);
+        let view = LedgerView::from_env(&home, Some(&base), Some("env-admin-token"));
+        assert_eq!(view.state, "reachable", "{view:?}");
+        assert_eq!(view.base.as_deref(), Some(base.as_str()));
+        assert_eq!(view.total_cost_usd.as_deref(), Some("0.01"));
+        assert_eq!(view.rows, 1);
+        assert_eq!(view.reason, None);
+        let request = seen
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("first request: {e}"));
         assert!(
-            request.contains("GET /usage/summary") && request.contains("Bearer "),
+            request.contains("GET /usage/summary") && request.contains("Bearer env-admin-token"),
             "{request}"
         );
-        assert_eq!(summary.rows.len(), 1);
-        assert_eq!(
-            summary.total_cost().map(|usd| usd.to_string()),
-            Some("0.01".to_owned())
+
+        let view = LedgerView::from_env(&home, Some(&base), None);
+        assert_eq!(view.state, "reachable", "{view:?}");
+        let request = seen
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("second request: {e}"));
+        assert!(
+            request.contains("Bearer file-admin-token"),
+            "token file was not the fallback: {request}"
         );
+
+        let view = LedgerView::from_env(&home, None, None);
+        assert_eq!(view.state, "unconfigured", "{view:?}");
+        assert_eq!(view.base, None);
+        assert!(
+            view.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("SUPERAI_LLMPROXY_URL")),
+            "{view:?}"
+        );
+
+        let view = LedgerView::from_env(&home, Some("http://far.example.com"), Some("t"));
+        assert_eq!(view.state, "refused", "{view:?}");
+        assert!(
+            view.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("loopback")),
+            "{view:?}"
+        );
+
+        let tokenless_home =
+            std::env::temp_dir().join(format!("superai-cli-vps-bare-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&tokenless_home));
+        std::fs::create_dir_all(&tokenless_home).unwrap();
+        let view = LedgerView::from_env(&tokenless_home, Some(&base), None);
+        assert_eq!(view.state, "unavailable", "{view:?}");
+        assert!(
+            view.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("llmproxy-admin-token")),
+            "{view:?}"
+        );
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let view = LedgerView::from_env(
+            &home,
+            Some(&format!("http://127.0.0.1:{dead_port}")),
+            Some("env-admin-token"),
+        );
+        assert_eq!(view.state, "unreachable", "{view:?}");
+        assert!(view.reason.is_some(), "{view:?}");
+
+        drop(std::fs::remove_dir_all(&home));
+        drop(std::fs::remove_dir_all(&tokenless_home));
     }
 
     #[test]
@@ -1297,21 +1414,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_rolled_back_deploy_never_points_harness_configs() {
-        let dir = std::env::temp_dir().join(format!(
-            "superai-cli-vps-rollback-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("temp: {e}"));
-        let registry_path = dir.join("instances.json");
-        let sentinel = b"{\"instances\":\"frozen sentinel bytes\"}";
-        std::fs::write(&registry_path, sentinel).unwrap_or_else(|e| panic!("write: {e}"));
-
-        let plan = DeployPlan {
+    fn pointing_fixture_plan() -> DeployPlan {
+        DeployPlan {
             host: "root@h.example.com".to_owned(),
             backend: "toride".to_owned(),
             service: "llmproxy",
@@ -1327,9 +1431,12 @@ mod tests {
                 checks: Vec::new(),
             },
             steps: Vec::new(),
-        };
-        let request = DeployRequest {
-            host: plan.host.clone(),
+        }
+    }
+
+    fn pointing_fixture_request() -> DeployRequest {
+        DeployRequest {
+            host: "root@h.example.com".to_owned(),
             ingress: IngressMode::Tls {
                 domain: "h.example.com".to_owned(),
                 email: "ops@example.com".to_owned(),
@@ -1344,7 +1451,25 @@ mod tests {
             env_file: None,
             point_instances: vec!["main".to_owned()],
             policy: HostKeyPolicy::Strict,
-        };
+        }
+    }
+
+    #[test]
+    fn a_rolled_back_deploy_never_points_harness_configs() {
+        let dir = std::env::temp_dir().join(format!(
+            "superai-cli-vps-rollback-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("temp: {e}"));
+        let registry_path = dir.join("instances.json");
+        let sentinel = b"{\"instances\":\"frozen sentinel bytes\"}";
+        std::fs::write(&registry_path, sentinel).unwrap_or_else(|e| panic!("write: {e}"));
+
+        let plan = pointing_fixture_plan();
+        let request = pointing_fixture_request();
         let journal = DeployJournal {
             backend: "toride".to_owned(),
             entries: Vec::new(),
@@ -1371,5 +1496,45 @@ mod tests {
             after, sentinel,
             "a rolled-back deploy must not touch harness configs"
         );
+    }
+
+    #[test]
+    fn a_pointing_failure_after_a_committed_deploy_surfaces_as_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "superai-cli-vps-pointing-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("temp: {e}"));
+        let registry_path = dir.join("instances.json");
+        let garbage = b"{ not a registry";
+        std::fs::write(&registry_path, garbage).unwrap_or_else(|e| panic!("write: {e}"));
+        let journal = DeployJournal {
+            backend: "toride".to_owned(),
+            entries: Vec::new(),
+            backups: Vec::new(),
+            rolled_back: None,
+        };
+
+        let result = finish_deploy(
+            false,
+            &pointing_fixture_plan(),
+            &pointing_fixture_request(),
+            &journal,
+            &registry_path,
+        );
+
+        let message = match result {
+            Ok(()) => panic!("a pointing failure must not report success"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            !message.contains("were not pointed"),
+            "a committed deploy must not borrow the rollback message: {message}"
+        );
+        let after = std::fs::read(&registry_path).unwrap_or_else(|e| panic!("reread: {e}"));
+        assert_eq!(after, garbage, "the failed pointing pass must not rewrite");
     }
 }

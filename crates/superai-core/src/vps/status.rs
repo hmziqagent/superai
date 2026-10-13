@@ -37,6 +37,8 @@ pub struct VpsStatusReport {
     pub backend: String,
     /// Service state.
     pub service: ServiceView,
+    /// Tunnel transport state, present for wireguard deployments.
+    pub tunnel: Option<ServiceView>,
     /// Bytes free on `/`, when `df` answered.
     pub disk_free_bytes: Option<u64>,
     /// `/proc/loadavg` first field, when it answered.
@@ -86,6 +88,13 @@ pub fn remote_status(host: &str, remote: &dyn RemoteHost) -> Result<VpsStatusRep
     };
     let manifest = read_manifest(remote)?;
     let mode = manifest.as_ref().map(|value| echo(value, "mode"));
+    let tunnel = match mode.as_deref() {
+        Some("tunnel-wireguard") => Some(ServiceView {
+            name: crate::vps::render::WG_QUICK_UNIT.to_owned(),
+            active: remote.service_is_active(crate::vps::render::WG_QUICK_UNIT)?,
+        }),
+        _ => None,
+    };
     let address = manifest.as_ref().map(|value| echo(value, "address"));
     let cert = match (&manifest, &address) {
         (Some(_), Some(domain))
@@ -105,6 +114,7 @@ pub fn remote_status(host: &str, remote: &dyn RemoteHost) -> Result<VpsStatusRep
         host: host.to_owned(),
         backend: remote.describe(),
         service,
+        tunnel,
         disk_free_bytes,
         loadavg,
         mode,
@@ -167,6 +177,8 @@ fn cert_expiry(remote: &dyn RemoteHost, domain: &str) -> Result<Option<CertView>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vps::HostKeyPolicy;
+    use crate::vps::TunnelKind;
     use crate::vps::execute::{UpgradeRequest, execute_deploy};
     use crate::vps::plan::{DeployRequest, IngressMode, ProviderToml, plan_deploy};
     use crate::vps::remote::FixtureRemote;
@@ -175,7 +187,7 @@ mod tests {
         let binary = dir.join("llmproxy");
         std::fs::write(&binary, b"musl-bytes").unwrap();
         let env_file = dir.join("secrets.env");
-        std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=x\n").unwrap();
+        std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=x\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\n").unwrap();
         DeployRequest {
             point_instances: Vec::new(),
             host: "root@203.0.113.10".to_owned(),
@@ -191,7 +203,7 @@ mod tests {
                 content: "api_key = \"PLACEHOLDER\"\n".to_owned(),
             }],
             env_file: Some(env_file),
-            policy: crate::vps::HostKeyPolicy::Strict,
+            policy: HostKeyPolicy::Strict,
         }
     }
 
@@ -212,6 +224,7 @@ mod tests {
 
         let report = remote_status("root@203.0.113.10", &remote).unwrap();
         assert!(report.service.active);
+        assert_eq!(report.tunnel, None, "TLS deployments report no tunnel unit");
         assert!(report.disk_free_bytes.is_some_and(|bytes| bytes > 0));
         assert!(report.loadavg.is_some());
         assert_eq!(report.mode.as_deref(), Some("tls"));
@@ -231,6 +244,44 @@ mod tests {
         };
         assert_eq!(cert.days_remaining, expected);
         assert!(cert.days_remaining > 0);
+    }
+
+    #[test]
+    fn status_reports_the_wireguard_tunnel_unit_for_tunnel_deploys() {
+        let dir = temp_dir("wg-status");
+        let binary = dir.join("llmproxy");
+        std::fs::write(&binary, b"musl-bytes").unwrap();
+        let env_file = dir.join("wg.env");
+        std::fs::write(
+            &env_file,
+            "LLMPROXY_ADMIN_TOKEN=x\nLLMPROXY_CLIENT_KEY_ID=workstation\n\
+             LLMPROXY_CLIENT_KEY_SECRET=client-secret\nLLMPROXY_WG_PRIVATE_KEY=wg-key\n",
+        )
+        .unwrap();
+        let request = DeployRequest {
+            host: "root@203.0.113.10".to_owned(),
+            point_instances: Vec::new(),
+            ingress: IngressMode::Tunnel(TunnelKind::Wireguard {
+                client_public_key: "clientpubkey=".to_owned(),
+            }),
+            geo_exit: None,
+            ack_geo_exit_proxy: false,
+            binary_path: binary,
+            providers: Vec::new(),
+            env_file: Some(env_file),
+            policy: HostKeyPolicy::Strict,
+        };
+        let remote = FixtureRemote::new("root@203.0.113.10");
+        let plan = plan_deploy(&request, &remote).unwrap();
+        execute_deploy(&plan, &remote).unwrap();
+        let report = remote_status("root@203.0.113.10", &remote).unwrap();
+        let tunnel = report
+            .tunnel
+            .as_ref()
+            .unwrap_or_else(|| panic!("{report:?}"));
+        assert_eq!(tunnel.name, "wg-quick@wg0");
+        assert!(tunnel.active);
+        assert_eq!(report.mode.as_deref(), Some("tunnel-wireguard"));
     }
 
     #[test]
@@ -260,7 +311,7 @@ mod tests {
             &UpgradeRequest {
                 host: "root@203.0.113.10".to_owned(),
                 binary_path: new_binary,
-                policy: crate::vps::HostKeyPolicy::Strict,
+                policy: HostKeyPolicy::Strict,
             },
             &remote,
         )

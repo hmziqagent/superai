@@ -7,11 +7,12 @@ use serde::Serialize;
 
 use crate::vps::remote::{HostKeyPolicy, RemoteHost, ensure_exec_argv, ensure_remote_path};
 use crate::vps::render::{
-    MIN_DISK_FREE_BYTES, REMOTE_BIN_PATH, REMOTE_ENV_PATH, REMOTE_MANIFEST_PATH,
-    REMOTE_NGINX_ENABLED_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_PROVIDERS_DIR, REMOTE_UNIT_PATH,
-    REMOTE_WG_CONF_PATH, SERVICE_NAME, WG_SERVER_ADDRESS, harness_base_url, policy_note,
-    redact_sensitive_lines, render_manifest, render_nginx_site, render_systemd_unit,
-    render_wireguard_conf,
+    ADMIN_BIND_LOOPBACK, MAIN_BIND_LOOPBACK, MIN_DISK_FREE_BYTES, REMOTE_BIN_PATH, REMOTE_ENV_PATH,
+    REMOTE_MANIFEST_PATH, REMOTE_NGINX_ENABLED_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_PROVIDERS_DIR,
+    REMOTE_SERVER_CONF_PATH, REMOTE_UNIT_PATH, REMOTE_WG_CONF_PATH, SERVICE_NAME, WG_QUICK_UNIT,
+    WG_SERVER_ADDRESS, WG_TUNNEL_ADMIN_BIND, WG_TUNNEL_MAIN_BIND, harness_base_url, policy_note,
+    redact_sensitive_lines, render_manifest, render_nginx_site, render_server_conf,
+    render_systemd_unit, render_wireguard_conf,
 };
 use crate::vps::{VpsError, validation};
 
@@ -64,7 +65,7 @@ impl ProviderToml {
         match geo_exit {
             None => self.content.clone(),
             Some(address) => format!(
-                "{}\n[egress]\nproxy = \"socks5://{address}\"\n",
+                "{}\n[egress]\nproxy = \"socks5h://{address}\"\n",
                 self.content.trim_end()
             ),
         }
@@ -642,30 +643,12 @@ pub fn plan_deploy(
         Some(path) => Some(read_env_file(path)?),
         None => None,
     };
-    if let IngressMode::Tunnel(TunnelKind::Wireguard { .. }) = &request.ingress {
-        require_wg_private_key(env_bytes.as_deref())?;
-    }
+    let (main_bind, admin_bind) = ingress_binds(&request.ingress);
+    require_env_keys(env_bytes.as_deref(), &ingress_env_keys(&request.ingress))?;
     let mut pre = preflight(&request.host, request.policy, remote)?;
     pre.checks.extend(ingress_checks(remote, &request.ingress));
-    if let Some(address) = &request.geo_exit {
-        pre.checks.push(PreflightCheck {
-            name: "geo-exit-proxy",
-            state: if request.ack_geo_exit_proxy {
-                CheckState::Pass(format!(
-                    "operator confirmed the forward proxy at socks5://{address} exists; \
-                     superai does not deploy it (llmproxy companion PRX-04)"
-                ))
-            } else {
-                CheckState::Fail(format!(
-                    "provider traffic would route through socks5://{address}, but superai \
-                     does not deploy the forward proxy (llmproxy companion PRX-04); confirm \
-                     it exists to proceed"
-                ))
-            },
-        });
-    }
+    push_geo_exit_check(&mut pre, request);
     let ours = owned_paths(remote)?;
-
     let mut steps = Vec::new();
     steps.push(upload_step(
         remote,
@@ -685,6 +668,7 @@ pub fn plan_deploy(
             &ours,
         )?);
     }
+    steps.extend(server_conf_steps(main_bind, admin_bind, remote, &ours)?);
     provider_steps(
         &request.providers,
         request.geo_exit.as_deref(),
@@ -701,8 +685,12 @@ pub fn plan_deploy(
         payload: Payload::Bare,
     });
     steps.extend(ingress_steps(remote, request, &ours)?);
-    steps.push(service_step("enable"));
-    steps.push(service_step("start"));
+    if let IngressMode::Tunnel(TunnelKind::Wireguard { .. }) = &request.ingress {
+        steps.push(service_step("enable", WG_QUICK_UNIT));
+        steps.push(service_step("start", WG_QUICK_UNIT));
+    }
+    steps.push(service_step("enable", SERVICE_NAME));
+    steps.push(service_step("start", SERVICE_NAME));
     let created: Vec<String> = steps
         .iter()
         .filter_map(|step| match &step.step {
@@ -736,8 +724,8 @@ pub fn plan_deploy(
     })
 }
 
-fn service_step(verb: &'static str) -> PlannedStep {
-    let name = SERVICE_NAME.to_owned();
+fn service_step(verb: &'static str, unit: &str) -> PlannedStep {
+    let name = unit.to_owned();
     let (step, preview) = match verb {
         "enable" => (
             DeployStep::EnableService { name: name.clone() },
@@ -759,6 +747,93 @@ fn service_step(verb: &'static str) -> PlannedStep {
         preview,
         payload: Payload::Bare,
     }
+}
+
+/// Geo-exit names its gap as a preflight check: the forward proxy is not
+/// deployed by superai (llmproxy companion PRX-04), so an unacknowledged
+/// request blocks instead of routing provider traffic into a black hole.
+fn push_geo_exit_check(pre: &mut PreflightReport, request: &DeployRequest) {
+    let Some(address) = &request.geo_exit else {
+        return;
+    };
+    pre.checks.push(PreflightCheck {
+        name: "geo-exit-proxy",
+        state: if request.ack_geo_exit_proxy {
+            CheckState::Pass(format!(
+                "operator confirmed the forward proxy at socks5h://{address} exists; \
+                 superai does not deploy it (llmproxy companion PRX-04)"
+            ))
+        } else {
+            CheckState::Fail(format!(
+                "provider traffic would route through socks5h://{address}, but superai \
+                 does not deploy the forward proxy (llmproxy companion PRX-04); confirm \
+                 it exists to proceed"
+            ))
+        },
+    });
+}
+
+/// Listener binds per ingress mode: TLS stays loopback behind nginx;
+/// wireguard binds both listeners to the tunnel interface so /usage answers
+/// through the tunnel (PRX-03); tailscale takes the operator's tailnet bind.
+fn ingress_binds(ingress: &IngressMode) -> (&'static str, &'static str) {
+    match ingress {
+        IngressMode::Tls { .. } => (MAIN_BIND_LOOPBACK, ADMIN_BIND_LOOPBACK),
+        IngressMode::Tunnel(TunnelKind::Wireguard { .. }) => {
+            (WG_TUNNEL_MAIN_BIND, WG_TUNNEL_ADMIN_BIND)
+        }
+        IngressMode::Tunnel(TunnelKind::Tailscale { .. }) => {
+            ("${LLMPROXY_BIND}", ADMIN_BIND_LOOPBACK)
+        }
+    }
+}
+
+/// Env keys whose presence the deploy refuses without, per ingress mode:
+/// admin token plus client credentials (PRX-01 makes client keys mandatory
+/// beyond loopback, and every deploy mode exposes the listener beyond it).
+fn ingress_env_keys(ingress: &IngressMode) -> Vec<&'static str> {
+    let mut keys = vec![
+        "LLMPROXY_ADMIN_TOKEN",
+        "LLMPROXY_CLIENT_KEY_ID",
+        "LLMPROXY_CLIENT_KEY_SECRET",
+    ];
+    match ingress {
+        IngressMode::Tunnel(TunnelKind::Wireguard { .. }) => keys.push("LLMPROXY_WG_PRIVATE_KEY"),
+        IngressMode::Tunnel(TunnelKind::Tailscale { .. }) => keys.push("LLMPROXY_BIND"),
+        IngressMode::Tls { .. } => {}
+    }
+    keys
+}
+
+/// Upload the llmproxy server config (binds and auth as placeholders) and
+/// schedule its on-VPS interpolation.
+fn server_conf_steps(
+    main_bind: &str,
+    admin_bind: &str,
+    remote: &dyn RemoteHost,
+    ours: &[String],
+) -> Result<Vec<PlannedStep>, VpsError> {
+    let server_conf = render_server_conf(main_bind, admin_bind);
+    let target = REMOTE_SERVER_CONF_PATH.to_owned();
+    let env = REMOTE_ENV_PATH.to_owned();
+    Ok(vec![
+        upload_step(
+            remote,
+            &target,
+            server_conf.into_bytes(),
+            0o600,
+            false,
+            ours,
+        )?,
+        PlannedStep {
+            step: DeployStep::InterpolateEnv {
+                target: target.clone(),
+                env: env.clone(),
+            },
+            preview: StepPreview::InterpolateEnv { target, env },
+            payload: Payload::Bare,
+        },
+    ])
 }
 
 /// Upload each provider TOML (placeholders only) and, when it carries
@@ -885,20 +960,34 @@ fn ingress_steps(
     }
 }
 
-/// Validation-only presence check; the key value never leaves the env file.
-fn require_wg_private_key(env_bytes: Option<&[u8]>) -> Result<(), VpsError> {
-    let refusal = |reason: &str| Err(validation("env_file", reason.to_owned()));
+/// Presence-only env check: every named key must have a non-empty value;
+/// the error names the missing keys, never any value.
+fn require_env_keys(env_bytes: Option<&[u8]>, names: &[&str]) -> Result<(), VpsError> {
+    let refusal = |reason: String| Err(validation("env_file", reason));
     let Some(bytes) = env_bytes else {
-        return refusal("wireguard tunnel mode needs an env file carrying LLMPROXY_WG_PRIVATE_KEY");
+        return refusal(format!(
+            "an env file carrying {} is required",
+            names.join(", ")
+        ));
     };
-    let present = String::from_utf8_lossy(bytes).lines().any(|line| {
-        line.strip_prefix("LLMPROXY_WG_PRIVATE_KEY=")
-            .is_some_and(|v| !v.trim().is_empty())
-    });
-    if present {
+    let env = String::from_utf8_lossy(bytes).into_owned();
+    let missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| {
+            !env.lines().any(|line| {
+                line.strip_prefix(&format!("{name}="))
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+        .collect();
+    if missing.is_empty() {
         Ok(())
     } else {
-        refusal("env file must carry a non-empty LLMPROXY_WG_PRIVATE_KEY")
+        refusal(format!(
+            "env file must carry non-empty values for {}",
+            missing.join(", ")
+        ))
     }
 }
 
@@ -1191,7 +1280,7 @@ mod tests {
         let binary = dir.join("llmproxy");
         std::fs::write(&binary, b"musl-bytes").unwrap();
         let env_file = dir.join("secrets.env");
-        std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=fixture-token\n").unwrap();
+        std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=fixture-token\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\n").unwrap();
         DeployRequest {
             host: "root@203.0.113.10".to_owned(),
             point_instances: Vec::new(),
@@ -1431,10 +1520,10 @@ mod tests {
             ) => {
                 let text = String::from_utf8(bytes.clone()).unwrap();
                 assert!(
-                    text.contains("[egress]\nproxy = \"socks5://10.7.0.1:3128\""),
+                    text.contains("[egress]\nproxy = \"socks5h://10.7.0.1:3128\""),
                     "{text}"
                 );
-                assert!(content.contains("proxy = \"socks5://10.7.0.1:3128\""));
+                assert!(content.contains("proxy = \"socks5h://10.7.0.1:3128\""));
                 assert!(content.contains("api_key=[REDACTED]"), "{content}");
             }
             other => panic!("provider preview: {other:?}"),
@@ -1458,7 +1547,7 @@ mod tests {
             client_public_key: "clientpubkey=".to_owned(),
         });
         let env_file = dir.join("wg.env");
-        std::fs::write(&env_file, "LLMPROXY_WG_PRIVATE_KEY=wg-server-secret\n").unwrap();
+        std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=fixture-token\nLLMPROXY_CLIENT_KEY_ID=workstation\nLLMPROXY_CLIENT_KEY_SECRET=client-secret\nLLMPROXY_WG_PRIVATE_KEY=wg-server-secret\n").unwrap();
         request.env_file = Some(env_file);
         let remote = FixtureRemote::new("root@host");
         let plan = plan_deploy(&request, &remote).unwrap();
@@ -1505,6 +1594,17 @@ mod tests {
         assert!(err.to_string().contains("LLMPROXY_WG_PRIVATE_KEY"), "{err}");
 
         let mut ts = tls_request(&dir);
+        let ts_env = dir.join("ts.env");
+        std::fs::write(
+            &ts_env,
+            "LLMPROXY_ADMIN_TOKEN=x
+LLMPROXY_CLIENT_KEY_ID=workstation
+LLMPROXY_CLIENT_KEY_SECRET=client-secret
+LLMPROXY_BIND=100.64.0.2:8080
+",
+        )
+        .unwrap();
+        ts.env_file = Some(ts_env);
         ts.ingress = IngressMode::Tunnel(TunnelKind::Tailscale {
             tailnet_host: "proxy-tailnet".to_owned(),
         });

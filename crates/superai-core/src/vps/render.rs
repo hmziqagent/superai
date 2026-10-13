@@ -30,6 +30,18 @@ pub(crate) const REMOTE_NGINX_ENABLED_PATH: &str = "/etc/nginx/sites-enabled/llm
 pub(crate) const REMOTE_WG_CONF_PATH: &str = "/etc/wireguard/wg0.conf";
 /// Remote superai ownership manifest; lists paths this tool created.
 pub(crate) const REMOTE_MANIFEST_PATH: &str = "/etc/llmproxy/superai-manifest.json";
+/// Remote llmproxy server config (binds and auth, secret placeholders).
+pub(crate) const REMOTE_SERVER_CONF_PATH: &str = "/etc/llmproxy/llmproxy.toml";
+/// Main-listener bind for TLS mode: loopback behind nginx.
+pub(crate) const MAIN_BIND_LOOPBACK: &str = PROXY_UPSTREAM;
+/// Admin-listener bind for TLS and tailscale modes (PRX-03 loopback default).
+pub(crate) const ADMIN_BIND_LOOPBACK: &str = "127.0.0.1:8081";
+/// Main-listener bind for wireguard mode: the tunnel interface only.
+pub(crate) const WG_TUNNEL_MAIN_BIND: &str = "10.7.0.1:8080";
+/// Admin-listener bind for wireguard mode so /usage answers through the tunnel.
+pub(crate) const WG_TUNNEL_ADMIN_BIND: &str = "10.7.0.1:8081";
+/// The wg-quick service unit for the tunnel interface.
+pub(crate) const WG_QUICK_UNIT: &str = "wg-quick@wg0";
 
 /// Certificate directory certbot provisions for a TLS domain.
 pub(crate) fn cert_dir(domain: &str) -> String {
@@ -244,6 +256,20 @@ pub(crate) fn harness_base_url(mode: &str, address: &str) -> String {
         "tunnel-tailscale" => format!("http://{address}:{PROXY_PORT}"),
         other => format!("{other}:{address}"),
     }
+}
+
+/// The llmproxy server config: binds and auth, secret values as `${NAME}`
+/// placeholders the deploy interpolates on the VPS. Table and key spellings
+/// follow docs/plans/export/llmproxy-usage-ledger.md (PRX-01/PRX-03); the
+/// main `bind` key name is an assumption pending that contract's own fixes.
+/// Client keys are mandatory because both deploy modes expose the listener
+/// beyond loopback (nginx in TLS mode, the tunnel interface otherwise).
+pub(crate) fn render_server_conf(main_bind: &str, admin_bind: &str) -> String {
+    format!(
+        "[server]\nbind = \"{main_bind}\"\nadmin_bind = \"{admin_bind}\"\n\n\
+         [auth.admin]\ntoken = \"${{LLMPROXY_ADMIN_TOKEN}}\"\n\n\
+         [auth.clients]\n\"${{LLMPROXY_CLIENT_KEY_ID}}\" = \"${{LLMPROXY_CLIENT_KEY_SECRET}}\"\n"
+    )
 }
 
 /// Host-key policy line for plan echoes.
