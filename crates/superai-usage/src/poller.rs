@@ -898,8 +898,10 @@ pub fn parse_zed_billing(body: &str) -> Result<ProviderUsageSnapshot, PollError>
 }
 
 /// Poll `endpoint` (the documented
-/// `https://cloud.zed.dev/frontend/billing/usage`) with the `zed.session`
-/// cookie value; the cookie reaches the wire header and nothing else.
+/// `https://cloud.zed.dev/frontend/billing/usage`) with the full `Cookie`
+/// request-header value (`zed.session=...`, exactly what `zed.js` sends and
+/// what `CodexBar`'s manual cookie source stores); it reaches the wire
+/// header verbatim and nothing else.
 pub fn poll_zed(
     endpoint: &str,
     session_cookie: &PollSecret,
@@ -989,10 +991,8 @@ pub fn parse_warp_graphql(body: &str) -> Result<ProviderUsageSnapshot, PollError
     if granted > 0 || remaining > 0 {
         let percent = if granted > 0 {
             used_percent((granted - remaining) as f64, granted as f64)
-        } else if remaining > 0 {
-            0.0
         } else {
-            100.0
+            0.0
         };
         snapshot.secondary = lane(percent, None, None, Some("add-on credits".to_owned()));
     }
@@ -1187,11 +1187,11 @@ pub const MINIMAX_REMAINS_PATH: &str = "/v1/api/openplatform/coding_plan/remains
 
 /// Ported `MiniMax` host policy (`docs/minimax.md` "Security policy"): an
 /// endpoint override must be https (a bare host is https-qualified), carry
-/// no userinfo, and hold no literal or percent-encoded host delimiter. With
-/// `provider_owned_only` (`MINIMAX_REQUIRE_PROVIDER_ENDPOINT_OVERRIDES`) the
-/// host must also be MiniMax-owned. Returns the normalized `https://`
-/// origin. Percent signs are refused outright, which is stricter than
-/// `CodexBar`'s decoder and refuses every encoded-host trick by construction.
+/// no userinfo, and name a host in ASCII letters, digits, hyphens, and dots
+/// only, which refuses literal and percent-encoded delimiters and non-ASCII
+/// homographs outright. With `provider_owned_only`
+/// (`MINIMAX_REQUIRE_PROVIDER_ENDPOINT_OVERRIDES`) the host must also be a
+/// MiniMax-owned DNS name. Returns the normalized `https://` origin.
 pub fn validate_minimax_endpoint_override(
     raw: &str,
     provider_owned_only: bool,
@@ -1245,26 +1245,30 @@ pub fn validate_minimax_endpoint_override(
         return Err(refused("port must be digits only"));
     }
     let lowered = host_name.to_ascii_lowercase();
+    let bracketed = authority.starts_with('[');
+    // A DNS host is ASCII letters, digits, hyphens, and dots and nothing
+    // else. Refusing every other character closes literal delimiters, the
+    // percent-encoded ones, and non-ASCII homographs of MiniMax domains in
+    // one fail-closed rule; IPv6 literals only ever arrive bracketed.
     if lowered.is_empty()
-        || lowered.chars().any(|c| c.is_control() || c.is_whitespace())
-        || lowered.contains('%')
-        || lowered.contains('/')
-        || lowered.contains('\\')
-        || lowered.contains('?')
-        || lowered.contains('#')
-        || lowered.contains('@')
-        || (!authority.starts_with('[') && lowered.contains(':'))
+        || (!bracketed
+            && !lowered
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
     {
-        return Err(refused("host must not carry encoded or literal delimiters"));
+        return Err(refused(
+            "host must be ASCII letters, digits, hyphens, and dots",
+        ));
     }
     if provider_owned_only
-        && !MINIMAX_PROVIDER_DOMAINS
-            .iter()
-            .any(|domain| lowered == *domain || lowered.ends_with(&format!(".{domain}")))
+        && (bracketed
+            || !MINIMAX_PROVIDER_DOMAINS
+                .iter()
+                .any(|domain| lowered == *domain || lowered.ends_with(&format!(".{domain}"))))
     {
-        return Err(refused("strict mode accepts MiniMax-owned hosts only"));
+        return Err(refused("strict mode accepts MiniMax-owned DNS hosts only"));
     }
-    let authority = if authority.starts_with('[') {
+    let authority = if bracketed {
         format!("[{lowered}]{tail}")
     } else {
         format!("{lowered}{tail}")

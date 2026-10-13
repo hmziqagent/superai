@@ -16,7 +16,7 @@ use superai_usage::poller::{
     PollError, PollLimits, PollSecret, ProviderUsageSnapshot, clinepass_providers_path,
     clinepass_session, parse_clinepass_limits, parse_deepseek_balance, parse_factory_limits,
     parse_kilo_credits, parse_minimax_remains, parse_mistral_credits, parse_openrouter_responses,
-    parse_warp_graphql, parse_zed_billing, poll_clinepass, poll_warp,
+    parse_warp_graphql, parse_zed_billing, poll_clinepass, poll_warp, poll_zed,
     validate_minimax_endpoint_override,
 };
 use superai_usage::window::LaneReading;
@@ -424,6 +424,30 @@ mod tests {
     }
 
     #[test]
+    fn zed_poll_sends_the_cookie_header_value_verbatim() {
+        let served = serve_once(ok_json(&fixture("zed-billing.json")));
+        let cookie_header = format!("zed.session={SENTINEL}; other=1");
+        let snapshot = poll_zed(
+            &served.endpoint,
+            &PollSecret::new(&cookie_header),
+            &limits(),
+        )
+        .unwrap_or_else(|e| panic!("poll failed: {e}"));
+        assert_eq!(snapshot.provider, "zed");
+        let request = served
+            .request
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server saw no request");
+        assert!(
+            request.contains(&format!("cookie: {cookie_header}")),
+            "the full Cookie header value must reach the wire verbatim: {request}"
+        );
+        let rendered = serde_json::to_string(&snapshot)
+            .unwrap_or_else(|e| panic!("snapshot not serializable: {e}"));
+        assert!(!rendered.contains(SENTINEL));
+    }
+
+    #[test]
     fn rejected_credentials_and_server_failures_are_typed_errors() {
         let served = serve_once(http_response("401 Unauthorized", &[], "{}"));
         let error = poll_clinepass(&served.endpoint, &PollSecret::new(SENTINEL), &limits())
@@ -586,6 +610,32 @@ mod tests {
         assert!(validate_minimax_endpoint_override("www.minimax.io", true).is_ok());
         assert!(validate_minimax_endpoint_override("https://api.minimaxi.com", true).is_ok());
         assert!(validate_minimax_endpoint_override("https://proxy.example.com", true).is_err());
+        // A real punycode subdomain stays MiniMax-owned; a confusable or
+        // delimiter-laden host spelling must never pass the ownership check.
+        assert!(
+            validate_minimax_endpoint_override("xn--vil-gna.minimax.io", true).is_ok(),
+            "punycode subdomains of a MiniMax domain are MiniMax-owned"
+        );
+        for raw in [
+            "evil].minimax.io",
+            "еvil.minimax.io",
+            "https://еvil.minimaxi.com",
+            "[::1]",
+        ] {
+            let error = validate_minimax_endpoint_override(raw, true)
+                .err()
+                .unwrap_or_else(|| panic!("{raw} passed strict mode"));
+            assert!(format!("{error}").contains("refused"), "{raw}: {error}");
+        }
+        // The same charset rule holds outside strict mode: no delimiters,
+        // no non-ASCII, while ordinary proxy hosts stay accepted.
+        for raw in ["evil].example.com", "еvil.example.com", "under_score.io"] {
+            assert!(
+                validate_minimax_endpoint_override(raw, false).is_err(),
+                "{raw} accepted"
+            );
+        }
+        assert!(validate_minimax_endpoint_override("my-proxy.example.com", false).is_ok());
     }
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
