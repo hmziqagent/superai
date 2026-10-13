@@ -133,10 +133,10 @@ mod tests {
         assert_eq!(
             event_summary(&outcome),
             vec![
-                ("openai", "gpt-5-mini", 8, 4, 2, 0),
-                ("openai", "gpt-5.1", 100, 50, 40, 0),
+                ("openai", "gpt-5-mini", 6, 4, 2, 0),
+                ("openai", "gpt-5.1", 60, 50, 40, 0),
                 ("openai", "gpt-5.1", 50, 20, 0, 0),
-                ("openai", "gpt-5.1", 10, 5, 5, 0),
+                ("openai", "gpt-5.1", 5, 5, 5, 0),
             ]
         );
         assert_eq!(outcome.events[1].timestamp, ts("2026-10-13T08:00:10Z"));
@@ -159,7 +159,7 @@ mod tests {
                 &outcome.into_recorded_usage(),
             )
             .unwrap_or_else(|e| panic!("total: {e:?}"));
-        let expected = Usd::parse("0.000965675").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
+        let expected = Usd::parse("0.000908925").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
         assert_eq!(report.total.spend, Spend::Exact(expected));
     }
 
@@ -174,19 +174,20 @@ mod tests {
     #[test]
     fn pi_sessions_estimate_costs_from_recorded_usage_only() {
         let outcome = scan_pi_sessions(&default_pi_roots());
-        assert_eq!(outcome.counts.parsed, 11);
+        assert_eq!(outcome.counts.parsed, 14);
         assert_eq!(outcome.counts.skipped, 3);
         assert_eq!(outcome.unreadable_artifacts, 0);
         assert_eq!(
             event_summary(&outcome),
             vec![
                 ("openai", "gpt-5-mini", 14, 6, 3, 0),
+                ("anthropic", "claude-opus-4-5", 3, 5, 1, 0),
                 ("anthropic", "claude-sonnet-4-5", 20, 40, 5, 2),
                 ("anthropic", "claude-sonnet-4-5", 10, 6, 4, 1),
             ]
         );
         assert_eq!(
-            outcome.events[2].timestamp,
+            outcome.events[3].timestamp,
             Timestamp::from_second(1_760_000_000)
                 .unwrap_or_else(|e| panic!("epoch seconds: {e:?}"))
         );
@@ -473,6 +474,21 @@ mod tests {
         for seed in [5u64, 61, 777, 0xcafe] {
             assert_property_holds("pi-prop", seed, pi_generated_line, scan_pi_sessions);
         }
+    }
+
+    #[test]
+    fn line_caps_differ_per_surface() {
+        let pad = "a".repeat(600 * 1024);
+        let big_line = json!({"type": "session", "id": "big", "pad": pad}).to_string();
+        let dir = write_corpus("caps", &[big_line.into_bytes()])
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let claude = scan_claude_transcripts(std::slice::from_ref(&dir));
+        assert_eq!(claude.counts.skipped, 1, "claude caps at 512 KiB");
+        let pi = scan_pi_sessions(std::slice::from_ref(&dir));
+        assert_eq!(pi.counts.skipped, 0, "pi accepts records up to 16 MiB");
+        assert_eq!(pi.counts.parsed, 1);
     }
 
     #[test]

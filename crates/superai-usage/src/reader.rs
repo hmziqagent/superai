@@ -51,9 +51,14 @@ impl ScanOutcome {
     }
 }
 
-/// Longest accepted record, matching `CodexBar`'s `maxLineBytes`; longer
-/// records are skipped whole so a hostile file cannot exhaust memory.
-const MAX_LINE_BYTES: usize = 512 * 1024;
+/// Record caps, one per surface, each matching its `CodexBar` scanner
+/// (claude 512 KiB, codex 256 KiB, pi 16 MiB); a longer record is skipped
+/// whole so a hostile file cannot exhaust memory.
+pub(crate) const CLAUDE_LINE_CAP: usize = 512 * 1024;
+/// Codex rollout records cap at 256 KiB (`CostUsageScanner.swift:4923`).
+pub(crate) const CODEX_LINE_CAP: usize = 256 * 1024;
+/// Pi session records cap at 16 MiB (`PiSessionCostScanner.swift:106`).
+pub(crate) const PI_LINE_CAP: usize = 16 * 1024 * 1024;
 
 enum RawLine {
     Complete(Vec<u8>),
@@ -66,11 +71,8 @@ struct CappedLines<R> {
 }
 
 impl<R: BufRead> CappedLines<R> {
-    fn new(reader: R) -> Self {
-        Self {
-            reader,
-            cap: MAX_LINE_BYTES,
-        }
+    fn new(reader: R, cap: usize) -> Self {
+        Self { reader, cap }
     }
 }
 
@@ -213,13 +215,14 @@ fn classify_entry(entry: &std::fs::DirEntry, files: &mut BTreeSet<PathBuf>) -> O
 fn for_each_line(
     path: &Path,
     outcome: &mut ScanOutcome,
+    cap: usize,
     mut on_line: impl FnMut(&[u8], &mut ScanCounts),
 ) {
     let Ok(file) = File::open(path) else {
         outcome.unreadable_artifacts += 1;
         return;
     };
-    for item in CappedLines::new(BufReader::new(file)) {
+    for item in CappedLines::new(BufReader::new(file), cap) {
         match item {
             Ok(RawLine::Oversized) => outcome.counts.skipped += 1,
             Ok(RawLine::Complete(mut bytes)) => {
@@ -258,7 +261,9 @@ mod tests {
 
     fn scan(path: &Path) -> (ScanCounts, u32) {
         let mut outcome = ScanOutcome::default();
-        for_each_line(path, &mut outcome, |_, counts| counts.parsed += 1);
+        for_each_line(path, &mut outcome, CLAUDE_LINE_CAP, |_, counts| {
+            counts.parsed += 1;
+        });
         (outcome.counts, outcome.unreadable_artifacts)
     }
 
@@ -280,7 +285,7 @@ mod tests {
 
     #[test]
     fn a_record_past_the_cap_is_skipped_and_does_not_exhaust_memory() {
-        let huge = format!("x{}", "a".repeat(MAX_LINE_BYTES + 1));
+        let huge = format!("x{}", "a".repeat(CLAUDE_LINE_CAP + 1));
         let path = write_temp("cap", &[huge, "after".to_owned()]);
         let (counts, _) = scan(&path);
         assert_eq!(counts.skipped, 1);

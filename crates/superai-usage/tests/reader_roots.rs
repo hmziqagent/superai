@@ -158,10 +158,38 @@ mod tests {
     }
 
     #[test]
-    fn pi_default_selectors_cover_the_agent_stores_and_existing_xdg_root() {
+    fn pi_default_selectors_cover_agent_stores_xdg_and_on_disk_profiles() {
         let home = fixtures().join("pi/home");
         let xdg = fixtures().join("pi/xdg");
         let selectors = PiSelectors {
+            xdg_data_home: Some(&xdg),
+            ..PiSelectors::default()
+        };
+        let resolved = pi_session_roots(&selectors, &home);
+        assert_eq!(resolved.refusal, None);
+        assert_eq!(
+            resolved.roots,
+            vec![
+                canonical(&home.join(".pi").join("agent").join("sessions")),
+                canonical(&home.join(".omp").join("agent").join("sessions")),
+                canonical(&xdg.join("omp").join("sessions")),
+                canonical(
+                    &home
+                        .join(".omp")
+                        .join("profiles")
+                        .join("work")
+                        .join("sessions")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pi_explicit_default_profile_still_limits_discovery_to_the_agent_stores() {
+        let home = fixtures().join("pi/home");
+        let xdg = fixtures().join("pi/xdg");
+        let selectors = PiSelectors {
+            omp_profile: Some("default"),
             xdg_data_home: Some(&xdg),
             ..PiSelectors::default()
         };
@@ -223,6 +251,26 @@ mod tests {
                     .join("sessions"),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_config_dir_through_an_escaping_symlink_is_refused() {
+        let home = temp_dir("pi-config-symlink");
+        let outside = temp_dir("pi-config-outside");
+        fs::create_dir_all(home.join("mountpoint")).unwrap_or_else(|e| panic!("mountpoint: {e}"));
+        std::os::unix::fs::symlink(&outside, home.join("escape"))
+            .unwrap_or_else(|e| panic!("symlink: {e}"));
+        let selectors = PiSelectors {
+            config_dir: Some("escape"),
+            ..PiSelectors::default()
+        };
+        let resolved = pi_session_roots(&selectors, &home);
+        assert_eq!(
+            resolved.refusal,
+            Some("PI_CONFIG_DIR must be a relative path inside HOME")
+        );
+        assert!(resolved.roots.is_empty());
     }
 
     #[test]

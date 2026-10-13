@@ -8,7 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use jiff::Timestamp;
 use serde_json::Value;
 
-use super::{ScanOutcome, for_each_line, jsonl_files};
+use super::{
+    CLAUDE_LINE_CAP, CODEX_LINE_CAP, PI_LINE_CAP, ScanOutcome, for_each_line, jsonl_files,
+};
 use crate::cost::UsageEvent;
 
 const ANTHROPIC: &str = "anthropic";
@@ -118,7 +120,8 @@ pub struct PiSessionRoots {
 
 /// pi/omp session roots (`CodexBar`'s `PiFamilySessionScanner`): an explicit
 /// session dir wins outright; otherwise the pi agent root joins the OMP
-/// agent/profile stores, and a named profile limits OMP discovery to it.
+/// agent store, every on-disk profile when no profile selector is set, or
+/// just the named profile when one is.
 pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRoots {
     if let Some(dir) = trimmed(selectors.session_dir) {
         return PiSessionRoots {
@@ -140,7 +143,8 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
         Some(dir) => roots.push(Path::new(dir).join("sessions")),
         None => roots.push(home.join(".pi").join("agent").join("sessions")),
     }
-    match normalize_profile(selectors.omp_profile.or(selectors.pi_profile)) {
+    let profile_selector = selectors.omp_profile.or(selectors.pi_profile);
+    match normalize_profile(profile_selector) {
         ProfileValue::Invalid => return refused(PROFILE_REFUSAL),
         ProfileValue::Default => {
             if agent_dir.is_none() {
@@ -148,6 +152,12 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
                 let xdg_sessions = xdg_base.join("omp").join("sessions");
                 if xdg_sessions.is_dir() {
                     roots.push(xdg_sessions);
+                }
+            }
+            if profile_selector.is_none() {
+                discover_profile_roots(&config.join("profiles"), &mut roots);
+                if agent_dir.is_none() {
+                    discover_profile_roots(&xdg_base.join("omp").join("profiles"), &mut roots);
                 }
             }
         }
@@ -169,8 +179,11 @@ pub fn scan_claude_transcripts(roots: &[PathBuf]) -> ScanOutcome {
     let mut keyed: BTreeMap<ClaudeKey, UsageEvent> = BTreeMap::new();
     let mut unkeyed = Vec::new();
     for path in jsonl_files(roots, &mut outcome.unreadable_artifacts) {
-        for_each_line(&path, &mut outcome, |bytes, counts| {
-            match claude_line(bytes) {
+        for_each_line(
+            &path,
+            &mut outcome,
+            CLAUDE_LINE_CAP,
+            |bytes, counts| match claude_line(bytes) {
                 LineOutcome::Parsed => counts.parsed += 1,
                 LineOutcome::Skipped => counts.skipped += 1,
                 LineOutcome::Row(row) => {
@@ -181,8 +194,8 @@ pub fn scan_claude_transcripts(roots: &[PathBuf]) -> ScanOutcome {
                     counts.skipped += 1;
                     keep_claude_row(&mut keyed, &mut unkeyed, row);
                 }
-            }
-        });
+            },
+        );
     }
     outcome.events = keyed.into_values().chain(unkeyed).collect();
     outcome
@@ -191,21 +204,26 @@ pub fn scan_claude_transcripts(roots: &[PathBuf]) -> ScanOutcome {
 /// Scan codex-cli rollout JSONL under the resolved session roots. Usage is
 /// the per-file delta of each record's cumulative `total_token_usage`
 /// (falling back to `last_token_usage`), so repeated records count once.
+/// Codex records cached reads as a subset of `input_tokens`; events split
+/// them so the input rate covers only the uncached remainder.
 pub fn scan_codex_rollouts(roots: &[PathBuf]) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     let mut events = Vec::new();
     for path in jsonl_files(roots, &mut outcome.unreadable_artifacts) {
         let mut file = CodexFile::default();
-        for_each_line(&path, &mut outcome, |bytes, counts| {
-            match codex_line(bytes, &mut file) {
+        for_each_line(
+            &path,
+            &mut outcome,
+            CODEX_LINE_CAP,
+            |bytes, counts| match codex_line(bytes, &mut file) {
                 LineOutcome::Parsed => counts.parsed += 1,
                 LineOutcome::Skipped => counts.skipped += 1,
                 LineOutcome::Row(event) | LineOutcome::RowWithGap(event) => {
                     counts.parsed += 1;
                     events.push(event);
                 }
-            }
-        });
+            },
+        );
     }
     outcome.events = events;
     outcome
@@ -220,19 +238,60 @@ pub fn scan_pi_sessions(roots: &[PathBuf]) -> ScanOutcome {
     let mut seen_entries: BTreeSet<(String, String)> = BTreeSet::new();
     for path in jsonl_files(roots, &mut outcome.unreadable_artifacts) {
         let mut file = PiFile::default();
-        for_each_line(&path, &mut outcome, |bytes, counts| {
-            match pi_line(bytes, &mut file) {
+        for_each_line(
+            &path,
+            &mut outcome,
+            PI_LINE_CAP,
+            |bytes, counts| match pi_line(bytes, &mut file) {
                 LineOutcome::Parsed => counts.parsed += 1,
                 LineOutcome::Skipped => counts.skipped += 1,
                 LineOutcome::Row(row) | LineOutcome::RowWithGap(row) => {
                     counts.parsed += 1;
                     keep_pi_row(row, &mut seen_entries, &mut events);
                 }
-            }
-        });
+            },
+        );
     }
     outcome.events = events;
     outcome
+}
+
+/// On-disk profile discovery, capped at `CodexBar`'s 64 profiles per scan;
+/// symlinked profile entries are skipped like every other symlink.
+fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(profiles_dir) else {
+        return;
+    };
+    let mut profiles = Vec::new();
+    for entry in entries.flatten() {
+        if profiles.len() == 64 {
+            break;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            profiles.push(entry.path());
+        }
+    }
+    profiles.sort();
+    for profile in profiles {
+        for layout in [
+            profile.join("sessions"),
+            profile.join("agent").join("sessions"),
+        ] {
+            if layout.is_dir() {
+                roots.push(layout);
+            }
+        }
+    }
 }
 
 fn push_named_profile_roots(roots: &mut Vec<PathBuf>, config: &Path, xdg_base: &Path, name: &str) {
@@ -328,7 +387,15 @@ fn omp_config_root(config_dir: Option<&str>, home: &Path) -> Option<PathBuf> {
         None => ".omp",
     };
     let root = home.join(name);
-    lexically_within(&root, home).then_some(root)
+    match root.canonicalize() {
+        // Symlinks resolve before the containment check, so a config dir
+        // pointing outside HOME fails closed the way the contract does.
+        Ok(resolved) => {
+            let home = home.canonicalize().ok()?;
+            resolved.starts_with(&home).then_some(resolved)
+        }
+        Err(_) => lexically_within(&root, home).then_some(root),
+    }
 }
 
 fn lexically_within(child: &Path, root: &Path) -> bool {
@@ -708,7 +775,7 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
                 timestamp,
                 provider: OPENAI.to_owned(),
                 model: model.to_owned(),
-                input_tokens: tokens.input,
+                input_tokens: tokens.input.saturating_sub(tokens.cache_read),
                 output_tokens: tokens.output,
                 cache_read_tokens: Some(tokens.cache_read),
                 cache_write_tokens: None,
@@ -857,8 +924,8 @@ fn pi_assistant(line: &Value, message: &Value, file: &PiFile) -> LineOutcome<PiR
         Chain::Value(n) if n > cache_write => return LineOutcome::Skipped,
         Chain::Value(_) | Chain::Absent => {}
     }
-    // The codex backend's cache writes have no separate tariff here, so
-    // they fold into input at the input rate, as CodexBar's codex path does.
+    // No openai cache-write tariff exists here, so codex-backend writes fold
+    // into input at the input rate; CodexBar's own 1.25x write tariff runs higher.
     let (input_tokens, cache_write_tokens) = if provider == OPENAI {
         (input.saturating_add(cache_write), None)
     } else {
