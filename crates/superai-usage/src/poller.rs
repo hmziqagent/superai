@@ -516,10 +516,6 @@ fn join_endpoint(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
 }
 
-// -----
-// ClinePass: API-key mode plus the read-only session-file mode
-// -----
-
 /// Window lengths `ClinePass` reports, keyed by its `type` field
 /// (`clinepass.ts` maps `five_hour`/`weekly`/`monthly` onto the three lanes).
 const CLINEPASS_WINDOW_MINUTES: [(&str, u32); 3] = [
@@ -599,18 +595,18 @@ pub fn clinepass_session(
     path: &Path,
     max_bytes: usize,
 ) -> Result<Option<ClinePassSession>, PollError> {
-    // Open first, then stat the handle: a path swapped to a FIFO between a
-    // stat and an open could otherwise block the read forever.
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_source) => return Ok(None),
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(None);
     };
-    let is_regular = file.metadata().is_ok_and(|meta| meta.is_file());
-    if !is_regular {
+    // Stat before open, never the reverse: opening a FIFO blocks before any
+    // read exists to bound, so non-regular paths are refused first (the
+    // registry loader guards the same hazard for *.json data files).
+    if !meta.is_file() {
         return Err(PollError::Invalid {
             reason: format!("{} is not a regular file", path.display()),
         });
     }
+    let file = File::open(path).map_err(|_source| PollError::Transport { class: "io" })?;
     let mut text = String::new();
     let mut capped = file.take((max_bytes + 1) as u64);
     capped
@@ -703,10 +699,6 @@ pub fn poll_clinepass(
     parse_clinepass_limits(&body)
 }
 
-// -----
-// DeepSeek: API-key balance endpoint (cost-only; no quota windows exist)
-// -----
-
 /// Parse the `/user/balance` response: per-currency `balance_infos`; USD is
 /// preferred when present, otherwise the first entry wins.
 pub fn parse_deepseek_balance(body: &str) -> Result<ProviderUsageSnapshot, PollError> {
@@ -756,10 +748,6 @@ pub fn poll_deepseek(
     let body = dispatch(&PollRequest::get(endpoint, bearer(secret)?), limits)?;
     parse_deepseek_balance(&body)
 }
-
-// -----
-// OpenRouter: current-key window plus account credits
-// -----
 
 /// Parse the `/api/v1/key` and (optional) `/api/v1/credits` responses. A
 /// capped key fills the primary lane from `limit`/`limit_remaining`; an
@@ -847,11 +835,6 @@ pub fn poll_openrouter(
     parse_openrouter_responses(&key_body, credits_body.as_deref())
 }
 
-// -----
-// Zed cloud: browser-billing usage endpoint (the caller supplies the
-// session cookie value; superai never reads browser storage itself)
-// -----
-
 /// Parse the `/frontend/billing/usage` response:
 /// `current_usage.edit_predictions` fills the primary lane (`limit` null or
 /// `"unlimited"` means unlimited), `token_spend` fills the cost lane from
@@ -930,10 +913,6 @@ pub fn poll_zed(
     let body = dispatch(&PollRequest::get(endpoint, headers), limits)?;
     parse_zed_billing(&body)
 }
-
-// -----
-// Warp: GraphQL GetRequestLimitInfo
-// -----
 
 /// Warp's documented query, ported verbatim from `WarpUsageFetcher.swift`.
 const WARP_GRAPHQL_QUERY: &str = "query GetRequestLimitInfo($requestContext: RequestContext!) { user(requestContext: $requestContext) { __typename ... on UserOutput { user { requestLimitInfo { isUnlimited nextRefreshTime requestLimit requestsUsedSinceLastRefresh } bonusGrants { requestCreditsGranted requestCreditsRemaining expiration } workspaces { bonusGrantsInfo { grants { requestCreditsGranted requestCreditsRemaining expiration } } } } } } }";
@@ -1054,10 +1033,6 @@ pub fn poll_warp(
     parse_warp_graphql(&body)
 }
 
-// -----
-// Factory: token-rate-limits billing endpoint
-// -----
-
 fn factory_lane(window: Option<&Value>, minutes: Option<u32>) -> Result<LaneReading, PollError> {
     let Some(window) = window else {
         return Ok(LaneReading::Unavailable);
@@ -1140,10 +1115,6 @@ pub fn poll_factory(
     parse_factory_limits(&body)
 }
 
-// -----
-// Kilo: tRPC credit blocks (api mode)
-// -----
-
 /// Parse the tRPC batch response for `user.getCreditBlocks`: credit blocks
 /// are micro-USD (`amount_mUsd` granted, `balance_mUsd` remaining), summed
 /// into one credits window.
@@ -1205,10 +1176,6 @@ pub fn poll_kilo(
     let body = dispatch(&PollRequest::get(&endpoint, bearer(secret)?), limits)?;
     parse_kilo_credits(&body)
 }
-
-// -----
-// MiniMax: coding-plan remains endpoint with the strict host-override policy
-// -----
 
 /// MiniMax-owned domains the strict host policy accepts.
 pub const MINIMAX_PROVIDER_DOMAINS: [&str; 2] = ["minimax.io", "minimaxi.com"];
@@ -1396,11 +1363,6 @@ pub fn poll_minimax(
     let body = dispatch(&PollRequest::get(&endpoint, headers), limits)?;
     parse_minimax_remains(&body)
 }
-
-// -----
-// Mistral: admin credits endpoint (the caller supplies the admin session
-// cookie; superai never reads browser storage itself)
-// -----
 
 /// Parse the `/api/billing/credits` response: available credits are
 /// `wallet_amount + credit_notes_amount - ongoing_usage_balance`, currency
