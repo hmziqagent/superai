@@ -350,6 +350,8 @@ pub(crate) enum Fault {
     Exec(String),
     /// Fail the next `upload`.
     Upload,
+    /// Fail the next `upload` writing this exact path.
+    UploadTo(String),
     /// Fail the next `install_unit`.
     UnitInstall,
     /// Fail the next `daemon_reload`.
@@ -650,7 +652,10 @@ impl RemoteHost for FixtureRemote {
 
     fn upload(&self, path: &str, bytes: &[u8], mode: u32) -> Result<(), RemoteError> {
         ensure_remote_path(path)?;
-        if Self::pop_fault(&self.state, |fault| matches!(fault, Fault::Upload)) {
+        if Self::pop_fault(&self.state, |fault| {
+            matches!(fault, Fault::Upload)
+                || matches!(fault, Fault::UploadTo(target) if target == path)
+        }) {
             return Err(RemoteError::Unreachable {
                 reason: "injected fixture fault".to_owned(),
             });
@@ -1172,12 +1177,15 @@ mod tests {
     #[test]
     fn every_fault_variant_fires_once_on_its_verb() {
         let remote = FixtureRemote::new("root@host");
-        let probes: [(Fault, fn(&FixtureRemote) -> Result<(), RemoteError>); 3] = [
+        let probes: [(Fault, fn(&FixtureRemote) -> Result<(), RemoteError>); 4] = [
             (Fault::UnitInstall, |r| {
                 r.install_unit("x", "[Unit]").map(|_| ())
             }),
             (Fault::Reload, |r| r.daemon_reload()),
             (Fault::Start, |r| r.service_start("x")),
+            (Fault::UploadTo("/etc/x".to_owned()), |r| {
+                r.upload("/etc/x", b"b", 0o644)
+            }),
         ];
         for (fault, probe) in probes {
             remote.fail_next(fault.clone());

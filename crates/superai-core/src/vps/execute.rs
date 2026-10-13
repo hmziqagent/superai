@@ -292,11 +292,21 @@ fn commit_one(
             });
         }
         (DeployStep::StartService { name }, Payload::Bare) => {
+            // A service already running before this run was not put up by
+            // it; rollback must stop only what the run itself started, or
+            // a failed redeploy takes a healthy deployment down.
+            let was_active = remote.service_is_active(name).map_err(fail)?;
             remote.service_start(name).map_err(fail)?;
-            run.started.push(name.clone());
+            if !was_active {
+                run.started.push(name.clone());
+            }
             run.entries.push(JournalEntry {
                 step: planned.step.clone(),
-                detail: format!("{name} started"),
+                detail: if was_active {
+                    format!("{name} already active; start reconfirmed it")
+                } else {
+                    format!("{name} started")
+                },
             });
         }
         (DeployStep::RestartService { name }, Payload::Bare) => {
@@ -613,6 +623,57 @@ mod tests {
             "partial progress is journaled"
         );
         abuse::assert_no_sentinel_in_debug(&journal, "rollback journal");
+    }
+
+    #[test]
+    fn a_failed_redeploy_leaves_a_pre_existing_service_running() {
+        let dir = temp_dir("redeploy-rollback");
+        let remote = FixtureRemote::new("root@host");
+        let first = plan_deploy(&tls_request(&dir, &sentinel_env()), &remote).unwrap();
+        execute_deploy(&first, &remote).unwrap();
+        assert!(remote.service_active(SERVICE_NAME));
+
+        let mut second_request = tls_request(&dir, &sentinel_env());
+        let v2 = dir.join("llmproxy-v2");
+        std::fs::write(&v2, b"musl-bytes-v2").unwrap();
+        second_request.binary_path = v2;
+        let second = plan_deploy(&second_request, &remote).unwrap();
+        // The manifest upload is the one step after the service start, so
+        // failing exactly it puts the failure after StartService committed
+        // onto a service the first deploy left running.
+        remote.fail_next(Fault::UploadTo(REMOTE_MANIFEST_PATH.to_owned()));
+        let journal = execute_deploy(&second, &remote).unwrap();
+        let rollback = journal.rolled_back.as_ref().unwrap();
+        assert!(
+            rollback.reason.contains("injected fixture fault"),
+            "{}",
+            rollback.reason
+        );
+        assert!(
+            remote.service_active(SERVICE_NAME),
+            "a service that was healthy before the run must survive its rollback"
+        );
+        assert_eq!(
+            remote.file(REMOTE_BIN_PATH),
+            Some(b"musl-bytes".to_vec()),
+            "files still roll back to the pre-deploy state"
+        );
+        assert!(
+            rollback.notes.iter().all(|note| !note.contains("stopped")),
+            "no service may be stopped by this rollback: {:?}",
+            rollback.notes
+        );
+        let start_detail = journal.entries.iter().find_map(|entry| match &entry.step {
+            DeployStep::StartService { name } if name == SERVICE_NAME => {
+                Some(entry.detail.as_str())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            start_detail,
+            Some("llmproxy already active; start reconfirmed it"),
+            "the start step must record the pre-existing state"
+        );
     }
 
     #[test]
