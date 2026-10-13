@@ -1,15 +1,9 @@
 //! Usage-layer error taxonomy.
 
-/// Errors for the registry and poller modules; cost and pricing carry
-/// their own `CostError` in [`crate::cost`].
+/// Errors for the poller module; registry and cost carry their own
+/// `RegistryError` and `CostError`.
 #[derive(Debug, thiserror::Error)]
 pub enum UsageError {
-    /// Two registry entries claimed the same provider id.
-    #[error("duplicate usage provider entry `{id}`")]
-    DuplicateProvider {
-        /// Provider id that collided.
-        id: String,
-    },
     /// Poller bounds the PRV-07 discipline forbids.
     #[error("invalid poller limits: {reason}")]
     InvalidPollLimits {
