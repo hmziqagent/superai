@@ -27,6 +27,40 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    // Subplan 14's overlap table; the bundled seed must carry every one,
+    // while additions to the data file stay data-only.
+    const OVERLAP_TABLE_PROVIDERS: &[&str] = &[
+        "amp",
+        "antigravity",
+        "claude",
+        "cline-pass",
+        "codex",
+        "command-code",
+        "copilot",
+        "cursor",
+        "deepseek",
+        "devin",
+        "factory",
+        "gemini",
+        "grok",
+        "kilo",
+        "kimi",
+        "kiro",
+        "mimo",
+        "minimax",
+        "mistral",
+        "muse",
+        "opencode",
+        "opencode-go",
+        "pi",
+        "qoder",
+        "qwen-cloud",
+        "warp",
+        "windsurf",
+        "workbuddy",
+        "zed",
+    ];
+
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -105,42 +139,13 @@ mod tests {
     fn bundled_covers_the_overlap_table_providers() {
         let registry =
             UsageRegistry::bundled().unwrap_or_else(|e| panic!("bundled seed invalid: {e:?}"));
-        let mut ids: Vec<&str> = registry.entries().map(|e| e.id.as_str()).collect();
-        ids.sort_unstable();
-        assert_eq!(
-            ids,
-            [
-                "amp",
-                "antigravity",
-                "claude",
-                "cline-pass",
-                "codex",
-                "command-code",
-                "copilot",
-                "cursor",
-                "deepseek",
-                "devin",
-                "factory",
-                "gemini",
-                "grok",
-                "kilo",
-                "kimi",
-                "kiro",
-                "mimo",
-                "minimax",
-                "mistral",
-                "muse",
-                "opencode",
-                "opencode-go",
-                "pi",
-                "qoder",
-                "qwen-cloud",
-                "warp",
-                "windsurf",
-                "workbuddy",
-                "zed",
-            ]
-        );
+        let ids: Vec<&str> = registry.entries().map(|e| e.id.as_str()).collect();
+        for expected in OVERLAP_TABLE_PROVIDERS {
+            assert!(
+                ids.contains(expected),
+                "overlap-table provider `{expected}` missing from the bundled seed: {ids:?}"
+            );
+        }
     }
 
     #[test]
@@ -181,11 +186,8 @@ mod tests {
         let bundled =
             UsageRegistry::bundled().unwrap_or_else(|e| panic!("bundled seed invalid: {e:?}"));
         assert_eq!(
-            from_data
-                .entries()
-                .map(|e| e.id.as_str())
-                .collect::<Vec<_>>(),
-            bundled.entries().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            from_data.entries().collect::<Vec<_>>(),
+            bundled.entries().collect::<Vec<_>>(),
             "bundled() must be exactly what the checked-in data file loads through load_dir"
         );
     }
@@ -281,6 +283,47 @@ mod tests {
         let registry =
             UsageRegistry::load_dir(&dir).unwrap_or_else(|e| panic!("array file rejected: {e:?}"));
         assert_eq!(registry.len(), 2);
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) -> bool {
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn load_dir_opens_regular_data_files_only() {
+        let dir = temp_dir("non-regular");
+        let entry = r#"{
+  "id": "regular-file-provider",
+  "label": "Regular File",
+  "window_strategy": "cost_only",
+  "pricing": "unverified"
+}"#;
+        fs::write(dir.join("regular.json"), entry)
+            .unwrap_or_else(|e| panic!("write regular provider: {e}"));
+        fs::create_dir_all(dir.join("nested.json"))
+            .unwrap_or_else(|e| panic!("create dir named *.json: {e}"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("regular.json", dir.join("alias.json"))
+                .unwrap_or_else(|e| panic!("symlink a data file: {e}"));
+            assert!(
+                make_fifo(&dir.join("evil.json")),
+                "mkfifo(1) must exist to run this test"
+            );
+        }
+        let registry = UsageRegistry::load_dir(&dir)
+            .unwrap_or_else(|e| panic!("non-regular entries broke the load: {e:?}"));
+        assert_eq!(registry.len(), 1);
+        assert!(
+            registry
+                .entries()
+                .all(|row| row.id.as_str() == "regular-file-provider")
+        );
         drop(fs::remove_dir_all(&dir));
     }
 }

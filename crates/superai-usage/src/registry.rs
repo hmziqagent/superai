@@ -275,13 +275,24 @@ impl UsageRegistry {
         })?;
         let mut paths: Vec<std::path::PathBuf> = Vec::new();
         for item in listing {
-            let path = item
-                .map_err(|source| RegistryError::Read {
-                    path: dir.display().to_string(),
-                    source,
-                })?
-                .path();
-            if path.extension().is_some_and(|ext| ext == "json") {
+            let entry = item.map_err(|source| RegistryError::Read {
+                path: dir.display().to_string(),
+                source,
+            })?;
+            // Regular data files only: opening a FIFO or device node named
+            // *.json blocks forever, and a followed symlink is not trusted
+            // (same discipline as the reader scan in `crate::reader`).
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
                 paths.push(path);
             }
         }
