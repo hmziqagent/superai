@@ -7,12 +7,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    // Lib deps that ride along as externs of this target without being
-    // referenced directly.
     use jiff::Timestamp;
     use rusqlite::{Connection, params};
+
+    // Lib deps that ride along as externs of this target without being
+    // referenced directly.
     use serde as _;
-    use serde_json as _;
     use superai_core as _;
     use thiserror as _;
 
