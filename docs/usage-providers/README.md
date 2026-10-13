@@ -40,14 +40,17 @@ starting index, not the source of record. All files verified 2026-10-13.
 
 ## Rules every source here follows
 
-Every poller runs one explicit, bounded, redacted request per invocation and
-returns; nothing schedules or retries itself (the PRV-07 probe discipline from
-subplan 07). Transport rules shared by all pollers and the llmproxy client:
-https everywhere except plain http on an exact loopback host, redirects
-refused, whole-request timeout within 1..=30 s, response body capped at 1 MiB
-by Content-Length precheck and capped read, control characters rejected in
-headers before any send. Errors carry static reasons and redacted URLs, never
-credential bytes or response bodies.
+Every poller runs explicit, bounded, redacted requests per invocation and
+returns; nothing schedules or retries itself (the PRV-07 probe discipline
+from subplan 07). OpenRouter is the one two-request poller (`/key` plus
+`/credits`). Shared transport rules: https everywhere except plain http on an
+exact loopback host, whole-request timeout within 1..=30 s, response body
+capped at 1 MiB by Content-Length precheck and capped read, control
+characters rejected in headers before any send. Pollers refuse redirects
+outright. The llmproxy client is the one exception: it follows redirects
+manually, re-validating every hop and requiring the ledger's own origin, and
+the admin bearer token is re-sent to each validated hop. Errors carry static
+reasons and redacted URLs, never credential bytes or response bodies.
 
 Local readers never write, open only regular files (symlinks, FIFOs, and
 device nodes are skipped), and cap each JSONL record (claude 512 KiB, codex

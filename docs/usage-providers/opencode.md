@@ -55,9 +55,9 @@ nothing in this repo polls it.
 
 `provider-only` fill: the database carries no quota denominator. `resets_at`
 is computed only for the month window (first instant of the next month, system
-zone); session and week report null. Failure modes split deliberately: a
-missing or locked database renders an empty row plus a note (exit 0), while a
-scan that fails after opening exits 1.
+zone); session and week report null. Failures degrade, never fail the report:
+a missing, locked, or corrupt database renders an empty row plus a note and
+the command still exits 0, so the other families keep flowing.
 
 ## Pricing
 

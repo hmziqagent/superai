@@ -24,8 +24,9 @@ Shapes (`parse_openrouter_responses`):
   (`limit > 0`) the primary lane fills from `limit - clamp(limit_remaining,
   0, limit)`, or from the window counter matching `limit_reset`
   (`usage_daily`/`usage_weekly`/`usage_monthly`) when `limit_remaining` is
-  absent. With no cap, the cost lane fills from `usage_monthly` (period "api
-  key this month") or `usage` ("api key total").
+  absent; an unrecognized `limit_reset` falls back to total `usage`, and
+  failing that to 0. With no cap, the cost lane fills from `usage_monthly`
+  (period "api key this month") or `usage` ("api key total").
 - `/credits` body: `{data: {total_credits, total_usage}}`; balance lane
   available = `total_credits - total_usage`, floored at 0, USD.
 

@@ -45,8 +45,12 @@ Recorded in `tests/fixtures/llmproxy/` as the drift baseline:
   epoch-millisecond numbers; cost as decimal strings or JSON numbers.
 - `keys.json`: `{keys[]}` with `caller` and `last_seen`.
 
-Unknown fields are ignored; missing fields become `None`; a wrong-typed known
-field or a missing `rows`/`keys` envelope fails the response loudly.
+Unknown fields are ignored; missing fields become `None`. Two field groups
+tolerate off-format values as `None` rather than failing: `cost_usd` (decimal
+string or JSON number) and the timestamps `received_at`, `completed_at`, and
+`last_seen` (RFC 3339 string or epoch-millisecond number). Any other
+wrong-typed known field, or a missing `rows`/`keys` envelope, fails the
+response loudly.
 
 ## Auth material
 

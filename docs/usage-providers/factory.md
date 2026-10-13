@@ -19,9 +19,10 @@ a Bearer key. Shape (`parse_factory_limits`):
   present, `windowEnd` may be an RFC 3339 string or an epoch number (seconds
   versus milliseconds split at `> 1e12`), and `secondsRemaining > 0` renders a
   "resets in Ns" description.
-- `limits.core`: the same three windows, emitted as named extras
-  (`factory-core-5h`, `factory-core-7-day`, `factory-core-monthly`) only when
-  the pool holds any data.
+- `limits.core`: the same three windows, emitted as named extras with ids
+  `factory-core-fiveHour`, `factory-core-weekly`, and
+  `factory-core-monthly` (titled "Core 5h", "Core 7-day", "Core monthly"),
+  only when the pool holds any data.
 - A missing `limits` object leaves every window `Unavailable` and only the
   balance survives.
 

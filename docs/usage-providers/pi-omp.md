@@ -15,18 +15,23 @@ Root resolution (`pi_session_roots` in
 `crates/superai-usage/src/reader/jsonl.rs:128`), selectors read by the caller
 and passed in:
 
-- `PI_CODING_AGENT_SESSION_DIR` (an explicit sessions directory) wins outright.
-- Otherwise the agent root is `PI_CODING_AGENT_DIR/sessions`, default
+- `PI_CODING_AGENT_SESSION_DIR` (an explicit sessions directory) wins
+  outright; nothing else joins.
+- Otherwise the agent root is `PI_CODING_AGENT_DIR/sessions` when set, else
   `~/.pi/agent/sessions`.
 - The omp config root is `PI_CONFIG_DIR` when it names a path relative to
   HOME (absolute or escaping values are refused), default `~/.omp`. Its
-  `agent/sessions` joins the roots, plus `$XDG_DATA_HOME/omp/sessions` when
-  present.
+  `agent/sessions` and `$XDG_DATA_HOME/omp/sessions` join only when
+  `PI_CODING_AGENT_DIR` is unset: an explicit agent dir narrows the scan to
+  that root plus the config-root profile discovery below.
 - Profile selection: `OMP_PROFILE`, else `PI_PROFILE`, names one profile under
   `~/.omp/profiles/<name>` or `$XDG_DATA_HOME/omp/profiles/<name>` (each
-  checked as `sessions/` and `agent/sessions/`). With no selector, every
-  on-disk profile joins, sorted, capped at 64; profiles past the cap are
-  dropped and flagged, so totals over those roots are floors.
+  checked as `sessions/` and `agent/sessions/`, with or without an explicit
+  agent dir). With no selector, every on-disk profile under the config root
+  joins, sorted, capped at 64 per discovery pass, and profiles under
+  `$XDG_DATA_HOME/omp/profiles` join too, but only when
+  `PI_CODING_AGENT_DIR` is unset. Profiles past a cap are dropped and
+  flagged, so totals over those roots are floors.
 
 The family is `pi = [pi, omp]`; the scan dedups entries across the overlapping
 roots by `(session id, entry id)` pair, so a session visible through both
