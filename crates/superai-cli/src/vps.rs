@@ -69,30 +69,54 @@ fn run_deploy(args: &[OsString]) -> Result<(), CliError> {
         crate::write_stdout(&render_plan(&plan))?;
     }
     let journal = core_vps::execute_deploy(&plan, &remote).map_err(CliError::from)?;
-    let pointing = point_harness_configs(&plan, &request)?;
-    if parsed.json {
-        write_json(&deploy_report_json(&plan, &journal, &pointing))?;
-    } else {
-        crate::write_stdout(&render_journal(&journal))?;
-        render_pointing(&pointing)?;
-    }
+    finish_deploy(
+        parsed.json,
+        &plan,
+        &request,
+        &journal,
+        &superai_core::Registry::default_path()?,
+    )
+}
+
+/// Pointing runs only after a fully committed deploy: a rolled-back host
+/// no longer exists, so pointing at it would route every named harness
+/// config at a dead URL.
+fn finish_deploy(
+    json: bool,
+    plan: &DeployPlan,
+    request: &DeployRequest,
+    journal: &DeployJournal,
+    registry_path: &Path,
+) -> Result<(), CliError> {
     if journal.rolled_back.is_some() {
+        if json {
+            write_json(&deploy_report_json(plan, journal, &[]))?;
+        } else {
+            crate::write_stdout(&render_journal(journal))?;
+        }
         return Err(CliError::Args {
-            reason: "deploy failed and rolled back; see the output above".to_owned(),
+            reason: "deploy failed and rolled back; harness configs were not pointed".to_owned(),
         });
+    }
+    let pointing = point_harness_configs(registry_path, plan, request)?;
+    if json {
+        write_json(&deploy_report_json(plan, journal, &pointing))?;
+    } else {
+        crate::write_stdout(&render_journal(journal))?;
+        render_pointing(&pointing)?;
     }
     Ok(())
 }
 
 /// Point every recorded instance the request named at the deployment base.
 fn point_harness_configs(
+    registry_path: &Path,
     plan: &DeployPlan,
     request: &DeployRequest,
 ) -> Result<Vec<core_vps::PointOutcome>, CliError> {
     if plan.point_instances.is_empty() {
         return Ok(Vec::new());
     }
-    let registry_path = superai_core::Registry::default_path()?;
     let provider_ids: Vec<&str> = request
         .providers
         .iter()
@@ -102,7 +126,7 @@ fn point_harness_configs(
         .iter()
         .map(|name| {
             core_vps::point_recorded_instance(
-                &registry_path,
+                registry_path,
                 name,
                 &provider_ids,
                 &plan.harness_base,
@@ -198,6 +222,7 @@ fn build_request(args: &DeployArgs) -> Result<DeployRequest, CliError> {
         host: args.host.clone(),
         ingress,
         geo_exit: args.geo_exit.clone(),
+        ack_geo_exit_proxy: args.geo_exit_live,
         binary_path: args.binary.clone(),
         providers,
         env_file: args.env_file.clone(),
@@ -287,6 +312,7 @@ struct DeployArgs {
     tailscale: Option<String>,
     wg_client_key: Option<String>,
     geo_exit: Option<String>,
+    geo_exit_live: bool,
     binary: PathBuf,
     providers: Vec<PathBuf>,
     env_file: Option<PathBuf>,
@@ -304,6 +330,7 @@ impl DeployArgs {
         let mut tailscale: Option<String> = None;
         let mut wg_client_key: Option<String> = None;
         let mut geo_exit: Option<String> = None;
+        let mut geo_exit_live = false;
         let mut binary: Option<PathBuf> = None;
         let mut providers: Vec<PathBuf> = Vec::new();
         let mut env_file: Option<PathBuf> = None;
@@ -337,6 +364,7 @@ impl DeployArgs {
                     "--geo-exit",
                     value_of(&mut words, "--geo-exit")?,
                 )?,
+                "--geo-exit-live" => geo_exit_live = true,
                 "--binary" => once(
                     &mut binary,
                     "--binary",
@@ -358,27 +386,15 @@ impl DeployArgs {
         let binary = binary.ok_or_else(|| CliError::Args {
             reason: "vps deploy needs --binary with the local musl build".to_owned(),
         })?;
-        let ingress_choices = [
-            domain.is_some() || email.is_some(),
+        validate_deploy_shape(DeployShape {
+            domain: domain.is_some(),
+            email: email.is_some(),
             tunnel,
-            tailscale.is_some(),
-        ];
-        if ingress_choices.iter().filter(|chosen| **chosen).count() != 1 {
-            return Err(CliError::Args {
-                reason: "pick one ingress: --domain with --email, --tunnel, or --tailscale"
-                    .to_owned(),
-            });
-        }
-        if domain.is_some() != email.is_some() {
-            return Err(CliError::Args {
-                reason: "--domain and --email go together".to_owned(),
-            });
-        }
-        if tunnel && wg_client_key.is_none() {
-            return Err(CliError::Args {
-                reason: "--tunnel needs --wg-client-key with the workstation peer key".to_owned(),
-            });
-        }
+            tailscale: tailscale.is_some(),
+            wg_client_key: wg_client_key.is_some(),
+            geo_exit: geo_exit.is_some(),
+            geo_exit_live,
+        })?;
         Ok(Self {
             host,
             policy: policy.unwrap_or(HostKeyPolicy::Strict),
@@ -388,6 +404,7 @@ impl DeployArgs {
             tailscale,
             wg_client_key,
             geo_exit,
+            geo_exit_live,
             binary,
             providers,
             env_file,
@@ -395,6 +412,58 @@ impl DeployArgs {
             json,
         })
     }
+}
+
+/// Which optional deploy flags were seen; input to shape validation.
+#[derive(Debug, Default, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flag-shape booleans mirror the CLI surface"
+)]
+struct DeployShape {
+    domain: bool,
+    email: bool,
+    tunnel: bool,
+    tailscale: bool,
+    wg_client_key: bool,
+    geo_exit: bool,
+    geo_exit_live: bool,
+}
+
+/// Shape validation for the deploy flags: one ingress, domain+email paired,
+/// wireguard key with --tunnel, geo-exit-live only with --geo-exit.
+fn validate_deploy_shape(shape: DeployShape) -> Result<(), CliError> {
+    let DeployShape {
+        domain,
+        email,
+        tunnel,
+        tailscale,
+        wg_client_key,
+        geo_exit,
+        geo_exit_live,
+    } = shape;
+    let ingress_choices = [domain || email, tunnel, tailscale];
+    if ingress_choices.iter().filter(|chosen| **chosen).count() != 1 {
+        return Err(CliError::Args {
+            reason: "pick one ingress: --domain with --email, --tunnel, or --tailscale".to_owned(),
+        });
+    }
+    if domain != email {
+        return Err(CliError::Args {
+            reason: "--domain and --email go together".to_owned(),
+        });
+    }
+    if tunnel && !wg_client_key {
+        return Err(CliError::Args {
+            reason: "--tunnel needs --wg-client-key with the workstation peer key".to_owned(),
+        });
+    }
+    if geo_exit_live && !geo_exit {
+        return Err(CliError::Args {
+            reason: "--geo-exit-live confirms --geo-exit; it goes with it".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -779,7 +848,21 @@ fn preview_text(preview: &StepPreview) -> String {
         StepPreview::Run { argv } => format!("run `{}`", argv.join(" ")),
         StepPreview::DaemonsReload => "daemon-reload".to_owned(),
         StepPreview::Service { name, verb } => format!("{verb} service {name}"),
-        StepPreview::Symlink { target, link } => format!("link {link} -> {target}"),
+        StepPreview::Symlink {
+            target,
+            link,
+            current,
+        } => match current {
+            None => format!("create link {link} -> {target}"),
+            Some(state) => format!(
+                "replace link {link} ({}: {} -> {target})",
+                match state.existing {
+                    superai_core::vps::Existing::Ours => "ours",
+                    superai_core::vps::Existing::Foreign => "foreign, backs up first",
+                },
+                state.target
+            ),
+        },
         StepPreview::InterpolateEnv { target, env } => {
             format!("fill ${{...}} in {target} from {env} on the host")
         }
@@ -936,6 +1019,8 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
 
+    use superai_core::vps::{PreflightReport, RollbackInfo};
+
     use super::*;
 
     fn os(args: &[&str]) -> Vec<OsString> {
@@ -1073,6 +1158,39 @@ mod tests {
     }
 
     #[test]
+    fn geo_exit_live_confirms_geo_exit_only() {
+        let text = err_text(DeployArgs::parse(&os(&[
+            "--host",
+            "root@h",
+            "--binary",
+            "/tmp/x",
+            "--domain",
+            "d.example.com",
+            "--email",
+            "ops@example.com",
+            "--geo-exit-live",
+        ])));
+        assert!(text.contains("goes with it"), "{text}");
+
+        let parsed = DeployArgs::parse(&os(&[
+            "--host",
+            "root@h",
+            "--binary",
+            "/tmp/x",
+            "--domain",
+            "d.example.com",
+            "--email",
+            "ops@example.com",
+            "--geo-exit",
+            "10.7.0.1:3128",
+            "--geo-exit-live",
+        ]))
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        assert_eq!(parsed.geo_exit.as_deref(), Some("10.7.0.1:3128"));
+        assert!(parsed.geo_exit_live);
+    }
+
+    #[test]
     fn status_and_upgrade_args_parse_their_surface() {
         let status = StatusArgs::parse(&os(&["--host", "root@h", "--json"]))
             .unwrap_or_else(|e| panic!("parse: {e}"));
@@ -1176,6 +1294,82 @@ mod tests {
             view.reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("SUPERAI_LLMPROXY_URL"))
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_deploy_never_points_harness_configs() {
+        let dir = std::env::temp_dir().join(format!(
+            "superai-cli-vps-rollback-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("temp: {e}"));
+        let registry_path = dir.join("instances.json");
+        let sentinel = b"{\"instances\":\"frozen sentinel bytes\"}";
+        std::fs::write(&registry_path, sentinel).unwrap_or_else(|e| panic!("write: {e}"));
+
+        let plan = DeployPlan {
+            host: "root@h.example.com".to_owned(),
+            backend: "toride".to_owned(),
+            service: "llmproxy",
+            mode: "tls".to_owned(),
+            harness_base: "https://h.example.com".to_owned(),
+            point_instances: vec!["main".to_owned()],
+            address: "h.example.com".to_owned(),
+            geo_exit: None,
+            preflight: PreflightReport {
+                host: "root@h.example.com".to_owned(),
+                backend: "toride".to_owned(),
+                policy: "strict".to_owned(),
+                checks: Vec::new(),
+            },
+            steps: Vec::new(),
+        };
+        let request = DeployRequest {
+            host: plan.host.clone(),
+            ingress: IngressMode::Tls {
+                domain: "h.example.com".to_owned(),
+                email: "ops@example.com".to_owned(),
+            },
+            geo_exit: None,
+            ack_geo_exit_proxy: false,
+            binary_path: PathBuf::from("fixture-binary"),
+            providers: vec![ProviderToml {
+                name: "anthropic".to_owned(),
+                content: "base_url = \"https://placeholder\"".to_owned(),
+            }],
+            env_file: None,
+            point_instances: vec!["main".to_owned()],
+            policy: HostKeyPolicy::Strict,
+        };
+        let journal = DeployJournal {
+            backend: "toride".to_owned(),
+            entries: Vec::new(),
+            backups: Vec::new(),
+            rolled_back: Some(RollbackInfo {
+                failed_step: DeployStep::ReloadDaemons,
+                reason: "fixture failure".to_owned(),
+                notes: Vec::new(),
+            }),
+        };
+
+        let result = finish_deploy(false, &plan, &request, &journal, &registry_path);
+
+        let message = match result {
+            Ok(()) => panic!("a rolled-back deploy must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("were not pointed"),
+            "wrong failure text: {message}"
+        );
+        let after = std::fs::read(&registry_path).unwrap_or_else(|e| panic!("reread: {e}"));
+        assert_eq!(
+            after, sentinel,
+            "a rolled-back deploy must not touch harness configs"
         );
     }
 }

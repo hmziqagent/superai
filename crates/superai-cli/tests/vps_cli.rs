@@ -1,6 +1,6 @@
 //! `superai vps` integration tests: the real binary against temp HOMEs.
 //! The production backend refuses typed until toride 0.2 publishes, so these
-//! prove dispatch, validation, and the honesty of that refusal — the
+//! prove dispatch, validation, and the honesty of that refusal; the
 //! fixture-proven deploy flow lives in superai-core's tests.
 
 #[cfg(test)]
