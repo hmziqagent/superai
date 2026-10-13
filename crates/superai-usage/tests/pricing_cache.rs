@@ -65,8 +65,13 @@ mod tests {
             .unwrap_or_else(|e| panic!("time math: {e}"))
     }
 
-    fn minutes_after(base: Timestamp, minutes: i64) -> Timestamp {
-        base.checked_add(jiff::Span::new().minutes(minutes))
+    fn seconds_before(base: Timestamp, seconds: i64) -> Timestamp {
+        base.checked_sub(jiff::Span::new().seconds(seconds))
+            .unwrap_or_else(|e| panic!("time math: {e}"))
+    }
+
+    fn seconds_after(base: Timestamp, seconds: i64) -> Timestamp {
+        base.checked_add(jiff::Span::new().seconds(seconds))
             .unwrap_or_else(|e| panic!("time math: {e}"))
     }
 
@@ -232,11 +237,15 @@ mod tests {
             "5 minutes after the last fetch the cooldown must hold"
         );
         cache
-            .store(&sample_table(), hours_before(now(), 15))
+            .store(&sample_table(), minutes_before(now(), 15))
             .unwrap();
         assert!(
+            !cache.unknown_model_refresh_allowed(seconds_before(now(), 1)),
+            "one second short of 15 minutes since the fetch the cooldown must hold"
+        );
+        assert!(
             cache.unknown_model_refresh_allowed(now()),
-            "the cooldown is exactly 15 minutes"
+            "a fetch exactly 15 minutes ago sits on the cooldown boundary"
         );
         drop(fs::remove_dir_all(&dir));
     }
@@ -246,9 +255,8 @@ mod tests {
         let dir = temp_dir("cache-cooldown-attempt");
         let cache = PricingCache::new(&dir);
         let missing = dir.join("does-not-exist.json");
-        let err = cache
-            .refresh(&file_url(&missing), minutes_before(now(), 5))
-            .unwrap_err();
+        let attempt_at = minutes_before(now(), 5);
+        let err = cache.refresh(&file_url(&missing), attempt_at).unwrap_err();
         assert!(matches!(err, CostError::Fetch { .. }), "{err:?}");
         assert!(cache.load().is_none());
         assert!(
@@ -256,8 +264,12 @@ mod tests {
             "5 minutes after a failed attempt the cooldown must hold with no cache at all"
         );
         assert!(
-            cache.unknown_model_refresh_allowed(minutes_after(now(), 11)),
-            "the cooldown from the attempt is the same 15 minutes"
+            !cache.unknown_model_refresh_allowed(seconds_after(now(), 599)),
+            "one second short of 15 minutes since the attempt the cooldown must hold"
+        );
+        assert!(
+            cache.unknown_model_refresh_allowed(seconds_after(now(), 600)),
+            "an attempt exactly 15 minutes old sits on the cooldown boundary"
         );
         drop(fs::remove_dir_all(&dir));
     }
