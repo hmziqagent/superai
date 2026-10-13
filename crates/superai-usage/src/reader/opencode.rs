@@ -12,10 +12,12 @@ use crate::cost::{RecordedUsage, UsageEvent};
 
 /// Resolve the v2 history database per docs/harness-configs/opencode.md: an
 /// `OPENCODE_DB` value wins, else `$XDG_DATA_HOME/opencode/` with a
-/// channel-suffixed file name on non-default channels.
+/// channel-suffixed file name on non-default channels; an unset or relative
+/// `XDG_DATA_HOME` falls back to `~/.local/share`.
 pub fn history_db_path(
     opencode_db_override: Option<&Path>,
-    xdg_data_home: &Path,
+    xdg_data_home: Option<&Path>,
+    home: &Path,
     channel: Option<&str>,
 ) -> PathBuf {
     if let Some(path) = opencode_db_override {
@@ -25,7 +27,14 @@ pub fn history_db_path(
         Some(channel) => format!("opencode-{channel}.db"),
         None => "opencode.db".to_owned(),
     };
-    xdg_data_home.join("opencode").join(file_name)
+    match xdg_data_home {
+        Some(dir) if dir.is_absolute() => dir.join("opencode").join(file_name),
+        _ => home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join(file_name),
+    }
 }
 
 /// Errors from the opencode v2 history scan.
@@ -149,7 +158,12 @@ mod tests {
     fn override_value_wins_over_every_derived_path() {
         let r#override = Path::new("/elsewhere/custom.db");
         assert_eq!(
-            history_db_path(Some(r#override), Path::new("/data"), Some("beta")),
+            history_db_path(
+                Some(r#override),
+                Some(Path::new("/data")),
+                Path::new("/home/u"),
+                Some("beta")
+            ),
             PathBuf::from("/elsewhere/custom.db")
         );
     }
@@ -157,7 +171,7 @@ mod tests {
     #[test]
     fn default_channel_uses_the_plain_file_name() {
         assert_eq!(
-            history_db_path(None, Path::new("/data"), None),
+            history_db_path(None, Some(Path::new("/data")), Path::new("/home/u"), None),
             PathBuf::from("/data/opencode/opencode.db")
         );
     }
@@ -165,8 +179,34 @@ mod tests {
     #[test]
     fn non_default_channel_suffixed_file_name() {
         assert_eq!(
-            history_db_path(None, Path::new("/data"), Some("beta")),
+            history_db_path(
+                None,
+                Some(Path::new("/data")),
+                Path::new("/home/u"),
+                Some("beta")
+            ),
             PathBuf::from("/data/opencode/opencode-beta.db")
+        );
+    }
+
+    #[test]
+    fn unset_xdg_data_home_falls_back_to_home_local_share() {
+        assert_eq!(
+            history_db_path(None, None, Path::new("/home/u"), None),
+            PathBuf::from("/home/u/.local/share/opencode/opencode.db")
+        );
+    }
+
+    #[test]
+    fn relative_xdg_data_home_is_ignored_per_the_xdg_rule() {
+        assert_eq!(
+            history_db_path(
+                None,
+                Some(Path::new("relative/data")),
+                Path::new("/home/u"),
+                Some("beta")
+            ),
+            PathBuf::from("/home/u/.local/share/opencode/opencode-beta.db")
         );
     }
 
