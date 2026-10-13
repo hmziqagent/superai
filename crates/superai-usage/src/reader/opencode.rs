@@ -10,31 +10,41 @@ use rusqlite::{Connection, OpenFlags, Row};
 
 use crate::cost::{RecordedUsage, UsageEvent};
 
-/// Resolve the v2 history database per docs/harness-configs/opencode.md: an
-/// `OPENCODE_DB` value wins, else `$XDG_DATA_HOME/opencode/` with a
-/// channel-suffixed file name on non-default channels; an unset or relative
-/// `XDG_DATA_HOME` falls back to `~/.local/share`.
+/// Resolve the v2 history database per docs/harness-configs/opencode.md: a
+/// non-empty `OPENCODE_DB` value wins, else `$XDG_DATA_HOME/opencode/` with
+/// a channel-suffixed file name on non-default channels; an unset or
+/// relative `XDG_DATA_HOME` falls back to `~/.local/share`. Returns `None`
+/// when the channel is not one safe file-name component (ASCII
+/// alphanumerics, `-`, `_`).
 pub fn history_db_path(
     opencode_db_override: Option<&Path>,
     xdg_data_home: Option<&Path>,
     home: &Path,
     channel: Option<&str>,
-) -> PathBuf {
-    if let Some(path) = opencode_db_override {
-        return path.to_path_buf();
+) -> Option<PathBuf> {
+    if let Some(path) = opencode_db_override.filter(|path| !path.as_os_str().is_empty()) {
+        return Some(path.to_path_buf());
     }
-    let file_name = match channel {
-        Some(channel) => format!("opencode-{channel}.db"),
+    let file_name = match channel.map(str::trim).filter(|channel| !channel.is_empty()) {
+        Some(channel) if safe_channel(channel) => format!("opencode-{channel}.db"),
+        Some(_) => return None,
         None => "opencode.db".to_owned(),
     };
-    match xdg_data_home {
+    Some(match xdg_data_home {
         Some(dir) if dir.is_absolute() => dir.join("opencode").join(file_name),
         _ => home
             .join(".local")
             .join("share")
             .join("opencode")
             .join(file_name),
-    }
+    })
+}
+
+fn safe_channel(channel: &str) -> bool {
+    !channel.is_empty()
+        && channel
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Errors from the opencode v2 history scan.
@@ -73,7 +83,8 @@ WHERE parsed.type = 'assistant'
   AND (session.fork_session_id IS NULL OR parsed.time_created >= session.time_created)";
 
 /// Scan the v2 history database into recorded usage, opening it read-only
-/// and never writing; unmappable rows are counted, never fatal.
+/// and never writing; unmappable rows are counted and all-zero rows are
+/// dropped, never fatal.
 pub fn scan_history(db_path: &Path) -> Result<RecordedUsage, OpenCodeError> {
     let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut statement = connection
@@ -82,12 +93,19 @@ pub fn scan_history(db_path: &Path) -> Result<RecordedUsage, OpenCodeError> {
     let mut rows = statement.query([]).map_err(OpenCodeError::Scan)?;
     let mut usage = RecordedUsage::default();
     while let Some(row) = rows.next().map_err(OpenCodeError::Scan)? {
-        match row_event(row) {
-            Some(event) => usage.events.push(event),
-            None => usage.unscanned_records += 1,
+        match row_usage(row) {
+            RowUsage::Event(event) => usage.events.push(event),
+            RowUsage::Zero => {}
+            RowUsage::Malformed => usage.unscanned_records += 1,
         }
     }
     Ok(usage)
+}
+
+enum RowUsage {
+    Event(UsageEvent),
+    Zero,
+    Malformed,
 }
 
 #[derive(Clone, Copy)]
@@ -150,6 +168,20 @@ fn row_event(row: &Row<'_>) -> Option<UsageEvent> {
     })
 }
 
+fn row_usage(row: &Row<'_>) -> RowUsage {
+    let Some(event) = row_event(row) else {
+        return RowUsage::Malformed;
+    };
+    if event.input_tokens == 0
+        && event.output_tokens == 0
+        && event.cache_read_tokens.is_none_or(|tokens| tokens == 0)
+        && event.cache_write_tokens.is_none_or(|tokens| tokens == 0)
+    {
+        return RowUsage::Zero;
+    }
+    RowUsage::Event(event)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +196,20 @@ mod tests {
                 Path::new("/home/u"),
                 Some("beta")
             ),
-            PathBuf::from("/elsewhere/custom.db")
+            Some(PathBuf::from("/elsewhere/custom.db"))
+        );
+    }
+
+    #[test]
+    fn empty_override_is_treated_as_unset() {
+        assert_eq!(
+            history_db_path(
+                Some(Path::new("")),
+                Some(Path::new("/data")),
+                Path::new("/home/u"),
+                None
+            ),
+            Some(PathBuf::from("/data/opencode/opencode.db"))
         );
     }
 
@@ -172,7 +217,20 @@ mod tests {
     fn default_channel_uses_the_plain_file_name() {
         assert_eq!(
             history_db_path(None, Some(Path::new("/data")), Path::new("/home/u"), None),
-            PathBuf::from("/data/opencode/opencode.db")
+            Some(PathBuf::from("/data/opencode/opencode.db"))
+        );
+    }
+
+    #[test]
+    fn blank_channel_is_the_default_channel() {
+        assert_eq!(
+            history_db_path(
+                None,
+                Some(Path::new("/data")),
+                Path::new("/home/u"),
+                Some("  ")
+            ),
+            Some(PathBuf::from("/data/opencode/opencode.db"))
         );
     }
 
@@ -185,15 +243,41 @@ mod tests {
                 Path::new("/home/u"),
                 Some("beta")
             ),
-            PathBuf::from("/data/opencode/opencode-beta.db")
+            Some(PathBuf::from("/data/opencode/opencode-beta.db"))
         );
+    }
+
+    #[test]
+    fn channel_must_be_one_safe_file_name_component() {
+        for escaping in [
+            "a/b",
+            "..",
+            ".",
+            "x/../../escape",
+            "win\\path",
+            "sp ace",
+            "semi;colon",
+            "nul\0byte",
+            "c:drive",
+        ] {
+            assert_eq!(
+                history_db_path(
+                    None,
+                    Some(Path::new("/data")),
+                    Path::new("/home/u"),
+                    Some(escaping)
+                ),
+                None,
+                "channel `{escaping}` must be refused"
+            );
+        }
     }
 
     #[test]
     fn unset_xdg_data_home_falls_back_to_home_local_share() {
         assert_eq!(
             history_db_path(None, None, Path::new("/home/u"), None),
-            PathBuf::from("/home/u/.local/share/opencode/opencode.db")
+            Some(PathBuf::from("/home/u/.local/share/opencode/opencode.db"))
         );
     }
 
@@ -206,7 +290,9 @@ mod tests {
                 Path::new("/home/u"),
                 Some("beta")
             ),
-            PathBuf::from("/home/u/.local/share/opencode/opencode-beta.db")
+            Some(PathBuf::from(
+                "/home/u/.local/share/opencode/opencode-beta.db"
+            ))
         );
     }
 

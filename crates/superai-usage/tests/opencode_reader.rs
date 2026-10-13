@@ -26,6 +26,8 @@ mod tests {
     const FULL_USAGE: &str = r#"{"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":120,"output":80,"reasoning":40,"cache":{"read":500,"write":10}}}"#;
     const NO_CACHE_USAGE: &str =
         r#"{"model":{"providerID":"openai","id":"gpt-5.1"},"tokens":{"input":10,"output":5}}"#;
+    const MODEL_ONLY: &str = r#"{"model":{"providerID":"custom-gw","id":"some-internal-model"}}"#;
+    const ZERO_USAGE: &str = r#"{"model":{"providerID":"custom-gw","id":"some-internal-model"},"tokens":{"input":0,"output":0,"reasoning":0}}"#;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -133,6 +135,24 @@ mod tests {
             cache_read_tokens: None,
             cache_write_tokens: None,
         }));
+    }
+
+    #[test]
+    fn model_only_and_zero_token_rows_are_dropped_without_a_gap() {
+        let fixture = Fixture::new("zero");
+        fixture.session("s1", None, BASE_MS);
+        fixture.message("m1", "s1", "assistant", BASE_MS, MODEL_ONLY);
+        fixture.message("m2", "s1", "assistant", BASE_MS + 1_000, ZERO_USAGE);
+        fixture.message("m3", "s1", "assistant", BASE_MS + 2_000, FULL_USAGE);
+        let path = fixture.done();
+
+        let usage = scan_history(&path).unwrap_or_else(|e| panic!("scan: {e}"));
+
+        assert_eq!(usage.events, vec![full_usage_event(BASE_MS + 2_000)]);
+        assert_eq!(
+            usage.unscanned_records, 0,
+            "a zero row is understood, not an unreadable record"
+        );
     }
 
     #[test]
