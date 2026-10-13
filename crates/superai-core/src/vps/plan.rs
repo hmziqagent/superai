@@ -1552,6 +1552,9 @@ mod tests {
         let remote = FixtureRemote::new("root@host");
         let plan = plan_deploy(&request, &remote).unwrap();
         assert_eq!(plan.mode, "tunnel-wireguard");
+        // The ledger client's plain-http gate accepts exactly this host
+        // shape; both sides must move together.
+        assert_eq!(plan.harness_base, "http://10.7.0.1:8080");
         let wg_step = plan
             .steps
             .iter()
@@ -1610,6 +1613,7 @@ LLMPROXY_BIND=100.64.0.2:8080
         });
         let plan = plan_deploy(&ts, &remote).unwrap();
         assert_eq!(plan.mode, "tunnel-tailscale");
+        assert_eq!(plan.harness_base, "http://proxy-tailnet:8080");
         assert!(plan.steps.iter().any(|step| match &step.step {
             DeployStep::Exec { argv } => argv.first().is_some_and(|program| program == "tailscale"),
             _ => false,

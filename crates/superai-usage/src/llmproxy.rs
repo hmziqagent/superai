@@ -385,8 +385,9 @@ pub struct LedgerClient {
 impl LedgerClient {
     /// Build a client for `base_url` (an origin such as
     /// `http://127.0.0.1:8080`, optionally carrying one of the known
-    /// `/usage` paths, which is stripped). Plain http is accepted only on
-    /// a loopback host, mirroring the registry's endpoint rule.
+    /// `/usage` paths, which is stripped). Plain http is accepted on
+    /// loopback and on the private-tunnel hosts the VPS deploy points
+    /// harnesses at; every other host must be https.
     pub fn new(
         base_url: &str,
         token: &AdminToken,
@@ -684,9 +685,9 @@ fn normalize_base(raw: &str) -> Result<String, LedgerError> {
     Ok(base.to_owned())
 }
 
-/// Same rule the registry pins for endpoint locators: https anywhere, plain
-/// http only on an exact loopback host, no userinfo, query, or control
-/// characters.
+/// Endpoint-locator rule: https anywhere, plain http only where the traffic
+/// stays inside a network the operator controls (loopback, the deploy's own
+/// tunnel hosts), no userinfo, query, or control characters.
 fn base_url_reason(url: &str) -> Option<String> {
     if let Some(reason) = endpoint_url_reason(url) {
         return Some(reason);
@@ -720,8 +721,8 @@ fn endpoint_url_reason(url: &str) -> Option<String> {
     if host.is_empty() {
         return Some("must name a host".to_owned());
     }
-    if !https && !is_loopback_host(host) {
-        return Some("plain http is allowed only on a loopback host".to_owned());
+    if !https && !is_loopback_host(host) && !is_tunnel_host(host) {
+        return Some("plain http is allowed only on a loopback or private-tunnel host".to_owned());
     }
     None
 }
@@ -730,6 +731,41 @@ fn endpoint_url_reason(url: &str) -> Option<String> {
 /// attacker controls, not a loopback address.
 fn is_loopback_host(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+/// Hosts plain http may reach beyond loopback: the wireguard subnet the VPS
+/// deploy binds (10.7.0.0/24), tailscale's CGNAT block (100.64.0.0/10) and
+/// `MagicDNS` names, and dotless names that resolve only through the
+/// operator's own search domains. Every one of these is inside a tunnel or
+/// a network the operator already controls, which is why the deploy writes
+/// plain-http bases for both tunnel modes.
+fn is_tunnel_host(host: &str) -> bool {
+    if let Some([a, b, c, _]) = ipv4_octets(host) {
+        return matches!((a, b, c), (10, 7, 0) | (100, 64..=127, _));
+    }
+    // A digits-only or colon-carrying string is an IP spelling, not a name;
+    // refusing those keeps public IPv6 literals off plain http.
+    host.ends_with(".ts.net")
+        || (!host.contains(['.', ':']) && host.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
+/// Strict dotted-quad parse: no empty or over-long part, no leading zero
+/// (libc reads those as octal), nothing past the fourth part.
+fn ipv4_octets(host: &str) -> Option<[u8; 4]> {
+    let mut parts = host.split('.');
+    let mut octets = [0u8; 4];
+    for slot in &mut octets {
+        let part = parts.next()?;
+        let digits = !part.is_empty()
+            && part.len() <= 3
+            && part.bytes().all(|b| b.is_ascii_digit())
+            && (part.len() == 1 || !part.starts_with('0'));
+        if !digits {
+            return None;
+        }
+        *slot = part.parse().ok()?;
+    }
+    parts.next().is_none().then_some(octets)
 }
 
 fn strip_port(authority: &str) -> &str {
@@ -802,6 +838,39 @@ mod tests {
             "http://[::1]:9910",
         ] {
             assert!(base_url_reason(url).is_none(), "`{url}` was refused");
+        }
+    }
+
+    #[test]
+    fn the_tunnel_bases_the_vps_deploy_writes_are_accepted_and_neighbors_refused() {
+        // These are the exact strings `harness_base_url` renders for the two
+        // tunnel ingress modes, plus the wireguard admin listener the status
+        // probe note points operators at.
+        for url in [
+            "http://10.7.0.1:8080",
+            "http://10.7.0.1:8081",
+            "http://10.7.0.2:8080",
+            "http://proxy-tailnet:8080",
+            "http://proxy.tailabcd1234.ts.net:8080",
+            "http://100.101.1.2:8080",
+        ] {
+            assert!(base_url_reason(url).is_none(), "`{url}` was refused");
+            assert!(
+                matches!(&normalize_base(url), Ok(base) if base.as_str() == url),
+                "`{url}` did not round-trip"
+            );
+        }
+        for url in [
+            "http://10.7.1.1:8080",
+            "http://10.8.0.1:8080",
+            "http://010.7.0.1:8080",
+            "http://100.63.0.1:8080",
+            "http://100.128.0.1:8080",
+            "http://[fd7a:115c:a1e0::1]:8080",
+            "http://12345:8080",
+            "http://public.example.com:8080",
+        ] {
+            assert!(base_url_reason(url).is_some(), "`{url}` passed validation");
         }
     }
 
