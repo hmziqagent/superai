@@ -1,0 +1,13 @@
+{
+  "id": "llmproxy",
+  "label": "llmproxy",
+  "locators": [
+    { "kind": "endpoint", "url": "http://127.0.0.1:8080/usage/summary" }
+  ],
+  "auth_material": [],
+  "window_strategy": "endpoint",
+  "pricing": "unverified",
+  "documentation_url": "docs/plans/export/llmproxy-usage-ledger.md",
+  "schema_version": 1,
+  "verified_at": "2026-10-13"
+}

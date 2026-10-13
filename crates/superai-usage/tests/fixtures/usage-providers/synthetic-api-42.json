@@ -1,0 +1,15 @@
+{
+  "id": "synthetic-api-42",
+  "label": "Synthetic API",
+  "locators": [
+    { "kind": "endpoint", "url": "https://usage.synthetic-42.example.com/v1/usage" }
+  ],
+  "auth_material": [
+    { "kind": "env_var", "name": "SYNTHETIC_API_KEY" }
+  ],
+  "window_strategy": "endpoint",
+  "pricing": "models_dev",
+  "documentation_url": "docs/plans/14-usage-and-proxy.md#usage-provider-registry",
+  "schema_version": 1,
+  "verified_at": "2026-10-13"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "synthetic-local-7",
+  "label": "Synthetic Local",
+  "locators": [
+    { "kind": "artifact_path", "template": "~/.synthetic-7/sessions" }
+  ],
+  "auth_material": [],
+  "window_strategy": "local_artifacts",
+  "pricing": "models_dev",
+  "documentation_url": "docs/plans/14-usage-and-proxy.md#usage-provider-registry",
+  "schema_version": 1,
+  "verified_at": "2026-10-13"
+}
