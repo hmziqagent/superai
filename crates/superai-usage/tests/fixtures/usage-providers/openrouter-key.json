@@ -1,0 +1,12 @@
+{
+  "data": {
+    "label": "main",
+    "usage": 0.0125,
+    "usage_daily": 0.001,
+    "usage_weekly": 0.01,
+    "usage_monthly": 0.012,
+    "limit": 10.0,
+    "limit_remaining": 9.9875,
+    "limit_reset": "monthly"
+  }
+}

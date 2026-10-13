@@ -1,0 +1,26 @@
+{
+  "baseResp": { "statusCode": 0, "statusMsg": "" },
+  "data": {
+    "baseResp": { "statusCode": 0, "statusMsg": "" },
+    "model_remains": [
+      {
+        "model_name": "abab6.5s-chat",
+        "current_interval_total_count": 500,
+        "current_interval_usage_count": 375,
+        "current_interval_remaining_percent": 25.0,
+        "start_time": 1760000000,
+        "end_time": 1760036400,
+        "remains_time": 36000
+      },
+      {
+        "model_name": "video",
+        "current_interval_total_count": 10,
+        "current_interval_usage_count": 5,
+        "current_interval_remaining_percent": 50.0,
+        "start_time": 1760000000,
+        "end_time": 1760036400
+      }
+    ],
+    "points_balance": 100
+  }
+}

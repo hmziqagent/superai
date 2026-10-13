@@ -1,0 +1,16 @@
+{
+  "providers": {
+    "cline": {
+      "settings": {
+        "apiKey": "sk-cline-static",
+        "auth": {
+          "accessToken": "raw-access-token",
+          "apiKey": "sk-cline-auth"
+        }
+      }
+    },
+    "other-provider": {
+      "settings": { "apiKey": "sk-unrelated" }
+    }
+  }
+}

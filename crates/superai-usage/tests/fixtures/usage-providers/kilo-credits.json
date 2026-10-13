@@ -1,0 +1,14 @@
+[
+  {
+    "result": {
+      "data": {
+        "json": {
+          "creditBlocks": [
+            { "amount_mUsd": 5000000, "balance_mUsd": 4000000 },
+            { "amount_mUsd": 2500000, "balance_mUsd": 2500000 }
+          ]
+        }
+      }
+    }
+  }
+]

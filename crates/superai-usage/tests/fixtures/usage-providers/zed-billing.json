@@ -1,0 +1,7 @@
+{
+  "plan": "pro",
+  "current_usage": {
+    "edit_predictions": { "used": 120, "limit": 500 },
+    "token_spend": { "spend_in_cents": 1234, "limit_in_cents": 5000 }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "usesTokenRateLimitsBilling": true,
+  "limits": {
+    "standard": {
+      "fiveHour": { "usedPercent": 15.5, "windowEnd": "2026-10-13T20:00:00Z", "secondsRemaining": null },
+      "weekly": { "usedPercent": 42.0, "windowEnd": 1760841600, "secondsRemaining": null },
+      "monthly": { "usedPercent": 7.25, "windowEnd": null, "secondsRemaining": 3600 }
+    },
+    "core": {
+      "fiveHour": { "usedPercent": 3.0, "windowEnd": null, "secondsRemaining": null },
+      "weekly": { "usedPercent": 0.0, "windowEnd": null, "secondsRemaining": null },
+      "monthly": { "usedPercent": 0.0, "windowEnd": null, "secondsRemaining": null }
+    }
+  },
+  "extraUsageBalanceCents": 1500,
+  "overagePreference": "allow",
+  "extraUsageAllowed": true,
+  "tokenRateLimitsRolloutEligible": true
+}
