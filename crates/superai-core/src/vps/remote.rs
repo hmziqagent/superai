@@ -615,7 +615,7 @@ impl RemoteHost for FixtureRemote {
                     Ok(ExecOutput::fail(1))
                 };
             }
-            "systemctl" if argv.get(1) == Some(&"reload") => {
+            "systemctl" if matches!(argv.get(1), Some(&"reload" | &"reload-or-restart")) => {
                 return Ok(ExecOutput::ok(""));
             }
             "tailscale" if argv.get(1) == Some(&"version") => {

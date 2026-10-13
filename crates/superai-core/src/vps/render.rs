@@ -116,7 +116,8 @@ pub(crate) fn render_systemd_unit() -> String {
 }
 
 /// The nginx TLS site terminating for `domain` and forwarding to the local
-/// proxy listener; rendered through toride-proxy's pure renderer.
+/// proxy listener: the HTTP stanza answers certbot's webroot challenges and
+/// redirects the rest, toride-proxy's pure renderer emits the TLS block.
 pub(crate) fn render_nginx_site(domain: &str) -> String {
     let dir = cert_dir(domain);
     let tls = TlsConfig::new(
@@ -124,10 +125,31 @@ pub(crate) fn render_nginx_site(domain: &str) -> String {
         format!("{dir}/fullchain.pem"),
         format!("{dir}/privkey.pem"),
     );
-    let block = ServerBlock::new(domain, 443, PROXY_UPSTREAM)
-        .with_tls(tls)
-        .with_directive("location /.well-known/acme-challenge/ { root /var/www/html; }".to_owned());
-    render_nginx_server_block(&block)
+    let block = ServerBlock::new(domain, 443, PROXY_UPSTREAM).with_tls(tls);
+    format!(
+        "{}\n{}",
+        render_nginx_http_stanza(domain),
+        render_nginx_server_block(&block)
+    )
+}
+
+/// The HTTP-only stanza both ingress writes carry: it serves certbot's
+/// webroot challenge on :80 and redirects everything else to https. It
+/// never proxies: plain http must not reach the proxy listener, whose
+/// client credentials would cross the network in the clear.
+pub(crate) fn render_nginx_http_stanza(domain: &str) -> String {
+    format!(
+        r"server {{
+    listen 80;
+    listen [::]:80;
+    server_name {domain};
+
+    location /.well-known/acme-challenge/ {{ root /var/www/html; }}
+
+    location / {{ return 301 https://$host$request_uri; }}
+}}
+"
+    )
 }
 
 /// The VPS-side wireguard interface conf. `server_private_key` is a secret:
@@ -317,6 +339,35 @@ mod tests {
             "{site}"
         );
         assert!(site.contains("acme-challenge"), "{site}");
+    }
+
+    #[test]
+    fn http_stanza_serves_the_webroot_challenge_and_never_proxies() {
+        let stanza = render_nginx_http_stanza("proxy.example.com");
+        assert!(stanza.contains("listen 80;"), "{stanza}");
+        assert!(
+            stanza.contains("server_name proxy.example.com;"),
+            "{stanza}"
+        );
+        assert!(
+            stanza.contains("location /.well-known/acme-challenge/ { root /var/www/html; }"),
+            "{stanza}"
+        );
+        assert!(
+            !stanza.contains("proxy_pass"),
+            "plain http must never proxy: {stanza}"
+        );
+
+        let site = render_nginx_site("proxy.example.com");
+        assert!(
+            site.contains("listen 80;") && site.contains("listen 443 ssl"),
+            "the live site keeps the challenge path after the swap: {site}"
+        );
+        assert_eq!(
+            site.matches("proxy_pass").count(),
+            1,
+            "only the TLS block proxies: {site}"
+        );
     }
 
     #[test]

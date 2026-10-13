@@ -11,8 +11,8 @@ use crate::vps::render::{
     REMOTE_MANIFEST_PATH, REMOTE_NGINX_ENABLED_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_PROVIDERS_DIR,
     REMOTE_SERVER_CONF_PATH, REMOTE_UNIT_PATH, REMOTE_WG_CONF_PATH, SERVICE_NAME, WG_QUICK_UNIT,
     WG_SERVER_ADDRESS, WG_TUNNEL_ADMIN_BIND, WG_TUNNEL_MAIN_BIND, harness_base_url, policy_note,
-    redact_sensitive_lines, render_manifest, render_nginx_site, render_server_conf,
-    render_systemd_unit, render_wireguard_conf,
+    redact_sensitive_lines, render_manifest, render_nginx_http_stanza, render_nginx_site,
+    render_server_conf, render_systemd_unit, render_wireguard_conf,
 };
 use crate::vps::{VpsError, validation};
 
@@ -691,7 +691,7 @@ pub fn plan_deploy(
     }
     steps.push(service_step("enable", SERVICE_NAME));
     steps.push(service_step("start", SERVICE_NAME));
-    let created: Vec<String> = steps
+    let mut created: Vec<String> = steps
         .iter()
         .filter_map(|step| match &step.step {
             DeployStep::UploadFile { path, .. } => Some(path.clone()),
@@ -700,6 +700,10 @@ pub fn plan_deploy(
         })
         .chain(std::iter::once(REMOTE_UNIT_PATH.to_owned()))
         .collect();
+    // TLS ingress uploads the site path twice (bootstrap, then TLS); the
+    // manifest lists each managed path once.
+    created.sort();
+    created.dedup();
     let manifest = render_manifest(mode, &address, &created);
     steps.push(upload_step(
         remote,
@@ -892,27 +896,24 @@ fn ingress_steps(
 ) -> Result<Vec<PlannedStep>, VpsError> {
     match &request.ingress {
         IngressMode::Tls { domain, email } => {
-            let site = render_nginx_site(domain);
+            // certbot's webroot authenticator needs nginx already serving
+            // the domain's acme-challenge location on :80, so the HTTP-only
+            // bootstrap site goes live first; standalone would have to bind
+            // :80 itself and lose to whichever server already holds it.
+            // The TLS site replaces the bootstrap once the certificate
+            // exists; `nginx -t` gates every reload so a broken config
+            // never goes live.
+            let bootstrap = render_nginx_http_stanza(domain).into_bytes();
+            let site = render_nginx_site(domain).into_bytes();
             Ok(vec![
                 upload_step(
                     remote,
                     REMOTE_NGINX_SITE_PATH,
-                    site.into_bytes(),
+                    bootstrap,
                     0o644,
                     false,
                     ours,
                 )?,
-                exec_step(&[
-                    "certbot",
-                    "certonly",
-                    "--standalone",
-                    "-d",
-                    domain,
-                    "-m",
-                    email,
-                    "--agree-tos",
-                    "--non-interactive",
-                ])?,
                 symlink_step(
                     REMOTE_NGINX_SITE_PATH,
                     REMOTE_NGINX_ENABLED_PATH,
@@ -920,7 +921,23 @@ fn ingress_steps(
                     ours,
                 )?,
                 exec_step(&["nginx", "-t"])?,
-                exec_step(&["systemctl", "reload", "nginx"])?,
+                exec_step(&["systemctl", "reload-or-restart", "nginx"])?,
+                exec_step(&[
+                    "certbot",
+                    "certonly",
+                    "--webroot",
+                    "-w",
+                    "/var/www/html",
+                    "-d",
+                    domain,
+                    "-m",
+                    email,
+                    "--agree-tos",
+                    "--non-interactive",
+                ])?,
+                upload_step(remote, REMOTE_NGINX_SITE_PATH, site, 0o644, false, ours)?,
+                exec_step(&["nginx", "-t"])?,
+                exec_step(&["systemctl", "reload-or-restart", "nginx"])?,
             ])
         }
         IngressMode::Tunnel(TunnelKind::Wireguard { client_public_key }) => {
@@ -1431,6 +1448,84 @@ mod tests {
             }
             other => panic!("env upload must be a create: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tls_ingress_serves_http_before_certbot_and_never_binds_80_itself() {
+        let dir = temp_dir("tls-order");
+        let remote = FixtureRemote::new("root@203.0.113.10");
+        let plan = plan_deploy(&tls_request(&dir), &remote).unwrap();
+        assert!(!plan.blocked());
+
+        let site_uploads = plan
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    &step.step,
+                    DeployStep::UploadFile { path, .. } if path == REMOTE_NGINX_SITE_PATH
+                )
+            })
+            .count();
+        let mut nginx_t = Vec::new();
+        let mut reloads = Vec::new();
+        let mut certbot_at = None;
+        for (index, step) in plan.steps.iter().enumerate() {
+            let DeployStep::Exec { argv } = &step.step else {
+                continue;
+            };
+            match argv.first().map(String::as_str) {
+                Some("nginx") => nginx_t.push(index),
+                Some("systemctl") if argv.contains(&"reload-or-restart".to_owned()) => {
+                    reloads.push(index);
+                }
+                Some("certbot") => {
+                    certbot_at = Some(index);
+                    assert!(argv.contains(&"--webroot".to_owned()), "{argv:?}");
+                    assert!(argv.contains(&"/var/www/html".to_owned()), "{argv:?}");
+                    assert!(
+                        !argv.contains(&"--standalone".to_owned()),
+                        "standalone cannot share :80 with a running nginx: {argv:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        let certbot_at = certbot_at.expect("the TLS plan must run certbot");
+        assert_eq!(site_uploads, 2, "bootstrap site, then the TLS site");
+        assert_eq!(nginx_t.len(), 2, "an `nginx -t` gates every reload");
+        assert_eq!(reloads.len(), 2);
+        assert!(
+            reloads[0] < certbot_at,
+            "nginx must own :80 before certbot asks for a challenge"
+        );
+        assert!(certbot_at < reloads[1], "the TLS swap follows issuance");
+        assert!(nginx_t[0] < reloads[0] && nginx_t[1] < reloads[1]);
+
+        let payloads: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match (&step.step, &step.payload) {
+                (DeployStep::UploadFile { path, .. }, Payload::Upload { bytes, .. })
+                    if path == REMOTE_NGINX_SITE_PATH =>
+                {
+                    std::str::from_utf8(bytes).ok()
+                }
+                _ => None,
+            })
+            .collect();
+        let (first, second) = (
+            payloads.first().copied().unwrap_or_default(),
+            payloads.get(1).copied().unwrap_or_default(),
+        );
+        assert!(
+            first.contains("listen 80;") && !first.contains("ssl_certificate"),
+            "the bootstrap carries no certificate paths: {first}"
+        );
+        assert!(
+            second.contains("listen 443 ssl") && second.contains("ssl_certificate"),
+            "the swap installs the TLS block: {second}"
+        );
     }
 
     #[test]
