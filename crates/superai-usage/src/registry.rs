@@ -8,16 +8,435 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use superai_core::ids::ProviderId;
 
-use PricingReference::{ModelsDev, NotPriced, Subscription, Unverified};
-use WindowStrategy::{CostOnly, Endpoint, ProviderOnly};
-
 /// Current schema version of a usage-provider entry.
 pub const USAGE_PROVIDER_SCHEMA_VERSION: u32 = 1;
 
-/// In-repo record every bundled entry was verified against.
-const BUNDLED_DOCUMENTATION_URL: &str = "docs/plans/14-usage-and-proxy.md#overlap-table";
-/// Date the bundled rows were verified against that record.
-const BUNDLED_VERIFIED_AT: &str = "2026-10-13";
+/// Error-source label for the embedded bundled seed.
+const BUNDLED_SOURCE: &str = "bundled usage-providers data (registry.rs)";
+
+/// The bundled seed as data: the same JSON `load_dir` reads, one object per
+/// overlap-table provider, verified against the `CodexBar` `f66d18f` docs.
+/// Adding a standard provider is editing this JSON, not Rust code.
+const BUNDLED_USAGE_PROVIDERS_JSON: &str = r#"[
+  {
+    "id": "amp",
+    "label": "Amp",
+    "locators": [
+      { "kind": "endpoint", "url": "https://ampcode.com/api/internal?userDisplayBalanceInfo" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "AMP_API_KEY" },
+      { "kind": "oauth_token" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "antigravity",
+    "label": "Antigravity",
+    "locators": [
+      { "kind": "endpoint", "url": "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary" }
+    ],
+    "auth_material": [ { "kind": "oauth_token" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "claude",
+    "label": "Claude",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.anthropic.com/api/oauth/usage?cedar_ember=1" },
+      { "kind": "artifact_path", "template": "~/.claude/projects" }
+    ],
+    "auth_material": [
+      { "kind": "token_file", "template": "~/.claude/.credentials.json" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "cline-pass",
+    "label": "ClinePass",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.cline.bot/api/v1/users/me/plan/usage-limits" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "CLINE_API_KEY" },
+      { "kind": "env_var", "name": "CLINEPASS_API_KEY" },
+      { "kind": "token_file", "template": "~/.cline/data/settings/providers.json" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "codex",
+    "label": "Codex",
+    "locators": [
+      { "kind": "endpoint", "url": "https://chatgpt.com/backend-api/wham/usage" },
+      { "kind": "endpoint", "url": "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" },
+      { "kind": "artifact_path", "template": "~/.codex/sessions" },
+      { "kind": "artifact_path", "template": "~/.codex/archived_sessions" }
+    ],
+    "auth_material": [
+      { "kind": "token_file", "template": "~/.codex/auth.json" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "command-code",
+    "label": "Command Code",
+    "locators": [],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "copilot",
+    "label": "Copilot",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.github.com/copilot_internal/user" }
+    ],
+    "auth_material": [ { "kind": "oauth_token" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "cursor",
+    "label": "Cursor",
+    "locators": [
+      { "kind": "endpoint", "url": "https://cursor.com/api/usage-summary" },
+      { "kind": "endpoint", "url": "https://cursor.com/api/dashboard/get-filtered-usage-events" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "deepseek",
+    "label": "DeepSeek",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.deepseek.com/user/balance" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "DEEPSEEK_API_KEY" },
+      { "kind": "env_var", "name": "DEEPSEEK_KEY" }
+    ],
+    "window_strategy": "cost_only",
+    "pricing": "unverified",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "devin",
+    "label": "Devin",
+    "locators": [],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "factory",
+    "label": "Factory",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.factory.ai/api/billing/limits" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "FACTORY_API_KEY" },
+      { "kind": "env_file", "template": "~/.factory/.env" },
+      { "kind": "browser_session" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "gemini",
+    "label": "Gemini",
+    "locators": [
+      { "kind": "endpoint", "url": "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota" }
+    ],
+    "auth_material": [
+      { "kind": "token_file", "template": "~/.gemini/oauth_creds.json" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "grok",
+    "label": "Grok",
+    "locators": [
+      { "kind": "endpoint", "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits" },
+      { "kind": "endpoint", "url": "https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets" }
+    ],
+    "auth_material": [
+      { "kind": "token_file", "template": "~/.grok/auth.json" },
+      { "kind": "env_var", "name": "GROK_OAUTH_TOKEN" },
+      { "kind": "browser_session" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "kilo",
+    "label": "Kilo",
+    "locators": [
+      { "kind": "endpoint", "url": "https://app.kilo.ai/api/trpc" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "KILO_API_KEY" },
+      { "kind": "token_file", "template": "~/.local/share/kilo/auth.json" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "kimi",
+    "label": "Kimi",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.kimi.com/coding/v1/usages" },
+      { "kind": "endpoint", "url": "https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages" }
+    ],
+    "auth_material": [
+      { "kind": "browser_session" },
+      { "kind": "oauth_token" }
+    ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "kiro",
+    "label": "Kiro",
+    "locators": [],
+    "auth_material": [ { "kind": "oauth_token" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "mimo",
+    "label": "MiMo",
+    "locators": [],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "minimax",
+    "label": "MiniMax",
+    "locators": [],
+    "auth_material": [
+      { "kind": "env_var", "name": "MINIMAX_CODING_API_KEY" },
+      { "kind": "env_var", "name": "MINIMAX_API_KEY" },
+      { "kind": "browser_session" }
+    ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "mistral",
+    "label": "Mistral",
+    "locators": [
+      { "kind": "endpoint", "url": "https://admin.mistral.ai/api/billing/credits" },
+      { "kind": "endpoint", "url": "https://admin.mistral.ai/api/billing/v2/usage" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "muse",
+    "label": "Muse",
+    "locators": [
+      { "kind": "endpoint", "url": "https://api.meta.ai/muse-code/key" },
+      { "kind": "artifact_path", "template": "~/.local/share/muse/sessions" }
+    ],
+    "auth_material": [
+      { "kind": "token_file", "template": "~/.config/muse/auth.json" },
+      { "kind": "oauth_token" }
+    ],
+    "window_strategy": "provider_only",
+    "pricing": "not_priced",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "opencode",
+    "label": "OpenCode",
+    "locators": [
+      { "kind": "endpoint", "url": "https://opencode.ai/console/api/billing/status" },
+      { "kind": "artifact_path", "template": "~/.local/share/opencode/opencode.db" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "unverified",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "opencode-go",
+    "label": "OpenCode Go",
+    "locators": [
+      { "kind": "endpoint", "url": "https://opencode.ai/zen/go/v1/usage" },
+      { "kind": "artifact_path", "template": "~/.local/share/opencode/opencode.db" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "OPENCODE_API_KEY" },
+      { "kind": "browser_session" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "unverified",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "pi",
+    "label": "Pi",
+    "locators": [
+      { "kind": "artifact_path", "template": "~/.pi/agent/sessions" }
+    ],
+    "auth_material": [],
+    "window_strategy": "cost_only",
+    "pricing": "models_dev",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "qoder",
+    "label": "Qoder",
+    "locators": [
+      { "kind": "endpoint", "url": "https://qoder.com/api/v2/me/usages/big_model_credits" },
+      { "kind": "endpoint", "url": "https://qoder.com.cn/api/v2/me/usages/big_model_credits" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "qwen-cloud",
+    "label": "Qwen Cloud",
+    "locators": [],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "warp",
+    "label": "Warp",
+    "locators": [
+      { "kind": "endpoint", "url": "https://app.warp.dev/graphql/v2?op=GetRequestLimitInfo" }
+    ],
+    "auth_material": [ { "kind": "env_var", "name": "WARP_API_KEY" } ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "windsurf",
+    "label": "Windsurf",
+    "locators": [
+      { "kind": "endpoint", "url": "https://windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/GetPlanStatus" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "workbuddy",
+    "label": "WorkBuddy",
+    "locators": [
+      { "kind": "endpoint", "url": "https://www.workbuddy.cn/billing/meter/get-user-resource-summary" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "zed",
+    "label": "Zed",
+    "locators": [
+      { "kind": "endpoint", "url": "https://cloud.zed.dev/frontend/billing/usage" },
+      { "kind": "endpoint", "url": "https://cloud.zed.dev/client/users/me" }
+    ],
+    "auth_material": [ { "kind": "browser_session" } ],
+    "window_strategy": "provider_only",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  }
+]"#;
 
 /// Everything registry construction, loading, and validation can fail with;
 /// cost keeps its own `CostError` in [`crate::cost`].
@@ -47,10 +466,10 @@ pub enum RegistryError {
         /// Underlying io failure.
         source: std::io::Error,
     },
-    /// A data file could not be parsed as entry data.
+    /// A data source could not be parsed as entry data.
     #[error("parse {path}: {reason}")]
     Parse {
-        /// File being parsed.
+        /// File (or embedded source label) being parsed.
         path: String,
         /// What did not parse.
         reason: String,
@@ -97,6 +516,7 @@ pub enum AuthMaterialKind {
         template: String,
     },
     /// Provider OAuth token whose storage superai does not own.
+    #[serde(rename = "oauth_token")]
     OAuthToken,
     /// Browser cookies or localStorage; reading them is out of scope for
     /// this subplan, so sources needing them stay deferred.
@@ -257,9 +677,10 @@ impl UsageRegistry {
     }
 
     /// The bundled entries: one per provider row of subplan 14's overlap
-    /// table, verified against the `CodexBar` `f66d18f` provider docs.
+    /// table, parsed and validated from the embedded JSON through the same
+    /// path as data files.
     pub fn bundled() -> Result<Self, RegistryError> {
-        Self::from_entries(bundled_entries()?)
+        Self::from_entries(parse_entries(BUNDLED_SOURCE, BUNDLED_USAGE_PROVIDERS_JSON)?)
     }
 
     /// Load a directory of `*.json` data files fresh from disk; each file
@@ -289,22 +710,7 @@ impl UsageRegistry {
                 path: path.display().to_string(),
                 source,
             })?;
-            let value: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| RegistryError::Parse {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
-            let file_entries = match value {
-                serde_json::Value::Array(items) => items
-                    .into_iter()
-                    .map(|item| deserialize_entry(&path, item))
-                    .collect::<Result<Vec<_>, _>>()?,
-                single => vec![deserialize_entry(&path, single)?],
-            };
-            for entry in file_entries {
-                entry.validate()?;
-                entries.push(entry);
-            }
+            entries.extend(parse_entries(&path.display().to_string(), &text)?);
         }
         Self::from_entries(entries)
     }
@@ -338,388 +744,29 @@ impl UsageRegistry {
     }
 }
 
-fn deserialize_entry(
-    path: &Path,
-    value: serde_json::Value,
-) -> Result<UsageProviderEntry, RegistryError> {
-    serde_json::from_value(value).map_err(|e| RegistryError::Parse {
-        path: path.display().to_string(),
-        reason: e.to_string(),
-    })
-}
-
-fn endpoint(url: &str) -> UsageLocator {
-    UsageLocator::Endpoint {
-        url: url.to_owned(),
-    }
-}
-
-fn artifact(template: &str) -> UsageLocator {
-    UsageLocator::ArtifactPath {
-        template: template.to_owned(),
-    }
-}
-
-fn env_auth(name: &str) -> AuthMaterialKind {
-    AuthMaterialKind::EnvVar {
-        name: name.to_owned(),
-    }
-}
-
-fn env_file(template: &str) -> AuthMaterialKind {
-    AuthMaterialKind::EnvFile {
-        template: template.to_owned(),
-    }
-}
-
-fn token_file(template: &str) -> AuthMaterialKind {
-    AuthMaterialKind::TokenFile {
-        template: template.to_owned(),
-    }
-}
-
-fn browser_auth() -> AuthMaterialKind {
-    AuthMaterialKind::BrowserSession
-}
-
-fn oauth_auth() -> AuthMaterialKind {
-    AuthMaterialKind::OAuthToken
-}
-
-fn entry(
-    id: &str,
-    label: &str,
-    window_strategy: WindowStrategy,
-    pricing: PricingReference,
-    locators: &[UsageLocator],
-    auth_material: &[AuthMaterialKind],
-) -> Result<UsageProviderEntry, RegistryError> {
-    Ok(UsageProviderEntry {
-        id: ProviderId::new(id).map_err(|e| RegistryError::Invalid {
-            id: id.to_owned(),
-            field: "id",
+/// Parse and validate one JSON document (single entry or array); the
+/// bundled seed and every loaded data file flow through here.
+fn parse_entries(source: &str, text: &str) -> Result<Vec<UsageProviderEntry>, RegistryError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| RegistryError::Parse {
+            path: source.to_owned(),
             reason: e.to_string(),
-        })?,
-        label: label.to_owned(),
-        locators: locators.to_vec(),
-        auth_material: auth_material.to_vec(),
-        window_strategy,
-        pricing,
-        documentation_url: Some(BUNDLED_DOCUMENTATION_URL.to_owned()),
-        schema_version: USAGE_PROVIDER_SCHEMA_VERSION,
-        verified_at: Some(BUNDLED_VERIFIED_AT.to_owned()),
-    })
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bundled seed is one row per overlap-table provider"
-)]
-fn bundled_entries() -> Result<Vec<UsageProviderEntry>, RegistryError> {
-    Ok(vec![
-        entry(
-            "codex",
-            "Codex",
-            Endpoint,
-            Subscription,
-            &[
-                endpoint("https://chatgpt.com/backend-api/wham/usage"),
-                endpoint("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"),
-                artifact("~/.codex/sessions"),
-                artifact("~/.codex/archived_sessions"),
-            ],
-            &[token_file("~/.codex/auth.json")],
-        )?,
-        entry(
-            "claude",
-            "Claude",
-            Endpoint,
-            Subscription,
-            &[
-                endpoint("https://api.anthropic.com/api/oauth/usage?cedar_ember=1"),
-                artifact("~/.claude/projects"),
-            ],
-            &[token_file("~/.claude/.credentials.json")],
-        )?,
-        entry(
-            "cline-pass",
-            "ClinePass",
-            Endpoint,
-            Subscription,
-            &[endpoint(
-                "https://api.cline.bot/api/v1/users/me/plan/usage-limits",
-            )],
-            &[
-                env_auth("CLINE_API_KEY"),
-                env_auth("CLINEPASS_API_KEY"),
-                token_file("~/.cline/data/settings/providers.json"),
-            ],
-        )?,
-        entry(
-            "cursor",
-            "Cursor",
-            ProviderOnly,
-            Subscription,
-            &[
-                endpoint("https://cursor.com/api/usage-summary"),
-                endpoint("https://cursor.com/api/dashboard/get-filtered-usage-events"),
-            ],
-            &[browser_auth()],
-        )?,
-        entry(
-            "copilot",
-            "Copilot",
-            ProviderOnly,
-            Subscription,
-            &[endpoint("https://api.github.com/copilot_internal/user")],
-            &[oauth_auth()],
-        )?,
-        entry(
-            "gemini",
-            "Gemini",
-            Endpoint,
-            Subscription,
-            &[endpoint(
-                "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-            )],
-            &[token_file("~/.gemini/oauth_creds.json")],
-        )?,
-        entry(
-            "antigravity",
-            "Antigravity",
-            ProviderOnly,
-            Subscription,
-            &[endpoint(
-                "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-            )],
-            &[oauth_auth()],
-        )?,
-        entry(
-            "opencode",
-            "OpenCode",
-            ProviderOnly,
-            Unverified,
-            &[
-                endpoint("https://opencode.ai/console/api/billing/status"),
-                artifact("~/.local/share/opencode/opencode.db"),
-            ],
-            &[browser_auth()],
-        )?,
-        entry(
-            "opencode-go",
-            "OpenCode Go",
-            Endpoint,
-            Unverified,
-            &[
-                endpoint("https://opencode.ai/zen/go/v1/usage"),
-                artifact("~/.local/share/opencode/opencode.db"),
-            ],
-            &[env_auth("OPENCODE_API_KEY"), browser_auth()],
-        )?,
-        entry(
-            "qwen-cloud",
-            "Qwen Cloud",
-            ProviderOnly,
-            Subscription,
-            &[],
-            &[browser_auth()],
-        )?,
-        entry(
-            "kimi",
-            "Kimi",
-            ProviderOnly,
-            Subscription,
-            &[
-                endpoint("https://api.kimi.com/coding/v1/usages"),
-                endpoint(
-                    "https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages",
-                ),
-            ],
-            &[browser_auth(), oauth_auth()],
-        )?,
-        entry(
-            "kilo",
-            "Kilo",
-            Endpoint,
-            Subscription,
-            &[endpoint("https://app.kilo.ai/api/trpc")],
-            &[
-                env_auth("KILO_API_KEY"),
-                token_file("~/.local/share/kilo/auth.json"),
-            ],
-        )?,
-        entry(
-            "zed",
-            "Zed",
-            ProviderOnly,
-            Subscription,
-            &[
-                endpoint("https://cloud.zed.dev/frontend/billing/usage"),
-                endpoint("https://cloud.zed.dev/client/users/me"),
-            ],
-            &[browser_auth()],
-        )?,
-        entry(
-            "windsurf",
-            "Windsurf",
-            ProviderOnly,
-            Subscription,
-            &[endpoint(
-                "https://windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/GetPlanStatus",
-            )],
-            &[browser_auth()],
-        )?,
-        entry(
-            "amp",
-            "Amp",
-            Endpoint,
-            Subscription,
-            &[endpoint(
-                "https://ampcode.com/api/internal?userDisplayBalanceInfo",
-            )],
-            &[env_auth("AMP_API_KEY"), oauth_auth()],
-        )?,
-        entry(
-            "grok",
-            "Grok",
-            Endpoint,
-            Subscription,
-            &[
-                endpoint("https://cli-chat-proxy.grok.com/v1/billing?format=credits"),
-                endpoint("https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets"),
-            ],
-            &[
-                token_file("~/.grok/auth.json"),
-                env_auth("GROK_OAUTH_TOKEN"),
-                browser_auth(),
-            ],
-        )?,
-        entry(
-            "deepseek",
-            "DeepSeek",
-            CostOnly,
-            Unverified,
-            &[endpoint("https://api.deepseek.com/user/balance")],
-            &[env_auth("DEEPSEEK_API_KEY"), env_auth("DEEPSEEK_KEY")],
-        )?,
-        entry(
-            "command-code",
-            "Command Code",
-            ProviderOnly,
-            Subscription,
-            &[],
-            &[browser_auth()],
-        )?,
-        entry(
-            "muse",
-            "Muse",
-            ProviderOnly,
-            NotPriced,
-            &[
-                endpoint("https://api.meta.ai/muse-code/key"),
-                artifact("~/.local/share/muse/sessions"),
-            ],
-            &[token_file("~/.config/muse/auth.json"), oauth_auth()],
-        )?,
-        entry(
-            "minimax",
-            "MiniMax",
-            ProviderOnly,
-            Subscription,
-            &[],
-            &[
-                env_auth("MINIMAX_CODING_API_KEY"),
-                env_auth("MINIMAX_API_KEY"),
-                browser_auth(),
-            ],
-        )?,
-        entry(
-            "factory",
-            "Factory",
-            Endpoint,
-            Subscription,
-            &[endpoint("https://api.factory.ai/api/billing/limits")],
-            &[
-                env_auth("FACTORY_API_KEY"),
-                env_file("~/.factory/.env"),
-                browser_auth(),
-            ],
-        )?,
-        entry(
-            "warp",
-            "Warp",
-            Endpoint,
-            Subscription,
-            &[endpoint(
-                "https://app.warp.dev/graphql/v2?op=GetRequestLimitInfo",
-            )],
-            &[env_auth("WARP_API_KEY")],
-        )?,
-        entry(
-            "devin",
-            "Devin",
-            ProviderOnly,
-            Subscription,
-            &[],
-            &[browser_auth()],
-        )?,
-        entry(
-            "kiro",
-            "Kiro",
-            ProviderOnly,
-            Subscription,
-            &[],
-            &[oauth_auth()],
-        )?,
-        entry(
-            "mimo",
-            "MiMo",
-            ProviderOnly,
-            Subscription,
-            &[],
-            &[browser_auth()],
-        )?,
-        entry(
-            "mistral",
-            "Mistral",
-            ProviderOnly,
-            Subscription,
-            &[
-                endpoint("https://admin.mistral.ai/api/billing/credits"),
-                endpoint("https://admin.mistral.ai/api/billing/v2/usage"),
-            ],
-            &[browser_auth()],
-        )?,
-        entry(
-            "workbuddy",
-            "WorkBuddy",
-            ProviderOnly,
-            Subscription,
-            &[endpoint(
-                "https://www.workbuddy.cn/billing/meter/get-user-resource-summary",
-            )],
-            &[browser_auth()],
-        )?,
-        entry(
-            "qoder",
-            "Qoder",
-            ProviderOnly,
-            Subscription,
-            &[
-                endpoint("https://qoder.com/api/v2/me/usages/big_model_credits"),
-                endpoint("https://qoder.com.cn/api/v2/me/usages/big_model_credits"),
-            ],
-            &[browser_auth()],
-        )?,
-        entry(
-            "pi",
-            "Pi",
-            CostOnly,
-            ModelsDev,
-            &[artifact("~/.pi/agent/sessions")],
-            &[],
-        )?,
-    ])
+        })?;
+    let raw = match value {
+        serde_json::Value::Array(items) => items,
+        single => vec![single],
+    };
+    let mut entries = Vec::new();
+    for item in raw {
+        let entry: UsageProviderEntry =
+            serde_json::from_value(item).map_err(|e| RegistryError::Parse {
+                path: source.to_owned(),
+                reason: e.to_string(),
+            })?;
+        entry.validate()?;
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn is_iso_date(value: &str) -> bool {
@@ -736,21 +783,19 @@ fn is_iso_date(value: &str) -> bool {
     dash_at(4) && dash_at(7) && digits_at((0, 4)) && digits_at((5, 7)) && digits_at((8, 10))
 }
 
+/// Exact loopback match only: `127.0.0.1.attacker.com` is a DNS name an
+/// attacker controls, not a loopback address.
 fn is_loopback_host(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-fn path_template_reason(template: &str) -> Option<String> {
-    (template.trim().is_empty() || template.chars().any(char::is_control))
-        .then(|| "must be a non-empty control-free path template".to_owned())
-}
-
-fn env_name_reason(name: &str) -> Option<String> {
-    (name.trim().is_empty()
-        || name
-            .chars()
-            .any(|c| char::is_control(c) || c.is_whitespace()))
-    .then(|| "env var names carry no spaces or control characters".to_owned())
+/// Host part of a URL authority with brackets and port stripped:
+/// `[::1]:8080` -> `::1`, `127.0.0.1:99` -> `127.0.0.1`.
+fn strip_port(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or_default();
+    }
+    authority.split(':').next().unwrap_or_default()
 }
 
 fn endpoint_url_reason(url: &str) -> Option<String> {
@@ -767,12 +812,12 @@ fn endpoint_url_reason(url: &str) -> Option<String> {
     {
         return Some("must not contain control or whitespace characters".to_owned());
     }
-    if url.contains('@') {
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..authority_end).unwrap_or_default();
+    if authority.contains('@') {
         return Some("must not carry userinfo".to_owned());
     }
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = rest.get(..host_end)?;
-    let host = authority.split(':').next().unwrap_or_default();
+    let host = strip_port(authority);
     if host.is_empty() {
         return Some("must name a host".to_owned());
     }
@@ -780,6 +825,19 @@ fn endpoint_url_reason(url: &str) -> Option<String> {
         return Some("plain http is allowed only on a loopback host".to_owned());
     }
     None
+}
+
+fn path_template_reason(template: &str) -> Option<String> {
+    (template.trim().is_empty() || template.chars().any(char::is_control))
+        .then(|| "must be a non-empty control-free path template".to_owned())
+}
+
+fn env_name_reason(name: &str) -> Option<String> {
+    (name.trim().is_empty()
+        || name
+            .chars()
+            .any(|c| char::is_control(c) || c.is_whitespace()))
+    .then(|| "env var names carry no spaces or control characters".to_owned())
 }
 
 #[cfg(test)]
@@ -793,8 +851,8 @@ mod tests {
             label: label.to_owned(),
             locators: Vec::new(),
             auth_material: Vec::new(),
-            window_strategy: ProviderOnly,
-            pricing: Unverified,
+            window_strategy: WindowStrategy::ProviderOnly,
+            pricing: PricingReference::Unverified,
             documentation_url: None,
             schema_version: USAGE_PROVIDER_SCHEMA_VERSION,
             verified_at: None,
@@ -871,13 +929,43 @@ mod tests {
     #[test]
     fn validation_rejects_plain_http_off_loopback_but_allows_a_local_proxy() {
         let mut row = entry("public-http", "Public Http");
-        row.locators = vec![endpoint("http://usage.example.com/v1/usage")];
+        row.locators = vec![UsageLocator::Endpoint {
+            url: "http://usage.example.com/v1/usage".to_owned(),
+        }];
         let msg = row.validate().unwrap_err().to_string();
         assert!(msg.contains("loopback"), "got: {msg}");
 
-        row.locators = vec![endpoint("http://127.0.0.1:8080/usage/summary")];
+        row.locators = vec![UsageLocator::Endpoint {
+            url: "http://127.0.0.1:8080/usage/summary".to_owned(),
+        }];
         row.validate()
             .unwrap_or_else(|e| panic!("loopback proxy endpoint rejected: {e:?}"));
+    }
+
+    #[test]
+    fn loopback_matching_is_exact_not_a_prefix() {
+        let mut row = entry("dns-spoof", "Dns Spoof");
+        row.locators = vec![UsageLocator::Endpoint {
+            url: "http://127.0.0.1.attacker.com/v1/usage".to_owned(),
+        }];
+        let msg = row.validate().unwrap_err().to_string();
+        assert!(msg.contains("loopback"), "got: {msg}");
+    }
+
+    #[test]
+    fn ipv6_bracketed_loopback_and_query_emails_are_valid_endpoint_data() {
+        let mut row = entry("ipv6-loopback", "Ipv6 Loopback");
+        row.locators = vec![UsageLocator::Endpoint {
+            url: "http://[::1]:8080/usage/summary".to_owned(),
+        }];
+        row.validate()
+            .unwrap_or_else(|e| panic!("bracketed IPv6 loopback rejected: {e:?}"));
+
+        row.locators = vec![UsageLocator::Endpoint {
+            url: "https://billing.example.com/v1/usage?email=a@b.com".to_owned(),
+        }];
+        row.validate()
+            .unwrap_or_else(|e| panic!("`@` inside a query string rejected: {e:?}"));
     }
 
     #[test]
@@ -889,7 +977,9 @@ mod tests {
             "ftp://example.com/usage",
         ] {
             let mut row = entry("bad-url", "Bad Url");
-            row.locators = vec![endpoint(url)];
+            row.locators = vec![UsageLocator::Endpoint {
+                url: url.to_owned(),
+            }];
             assert!(row.validate().is_err(), "`{url}` passed validation");
         }
     }
@@ -897,9 +987,13 @@ mod tests {
     #[test]
     fn validation_rejects_auth_names_that_cannot_be_looked_up() {
         let mut row = entry("bad-env", "Bad Env");
-        row.auth_material = vec![env_auth("NOT A NAME")];
+        row.auth_material = vec![AuthMaterialKind::EnvVar {
+            name: "NOT A NAME".to_owned(),
+        }];
         assert!(row.validate().is_err());
-        row.auth_material = vec![env_auth("DEEPSEEK_API_KEY")];
+        row.auth_material = vec![AuthMaterialKind::EnvVar {
+            name: "DEEPSEEK_API_KEY".to_owned(),
+        }];
         row.validate()
             .unwrap_or_else(|e| panic!("clean env name rejected: {e:?}"));
     }

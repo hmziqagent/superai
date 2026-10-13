@@ -48,6 +48,59 @@ mod tests {
         fs::copy(&from, dir.join(name)).unwrap_or_else(|e| panic!("copy fixture `{fixture}`: {e}"));
     }
 
+    fn slugify(heading: &str) -> String {
+        heading
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_whitespace() { '-' } else { c })
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect()
+    }
+
+    fn heading_anchors(path: &Path) -> Vec<String> {
+        let text =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        text.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                let heading = trimmed.trim_start_matches('#');
+                if heading.len() == trimmed.len() {
+                    return None;
+                }
+                Some(slugify(heading.strip_prefix(' ').unwrap_or(heading)))
+            })
+            .collect()
+    }
+
+    fn assert_documentation_links_resolve<'a>(
+        entries: impl Iterator<Item = &'a UsageProviderEntry>,
+    ) {
+        for row in entries {
+            let link = row
+                .documentation_url
+                .as_deref()
+                .unwrap_or_else(|| panic!("entry `{}` carries no documentation link", row.id));
+            let (file, fragment) = match link.split_once('#') {
+                Some((file, fragment)) => (file, Some(fragment)),
+                None => (link, None),
+            };
+            let path = repo_root().join(file);
+            assert!(
+                path.is_file(),
+                "entry `{}` links `{file}`, which is not a file in this repo",
+                row.id
+            );
+            if let Some(fragment) = fragment {
+                let anchors = heading_anchors(&path);
+                assert!(
+                    anchors.iter().any(|anchor| anchor == fragment),
+                    "entry `{}` links `#{fragment}`, which is no heading in `{file}` (anchors: {anchors:?})",
+                    row.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn bundled_covers_the_overlap_table_providers() {
         let registry =
@@ -99,18 +152,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("bundled entry invalid: {e:?}"));
         for row in registry.entries() {
             assert_eq!(row.schema_version, USAGE_PROVIDER_SCHEMA_VERSION);
-            let link = row
-                .documentation_url
-                .as_deref()
-                .unwrap_or_else(|| panic!("entry `{}` carries no documentation link", row.id));
-            let file = link.split('#').next().unwrap_or_default();
-            let path = repo_root().join(file);
-            assert!(
-                path.is_file(),
-                "entry `{}` links `{file}`, which is not a file in this repo",
-                row.id
-            );
         }
+        assert_documentation_links_resolve(registry.entries());
     }
 
     #[test]
@@ -139,6 +182,7 @@ mod tests {
         let first =
             UsageRegistry::load_dir(&dir).unwrap_or_else(|e| panic!("fixture dir rejected: {e:?}"));
         assert_eq!(first.len(), 3);
+        assert_documentation_links_resolve(first.entries());
 
         let new_entry = r#"{
   "id": "synthetic-new-99",
