@@ -103,6 +103,78 @@ mod tests {
         );
     }
 
+    fn claude_estimate(input: u64) -> String {
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-10-13T09:30:00Z",
+            "sessionId": "sess-merge",
+            "requestId": "req-merge",
+            "message": {
+                "id": "msg-merge",
+                "model": "claude-sonnet-4-5",
+                "stop_reason": null,
+                "usage": {"input_tokens": input, "output_tokens": 0},
+            },
+        })
+        .to_string()
+    }
+
+    fn claude_complete(input: u64, output: u64) -> String {
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-10-13T09:30:01Z",
+            "sessionId": "sess-merge",
+            "requestId": "req-merge",
+            "message": {
+                "id": "msg-merge",
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": input, "output_tokens": output},
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_complete_row_displaces_a_larger_estimate_under_the_same_key() {
+        let corpus = write_corpus(
+            "claude-complete-wins",
+            &[
+                claude_estimate(500).into_bytes(),
+                claude_complete(10, 5).into_bytes(),
+            ],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_claude_transcripts(&[root.to_path_buf()]);
+        assert_eq!(
+            event_summary(&outcome),
+            vec![("anthropic", "claude-sonnet-4-5", 10, 5, 0, 0)],
+            "completeness must outrank the estimate's larger total"
+        );
+        assert_eq!(
+            outcome.counts.skipped, 1,
+            "the estimate stays a flagged gap"
+        );
+    }
+
+    #[test]
+    fn a_larger_estimate_never_displaces_a_complete_row() {
+        let corpus = write_corpus(
+            "claude-estimate-loses",
+            &[
+                claude_complete(10, 5).into_bytes(),
+                claude_estimate(500).into_bytes(),
+            ],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_claude_transcripts(&[root.to_path_buf()]);
+        assert_eq!(
+            event_summary(&outcome),
+            vec![("anthropic", "claude-sonnet-4-5", 10, 5, 0, 0)]
+        );
+        assert_eq!(outcome.counts.skipped, 1);
+    }
+
     #[test]
     fn claude_events_price_exactly_through_the_cost_engine() {
         let outcome = scan_claude_transcripts(&[fixtures().join("claude/projects")]);
@@ -128,7 +200,7 @@ mod tests {
             fixtures().join("codex/sessions"),
             fixtures().join("codex/archived_sessions"),
         ]);
-        assert_eq!(outcome.counts.parsed, 10);
+        assert_eq!(outcome.counts.parsed, 12);
         assert_eq!(outcome.counts.skipped, 4);
         assert_eq!(outcome.unreadable_artifacts, 0);
         assert_eq!(
@@ -138,6 +210,7 @@ mod tests {
                 ("openai", "gpt-5.1", 60, 50, 40, 0),
                 ("openai", "gpt-5.1", 50, 20, 0, 0),
                 ("openai", "gpt-5.1", 5, 5, 5, 0),
+                ("openai", "gpt-5.1", 10, 8, 2, 0),
             ]
         );
         assert_eq!(outcome.events[1].timestamp, ts("2026-10-13T08:00:10Z"));
@@ -160,8 +233,72 @@ mod tests {
                 &outcome.into_recorded_usage(),
             )
             .unwrap_or_else(|e| panic!("total: {e:?}"));
-        let expected = Usd::parse("0.000908925").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
+        let expected = Usd::parse("0.001001675").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
         assert_eq!(report.total.spend, Spend::Exact(expected));
+    }
+
+    #[test]
+    fn codex_ledger_records_count_once_against_their_token_count_mirrors() {
+        let corpus = write_corpus(
+            "codex-ledger",
+            &[
+                json!({"timestamp":"2026-10-13T08:00:00Z","type":"turn_context","payload":{"model":"gpt-5.1"}})
+                    .to_string()
+                    .into_bytes(),
+                json!({
+                    "timestamp": "2026-10-13T08:00:10Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 50}},
+                    },
+                })
+                .to_string()
+                .into_bytes(),
+                json!({
+                    "timestamp": "2026-10-13T08:00:11Z",
+                    "type": "token_usage_record",
+                    "payload": {
+                        "thread_id": "th-1",
+                        "response_id": "resp-1",
+                        "usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 50},
+                        "thread_token_usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 50},
+                    },
+                })
+                .to_string()
+                .into_bytes(),
+                json!({
+                    "timestamp": "2026-10-13T08:00:12Z",
+                    "type": "token_usage_record",
+                    "payload": {
+                        "thread_id": "th-1",
+                        "response_id": "resp-2",
+                        "usage": {"input_tokens": 50, "cached_input_tokens": 5, "output_tokens": 20},
+                        "thread_token_usage": {"input_tokens": 150, "cached_input_tokens": 45, "output_tokens": 70},
+                    },
+                })
+                .to_string()
+                .into_bytes(),
+                json!({"timestamp":"2026-10-13T08:00:13Z","type":"token_usage_record","payload":{"input_tokens":9,"output_tokens":9}})
+                    .to_string()
+                    .into_bytes(),
+            ],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_codex_rollouts(&[root.to_path_buf()]);
+        assert_eq!(
+            event_summary(&outcome),
+            vec![
+                ("openai", "gpt-5.1", 60, 50, 40, 0),
+                ("openai", "gpt-5.1", 45, 20, 5, 0),
+            ],
+            "the mirror must add nothing; only the advancing record emits"
+        );
+        assert_eq!(outcome.counts.parsed, 4);
+        assert_eq!(
+            outcome.counts.skipped, 1,
+            "a record without thread_token_usage is a flagged gap"
+        );
     }
 
     fn default_pi_roots() -> Vec<PathBuf> {
@@ -210,6 +347,24 @@ mod tests {
                 ("anthropic", "claude-sonnet-4-5", 10, 6, 4, 1),
             ]
         );
+    }
+
+    #[test]
+    fn pi_events_price_exactly_through_the_cost_engine() {
+        let outcome = scan_pi_sessions(&default_pi_roots());
+        let engine = CostEngine::new(
+            RateTable::bundled().unwrap_or_else(|e| panic!("bundled rates: {e:?}")),
+        );
+        let report = engine
+            .total(
+                &CostPeriod::AllHistory,
+                ts("2026-10-13T12:00:00Z"),
+                "UTC",
+                &outcome.into_recorded_usage(),
+            )
+            .unwrap_or_else(|e| panic!("total: {e:?}"));
+        let expected = Usd::parse("0.000950025").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
+        assert_eq!(report.total.spend, Spend::Exact(expected));
     }
 
     #[test]
@@ -337,7 +492,7 @@ mod tests {
     }
 
     fn codex_generated_line(rng: &mut XorShift64) -> Vec<u8> {
-        match rng.below(8) {
+        match rng.below(9) {
             0 => json!({
                 "timestamp": "2026-10-13T08:00:00Z",
                 "type": "event_msg",
@@ -369,6 +524,19 @@ mod tests {
                 .to_string()
                 .into_bytes(),
             6 => vec![b'{', b'"', 0xc3, 0x28],
+            7 => json!({
+                "timestamp": "2026-10-13T08:00:00Z",
+                "type": "token_usage_record",
+                "payload": {
+                    "thread_id": "th-gen",
+                    "response_id": format!("r-{}", rng.below(50)),
+                    "model": "gpt-5.1",
+                    "usage": {"input_tokens": rng.below(900), "cached_input_tokens": rng.below(90), "output_tokens": rng.below(900)},
+                    "thread_token_usage": {"input_tokens": rng.below(9000), "cached_input_tokens": rng.below(900), "output_tokens": rng.below(9000)},
+                },
+            })
+            .to_string()
+            .into_bytes(),
             _ => json!({"timestamp": "not-a-time", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 5, "output_tokens": 5}}}})
                 .to_string()
                 .into_bytes(),

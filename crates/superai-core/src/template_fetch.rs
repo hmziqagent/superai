@@ -1,6 +1,7 @@
 //! Template fetch client (TPL-03): bounded HTTPS fetch, size limits,
 //! digest verification, traversal rejection before any filesystem use.
 
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -221,36 +222,46 @@ fn has_parent_component(path: &Path) -> bool {
         .any(|comp| matches!(comp, std::path::Component::ParentDir))
 }
 
+/// Bounded local read for the `file://` test branch: `take()` caps the
+/// read itself, so an oversized file is never slurped whole.
+fn read_file_bounded(
+    path: &Path,
+    context: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, TemplateFetchError> {
+    let open_err = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            TemplateFetchError::NotFound {
+                template: context.to_owned(),
+                reason: format!("file not found `{}`: {e}", path.display()),
+            }
+        } else {
+            TemplateFetchError::Network {
+                template: context.to_owned(),
+                reason: format!("file read failed `{}`: {e}", path.display()),
+            }
+        }
+    };
+    let file = File::open(path).map_err(&open_err)?;
+    let mut bytes = Vec::new();
+    let mut capped = file.take(max_bytes as u64 + 1);
+    capped.read_to_end(&mut bytes).map_err(open_err)?;
+    if bytes.len() > max_bytes {
+        return Err(TemplateFetchError::SizeLimit {
+            template: context.to_owned(),
+            reason: format!("file size exceeds limit {max_bytes}"),
+        });
+    }
+    Ok(bytes)
+}
+
 /// Fetch raw bytes: `file://` reads local (tests); else a blocking HTTPS
 /// GET with bounded redirects, size cap, timeout, `USER_AGENT`.
 pub fn fetch_bytes(url: &str, context: &str) -> Result<Vec<u8>, TemplateFetchError> {
     validate_fetch_url(url, context)?;
 
     if let Some(path_str) = url.strip_prefix("file://") {
-        let path = Path::new(path_str);
-        let bytes = std::fs::read(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                TemplateFetchError::NotFound {
-                    template: context.to_owned(),
-                    reason: format!("file not found `{path_str}`: {e}"),
-                }
-            } else {
-                TemplateFetchError::Network {
-                    template: context.to_owned(),
-                    reason: format!("file read failed `{path_str}`: {e}"),
-                }
-            }
-        })?;
-        if bytes.len() > MAX_TEMPLATE_BYTES {
-            return Err(TemplateFetchError::SizeLimit {
-                template: context.to_owned(),
-                reason: format!(
-                    "file size {} exceeds limit {MAX_TEMPLATE_BYTES}",
-                    bytes.len()
-                ),
-            });
-        }
-        return Ok(bytes);
+        return read_file_bounded(Path::new(path_str), context, MAX_TEMPLATE_BYTES);
     }
 
     fetch_bounded(
@@ -464,28 +475,7 @@ pub fn fetch_catalog(config: &TemplateRepoConfig) -> Result<Catalog, TemplateFet
 
 /// Fetch a catalog from a local file path (tests; no network involved).
 pub fn fetch_catalog_from_path(path: &Path) -> Result<Catalog, TemplateFetchError> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            TemplateFetchError::NotFound {
-                template: "catalog".to_owned(),
-                reason: format!("catalog file not found `{}`: {e}", path.display()),
-            }
-        } else {
-            TemplateFetchError::Network {
-                template: "catalog".to_owned(),
-                reason: format!("read failed `{}`: {e}", path.display()),
-            }
-        }
-    })?;
-    if bytes.len() > MAX_TEMPLATE_BYTES {
-        return Err(TemplateFetchError::SizeLimit {
-            template: "catalog".to_owned(),
-            reason: format!(
-                "catalog size {} exceeds limit {MAX_TEMPLATE_BYTES}",
-                bytes.len()
-            ),
-        });
-    }
+    let bytes = read_file_bounded(path, "catalog", MAX_TEMPLATE_BYTES)?;
     let catalog =
         Catalog::from_json_bytes(&bytes).map_err(|e| TemplateFetchError::SchemaInvalid {
             template: "catalog".to_owned(),
@@ -889,6 +879,19 @@ mod tests {
             TemplateFetchError::SizeLimit { .. } => {}
             other => panic!("expected SizeLimit, got {other:?}"),
         }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_file_at_exactly_the_cap_still_loads() {
+        let dir = crate::test_util::temp_dir_unique("tpl-fetch");
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let edge = dir.join("edge.bin");
+        std::fs::write(&edge, vec![b'a'; MAX_TEMPLATE_BYTES]).unwrap();
+        let url = format!("file://{}", edge.display());
+        let bytes = fetch_bytes(&url, "catalog").unwrap();
+        assert_eq!(bytes.len(), MAX_TEMPLATE_BYTES);
         drop(std::fs::remove_dir_all(&dir));
     }
 

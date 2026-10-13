@@ -163,7 +163,9 @@ impl Usd {
     }
 
     /// Parse an exact decimal such as `3`, `0.075`, or `4.2929e-2`.
-    /// More than 12 fractional digits is an error, not a rounding.
+    /// Fractional digits past the 12-digit scale are an error only when
+    /// they add precision: `3.0000000000000` parses, `0.0000000000001`
+    /// does not.
     pub fn parse(text: &str) -> CostResult<Self> {
         let trimmed = text.trim();
         let (negative, unsigned) = match trimmed.strip_prefix('-') {
@@ -947,16 +949,17 @@ impl PricingCache {
     }
 
     /// Whether an unknown-model lookup may trigger a refresh yet; the
-    /// cooldown runs from the cache's effective fetch time.
+    /// cooldown runs from the later of the cache's fetch time and the
+    /// last recorded attempt, so failed fetches pace hammering too.
     pub fn unknown_model_refresh_allowed(&self, now: Timestamp) -> bool {
-        let Some(cached) = self.load() else {
+        let anchors = [
+            self.load().map(|cached| cached.fetched_at.as_second()),
+            self.last_attempt_second(),
+        ];
+        let Some(anchor) = anchors.into_iter().flatten().max() else {
             return true;
         };
-        now.as_second()
-            >= cached
-                .fetched_at
-                .as_second()
-                .saturating_add(UNKNOWN_MODEL_COOLDOWN_SECS)
+        now.as_second() >= anchor.saturating_add(UNKNOWN_MODEL_COOLDOWN_SECS)
     }
 
     /// Atomic replace: temp file in the same directory, `rename(2)` over
@@ -970,44 +973,32 @@ impl PricingCache {
         let bytes = serde_json::to_vec(&doc).map_err(|e| CostError::CacheIo {
             reason: format!("encode: {e}"),
         })?;
-        let parent = self.path.parent().ok_or_else(|| CostError::CacheIo {
-            reason: "cache path has no parent directory".to_owned(),
-        })?;
-        std::fs::create_dir_all(parent).map_err(|e| CostError::CacheIo {
-            reason: format!("create {}: {e}", parent.display()),
-        })?;
-        let temp = parent.join(format!(
-            ".models-dev.json.tmp-{}-{}",
-            fetched_at.as_second(),
-            std::process::id()
-        ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|e| CostError::CacheIo {
-                reason: format!("create temp {}: {e}", temp.display()),
-            })?;
-        let write_result = file
-            .write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| std::fs::rename(&temp, &self.path));
-        if let Err(e) = write_result {
-            if let Err(cleanup) = std::fs::remove_file(&temp) {
-                return Err(CostError::CacheIo {
-                    reason: format!("store failed: {e}; temp cleanup also failed: {cleanup}"),
-                });
-            }
-            return Err(CostError::CacheIo {
-                reason: format!("store failed: {e}"),
-            });
-        }
-        Ok(())
+        atomic_replace(&self.path, &bytes)
     }
 
-    /// Fetch `url`, validate plausibility, and store atomically. On any
-    /// failure the previous cache is left untouched and remains loadable.
+    fn attempt_marker_path(&self) -> PathBuf {
+        self.path.with_file_name("models-dev.last-attempt")
+    }
+
+    fn last_attempt_second(&self) -> Option<i64> {
+        let mut bytes = Vec::new();
+        let mut capped = File::open(self.attempt_marker_path()).ok()?.take(64);
+        capped.read_to_end(&mut bytes).ok()?;
+        std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+    }
+
+    fn note_refresh_attempt(&self, now: Timestamp) -> CostResult<()> {
+        atomic_replace(
+            &self.attempt_marker_path(),
+            now.as_second().to_string().as_bytes(),
+        )
+    }
+
+    /// Fetch `url`, validate plausibility, and store atomically. Every
+    /// attempt is stamped first, so a failure still paces the
+    /// unknown-model cooldown; the previous cache stays loadable.
     pub fn refresh(&self, url: &str, now: Timestamp) -> CostResult<CachedRates> {
+        self.note_refresh_attempt(now)?;
         let bytes = fetch_models_dev_bytes(url)?;
         let rates = RateTable::from_models_dev_json(&bytes)?;
         if !rates.is_plausible() {
@@ -1024,6 +1015,53 @@ impl PricingCache {
     }
 }
 
+fn next_temp_token() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn atomic_replace(target: &Path, bytes: &[u8]) -> CostResult<()> {
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CostError::CacheIo {
+            reason: format!("cache path has no file name: {}", target.display()),
+        })?;
+    let parent = target.parent().ok_or_else(|| CostError::CacheIo {
+        reason: "cache path has no parent directory".to_owned(),
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| CostError::CacheIo {
+        reason: format!("create {}: {e}", parent.display()),
+    })?;
+    let temp = parent.join(format!(
+        ".{name}.tmp-{}-{}",
+        next_temp_token(),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| CostError::CacheIo {
+            reason: format!("create temp {}: {e}", temp.display()),
+        })?;
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temp, target));
+    if let Err(e) = write_result {
+        if let Err(cleanup) = std::fs::remove_file(&temp) {
+            return Err(CostError::CacheIo {
+                reason: format!("store failed: {e}; temp cleanup also failed: {cleanup}"),
+            });
+        }
+        return Err(CostError::CacheIo {
+            reason: format!("store failed: {e}"),
+        });
+    }
+    Ok(())
+}
+
 /// Bounded catalog fetch over core's shared client (https-only, redirects
 /// re-validated per hop, size-capped); `file://` reads local bytes for tests.
 pub fn fetch_models_dev_bytes(url: &str) -> CostResult<Vec<u8>> {
@@ -1031,9 +1069,18 @@ pub fn fetch_models_dev_bytes(url: &str) -> CostResult<Vec<u8>> {
         reason: echo(&format!("{e}")),
     })?;
     if let Some(path) = url.strip_prefix("file://") {
-        let bytes = std::fs::read(path).map_err(|e| CostError::Fetch {
+        // take() bounds the read itself; a hostile local file is never
+        // slurped whole just to be rejected afterwards.
+        let file = File::open(path).map_err(|e| CostError::Fetch {
             reason: format!("read {path}: {e}"),
         })?;
+        let mut bytes = Vec::new();
+        let mut capped = file.take(MAX_MODELS_DEV_BYTES as u64 + 1);
+        capped
+            .read_to_end(&mut bytes)
+            .map_err(|e| CostError::Fetch {
+                reason: format!("read {path}: {e}"),
+            })?;
         if bytes.len() > MAX_MODELS_DEV_BYTES {
             return Err(CostError::FetchSizeLimit {
                 max_bytes: MAX_MODELS_DEV_BYTES,

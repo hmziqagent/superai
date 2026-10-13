@@ -141,21 +141,92 @@ mod tests {
         );
     }
 
+    fn bundled_rows() -> Vec<(String, String, ModelRates)> {
+        let table = RateTable::bundled().unwrap_or_else(|e| panic!("bundled table invalid: {e}"));
+        let json =
+            serde_json::to_value(&table).unwrap_or_else(|e| panic!("serialize bundled table: {e}"));
+        let providers = json
+            .get("providers")
+            .and_then(|value| value.as_object())
+            .unwrap_or_else(|| panic!("bundled table must serialize as a providers map"));
+        let mut rows = Vec::new();
+        for (provider, models) in providers {
+            for (model, raw) in models
+                .as_object()
+                .unwrap_or_else(|| panic!("provider `{provider}` must serialize as a model map"))
+            {
+                let rates = serde_json::from_value::<ModelRates>(raw.clone())
+                    .unwrap_or_else(|e| panic!("bundled `{provider}/{model}`: {e}"));
+                rows.push((provider.clone(), model.clone(), rates));
+            }
+        }
+        rows
+    }
+
     #[test]
-    fn bundled_table_matches_the_published_first_party_rates() {
-        let table = RateTable::bundled().unwrap();
-        let sonnet = table.lookup("anthropic", "claude-sonnet-4-5").unwrap();
-        assert_eq!(sonnet.input.to_string(), "3");
-        assert_eq!(sonnet.output.to_string(), "15");
-        assert_eq!(sonnet.cache_read.map(|r| r.to_string()), Some("0.3".into()));
-        assert_eq!(
-            sonnet.cache_write.map(|r| r.to_string()),
-            Some("3.75".into())
+    fn bundled_rates_round_trip_and_writes_outprice_reads() {
+        let rows = bundled_rows();
+        assert!(
+            !rows.is_empty(),
+            "the bundled table must carry priced models"
         );
-        let gpt = table.lookup("openai", "gpt-5.1").unwrap();
-        assert_eq!(gpt.input.to_string(), "1.25");
-        assert_eq!(gpt.output.to_string(), "10");
-        assert_eq!(gpt.cache_read.map(|r| r.to_string()), Some("0.125".into()));
-        assert_eq!(gpt.cache_write, None);
+        for (provider, model, rates) in &rows {
+            for (label, rate) in [
+                ("input", rates.input),
+                ("output", rates.output),
+                ("cache_read", rates.cache_read.unwrap_or_default()),
+                ("cache_write", rates.cache_write.unwrap_or_default()),
+            ] {
+                let text = rate.to_string();
+                assert_eq!(
+                    Usd::parse(&text).ok(),
+                    Some(rate),
+                    "{provider}/{model}: `{label}` must re-parse its own display form"
+                );
+            }
+            if let (Some(read), Some(write)) = (rates.cache_read, rates.cache_write) {
+                assert!(
+                    write.as_picos() > read.as_picos(),
+                    "{provider}/{model}: cache writes must outprice cache reads"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_keeps_the_remote_override_and_every_other_bundled_row() {
+        let table = RateTable::bundled().unwrap();
+        assert_eq!(
+            table.merge_additive(&RateTable::default()),
+            table,
+            "an empty remote catalog must not disturb any bundled row"
+        );
+        let mut remote = RateTable::default();
+        remote.insert(
+            "anthropic",
+            "claude-sonnet-4-5",
+            ModelRates {
+                input: Usd::parse_rate_per_mtok("9.99").unwrap(),
+                output: Usd::parse_rate_per_mtok("99").unwrap(),
+                cache_read: None,
+                cache_write: None,
+            },
+        );
+        let merged = table.merge_additive(&remote);
+        assert_eq!(
+            merged.lookup("anthropic", "claude-sonnet-4-5"),
+            remote.lookup("anthropic", "claude-sonnet-4-5"),
+            "the remote entry must win over the bundled row"
+        );
+        for (provider, model, rates) in bundled_rows() {
+            if provider == "anthropic" && model == "claude-sonnet-4-5" {
+                continue;
+            }
+            assert_eq!(
+                merged.lookup(&provider, &model),
+                Some(&rates),
+                "bundled `{provider}/{model}` must survive the merge unchanged"
+            );
+        }
     }
 }

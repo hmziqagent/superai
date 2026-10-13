@@ -65,6 +65,11 @@ mod tests {
             .unwrap_or_else(|e| panic!("time math: {e}"))
     }
 
+    fn minutes_after(base: Timestamp, minutes: i64) -> Timestamp {
+        base.checked_add(jiff::Span::new().minutes(minutes))
+            .unwrap_or_else(|e| panic!("time math: {e}"))
+    }
+
     fn sample_table() -> RateTable {
         RateTable::from_models_dev_json(PLAUSIBLE_CATALOG.as_bytes())
             .unwrap_or_else(|e| panic!("fixture catalog: {e}"))
@@ -202,8 +207,11 @@ mod tests {
         assert_eq!(fs::read(cache.path()).unwrap(), before);
         assert_eq!(
             listing(cache_dir),
-            vec!["models-dev.json".to_owned()],
-            "a failed refresh must not leave temp files behind"
+            vec![
+                "models-dev.json".to_owned(),
+                "models-dev.last-attempt".to_owned()
+            ],
+            "a failed refresh leaves the cache plus its attempt stamp, never a temp file"
         );
         drop(fs::remove_dir_all(&dir));
     }
@@ -214,7 +222,7 @@ mod tests {
         let cache = PricingCache::new(&dir);
         assert!(
             cache.unknown_model_refresh_allowed(now()),
-            "with no cache an unknown-model refresh is always allowed"
+            "with no cache and no recorded attempt a refresh is always allowed"
         );
         cache
             .store(&sample_table(), minutes_before(now(), 5))
@@ -229,6 +237,49 @@ mod tests {
         assert!(
             cache.unknown_model_refresh_allowed(now()),
             "the cooldown is exactly 15 minutes"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_failed_attempt_paces_the_cooldown_even_with_no_cache() {
+        let dir = temp_dir("cache-cooldown-attempt");
+        let cache = PricingCache::new(&dir);
+        let missing = dir.join("does-not-exist.json");
+        let err = cache
+            .refresh(&file_url(&missing), minutes_before(now(), 5))
+            .unwrap_err();
+        assert!(matches!(err, CostError::Fetch { .. }), "{err:?}");
+        assert!(cache.load().is_none());
+        assert!(
+            !cache.unknown_model_refresh_allowed(now()),
+            "5 minutes after a failed attempt the cooldown must hold with no cache at all"
+        );
+        assert!(
+            cache.unknown_model_refresh_allowed(minutes_after(now(), 11)),
+            "the cooldown from the attempt is the same 15 minutes"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_newer_failed_attempt_re_arms_the_cooldown_over_an_older_cache() {
+        let dir = temp_dir("cache-cooldown-rearm");
+        let cache = PricingCache::new(&dir);
+        cache
+            .store(&sample_table(), hours_before(now(), 1))
+            .unwrap();
+        assert!(
+            cache.unknown_model_refresh_allowed(now()),
+            "an hour-old cache no longer paces refreshes"
+        );
+        let missing = dir.join("nope.json");
+        cache
+            .refresh(&file_url(&missing), minutes_before(now(), 2))
+            .unwrap_err();
+        assert!(
+            !cache.unknown_model_refresh_allowed(now()),
+            "the later attempt, not the older cache, must anchor the cooldown"
         );
         drop(fs::remove_dir_all(&dir));
     }
@@ -299,6 +350,21 @@ mod tests {
         fs::write(&big, &payload).unwrap();
         let err = fetch_models_dev_bytes(&file_url(&big)).unwrap_err();
         assert!(matches!(err, CostError::FetchSizeLimit { .. }), "{err:?}");
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_local_file_at_exactly_the_cap_still_loads() {
+        let dir = temp_dir("cache-fetch-cap-edge");
+        let edge = dir.join("edge.json");
+        let mut payload = Vec::new();
+        payload.push(b'[');
+        payload.resize(MAX_MODELS_DEV_BYTES - 1, b'1');
+        payload.push(b']');
+        fs::write(&edge, &payload).unwrap();
+        let bytes = fetch_models_dev_bytes(&file_url(&edge))
+            .unwrap_or_else(|e| panic!("edge-size fetch: {e}"));
+        assert_eq!(bytes.len(), MAX_MODELS_DEV_BYTES);
         drop(fs::remove_dir_all(&dir));
     }
 
