@@ -263,7 +263,7 @@ impl Adapter for OmpAdapter {
             UsageSurface::new(UsageReaderKind::TranscriptJsonl, None).with_artifact(
                 "agent-sessions",
                 PathResolver::fallback_only(
-                    "~/.omp/agent session stores (OMP XDG roots; OMP_PROFILE-selected)",
+                    "~/.omp/agent/sessions (OMP XDG + profile stores; OMP_PROFILE-selected)",
                 ),
             ),
         )

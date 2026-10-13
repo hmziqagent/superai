@@ -113,6 +113,12 @@ mod tests {
                     .is_none_or(|a| !a.is_empty()),
                 "{id} account label must be a non-empty name or None",
             );
+            for note in &surface.not_modeled_roots {
+                assert!(
+                    !note.trim().is_empty(),
+                    "{id} carries a blank not-modeled root note"
+                );
+            }
         }
     }
 
@@ -175,6 +181,14 @@ mod tests {
                 b"no-env claude bytes",
             ),
             (
+                "home/.claude-swap-backup/sessions/1-work/projects/proj/s.jsonl",
+                b"legacy swap-slot bytes",
+            ),
+            (
+                "data/claude-swap/sessions/2-alt/projects/proj/s.jsonl",
+                b"xdg swap-slot bytes",
+            ),
+            (
                 "home/.codex/sessions/2026/10/12/r.jsonl",
                 b"codex rollout bytes",
             ),
@@ -234,6 +248,64 @@ mod tests {
         out
     }
 
+    /// Bound path for a hint: alternative before ", else", prose after '('
+    /// dropped, `$VAR` via `TREE_ENV`, `~` as HOME, stop at a shape marker.
+    fn bound_root(label: &str, hint: &str) -> String {
+        let hint = hint.split_once(", else ").map_or(hint, |(bound, _)| bound);
+        let hint = hint
+            .split_once('(')
+            .map_or(hint, |(path, _)| path)
+            .trim_end();
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in hint.split('/') {
+            if segment.is_empty() {
+                continue;
+            }
+            if segment.contains(['<', '>', '*', '?']) {
+                break;
+            }
+            if let Some(name) = segment.strip_prefix('$') {
+                match TREE_ENV.iter().find(|(var, _)| *var == name) {
+                    Some((_, bound)) => segments.extend(bound.split('/')),
+                    None => panic!("{label} declares unbound env var ${name}"),
+                }
+            } else if segment == "~" {
+                segments.push("home");
+            } else {
+                segments.push(segment);
+            }
+        }
+        let bound = segments.join("/");
+        assert!(!bound.is_empty(), "{label} hint {hint:?} binds no path");
+        bound
+    }
+
+    /// Every artifact root the overlap adapters declare, resolved against
+    /// `TREE_ENV` inside the planted tree.
+    fn declared_bound_roots(root: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+        OVERLAP_HARNESS_IDS
+            .iter()
+            .filter_map(|id| {
+                overlap_adapter(id)
+                    .usage_surface()
+                    .map(|surface| (*id, surface))
+            })
+            .flat_map(|(id, surface)| {
+                surface
+                    .artifacts
+                    .iter()
+                    .map(|artifact| {
+                        let resolver = &artifact.path_resolver;
+                        let hint = resolver.linux.as_deref().unwrap_or(&resolver.fallback);
+                        let label = format!("{id}/{}", artifact.id);
+                        let bound = root.join(bound_root(&label, hint));
+                        (label, bound)
+                    })
+                    .collect::<Vec<(String, std::path::PathBuf)>>()
+            })
+            .collect()
+    }
+
     #[test]
     fn declaring_usage_surfaces_never_writes_disk() {
         if std::env::var_os(SWEEP_ENV).is_some() {
@@ -256,11 +328,28 @@ mod tests {
         let proof_root = temp_dir_unique("usage-never-writes-proof");
         build_bound_tree(&root);
         let before = snapshot_tree(&root);
-        assert_eq!(
-            before.len(),
-            13,
-            "bound tree must carry every declared root"
+        let declared = declared_bound_roots(&root);
+        assert!(
+            !declared.is_empty(),
+            "no overlap adapter declared a bound root"
         );
+        for (label, expected) in &declared {
+            assert!(
+                before
+                    .keys()
+                    .any(|file| std::path::Path::new(file).starts_with(expected)),
+                "{label} declares bound root {} with no fixture in the planted tree",
+                expected.display()
+            );
+        }
+        for file in before.keys() {
+            assert!(
+                declared
+                    .iter()
+                    .any(|(_, expected)| std::path::Path::new(file).starts_with(expected)),
+                "fixture {file} is claimed by no declared usage root"
+            );
+        }
 
         // Env is process-global and sibling tests read HOME, so the sweep
         // runs in a child process whose env points at the observed tree.

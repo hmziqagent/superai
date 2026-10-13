@@ -475,6 +475,11 @@ pub struct UsageSurface {
     /// Provider account the telemetry belongs to; `None` for local-only
     /// telemetry that any provider account may have produced.
     pub provider_account: Option<String>,
+    /// Root families the harness or a companion app writes that superai's
+    /// reader deliberately does not scan: locator notes, so a known root
+    /// stays declared instead of silently dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_modeled_roots: Vec<String>,
 }
 
 impl UsageSurface {
@@ -485,6 +490,7 @@ impl UsageSurface {
             artifacts: Vec::new(),
             reader,
             provider_account: provider_account.map(ToOwned::to_owned),
+            not_modeled_roots: Vec::new(),
         }
     }
 
@@ -495,6 +501,13 @@ impl UsageSurface {
             id: id.to_owned(),
             path_resolver,
         });
+        self
+    }
+
+    /// Record a root the reader knowingly leaves unscanned.
+    #[must_use]
+    pub fn with_not_modeled_root(mut self, note: &str) -> Self {
+        self.not_modeled_roots.push(note.to_owned());
         self
     }
 }
@@ -2164,11 +2177,20 @@ mod tests {
                 .with_artifact(
                     "plan-cache",
                     PathResolver::fallback_only("~/Library/state.vscdb"),
-                );
+                )
+                .with_not_modeled_root("~/.cache/windsurf (rotates too fast to scan)");
         let json = serde_json::to_string(&surface).unwrap();
         let back: super::UsageSurface = serde_json::from_str(&json).unwrap();
         assert_eq!(back, surface);
+        assert_eq!(
+            surface.not_modeled_roots,
+            vec!["~/.cache/windsurf (rotates too fast to scan)".to_owned()]
+        );
         assert_eq!(surface.reader.to_string(), "plan_cache_sqlite");
+        // Legacy declarations without the field still deserialize.
+        let legacy = r#"{"artifacts":[],"reader":"history_sqlite","provider_account":null}"#;
+        let old: super::UsageSurface = serde_json::from_str(legacy).unwrap();
+        assert!(old.not_modeled_roots.is_empty());
     }
 
     #[test]

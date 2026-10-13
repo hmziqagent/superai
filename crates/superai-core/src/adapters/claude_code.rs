@@ -485,6 +485,28 @@ impl Adapter for ClaudeCodeAdapter {
                 .with_artifact(
                     "transcripts-no-env",
                     PathResolver::fallback_only("~/.config/claude/projects (no CLAUDE_CONFIG_DIR)"),
+                )
+                .with_artifact(
+                    "transcripts-swap-legacy",
+                    PathResolver::new(
+                        Some("~/.claude-swap-backup/sessions/<slot>/projects"),
+                        Some("~/.claude-swap-backup/sessions/<slot>/projects"),
+                        None,
+                        "~/.claude-swap-backup/sessions/<slot>/projects (cswap slots, any config dir)",
+                    ),
+                )
+                .with_artifact(
+                    "transcripts-swap-xdg",
+                    PathResolver::new(
+                        Some("$XDG_DATA_HOME/claude-swap/sessions/<slot>/projects"),
+                        None,
+                        None,
+                        "~/.local/share/claude-swap/sessions/<slot>/projects (Linux cswap slots, any config dir)",
+                    ),
+                )
+                .with_not_modeled_root(
+                    "~/Library/Application Support/Claude/{local-agent-mode-sessions,\
+                     claude-code-sessions} desktop locator: BFS depth<=4 to .claude/projects",
                 ),
         )
     }
