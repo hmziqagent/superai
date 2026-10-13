@@ -3,9 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One provider-reported quota window. Raw values are kept exactly as
-/// reported, over-quota included; clamping is a display concern, never
-/// done here.
+/// One provider-reported quota window; values stay raw, over-quota
+/// included, and clamping stays a display concern.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateWindow {
     /// Usage as a percentage of the window, unclamped.
