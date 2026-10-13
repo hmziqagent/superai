@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -60,8 +60,8 @@ pub enum CostError {
         /// Offending text, truncated for display.
         text: String,
     },
-    /// A parseable decimal that needs more precision than the money scale
-    /// (or the per-million rate scale) can represent exactly.
+    /// A plain decimal whose exact value does not fit the 10^-12 money
+    /// scale, by fractional precision or magnitude.
     #[error("decimal `{text}` is too precise to represent exactly")]
     DecimalTooPrecise {
         /// Offending text, truncated for display.
@@ -185,17 +185,22 @@ impl Usd {
         }
         let mantissa: i128 = digits
             .parse()
-            .map_err(|_int_err| CostError::MalformedDecimal { text: echo(text) })?;
+            .map_err(|_range| CostError::DecimalTooPrecise { text: echo(text) })?;
         let exponent: i64 = match exponent_text {
-            Some(e) => e
-                .parse()
-                .map_err(|_int_err| CostError::MalformedDecimal { text: echo(text) })?,
+            Some(e) => {
+                let exp_digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+                if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(CostError::MalformedDecimal { text: echo(text) });
+                }
+                e.parse()
+                    .map_err(|_range| CostError::DecimalTooPrecise { text: echo(text) })?
+            }
             None => 0,
         };
         let frac_len = i64::try_from(frac_digits.map_or(0, str::len)).unwrap_or(i64::MAX);
         let exp10 = exponent
             .checked_sub(frac_len)
-            .ok_or(CostError::MalformedDecimal { text: echo(text) })?;
+            .ok_or(CostError::DecimalTooPrecise { text: echo(text) })?;
         let picos = scaled_picos(mantissa, exp10, negative, text)?;
         Ok(Self::from_picos(picos))
     }
@@ -216,8 +221,8 @@ fn scaled_picos(mantissa: i128, exponent: i64, negative: bool, text: &str) -> Co
     if mantissa == 0 {
         return Ok(0);
     }
-    let malformed = || CostError::MalformedDecimal { text: echo(text) };
-    let shift = exponent.checked_add(12).ok_or_else(malformed)?;
+    let too_precise = || CostError::DecimalTooPrecise { text: echo(text) };
+    let shift = exponent.checked_add(12).ok_or_else(too_precise)?;
     let power = match u32::try_from(shift.unsigned_abs()) {
         Ok(p) => 10i128.checked_pow(p),
         Err(_) => None,
@@ -227,13 +232,13 @@ fn scaled_picos(mantissa: i128, exponent: i64, negative: bool, text: &str) -> Co
     } else {
         match power {
             Some(divisor) if mantissa % divisor == 0 => Some(mantissa / divisor),
-            Some(_) => return Err(CostError::DecimalTooPrecise { text: echo(text) }),
+            Some(_) => return Err(too_precise()),
             None => None,
         }
     }
-    .ok_or_else(malformed)?;
+    .ok_or_else(too_precise)?;
     if negative {
-        return magnitude.checked_neg().ok_or_else(malformed);
+        return magnitude.checked_neg().ok_or_else(too_precise);
     }
     Ok(magnitude)
 }
@@ -299,9 +304,8 @@ struct BundledRate {
     cache_write: Option<&'static str>,
 }
 
-/// First-party list prices fetched 2026-10-13 from the models.dev catalog
-/// (anomalyco/models.dev, providers/{anthropic,openai}/models). Estimates,
-/// never a bill.
+/// First-party list prices fetched 2026-10-13 from anomalyco/models.dev
+/// (providers/{anthropic,openai}); estimates, never a bill.
 const BUNDLED_RATES: &[BundledRate] = &[
     BundledRate {
         provider: "anthropic",
@@ -537,9 +541,8 @@ impl CostPeriod {
         Ok(Self::RollingDays { days })
     }
 
-    /// The half-open instant window [`PeriodRange::contains`] tests against.
-    /// `bucket_zone` resolves rolling day boundaries; [`CostPeriod::MonthToDate`]
-    /// ignores it and uses its own pinned zone.
+    /// The inclusive instant window [`PeriodRange::contains`] tests against.
+    /// `bucket_zone` pins rolling day boundaries; [`CostPeriod::MonthToDate`] pins its own.
     pub fn range(&self, now: Timestamp, bucket_zone: &str) -> CostResult<PeriodRange> {
         match self {
             Self::AllHistory => Ok(PeriodRange {
@@ -644,9 +647,8 @@ pub enum Spend {
     /// Every matched record is priced; the exact recorded sum. Recorded
     /// spend, never a bill.
     Exact(Usd),
-    /// At least one matched record references a model (or a cache class
-    /// of a model) with no known price; the aggregate cannot be
-    /// represented. Entries are `provider/model`, sorted and unique.
+    /// A matched record's model or cache class has no usable rate, so the
+    /// total is unrepresentable; entries are `provider/model`, sorted.
     Unavailable {
         /// Models that blocked the aggregate.
         missing_pricing: Vec<String>,
@@ -728,7 +730,7 @@ impl CostEngine {
         usage: &RecordedUsage,
     ) -> CostResult<PeriodReport> {
         let range = period.range(now, bucket_zone)?;
-        let mut groups: BTreeMap<(String, String), ModelCost> = BTreeMap::new();
+        let mut groups: BTreeMap<(&str, &str), ModelCost> = BTreeMap::new();
         let mut missing: Vec<String> = Vec::new();
         let mut exact_total = Usd::ZERO;
         for event in &usage.events {
@@ -736,7 +738,7 @@ impl CostEngine {
                 continue;
             }
             let entry = groups
-                .entry((event.provider.clone(), event.model.clone()))
+                .entry((event.provider.as_str(), event.model.as_str()))
                 .or_insert_with(|| ModelCost {
                     provider: event.provider.clone(),
                     model: event.model.clone(),
@@ -896,13 +898,15 @@ impl PricingCache {
     }
 
     /// Read the cache fresh from disk; `None` when missing, corrupt, or
-    /// oversized.
+    /// oversized (the cap binds the read itself, not a prior stat).
     pub fn load(&self) -> Option<CachedRates> {
-        let meta = std::fs::metadata(&self.path).ok()?;
-        if meta.len() > MAX_CACHE_FILE_BYTES as u64 {
+        let file = File::open(&self.path).ok()?;
+        let mut bytes = Vec::new();
+        let mut capped = file.take(MAX_CACHE_FILE_BYTES as u64 + 1);
+        capped.read_to_end(&mut bytes).ok()?;
+        if bytes.len() > MAX_CACHE_FILE_BYTES {
             return None;
         }
-        let bytes = std::fs::read(&self.path).ok()?;
         let doc: CachedRatesDoc = serde_json::from_slice(&bytes).ok()?;
         (doc.schema_version == CACHE_SCHEMA_VERSION).then_some(CachedRates {
             fetched_at: doc.fetched_at,
@@ -939,9 +943,8 @@ impl PricingCache {
                 .saturating_add(UNKNOWN_MODEL_COOLDOWN_SECS)
     }
 
-    /// Atomically replace the cache: temp file in the same directory,
-    /// `rename(2)` over the target. A failed store leaves the previous
-    /// cache intact.
+    /// Atomic replace: temp file in the same directory, `rename(2)` over
+    /// the target; a failed store leaves the old cache intact.
     pub fn store(&self, rates: &RateTable, fetched_at: Timestamp) -> CostResult<()> {
         let doc = CachedRatesDoc {
             schema_version: CACHE_SCHEMA_VERSION,
@@ -1005,9 +1008,8 @@ impl PricingCache {
     }
 }
 
-/// Bounded fetch of the pricing catalog over core's shared client
-/// (`https://` only, redirects re-validated per hop, size-capped,
-/// timeout-bounded); `file://` reads local bytes for tests.
+/// Bounded catalog fetch over core's shared client (https-only, redirects
+/// re-validated per hop, size-capped); `file://` reads local bytes for tests.
 pub fn fetch_models_dev_bytes(url: &str) -> CostResult<Vec<u8>> {
     validate_fetch_url(url, "models.dev pricing").map_err(|e| CostError::Fetch {
         reason: echo(&format!("{e}")),
@@ -1105,12 +1107,35 @@ mod tests {
             "0.1e-9223372036854775808",
             "1e-9223372036854775808",
             "0.1e9223372036854775807",
+            "1e99999999999999999999",
         ] {
             assert!(
-                matches!(Usd::parse(text), Err(CostError::MalformedDecimal { .. })),
-                "`{text}` must be a MalformedDecimal, not a panic or a wrap"
+                matches!(Usd::parse(text), Err(CostError::DecimalTooPrecise { .. })),
+                "`{text}` must be a DecimalTooPrecise, not a panic or a wrap"
             );
         }
+    }
+
+    #[test]
+    fn usd_unrepresentable_values_agree_across_spellings() {
+        let long_fraction = format!("0.{}1", "0".repeat(100));
+        let long_integer = format!("1{}2", "0".repeat(45));
+        for text in [
+            "1e-100",
+            long_fraction.as_str(),
+            "1e100",
+            long_integer.as_str(),
+        ] {
+            assert!(
+                matches!(Usd::parse(text), Err(CostError::DecimalTooPrecise { .. })),
+                "`{text}` and its exponent spelling must fail identically"
+            );
+        }
+    }
+
+    #[test]
+    fn usd_trailing_zeros_add_no_precision() {
+        assert_eq!(Usd::parse("3.0000000000000").unwrap().to_string(), "3");
     }
 
     #[test]
