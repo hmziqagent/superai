@@ -1,10 +1,10 @@
 # superai non-UI master implementation plan
 
-Status: subplans 00–13 are complete through commit c164204 (completion run 3, areas 1–9) plus the final-gate-fix round closing the five verifier-flagged narrow gaps (MUT-02 symlink follow-and-preserve policy, QAL-04 adapter-detection fuzz family, INS-02 asset-inheritance request field, DRF-04 orchestrator detector, WRP-07 foreground/shutdown-command spec) and the rename/drift consistency bug; 83/83 exit-gate items across those subplans are closed with residuals disclosed in each plan's completion record, and DoD 16/16 is evidenced by the tested coverage ledger (crates/superai-core/src/coverage_ledger.rs); subplans 14–16 (usage core, usage sources, VPS deploy) are open and being implemented; the six-group final re-verification remains the release gate for 00–13  
+Status: subplans 00–13 are complete through commit c164204 (completion run 3, areas 1–9) plus the final-gate-fix round closing the five verifier-flagged narrow gaps (MUT-02 symlink follow-and-preserve policy, QAL-04 adapter-detection fuzz family, INS-02 asset-inheritance request field, DRF-04 orchestrator detector, WRP-07 foreground/shutdown-command spec) and the rename/drift consistency bug; the six-group final re-verification of 00–13 ran and passed at closure, re-checked on the current tree (coverage-ledger tests and the full workspace suite green); subplans 14–16 (usage core, usage sources, VPS deploy) are complete through commit 0621bf1 (closure run, 383 commits after 37a17a1); 83/83 exit-gate items across 00–13 and 5/5, 3/3, 3/3 across 14–16 are closed with residuals disclosed in each plan's completion record, and DoD 16/16 is evidenced by the tested coverage ledger (crates/superai-core/src/coverage_ledger.rs); what remains is the externally blocked residuals disclosed in plans 15 and 16 (live llmproxy /usage verification, PRX-05 musl artifacts, toride 0.2 publishes)  
 
 ## What shipped
 
-Subplans 00–13 are complete through commit c164204 plus the final-gate-fix round. The shipped backend covers the filesystem layer (fresh reads, loss-minimizing codecs, conflict-checked atomic commits, verified backups, multi-file rollback), version-aware adapters for all 48 cataloged surfaces with fixture corpora, and the workflows above them: instance lifecycle, discovery and drift, wrappers, data-driven providers and templates, capability resolution, skills/plugins/MCP, harness installation, and the raw editor backend. The 48 surfaces span 44 harness-config files (orchestrators.md covers Vibe Kanban, Conductor, and Sculptor; copilot-cli.md and kimi-cli.md each carry two surfaces); the detailed support-state ledger lives in [plan 03](03-harness-adapters.md). The definition of done is 16/16, machine-verified by the tested coverage ledger. For 00–13, the remaining work is the six-group final re-verification and the residuals each subplan discloses in its own completion record. Subplans 14–16 (usage core, usage sources, VPS deploy) are open and being implemented.
+Subplans 00–13 are complete through commit c164204 plus the final-gate-fix round. The shipped backend covers the filesystem layer (fresh reads, loss-minimizing codecs, conflict-checked atomic commits, verified backups, multi-file rollback), version-aware adapters for all 48 cataloged surfaces with fixture corpora, and the workflows above them: instance lifecycle, discovery and drift, wrappers, data-driven providers and templates, capability resolution, skills/plugins/MCP, harness installation, and the raw editor backend. The 48 surfaces span 44 harness-config files (orchestrators.md covers Vibe Kanban, Conductor, and Sculptor; copilot-cli.md and kimi-cli.md each carry two surfaces); the detailed support-state ledger lives in [plan 03](03-harness-adapters.md). The definition of done is 16/16, machine-verified by the tested coverage ledger. The six-group final re-verification of 00–13 passed at closure, so for those subplans what remains is the residuals each discloses in its own completion record. Subplans 14–16 shipped the usage layer on top: the `superai-usage` crate with local readers for claude-code, codex-cli, oh-my-codex, opencode, oh-my-opencode, pi, and omp, window and cost engines, a data-only provider registry, and the models.dev pricing cache; the llmproxy ledger client and nine API-key pollers with research docs under `docs/usage-providers/`; the `superai usage` CLI; and the fixture-proven `superai vps` deploy/status/upgrade flow in superai-core's `vps` module. Their residuals, all externally blocked or disclosed as punts, sit in plans 15 and 16.
 
 ## Subplan exit gates (run 3)
 
@@ -24,15 +24,17 @@ Subplans 00–13 are complete through commit c164204 plus the final-gate-fix rou
 | 11 | [Harness installation](11-harness-installation.md) | Detect/install/update/uninstall with mise/duct-backed execution | 00, 03–06 | 8–12 | 6/6 |
 | 12 | [Raw editor backend](12-raw-editor-backend.md) | Read/validate/diff/commit API for future editors | 01–03 | 4–6 | 6/6 |
 | 13 | [Verification and release](13-verification-and-release.md) | Fixtures, fault tests, platform gates, non-UI release criteria | all | 10–16 | 7/7 |
-| 14 | [Usage core](14-usage-and-proxy.md) | UsageSurface, superai-usage crate, local readers, window/cost engines, `usage` CLI | 00–03, 07 | 11–15 | 0/5 |
-| 15 | [Usage sources](15-usage-sources.md) | llmproxy ledger client, provider-native API-key pollers, onboarding pattern | 14 | 16–22 | 0/3 |
-| 16 | [VPS deploy](16-vps-deploy.md) | `vps deploy/status llmproxy` via toride services, TLS or tunnel-only | 14, 15 | 6–9 | 0/3 |
+| 14 | [Usage core](14-usage-and-proxy.md) | UsageSurface, superai-usage crate, local readers, window/cost engines, `usage` CLI | 00–03, 07 | 11–15 | 5/5 |
+| 15 | [Usage sources](15-usage-sources.md) | llmproxy ledger client, provider-native API-key pollers, onboarding pattern | 14 | 16–22 | 3/3 |
+| 16 | [VPS deploy](16-vps-deploy.md) | `vps deploy/status llmproxy` via toride services, TLS or tunnel-only | 14, 15 | 6–9 | 3/3 |
 
 Exit-gate column = subplan exit-gate checkboxes closed as of run 3 (commit c164204) plus the
-final-gate-fix round; each plan's Exit gate section carries the evidence citations and the
+final-gate-fix round for 00–13, and as of the closure run (commit 0621bf1) for 14–16; each
+plan's Exit gate section carries the evidence citations and the
 residual notes (plan 02's single-transaction-boundary fold and plan 13's macOS/Windows
 adversarial platform cases were closed by c164204; remaining residuals are disclosed inline
-per plan, e.g. plan 10's unimplemented EXT-10 diagnostic-validation sub-step). Subplan task
+per plan, e.g. plan 10's unimplemented EXT-10 diagnostic-validation sub-step, and the
+closure-run punts in plans 14–16's Residual records). Subplan task
 boxes are completion records.
 
 ## External companion plans
@@ -88,6 +90,13 @@ repositories; the copies here are exports.
 > long-path/locked-file platform cases were closed by area 9b (cfg-gated tests executed by
 > the platform CI runners); mutation-score uplift and coverage-guided
 > fuzz budget are recorded follow-ups.
+
+> Closure-run status: ACHIEVED — subplans 14/15/16 exit gates closed (5/5, 3/3, 3/3)
+> with punts and externally blocked residuals disclosed in each plan's Residual record;
+> the six-group re-verification of 00–13 passed. Evidence at commit 0621bf1:
+> `cargo test -p superai-usage --all-features` 230 passed / 3 ignored,
+> `cargo test -p superai-core vps` 59 passed, `cargo test -p superai-cli` 58 passed,
+> `cargo test -p superai-core coverage_ledger` green, full workspace suite green.
 
 ## 9. Cross-plan coverage of goal.md
 

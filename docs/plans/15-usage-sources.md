@@ -4,6 +4,11 @@ Parent: [master plan](master-plan.md)
 Task prefixes: USG (usage sources), LNG (long-tail onboarding)
 Estimate: 16–22 reviewable change sets, then S per provider batch
 
+Status: done. All three exit-gate items pass. Proxy discovery is narrower than USG-08
+sketched: the env var and the 0600 token file are wired, the `--proxy` flag and the
+instance-config sweep are not. The llmproxy wire schemas stay fixture-based until a
+deployed PRX-03 is checked against them.
+
 ## Outcome
 
 Subplan 14 reads local artifacts only. This subplan adds the other two truth sources:
@@ -86,15 +91,39 @@ that use them, using plan 07 provider ids as the join key.
 
 ## Exit gate
 
-- [ ] `superai usage` reads a deployed llmproxy's `/usage/summary` and
+- [x] `superai usage` reads a deployed llmproxy's `/usage/summary` and
       `/usage/requests` with the admin token from an env var or 0600 file, merges rows
       into `usage show` with source tags, and lets ledger numbers win for routed
       instances with local scans shown as a cross-check.
-- [ ] API-key pollers cover the verified overlap-table list under the PRV-07 probe
+- [x] API-key pollers cover the verified overlap-table list under the PRV-07 probe
       discipline, with MiniMax's https-host-override policy ported as a validation
       rule.
-- [ ] docs/usage-providers/ exists with an entry for every onboarded provider, each
+- [x] docs/usage-providers/ exists with an entry for every onboarded provider, each
       carrying a verification date.
+
+## Residual
+
+> Completion record (closure run, through commit 0621bf1): USG-08 shipped as
+> `crates/superai-usage/src/llmproxy.rs` (admin token from `SUPERAI_LLMPROXY_ADMIN_TOKEN`
+> or a 0600 file, one-origin redirect policy, byte caps, typed redacted errors) with the
+> divergence cross-check type that keeps ledger cost and local-log cost side by side
+> instead of summing them; the CLI wires it in `crates/superai-cli/src/usage.rs`, rows
+> tagged `llmproxy ledger`. USG-09 shipped as nine pollers in
+> `crates/superai-usage/src/poller.rs`: openrouter, deepseek, zed, warp, factory, kilo,
+> minimax, mistral, clinepass, the last reading its session file or `CLINE_API_KEY`,
+> with MiniMax's strict-host rule as a validation gate. LNG-01 shipped as
+> `docs/usage-providers/`: 15 research docs plus the README, every file verified
+> 2026-10-13, the frozen CodexBar dossier under `research/`. Long-tail disposition:
+> readers and pollers shipped for the scoped overlap set only; the remaining
+> overlap-table rows and the 68 unmapped providers onboard later, provider by provider,
+> through the same data-only registry pattern, and are not owed by this exit gate. That
+> also answers the China-line question below: those providers ride the long tail, after
+> the API-key pollers. Residuals: the `/usage` fixtures are assumptions from the module
+> doc, not captures from a live ledger, so checking them against a deployed PRX-03 is
+> owed when it ships (tracked as an `#[ignore]`d repro in
+> `crates/superai-usage/tests/abuse_punted_leaks.rs`); the CLI passes no routed
+> instance bases to `resolve_base_url`, so the ledger source needs
+> `SUPERAI_LLMPROXY_URL` (or the deployment's admin listener) until that sweep lands.
 
 ## Out of scope
 

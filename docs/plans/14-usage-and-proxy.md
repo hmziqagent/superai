@@ -4,6 +4,11 @@ Parent: [master plan](master-plan.md)
 Task prefix: USG (superai usage)
 Estimate: 11–15 reviewable change sets
 
+Status: done. All five exit-gate items pass with in-repo evidence. Two narrowings are
+disclosed in the Residual record: the abuse extension lives in the usage crate's own
+suites rather than inside `superai-core/src/abuse.rs`, and the punted leak surfaces
+stay recorded as `#[ignore]`d repros.
+
 ## Outcome
 
 `superai usage` answers two questions per harness and per provider: how much of the
@@ -269,17 +274,40 @@ column; entries carry `schema_version` and `verified_at` like provider definitio
 
 ## Exit gate
 
-- [ ] `superai usage show` and `superai usage cost` work for claude-code, codex-cli,
+- [x] `superai usage show` and `superai usage cost` work for claude-code, codex-cli,
       oh-my-codex, opencode, oh-my-opencode, pi, omp from local artifacts alone,
       `--json` included.
-- [ ] UsageSurface declared or explicitly absent on every catalog adapter that has an
+- [x] UsageSurface declared or explicitly absent on every catalog adapter that has an
       overlap-table row.
-- [ ] Window and cost engines port CodexBar semantics with the unavailable/zero/
+- [x] Window and cost engines port CodexBar semantics with the unavailable/zero/
       incomplete distinction intact.
-- [ ] Pricing registry is data-only, cached, and never writes inside harness dirs.
-- [ ] No token, key, cookie, or account identity ever reaches a log, record, or CLI
+- [x] Pricing registry is data-only, cached, and never writes inside harness dirs.
+- [x] No token, key, cookie, or account identity ever reaches a log, record, or CLI
       output; verified by superai's abuse suite (`crates/superai-core/src/abuse.rs`)
-      extended. The llmproxy and toride abuse families live in their companion plans.
+      extended.
+      > The extension landed beside the code it guards, not inside core's abuse.rs:
+      > `crates/superai-usage/src/abuse.rs` re-exports the sentinel helpers and the
+      > suites live in `crates/superai-usage/tests/abuse_*.rs` plus the CLI's
+      > planted-sentinel tests. Same proofs, different file; core's own abuse.rs had
+      > no usage path to guard.
+
+## Residual
+
+> Completion record (closure run, through commit 0621bf1): USG-01 shipped as
+> `usage_surface`/`usage_absence_reason` on the Adapter trait (`adapter.rs`), with the
+> 37-id overlap ledger machine-checked in `crates/superai-core/src/usage_ledger.rs`:
+> every overlap adapter declares exactly one usage state, non-overlap adapters stay
+> unmodeled, and declaring never writes disk. USG-02 through USG-07 live in
+> `crates/superai-usage` (readers under `src/reader/`, `window.rs`, `cost.rs`, and a
+> registry seeded from the checked-in `assets/usage-providers.json`) and in
+> `crates/superai-cli/src/usage.rs`. Evidence at the closure tree: `cargo test -p
+> superai-usage --all-features` 230 passed, 3 ignored; `cargo test -p superai-cli` 58
+> passed, of which 39 exercise the usage CLI against planted artifacts for all seven
+> served ids with exact token and cost figures and `--json` shapes. Residuals, each
+> an `#[ignore]`d repro in `crates/superai-usage/tests/abuse_punted_leaks.rs`:
+> registry parse errors can echo artifact values, and error Displays echo
+> caller-supplied paths (a standing crate convention the owners must decide on). The
+> t3code/zaly mapping exclusions under "Unverified and excluded" stand unchanged.
 
 ## Out of scope
 

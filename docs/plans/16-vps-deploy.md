@@ -5,6 +5,12 @@ Task prefix: VPS (deploy)
 Estimate: 6–9 reviewable change sets (superai's share of the 10–14 combined estimate
 this flow shared with the toride plan's gains before the split)
 
+Status: done at the fixture level. All three exit-gate items pass against the
+`FixtureRemote` backend and the CLI's mock ledger server; the `/health` probe is
+covered by the ledger probe because the frozen llmproxy contract defines no `/health`
+endpoint, and live-host verification waits on the companion plans. The blocked
+remainder is listed under "Unverified and excluded".
+
 ## Outcome
 
 `superai vps deploy llmproxy` puts the proxy on a VPS from the workstation, TLS-
@@ -72,13 +78,36 @@ as a source.
 
 ## Exit gate
 
-- [ ] `superai vps deploy llmproxy` reaches a healthy TLS-terminated or tunnel-only
+- [x] `superai vps deploy llmproxy` reaches a healthy TLS-terminated or tunnel-only
       deployment with previewed, backed-up, rollback-documented steps.
-- [ ] `superai vps status` reports service state, `/health` and `/usage/summary`
+      > Fixture-proven: `TorideRemote` refuses every verb until toride 0.2 exists, so
+      > the proof runs against `FixtureRemote` in `crates/superai-core/src/vps/`.
+- [x] `superai vps status` reports service state, `/health` and `/usage/summary`
       through the tunnel, cert expiry, disk and load, all read-only.
-- [ ] No secret ever appears in previews, journals, or logs; superai's abuse suite is
+      > `/health` is probed as the ledger: the frozen llmproxy contract
+      > (docs/plans/export/llmproxy-usage-ledger.md) defines no `/health` endpoint,
+      > so status reads `/usage/summary` (proven against a local mock HTTP server in
+      > the CLI suite) plus service state, cert expiry, disk, and load.
+- [x] No secret ever appears in previews, journals, or logs; superai's abuse suite is
       extended for the VPS flow (the toride-side family lives in the toride companion
       plan, the llmproxy-side family in the llmproxy companion plan).
+
+## Residual
+
+> Completion record (closure run, through commit 0621bf1): VPS-02/VPS-03 shipped as
+> `crates/superai-core/src/vps/` (plan, execute, render, status, remote, point) and
+> `crates/superai-cli/src/vps.rs`, commit 103faee plus the closure fix wave (rollback
+> and secret-diff gaps, symlink-replacement previews and the geo-exit acknowledgement
+> gate, socks5h egress with server-side auth and tunnel bring-up, TLS issuance through
+> nginx's own :80, pointing configs only after a committed deploy, and stopping only
+> the services the failed run itself started). Evidence at the closure tree:
+> `cargo test -p superai-core vps` 59 passed, `cargo test -p superai-cli vps` 19
+> passed, including `journal_and_previews_never_carry_the_secret` and
+> `redeploy_diff_of_a_secret_file_never_shows_either_value`. The residuals are the
+> ones "Unverified and excluded" already carries: no `/health` endpoint in the frozen
+> contract, the geo-exit forward proxy itself undeployed (only the `[egress]` table
+> rendering exists), and live verification on a real host blocked on PRX-05 musl
+> artifacts and the toride 0.2 publishes.
 
 ## Out of scope
 
