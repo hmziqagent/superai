@@ -22,6 +22,8 @@ enum CliError {
     Window { reason: String },
     #[error("usage pricing failed: {reason}")]
     Pricing { reason: String },
+    #[error("usage report failed: {reason}")]
+    Report { reason: String },
     #[error("failed printing to stdout: {reason}")]
     Output { reason: String },
 }
@@ -113,9 +115,11 @@ pub(crate) fn finish_lines(mut lines: Vec<String>) -> String {
 }
 
 fn note_on_stderr(text: &str) {
-    // Diagnostics must never mix into --json stdout; a closed stderr drops
-    // them, and the failure exit code is the remaining report for errors.
-    let _unsent: std::io::Result<()> = writeln!(std::io::stderr(), "{text}");
+    // Diagnostics must never mix into --json stdout. When stderr itself is
+    // closed nothing can carry them; the failure exit code already says so.
+    if writeln!(std::io::stderr(), "{text}").is_err() {
+        // Deliberately nothing: there is no channel left to report on.
+    }
 }
 
 fn note_failure(error: &CliError) {

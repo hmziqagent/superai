@@ -74,8 +74,8 @@ fn run_cost(args: &[OsString], home: &Path) -> Result<(), CliError> {
 }
 
 fn write_json(report: &impl Serialize) -> Result<(), CliError> {
-    let text = serde_json::to_string_pretty(report).map_err(|e| CliError::Scan {
-        reason: format!("report encoding failed: {e}"),
+    let text = serde_json::to_string_pretty(report).map_err(|e| CliError::Report {
+        reason: format!("encoding failed: {e}"),
     })?;
     crate::write_stdout(&format!("{text}\n"))
 }
@@ -213,12 +213,16 @@ fn unknown_flag(flag: &str) -> CliError {
 }
 
 fn value_of(words: &mut std::slice::Iter<'_, OsString>, flag: &str) -> Result<String, CliError> {
-    words
-        .next()
-        .and_then(|value| value.to_str())
+    let Some(value) = words.next() else {
+        return Err(CliError::Args {
+            reason: format!("{flag} needs a value"),
+        });
+    };
+    value
+        .to_str()
         .map(str::to_owned)
         .ok_or_else(|| CliError::Args {
-            reason: format!("{flag} needs a value"),
+            reason: format!("{flag} value is not valid UTF-8"),
         })
 }
 
@@ -437,7 +441,7 @@ struct SourceScan {
     notes: Vec<String>,
 }
 
-fn scan_family(family: Family, env: &UsageEnv) -> Result<SourceScan, CliError> {
+fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
     match family {
         Family::Claude => {
             let roots = claude_projects_roots(
@@ -445,19 +449,19 @@ fn scan_family(family: Family, env: &UsageEnv) -> Result<SourceScan, CliError> {
                 env.xdg_data_home.as_deref(),
                 &env.home,
             );
-            Ok(SourceScan {
+            SourceScan {
                 recorded: scan_claude_transcripts(&roots).into_recorded_usage(),
                 notes: Vec::new(),
-            })
+            }
         }
-        Family::Codex => Ok(SourceScan {
+        Family::Codex => SourceScan {
             recorded: scan_codex_rollouts(&codex_sessions_roots(
                 env.codex_home.as_deref(),
                 &env.home,
             ))
             .into_recorded_usage(),
             notes: Vec::new(),
-        }),
+        },
         // The channel is not env-selectable, so only the default database
         // or an OPENCODE_DB override is read (docs/harness-configs/opencode.md §6).
         Family::OpenCode => {
@@ -467,25 +471,27 @@ fn scan_family(family: Family, env: &UsageEnv) -> Result<SourceScan, CliError> {
                 &env.home,
                 None,
             ) else {
-                return Ok(SourceScan {
+                return SourceScan {
                     recorded: RecordedUsage::default(),
                     notes: vec!["usage database path could not be resolved".to_owned()],
-                });
+                };
             };
+            // A missing, locked, drifted, or corrupt database means no
+            // recorded usage for this source, not a failed report; the
+            // note keeps the row honest while other families still flow.
             match scan_history(&path) {
-                Ok(recorded) => Ok(SourceScan {
+                Ok(recorded) => SourceScan {
                     recorded,
                     notes: Vec::new(),
-                }),
-                // A missing or locked database means no recorded usage, not
-                // a failed query; the note keeps the row honest.
-                Err(OpenCodeError::Open(e)) => Ok(SourceScan {
+                },
+                Err(OpenCodeError::Open(e)) => SourceScan {
                     recorded: RecordedUsage::default(),
                     notes: vec![format!("history database could not be opened: {e}")],
-                }),
-                Err(OpenCodeError::Scan(e)) => Err(CliError::Scan {
-                    reason: format!("opencode: {e}"),
-                }),
+                },
+                Err(OpenCodeError::Scan(e)) => SourceScan {
+                    recorded: RecordedUsage::default(),
+                    notes: vec![format!("history database could not be scanned: {e}")],
+                },
             }
         }
         Family::Pi => {
@@ -501,10 +507,10 @@ fn scan_family(family: Family, env: &UsageEnv) -> Result<SourceScan, CliError> {
             let mut notes = Vec::new();
             if let Some(refusal) = roots.refusal {
                 notes.push(refusal.to_owned());
-                return Ok(SourceScan {
+                return SourceScan {
                     recorded: RecordedUsage::default(),
                     notes,
-                });
+                };
             }
             if roots.profile_cap_hit {
                 notes.push(
@@ -512,10 +518,10 @@ fn scan_family(family: Family, env: &UsageEnv) -> Result<SourceScan, CliError> {
                         .to_owned(),
                 );
             }
-            Ok(SourceScan {
+            SourceScan {
                 recorded: scan_pi_sessions(&roots.roots).into_recorded_usage(),
                 notes,
-            })
+            }
         }
     }
 }
@@ -652,7 +658,7 @@ fn build_show(
     };
     let mut sources = Vec::new();
     for family in families {
-        let scan = scan_family(*family, env)?;
+        let scan = scan_family(*family, env);
         let report = engine
             .total(
                 &CostPeriod::AllHistory,
@@ -731,7 +737,7 @@ fn build_cost(
     let engine = CostEngine::new(load_rates(env)?);
     let mut sources = Vec::new();
     for family in families {
-        let scan = scan_family(*family, env)?;
+        let scan = scan_family(*family, env);
         let report = engine
             .total(&period, now, zone_name(zone), &scan.recorded)
             .map_err(|e| CliError::Pricing {
@@ -787,7 +793,7 @@ fn render_show(report: &ShowReport) -> String {
     let mut lines = vec![format!("window: {}", report.window)];
     for row in &report.sources {
         lines.push(format!(
-            "{} [{}] — {}",
+            "{} [{}] {}",
             row.source,
             row.harnesses.join(", "),
             TruthSource::LocalArtifacts.as_str()
@@ -812,7 +818,7 @@ fn render_show(report: &ShowReport) -> String {
 
 fn render_cost(report: &CostReport) -> String {
     let mut lines = vec![format!(
-        "period: {}; range: {} — {}; zone: {}",
+        "period: {}; range: {} to {}; zone: {}",
         report.period.human(),
         report
             .range
@@ -824,7 +830,7 @@ fn render_cost(report: &CostReport) -> String {
     )];
     for row in &report.sources {
         lines.push(format!(
-            "{} [{}] — {}",
+            "{} [{}] {}",
             row.source,
             row.harnesses.join(", "),
             TruthSource::LocalArtifacts.as_str()
@@ -947,6 +953,21 @@ mod tests {
             ])))
             .contains("given twice")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_present_but_non_utf8_flag_value_is_not_reported_as_missing() {
+        use std::os::unix::ffi::OsStringExt;
+        let args = vec![
+            OsString::from("--harness"),
+            OsString::from_vec(vec![0xff, 0xfe]),
+        ];
+
+        let text = err_text(ShowArgs::parse(&args));
+
+        assert!(text.contains("not valid UTF-8"), "{text}");
+        assert!(!text.contains("needs a value"), "{text}");
     }
 
     #[test]

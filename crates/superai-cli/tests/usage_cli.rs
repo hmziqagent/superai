@@ -19,21 +19,45 @@ mod tests {
     use thiserror as _;
 
     const CLAUDE_LINE: &str = r#"{"type":"assistant","timestamp":"2026-01-15T09:00:05Z","sessionId":"s1","requestId":"r1","message":{"id":"m1","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":10,"output_tokens":200}}}"#;
-    const CLAUDE_SENTINEL_LINE: &str = r#"{"type":"assistant","timestamp":"2026-01-15T09:00:06Z","sessionId":"s1","message":{"id":"m2","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"apiKey":"usage-test-token-4f2a9c-fake"}}"#;
+    fn sentinel_at(index: usize) -> &'static str {
+        SENTINELS
+            .get(index)
+            .unwrap_or_else(|| panic!("abuse SENTINELS has no entry {index}"))
+    }
+
+    fn claude_sentinel_line(sentinel: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-15T09:00:06Z","sessionId":"s1","message":{{"id":"m2","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{{"input_tokens":1,"output_tokens":1}},"apiKey":"{sentinel}"}}}}"#
+        )
+    }
     const CODEX_LINE: &str = r#"{"timestamp":"2026-01-15T08:00:10.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.1","last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":50},"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":50}}}}"#;
-    const CODEX_SENTINEL_LINE: &str = r#"{"timestamp":"2026-01-15T08:00:11.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.1","total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":50},"api_key":"usage-test-key-7b31d0-fake"}}}"#;
+    fn codex_sentinel_line(sentinel: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-01-15T08:00:11.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"model":"gpt-5.1","total_token_usage":{{"input_tokens":100,"cached_input_tokens":40,"output_tokens":50}},"api_key":"{sentinel}"}}}}}}"#
+        )
+    }
     const OPENCODE_USAGE: &str = r#"{"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":120,"output":80,"reasoning":40,"cache":{"read":500,"write":10}}}"#;
-    const PI_LINES: &[&str] = &[
-        r#"{"type":"session","id":"pi-s1"}"#,
-        r#"{"type":"model_change","provider":"anthropic","modelId":"claude-sonnet-4-5"}"#,
-        r#"{"type":"message","id":"e1","timestamp":"2026-01-15T09:30:00Z","message":{"role":"assistant","model":"claude-sonnet-4-5","timestamp":"2026-01-15T09:30:00Z","usage":{"input":20,"cacheRead":5,"cacheWrite":2,"output":40}}}"#,
-        r#"{"type":"message","id":"e9","timestamp":"2026-01-15T09:31:00Z","message":{"role":"assistant","model":"claude-sonnet-4-5","timestamp":"2026-01-15T09:31:00Z","usage":{"input":1,"output":1},"account":"usage-test-account-93c6f1-fake"}}"#,
-    ];
-    const OMP_LINES: &[&str] = &[
-        r#"{"type":"session","id":"omp-s1"}"#,
-        r#"{"type":"model_change","provider":"openai-codex","modelId":"gpt-5-mini"}"#,
-        r#"{"type":"message","id":"o1","message":{"role":"assistant","timestamp":1760000100,"usage":{"input":12,"cacheRead":3,"output":6},"cookie":"usage-test-cookie-58e0ab-fake"}}"#,
-    ];
+    fn pi_lines(sentinel: &str) -> [String; 4] {
+        [
+            r#"{"type":"session","id":"pi-s1"}"#.to_owned(),
+            r#"{"type":"model_change","provider":"anthropic","modelId":"claude-sonnet-4-5"}"#.to_owned(),
+            r#"{"type":"message","id":"e1","timestamp":"2026-01-15T09:30:00Z","message":{"role":"assistant","model":"claude-sonnet-4-5","timestamp":"2026-01-15T09:30:00Z","usage":{"input":20,"cacheRead":5,"cacheWrite":2,"output":40}}}"#.to_owned(),
+            format!(
+                r#"{{"type":"message","id":"e9","timestamp":"2026-01-15T09:31:00Z","message":{{"role":"assistant","model":"claude-sonnet-4-5","timestamp":"2026-01-15T09:31:00Z","usage":{{"input":1,"output":1}},"account":"{sentinel}"}}}}"#
+            ),
+        ]
+    }
+
+    fn omp_lines(sentinel: &str) -> [String; 3] {
+        [
+            r#"{"type":"session","id":"omp-s1"}"#.to_owned(),
+            r#"{"type":"model_change","provider":"openai-codex","modelId":"gpt-5-mini"}"#
+                .to_owned(),
+            format!(
+                r#"{{"type":"message","id":"o1","message":{{"role":"assistant","timestamp":1760000100,"usage":{{"input":12,"cacheRead":3,"output":6}},"cookie":"{sentinel}"}}}}"#
+            ),
+        ]
+    }
 
     const OPENCODE_MS: i64 = 1_768_467_600_000;
 
@@ -64,16 +88,22 @@ mod tests {
 
     fn full_usage_home(tag: &str) -> PathBuf {
         let home = temp_home(tag);
+        let claude = claude_sentinel_line(sentinel_at(0));
         write_lines(
             &home.join(".claude/projects/proj/session.jsonl"),
-            &[CLAUDE_LINE, CLAUDE_SENTINEL_LINE],
+            &[CLAUDE_LINE, claude.as_str()],
         );
+        let codex = codex_sentinel_line(sentinel_at(1));
         write_lines(
             &home.join(".codex/sessions/2026/10/13/rollout.jsonl"),
-            &[CODEX_LINE, CODEX_SENTINEL_LINE],
+            &[CODEX_LINE, codex.as_str()],
         );
-        write_lines(&home.join(".pi/agent/sessions/alpha.jsonl"), PI_LINES);
-        write_lines(&home.join(".omp/agent/sessions/omp.jsonl"), OMP_LINES);
+        let pi = pi_lines(sentinel_at(2));
+        let pi_refs: Vec<&str> = pi.iter().map(String::as_str).collect();
+        write_lines(&home.join(".pi/agent/sessions/alpha.jsonl"), &pi_refs);
+        let omp = omp_lines(sentinel_at(3));
+        let omp_refs: Vec<&str> = omp.iter().map(String::as_str).collect();
+        write_lines(&home.join(".omp/agent/sessions/omp.jsonl"), &omp_refs);
         opencode_db(&home);
         home
     }
@@ -87,14 +117,21 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap_or_else(|| panic!("db parent")))
             .unwrap_or_else(|e| panic!("mkdir: {e}"));
         let conn = Connection::open(&path).unwrap_or_else(|e| panic!("db open: {e}"));
-        conn.execute_batch(&format!(
+        conn.execute_batch(
             "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, fork_session_id TEXT, time_created INTEGER NOT NULL);
              CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
-             CREATE TABLE account (id TEXT PRIMARY KEY, access_token TEXT, refresh_token TEXT NOT NULL, time_updated INTEGER NOT NULL);
-             INSERT INTO account VALUES ('acc-1', '{token}', '{token}', 0);",
-            token = SENTINELS.first().unwrap_or_else(|| panic!("abuse sentinels are empty"))
-        ))
+             CREATE TABLE account (id TEXT PRIMARY KEY, access_token TEXT, refresh_token TEXT NOT NULL, time_updated INTEGER NOT NULL);",
+        )
         .unwrap_or_else(|e| panic!("db schema: {e}"));
+        // Every abuse sentinel lives in the credential table, so each one
+        // the module plants is also one the output test asserts against.
+        for (index, sentinel) in SENTINELS.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO account VALUES (?1, ?2, ?2, 0)",
+                params![format!("acc-{index}"), sentinel],
+            )
+            .unwrap_or_else(|e| panic!("account row {index}: {e}"));
+        }
         conn.execute(
             "INSERT INTO session_v2 (id, fork_session_id, time_created) VALUES ('s1', NULL, ?1)",
             params![OPENCODE_MS],
@@ -603,6 +640,34 @@ mod tests {
             stderr(&output).contains("failed printing to stdout"),
             "unexpected stderr: {}",
             stderr(&output)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_opencode_database_is_a_note_not_a_fatal_report() {
+        let home = full_usage_home("oc-corrupt");
+        let db = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
+        fs::remove_file(&db).unwrap_or_else(|e| panic!("remove db: {e}"));
+        let conn = Connection::open(&db).unwrap_or_else(|e| panic!("db open: {e}"));
+        conn.execute_batch("CREATE TABLE unrelated (x TEXT);")
+            .unwrap_or_else(|e| panic!("wrong schema: {e}"));
+        drop(conn);
+
+        let output = run(&home, &["usage", "show"]);
+        assert!(
+            output.status.success(),
+            "a drifted database must not fail the report: {}",
+            stderr(&output)
+        );
+        let text = stdout(&output);
+        assert!(text.contains("could not be scanned"), "{text}");
+        assert!(
+            text.contains("claude-code"),
+            "other families must still flow: {text}"
         );
     }
 }
