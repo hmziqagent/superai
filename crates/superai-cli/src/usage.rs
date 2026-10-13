@@ -47,9 +47,9 @@ fn run_show(args: &[OsString], home: &Path) -> Result<(), CliError> {
         &TimeZone::system(),
     )?;
     if parsed.json {
-        print_json(&report)?;
+        write_json(&report)?;
     } else {
-        print_show(&report);
+        crate::write_stdout(&render_show(&report))?;
     }
     Ok(())
 }
@@ -66,19 +66,18 @@ fn run_cost(args: &[OsString], home: &Path) -> Result<(), CliError> {
         &TimeZone::system(),
     )?;
     if parsed.json {
-        print_json(&report)?;
+        write_json(&report)?;
     } else {
-        print_cost(&report);
+        crate::write_stdout(&render_cost(&report))?;
     }
     Ok(())
 }
 
-fn print_json(report: &impl Serialize) -> Result<(), CliError> {
+fn write_json(report: &impl Serialize) -> Result<(), CliError> {
     let text = serde_json::to_string_pretty(report).map_err(|e| CliError::Scan {
         reason: format!("report encoding failed: {e}"),
     })?;
-    println!("{text}");
-    Ok(())
+    crate::write_stdout(&format!("{text}\n"))
 }
 
 fn not_utf8() -> CliError {
@@ -784,34 +783,35 @@ fn next_month_start(now: Timestamp, zone: &TimeZone) -> Result<String, CliError>
         })
 }
 
-fn print_show(report: &ShowReport) {
-    println!("window: {}", report.window);
+fn render_show(report: &ShowReport) -> String {
+    let mut lines = vec![format!("window: {}", report.window)];
     for row in &report.sources {
-        println!(
+        lines.push(format!(
             "{} [{}] — {}",
             row.source,
             row.harnesses.join(", "),
             TruthSource::LocalArtifacts.as_str()
-        );
-        println!(
+        ));
+        lines.push(format!(
             "  fill: provider-only; resets: {}",
             row.window.resets_at.as_deref().unwrap_or("unknown")
-        );
-        println!(
+        ));
+        lines.push(format!(
             "  tokens: in {} out {} cache-read {} cache-write {} events {}",
             row.tokens.input,
             row.tokens.output,
             row.tokens.cache_read,
             row.tokens.cache_write,
             row.tokens.events
-        );
-        print_spend_and_coverage(&row.cost, &row.coverage);
-        print_notes(&row.notes);
+        ));
+        lines.extend(spend_lines(&row.cost, &row.coverage));
+        lines.extend(note_lines(&row.notes));
     }
+    crate::finish_lines(lines)
 }
 
-fn print_cost(report: &CostReport) {
-    println!(
+fn render_cost(report: &CostReport) -> String {
+    let mut lines = vec![format!(
         "period: {}; range: {} — {}; zone: {}",
         report.period.human(),
         report
@@ -821,17 +821,17 @@ fn print_cost(report: &CostReport) {
             .unwrap_or("beginning of records"),
         report.range.end,
         report.zone
-    );
+    )];
     for row in &report.sources {
-        println!(
+        lines.push(format!(
             "{} [{}] — {}",
             row.source,
             row.harnesses.join(", "),
             TruthSource::LocalArtifacts.as_str()
-        );
-        print_spend_and_coverage(&row.total, &row.coverage);
+        ));
+        lines.extend(spend_lines(&row.total, &row.coverage));
         for model in &row.models {
-            println!(
+            lines.push(format!(
                 "  {}/{}: in {} out {} events {} cost {}",
                 model.provider,
                 model.model,
@@ -839,34 +839,34 @@ fn print_cost(report: &CostReport) {
                 model.output_tokens,
                 model.events,
                 model.cost.as_deref().unwrap_or("unpriced")
-            );
+            ));
         }
-        print_notes(&row.notes);
+        lines.extend(note_lines(&row.notes));
     }
+    crate::finish_lines(lines)
 }
 
-fn print_spend_and_coverage(spend: &SpendView, coverage: &CoverageView) {
+fn spend_lines(spend: &SpendView, coverage: &CoverageView) -> Vec<String> {
     let amount = match (spend.state, spend.usd.as_deref()) {
         ("exact", Some(amount)) => format!("${amount}"),
         ("zero", _) => "0".to_owned(),
         _ => spend.missing_pricing.join(", "),
     };
-    println!(
+    let mut lines = vec![format!(
         "  cost: {amount} ({}); coverage: {}",
         spend.state, coverage.state
-    );
+    )];
     if coverage.unscanned_records > 0 {
-        println!(
+        lines.push(format!(
             "  {} records could not be scanned; totals are a floor",
             coverage.unscanned_records
-        );
+        ));
     }
+    lines
 }
 
-fn print_notes(notes: &[String]) {
-    for note in notes {
-        println!("  note: {note}");
-    }
+fn note_lines(notes: &[String]) -> Vec<String> {
+    notes.iter().map(|note| format!("  note: {note}")).collect()
 }
 
 #[cfg(test)]
@@ -877,8 +877,7 @@ mod tests {
 
     use superai_usage::cost::{ModelRates, Usd};
 
-    // rusqlite is this package's dev-dependency; the bin itself never
-    // opens a database, so this ack is all it gets.
+    // unused_crate_dependencies demands an ack for the dev-dependency.
     use rusqlite as _;
 
     use super::*;

@@ -4,6 +4,7 @@
 mod usage;
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -21,6 +22,8 @@ enum CliError {
     Window { reason: String },
     #[error("usage pricing failed: {reason}")]
     Pricing { reason: String },
+    #[error("failed printing to stdout: {reason}")]
+    Output { reason: String },
 }
 
 fn main() -> ExitCode {
@@ -28,7 +31,7 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("superai: {e}");
+            note_failure(&e);
             ExitCode::FAILURE
         }
     }
@@ -46,7 +49,7 @@ fn run(args: &[OsString]) -> Result<(), CliError> {
     })?;
     let recovery = superai_core::failure::recover_pending(&home)?;
     for journal in &recovery.journals {
-        println!("recovered: {}", journal.outcome);
+        note_on_stderr(&format!("recovered: {}", journal.outcome));
     }
 
     match args.split_first() {
@@ -71,25 +74,52 @@ fn list_instances() -> Result<(), CliError> {
     let path = Registry::default_path()?;
     let registry = Registry::load(&path)?;
 
-    println!("records: {}", path.display());
+    let mut lines = vec![format!("records: {}", path.display())];
     if registry.instances().is_empty() {
-        println!("no instances recorded");
-        return Ok(());
+        lines.push("no instances recorded".to_owned());
+    } else {
+        for instance in registry.instances() {
+            let template = instance
+                .template
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |t| format!("{}@{}", t.name, t.version));
+            lines.push(format!(
+                "{}  {}  {}  {}",
+                instance.name,
+                instance.harness,
+                instance.config_root.as_path().display(),
+                template
+            ));
+        }
     }
-    for instance in registry.instances() {
-        let template = instance
-            .template
-            .as_ref()
-            .map_or_else(|| "-".to_owned(), |t| format!("{}@{}", t.name, t.version));
-        println!(
-            "{}  {}  {}  {}",
-            instance.name,
-            instance.harness,
-            instance.config_root.as_path().display(),
-            template
-        );
-    }
-    Ok(())
+    write_stdout(&finish_lines(lines))
+}
+
+/// Reports go to stdout as one fallible write so a consumer closing the
+/// pipe (`| head`) surfaces as `CliError::Output`, never a panic.
+pub(crate) fn write_stdout(text: &str) -> Result<(), CliError> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| CliError::Output {
+            reason: e.to_string(),
+        })
+}
+
+/// Join report lines with a trailing newline.
+pub(crate) fn finish_lines(mut lines: Vec<String>) -> String {
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn note_on_stderr(text: &str) {
+    // Diagnostics must never mix into --json stdout; a closed stderr drops
+    // them, and the failure exit code is the remaining report for errors.
+    let _unsent: std::io::Result<()> = writeln!(std::io::stderr(), "{text}");
+}
+
+fn note_failure(error: &CliError) {
+    note_on_stderr(&format!("superai: {error}"));
 }
 
 /// Cap any user-supplied text echoed back in an error so nothing unbounded

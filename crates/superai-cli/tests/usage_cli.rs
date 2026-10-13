@@ -6,13 +6,13 @@
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rusqlite::{Connection, params};
     use superai_usage::abuse::SENTINELS;
 
-    // Externs of this target that ride along without being referenced.
+    // unused_crate_dependencies demands an ack per unreferenced extern.
     use jiff as _;
     use serde as _;
     use superai_core as _;
@@ -533,6 +533,76 @@ mod tests {
             stdout(&output).contains("no instances recorded"),
             "{}",
             stdout(&output)
+        );
+    }
+
+    #[test]
+    fn recovery_notices_stay_off_stdout_so_json_stays_pure() {
+        let home = full_usage_home("journal-preamble");
+        let journal_dir = home.join(".superai").join("journal");
+        fs::create_dir_all(&journal_dir).unwrap_or_else(|e| panic!("journal dir: {e}"));
+        let stray = journal_dir.join("stray.journal.json");
+        for args in [
+            vec!["usage", "show", "--harness", "claude-code", "--json"],
+            vec![
+                "usage",
+                "cost",
+                "--harness",
+                "claude-code",
+                "--period",
+                "all",
+                "--json",
+            ],
+        ] {
+            // Recovery deletes an empty stray as "nothing to recover", so
+            // each invocation plants its own.
+            fs::write(&stray, b"").unwrap_or_else(|e| panic!("journal file: {e}"));
+            let output = run(&home, &args);
+            assert!(
+                output.status.success(),
+                "`{args:?}` failed: {}",
+                stderr(&output)
+            );
+            let report: serde_json::Value = serde_json::from_str(&stdout(&output))
+                .unwrap_or_else(|e| panic!("stdout was not pure json for `{args:?}`: {e}"));
+            assert_eq!(report["sources"][0]["source"], "claude-code");
+            assert!(
+                stderr(&output).contains("recovered:"),
+                "recovery notice missing from stderr: {}",
+                stderr(&output)
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_stdout_pipe_fails_cleanly_instead_of_panicking() {
+        let home = full_usage_home("broken-pipe");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_superai"));
+        command
+            .args(["usage", "show"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn superai: {e}"));
+        drop(child.stdout.take());
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("wait superai: {e}"));
+
+        assert_ne!(
+            output.status.code(),
+            Some(101),
+            "a broken pipe must not panic"
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains("failed printing to stdout"),
+            "unexpected stderr: {}",
+            stderr(&output)
         );
     }
 }
