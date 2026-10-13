@@ -2,9 +2,10 @@
 //! endpoint semantics frozen in docs/plans/export/llmproxy-usage-ledger.md
 //! PRX-03). PRX-03 fixes semantics, not JSON keys: the shapes recorded in
 //! `tests/fixtures/llmproxy/` are the assumed baseline for drift checking.
-//! Unknown fields are ignored, missing fields surface as `None`, and a
-//! field present with an unusable type fails the whole response loudly
-//! (cost and timestamps additionally tolerate off-format values as `None`).
+//! Unknown fields are ignored, missing row fields surface as `None` (the
+//! `rows`/`keys` envelopes themselves are required), and a field present
+//! with an unusable type fails the whole response loudly (cost and
+//! timestamps additionally tolerate off-format values as `None`).
 
 use std::fmt;
 use std::fs::File;
@@ -188,7 +189,9 @@ impl LedgerCrossCheck {
     }
 
     /// Absolute ledger-minus-local difference, present only when both
-    /// sides carry a priced amount.
+    /// sides carry a priced amount whose difference is representable; a
+    /// hostile ledger amount near the integer rails yields `None`, never
+    /// a wrapped value.
     pub fn divergence(&self) -> Option<Usd> {
         let ledger = self.winning_cost()?;
         let local = self.local?;
@@ -197,7 +200,7 @@ impl LedgerCrossCheck {
         } else {
             (local.as_picos(), ledger.as_picos())
         };
-        Some(Usd::from_picos(hi - lo))
+        hi.checked_sub(lo).map(Usd::from_picos)
     }
 
     /// Whether the divergence line should be shown.
@@ -453,7 +456,11 @@ impl LedgerClient {
     }
 
     fn get_bounded(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>, LedgerError> {
-        let mut current = format!("{}{path}", self.base_url);
+        // Errors name the configured endpoint only: after a redirect,
+        // `current` carries Location-derived bytes that must never reach
+        // error text.
+        let endpoint = format!("{}{path}", self.base_url);
+        let mut current = endpoint.clone();
         for _ in 0..=MAX_REDIRECTS {
             let mut request = self
                 .agent
@@ -466,7 +473,7 @@ impl LedgerClient {
             let mut response = request.call().map_err(|e| match e {
                 ureq::Error::StatusCode(code) => LedgerError::Status { code },
                 other => LedgerError::Unreachable {
-                    reason: format!("{other} for `{current}`"),
+                    reason: format!("{other} for `{endpoint}`"),
                 },
             })?;
             let status = response.status().as_u16();
@@ -490,7 +497,7 @@ impl LedgerClient {
             limited
                 .read_to_end(&mut body)
                 .map_err(|e| LedgerError::Unreachable {
-                    reason: format!("read failed for `{current}`: {e}"),
+                    reason: format!("read failed for `{endpoint}`: {e}"),
                 })?;
             if body.len() > self.limits.max_response_bytes {
                 return Err(LedgerError::TooLarge {
@@ -623,7 +630,7 @@ fn redirect_target(
     else {
         return Err(LedgerError::Unreachable {
             reason: format!(
-                "redirect {} without a Location header for `{current}`",
+                "redirect {} without a Location header",
                 response.status().as_u16()
             ),
         });
@@ -633,10 +640,11 @@ fn redirect_target(
 
 /// Resolve a redirect `Location` (absolute http(s) or a same-origin path).
 /// The target re-passes endpoint validation and must stay on the ledger's
-/// origin, so the admin token is never re-sent to a host the ledger names.
+/// origin, so the admin token is never re-sent to a host the ledger names;
+/// the Location itself is untrusted and never reaches error text.
 fn resolve_redirect(base: &str, location: &str) -> Result<String, LedgerError> {
     let refused = |reason: String| LedgerError::InvalidBase {
-        reason: format!("redirect target `{location}` refused: {reason}"),
+        reason: format!("redirect refused: {reason}"),
     };
     let resolved = if location.starts_with("http://") || location.starts_with("https://") {
         location.to_owned()
@@ -644,7 +652,7 @@ fn resolve_redirect(base: &str, location: &str) -> Result<String, LedgerError> {
         origin_of(base)
             .map(|origin| format!("{origin}{location}"))
             .ok_or_else(|| LedgerError::InvalidBase {
-                reason: format!("redirect from `{base}` has no origin"),
+                reason: "redirect base has no origin".to_owned(),
             })?
     } else {
         return Err(refused("location must be absolute".to_owned()));
@@ -855,6 +863,19 @@ mod tests {
             resolve_base_url(None, Some("http://far.example.com"), &[]),
             Err(LedgerError::InvalidBase { .. })
         ));
+    }
+
+    #[test]
+    fn an_absurd_ledger_cost_cannot_overflow_the_divergence() {
+        // The drift-tolerant cost parse accepts this near-i128::MIN picos
+        // amount; a modest positive local spend must not panic on hi - lo.
+        let hostile = Usd::parse("-170141183460469231731687303")
+            .unwrap_or_else(|e| panic!("hostile amount should parse: {e:?}"));
+        let local = Usd::parse("400").unwrap_or_else(|e| panic!("local amount: {e:?}"));
+        let check = LedgerCrossCheck::new(LedgerCost::Reported(Some(hostile)), Some(local));
+        assert_eq!(check.divergence(), None);
+        assert!(!check.diverged());
+        assert_eq!(check.winning_cost(), Some(hostile));
     }
 
     #[test]

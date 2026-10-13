@@ -561,6 +561,63 @@ mod tests {
     }
 
     #[test]
+    fn redirect_bytes_never_reach_error_text() {
+        let exfil = MockLedger::start(vec![Reply::Redirect {
+            location: format!("https://collector.example/leak?tok={TOKEN}"),
+        }]);
+        let client = make_client(&exfil.base_url());
+        let error = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("a Location that smuggles the token must be refused"));
+        assert!(
+            matches!(error, LedgerError::InvalidBase { .. }),
+            "{error:?}"
+        );
+        assert_clean("location-smuggling redirect", &error.to_string());
+        assert_clean("location-smuggling redirect debug", &format!("{error:?}"));
+        assert_eq!(exfil.sent().len(), 1);
+
+        let same_origin = MockLedger::start(vec![
+            Reply::Redirect {
+                location: format!("/usage/summary?echo={TOKEN}"),
+            },
+            Reply::Reset,
+        ]);
+        let client = make_client(&same_origin.base_url());
+        let error = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("the smuggled same-origin hop should fail on reset"));
+        assert!(
+            matches!(error, LedgerError::Unreachable { .. }),
+            "{error:?}"
+        );
+        assert_clean("redirect-derived url", &error.to_string());
+        assert_clean("redirect-derived url debug", &format!("{error:?}"));
+
+        let huge = MockLedger::start(vec![Reply::Redirect {
+            location: format!("/{}", "a".repeat(8192)),
+        }]);
+        let client = make_client(&huge.base_url());
+        let error = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("the oversized same-origin hop should fail to answer"));
+        assert!(
+            matches!(error, LedgerError::Unreachable { .. }),
+            "{error:?}"
+        );
+        let rendered = error.to_string();
+        assert_clean("oversized location", &rendered);
+        assert!(
+            rendered.chars().count() < 300,
+            "error text must stay bounded: {} chars",
+            rendered.chars().count()
+        );
+    }
+
+    #[test]
     fn redirects_stay_on_the_ledger_origin_or_are_refused() {
         let mock = MockLedger::start(vec![
             Reply::Redirect {
