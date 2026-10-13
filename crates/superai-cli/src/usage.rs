@@ -545,9 +545,8 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
                     ledger_rows: Vec::new(),
                 };
             };
-            // A missing, locked, drifted, or corrupt database means no
-            // recorded usage for this source, not a failed report; the
-            // note keeps the row honest while other families still flow.
+            // A database that fails before any row folds yields no recorded
+            // usage here, not a failed report; mid-scan corruption keeps a floor.
             match scan_history(&path) {
                 Ok(recorded) => SourceScan {
                     recorded,
@@ -657,6 +656,7 @@ fn ledger_scan(env: &UsageEnv) -> SourceScan {
                 output_tokens: row.output_tokens.unwrap_or(0),
                 cache_read_tokens: row.cache_read_tokens,
                 cache_write_tokens: row.cache_write_tokens,
+                cache_write_1h_tokens: None,
             }),
             _ => recorded.unscanned_records += 1,
         }
@@ -1656,6 +1656,7 @@ mod tests {
             output_tokens: 1,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
         });
         usage.events.push(UsageEvent {
             timestamp: ts("2026-10-13T12:00:01Z"),
@@ -1665,6 +1666,7 @@ mod tests {
             output_tokens: 1,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
         });
 
         let range = PeriodRange {

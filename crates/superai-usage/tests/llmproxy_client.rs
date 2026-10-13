@@ -829,6 +829,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
             }],
             unscanned_records: 0,
         }

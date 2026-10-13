@@ -215,10 +215,10 @@ pub fn scan_claude_transcripts(roots: &[PathBuf]) -> ScanOutcome {
 }
 
 /// Scan codex-cli rollout JSONL under the resolved session roots. Usage is
-/// the per-file delta of cumulative token totals (`total_token_usage`, the
-/// `last_token_usage` fallback, or a `token_usage_record` ledger line's
-/// `thread_token_usage`), so replays and token-count/ledger mirror pairs
-/// count once.
+/// the per-file delta of cumulative token totals (`total_token_usage`, a
+/// `token_usage_record` ledger line's `thread_token_usage`, or a
+/// `last_token_usage`-only row whose emission adds into the same
+/// watermark), so replays and token-count/ledger mirror pairs count once.
 /// Codex records cached reads as a subset of `input_tokens`; events split
 /// them so the input rate covers only the uncached remainder.
 pub fn scan_codex_rollouts(roots: &[PathBuf]) -> ScanOutcome {
@@ -482,6 +482,19 @@ fn text_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .and_then(identifier)
 }
 
+/// `usage.cache_creation.ephemeral_1h_input_tokens`, clamped to
+/// `[0, cache_write_tokens]`; absent reads as 0, unreadable spoils the payload.
+fn claude_one_hour(usage: &Value, cache_write_tokens: u64) -> Option<u64> {
+    let found = usage
+        .get("cache_creation")
+        .filter(|c| c.is_object())
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"));
+    match found {
+        None => Some(0),
+        Some(value) => value.as_u64().map(|n| n.min(cache_write_tokens)),
+    }
+}
+
 /// One consumed counter: absent reads as 0 (the harness omits it), a
 /// present-but-unreadable value makes the whole payload unreadable.
 fn strict_counter(usage: &Value, key: &str) -> Option<u64> {
@@ -614,6 +627,9 @@ fn claude_line(bytes: &[u8]) -> LineOutcome<ClaudeRow> {
     let Some(output_tokens) = strict_counter(usage, "output_tokens") else {
         return LineOutcome::Skipped;
     };
+    let Some(one_hour_tokens) = claude_one_hour(usage, cache_write_tokens) else {
+        return LineOutcome::Skipped;
+    };
     if input_tokens == 0 && cache_read_tokens == 0 && cache_write_tokens == 0 && output_tokens == 0
     {
         return LineOutcome::Parsed;
@@ -636,6 +652,7 @@ fn claude_line(bytes: &[u8]) -> LineOutcome<ClaudeRow> {
         output_tokens,
         cache_read_tokens: Some(cache_read_tokens),
         cache_write_tokens: Some(cache_write_tokens),
+        cache_write_1h_tokens: Some(one_hour_tokens),
     };
     let key = message
         .get("id")
@@ -770,6 +787,18 @@ fn advance(watermark: &mut Option<CodexTotals>, total: CodexTotals) -> CodexTota
     }
 }
 
+/// A `last_token_usage` row is per-request, not cumulative, so its emission
+/// adds into the watermark; otherwise its ledger mirror's cumulative total
+/// would re-emit the same tokens.
+fn absorb(watermark: &mut Option<CodexTotals>, emitted: CodexTotals) {
+    let merged = watermark.map_or(emitted, |prev| CodexTotals {
+        input: prev.input.saturating_add(emitted.input),
+        cache_read: prev.cache_read.saturating_add(emitted.cache_read),
+        output: prev.output.saturating_add(emitted.output),
+    });
+    *watermark = Some(merged);
+}
+
 fn codex_row(timestamp: Timestamp, model: &str, tokens: CodexTotals) -> LineOutcome<UsageEvent> {
     if tokens.is_zero() {
         return LineOutcome::Parsed;
@@ -782,6 +811,7 @@ fn codex_row(timestamp: Timestamp, model: &str, tokens: CodexTotals) -> LineOutc
         output_tokens: tokens.output,
         cache_read_tokens: Some(tokens.cache_read),
         cache_write_tokens: None,
+        cache_write_1h_tokens: None,
     })
 }
 
@@ -872,7 +902,10 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
                     .filter(|l| l.is_object())
                     .and_then(CodexTotals::read)
                 {
-                    Some(last) => last,
+                    Some(last) => {
+                        absorb(&mut file.watermark, last);
+                        last
+                    }
                     None => return LineOutcome::Skipped,
                 },
             };
@@ -1036,6 +1069,7 @@ fn pi_assistant(line: &Value, message: &Value, file: &PiFile) -> LineOutcome<PiR
         output_tokens: output,
         cache_read_tokens: Some(cache_read),
         cache_write_tokens,
+        cache_write_1h_tokens: None,
     };
     let entry = text_field(line, &["id"]);
     let key = match (&file.session, entry) {

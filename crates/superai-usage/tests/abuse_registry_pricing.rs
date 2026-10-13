@@ -130,6 +130,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
         };
         let report = CostEngine::new(cached.rates)
             .total(

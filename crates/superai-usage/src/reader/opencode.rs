@@ -198,6 +198,7 @@ fn row_event(row: &Row<'_>) -> Option<UsageEvent> {
         output_tokens: output.checked_add(reasoning)?,
         cache_read_tokens,
         cache_write_tokens,
+        cache_write_1h_tokens: None,
     })
 }
 

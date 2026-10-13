@@ -634,6 +634,9 @@ pub struct UsageEvent {
     pub cache_read_tokens: Option<u64>,
     /// Cache-creation tokens, when the harness records them.
     pub cache_write_tokens: Option<u64>,
+    /// One-hour-TTL cache writes, never exceeding `cache_write_tokens`;
+    /// billed at twice the input rate, the remainder at the cache-write rate.
+    pub cache_write_1h_tokens: Option<u64>,
 }
 
 /// Everything a reader scanned for one query, plus the records it could
@@ -829,11 +832,23 @@ fn event_cost(rates: &ModelRates, event: &UsageEvent) -> CostResult<Option<Usd>>
             .map(|picos| Some(Usd::from_picos(picos)))
             .ok_or(CostError::CostOverflow)
     };
+    // Anthropic prompt caching: 1-hour writes bill at 2x the input rate,
+    // the 5-minute remainder at the cache-creation rate.
+    let one_hour = event
+        .cache_write_1h_tokens
+        .unwrap_or(0)
+        .min(event.cache_write_tokens.unwrap_or(0));
+    let five_minute = event.cache_write_tokens.map(|write| write - one_hour);
+    let doubled_input = rates
+        .input
+        .checked_add(rates.input)
+        .ok_or(CostError::CostOverflow)?;
     let parts = [
         class_cost(Some(rates.input), Some(event.input_tokens))?,
         class_cost(Some(rates.output), Some(event.output_tokens))?,
         class_cost(rates.cache_read, event.cache_read_tokens)?,
-        class_cost(rates.cache_write, event.cache_write_tokens)?,
+        class_cost(rates.cache_write, five_minute)?,
+        class_cost(Some(doubled_input), Some(one_hour))?,
     ];
     let mut sum = Usd::ZERO;
     for part in parts {

@@ -190,7 +190,77 @@ mod tests {
                 &outcome.into_recorded_usage(),
             )
             .unwrap_or_else(|e| panic!("total: {e:?}"));
-        let expected = Usd::parse("0.0036455").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
+        let expected = Usd::parse("0.0036545").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
+        assert_eq!(report.total.spend, Spend::Exact(expected));
+    }
+
+    fn claude_write_row(one_hour: &serde_json::Value) -> String {
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-10-13T09:00:00Z",
+            "message": {
+                "id": "msg-1h",
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 10,
+                    "cache_creation": {"ephemeral_1h_input_tokens": one_hour},
+                },
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn claude_one_hour_cache_writes_bill_at_twice_the_input_rate() {
+        let corpus = write_corpus(
+            "claude-1h-split",
+            &[claude_write_row(&json!(4)).into_bytes()],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_claude_transcripts(&[root.to_path_buf()]);
+        assert_eq!(outcome.events[0].cache_write_1h_tokens, Some(4));
+        let engine = CostEngine::new(
+            RateTable::bundled().unwrap_or_else(|e| panic!("bundled rates: {e:?}")),
+        );
+        let report = engine
+            .total(
+                &CostPeriod::AllHistory,
+                ts("2026-10-13T12:00:00Z"),
+                "UTC",
+                &outcome.into_recorded_usage(),
+            )
+            .unwrap_or_else(|e| panic!("total: {e:?}"));
+        // 6 writes at 3.75/MTok plus 4 at twice the 3/MTok input rate.
+        let expected = Usd::parse("0.0000465").unwrap_or_else(|e| panic!("expected: {e:?}"));
+        assert_eq!(report.total.spend, Spend::Exact(expected));
+    }
+
+    #[test]
+    fn claude_one_hour_cache_writes_clamp_to_the_write_total() {
+        let corpus = write_corpus(
+            "claude-1h-clamp",
+            &[claude_write_row(&json!(99)).into_bytes()],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_claude_transcripts(&[root.to_path_buf()]);
+        assert_eq!(outcome.events[0].cache_write_1h_tokens, Some(10));
+        let engine = CostEngine::new(
+            RateTable::bundled().unwrap_or_else(|e| panic!("bundled rates: {e:?}")),
+        );
+        let report = engine
+            .total(
+                &CostPeriod::AllHistory,
+                ts("2026-10-13T12:00:00Z"),
+                "UTC",
+                &outcome.into_recorded_usage(),
+            )
+            .unwrap_or_else(|e| panic!("total: {e:?}"));
+        // All 10 writes priced at twice the 3/MTok input rate.
+        let expected = Usd::parse("0.00006").unwrap_or_else(|e| panic!("expected: {e:?}"));
         assert_eq!(report.total.spend, Spend::Exact(expected));
     }
 
@@ -299,6 +369,48 @@ mod tests {
             outcome.counts.skipped, 1,
             "a record without thread_token_usage is a flagged gap"
         );
+    }
+
+    #[test]
+    fn a_last_only_token_count_and_its_ledger_mirror_count_once() {
+        let corpus = write_corpus(
+            "codex-last-mirror",
+            &[
+                json!({"timestamp":"2026-10-13T08:00:00Z","type":"turn_context","payload":{"model":"gpt-5.1"}})
+                    .to_string()
+                    .into_bytes(),
+                json!({
+                    "timestamp": "2026-10-13T08:00:10Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"last_token_usage": {"input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 20}},
+                    },
+                })
+                .to_string()
+                .into_bytes(),
+                json!({
+                    "timestamp": "2026-10-13T08:00:11Z",
+                    "type": "token_usage_record",
+                    "payload": {
+                        "thread_id": "th-1",
+                        "response_id": "resp-1",
+                        "thread_token_usage": {"input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 20},
+                    },
+                })
+                .to_string()
+                .into_bytes(),
+            ],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_codex_rollouts(&[root.to_path_buf()]);
+        assert_eq!(
+            event_summary(&outcome),
+            vec![("openai", "gpt-5.1", 50, 20, 0, 0)],
+            "the mirror's cumulative total must not re-emit the last-only row"
+        );
+        assert_eq!(outcome.counts.parsed, 3);
+        assert_eq!(outcome.counts.skipped, 0);
     }
 
     fn default_pi_roots() -> Vec<PathBuf> {
@@ -655,9 +767,14 @@ mod tests {
             br#"{"type":"assistant","timestamp":"2026-10-13T09:00:00Z","message":{"id":"m1","model":"claude-sonnet-4-5","usage":{"input_tokens":"100","output_tokens":"50"}}}"#,
         )
         .unwrap_or_else(|e| panic!("claude corpus: {e}"));
+        fs::write(
+            claude_dir.join("b.jsonl"),
+            br#"{"type":"assistant","timestamp":"2026-10-13T09:00:00Z","message":{"id":"m2","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":"4"}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("claude 1h corpus: {e}"));
         let claude = scan_claude_transcripts(&[claude_dir]);
         assert_eq!(claude.counts.parsed, 0);
-        assert_eq!(claude.counts.skipped, 1);
+        assert_eq!(claude.counts.skipped, 2);
         assert_eq!(claude.events.len(), 0);
 
         let codex_dir = dir.join("codex");

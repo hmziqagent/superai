@@ -57,6 +57,7 @@ mod tests {
             output_tokens: 120,
             cache_read_tokens: Some(500),
             cache_write_tokens: Some(10),
+            cache_write_1h_tokens: None,
         }
     }
 
@@ -135,6 +136,7 @@ mod tests {
             output_tokens: 5,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
         }));
     }
 
