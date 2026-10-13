@@ -287,6 +287,10 @@ mod tests {
         }
         let resolved = pi_session_roots(&PiSelectors::default(), &home);
         assert_eq!(resolved.refusal, None);
+        assert!(
+            resolved.profile_cap_hit,
+            "dropping profiles past the cap must be flagged, not silent"
+        );
         let discovered: Vec<String> = resolved
             .roots
             .iter()
@@ -319,6 +323,7 @@ mod tests {
             superai_usage::reader::jsonl::PiSessionRoots {
                 roots: Vec::new(),
                 refusal: Some("OMP_PROFILE/PI_PROFILE is not a valid profile name"),
+                profile_cap_hit: false,
             }
         );
         for config_dir in ["/abs/root", "../../etc", ".."] {

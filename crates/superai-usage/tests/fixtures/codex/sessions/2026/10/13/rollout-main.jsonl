@@ -9,3 +9,4 @@
 {"timestamp":"2026-10-13T08:00:33.000Z","type":"event_msg"
 {"timestamp":"2026-10-13T08:00:40.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160,"cached_input_tokens":45,"output_tokens":75}}}}
 {"timestamp":"2026-10-13T08:00:41.000Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+{"timestamp":"2026-10-13T08:00:50.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.1","total_token_usage":{"input_tokens":100.5,"cached_input_tokens":40,"output_tokens":10}}}}

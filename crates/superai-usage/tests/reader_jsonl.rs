@@ -69,7 +69,7 @@ mod tests {
     fn claude_corpus_yields_events_and_counts_every_unreadable_line() {
         let outcome = scan_claude_transcripts(&[fixtures().join("claude/projects")]);
         assert_eq!(outcome.counts.parsed, 9);
-        assert_eq!(outcome.counts.skipped, 6);
+        assert_eq!(outcome.counts.skipped, 7);
         assert_eq!(outcome.unreadable_artifacts, 0);
         assert_eq!(
             event_summary(&outcome),
@@ -83,7 +83,7 @@ mod tests {
         );
         assert_eq!(outcome.events[0].timestamp, ts("2026-10-13T09:00:05.123Z"));
         let recorded = outcome.into_recorded_usage();
-        assert_eq!(recorded.unscanned_records, 6);
+        assert_eq!(recorded.unscanned_records, 7);
         assert_eq!(recorded.events.len(), 5);
     }
 
@@ -128,7 +128,7 @@ mod tests {
             fixtures().join("codex/archived_sessions"),
         ]);
         assert_eq!(outcome.counts.parsed, 10);
-        assert_eq!(outcome.counts.skipped, 3);
+        assert_eq!(outcome.counts.skipped, 4);
         assert_eq!(outcome.unreadable_artifacts, 0);
         assert_eq!(
             event_summary(&outcome),
@@ -474,6 +474,38 @@ mod tests {
         for seed in [5u64, 61, 777, 0xcafe] {
             assert_property_holds("pi-prop", seed, pi_generated_line, scan_pi_sessions);
         }
+    }
+
+    #[test]
+    fn unreadable_token_counters_skip_the_record_instead_of_zeroing_it() {
+        let dir = temp_dir("strict-counters");
+        let claude_dir = dir.join("claude");
+        fs::create_dir_all(&claude_dir).unwrap_or_else(|e| panic!("claude dir: {e}"));
+        fs::write(
+            claude_dir.join("a.jsonl"),
+            br#"{"type":"assistant","timestamp":"2026-10-13T09:00:00Z","message":{"id":"m1","model":"claude-sonnet-4-5","usage":{"input_tokens":"100","output_tokens":"50"}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("claude corpus: {e}"));
+        let claude = scan_claude_transcripts(&[claude_dir]);
+        assert_eq!(claude.counts.parsed, 0);
+        assert_eq!(claude.counts.skipped, 1);
+        assert_eq!(claude.events.len(), 0);
+
+        let codex_dir = dir.join("codex");
+        fs::create_dir_all(&codex_dir).unwrap_or_else(|e| panic!("codex dir: {e}"));
+        fs::write(
+            codex_dir.join("r.jsonl"),
+            br#"{"timestamp":"2026-10-13T08:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.1","total_token_usage":{"input_tokens":100.5,"cached_input_tokens":40,"output_tokens":10}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("codex corpus: {e}"));
+        let codex = scan_codex_rollouts(&[codex_dir]);
+        assert_eq!(codex.counts.parsed, 0);
+        assert_eq!(codex.counts.skipped, 1);
+        assert_eq!(
+            codex.events.len(),
+            0,
+            "an unreadable counter must not yield a zero-token event"
+        );
     }
 
     #[cfg(unix)]

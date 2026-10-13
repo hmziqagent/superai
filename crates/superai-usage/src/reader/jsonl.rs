@@ -116,6 +116,9 @@ pub struct PiSessionRoots {
     /// Display-safe refusal when an explicit selector could not be
     /// honored; `roots` is empty and nothing may be read.
     pub refusal: Option<&'static str>,
+    /// Discovery dropped profiles past its 64-profile cap; totals over
+    /// these roots are floors, not complete coverage.
+    pub profile_cap_hit: bool,
 }
 
 /// pi/omp session roots (`CodexBar`'s `PiFamilySessionScanner`): an explicit
@@ -127,11 +130,13 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
         return PiSessionRoots {
             roots: dedup_roots(vec![PathBuf::from(dir)]),
             refusal: None,
+            profile_cap_hit: false,
         };
     }
     let refused = |reason: &'static str| PiSessionRoots {
         roots: Vec::new(),
         refusal: Some(reason),
+        profile_cap_hit: false,
     };
     let Some(config) = omp_config_root(selectors.config_dir, home) else {
         return refused(CONFIG_REFUSAL);
@@ -144,6 +149,7 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
         None => roots.push(home.join(".pi").join("agent").join("sessions")),
     }
     let profile_selector = selectors.omp_profile.or(selectors.pi_profile);
+    let mut profile_cap_hit = false;
     match normalize_profile(profile_selector) {
         ProfileValue::Invalid => return refused(PROFILE_REFUSAL),
         ProfileValue::Default => {
@@ -155,9 +161,10 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
                 }
             }
             if profile_selector.is_none() {
-                discover_profile_roots(&config.join("profiles"), &mut roots);
+                profile_cap_hit |= discover_profile_roots(&config.join("profiles"), &mut roots);
                 if agent_dir.is_none() {
-                    discover_profile_roots(&xdg_base.join("omp").join("profiles"), &mut roots);
+                    profile_cap_hit |=
+                        discover_profile_roots(&xdg_base.join("omp").join("profiles"), &mut roots);
                 }
             }
         }
@@ -168,6 +175,7 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
     PiSessionRoots {
         roots: dedup_roots(roots),
         refusal: None,
+        profile_cap_hit,
     }
 }
 
@@ -256,11 +264,12 @@ pub fn scan_pi_sessions(roots: &[PathBuf]) -> ScanOutcome {
     outcome
 }
 
-/// On-disk profile discovery, capped at 64 profiles per pass (`CodexBar`
+/// On-disk profile discovery over at most 64 profiles per pass (`CodexBar`
 /// caps its own discovery at 64 roots); symlinked entries are skipped.
-fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) {
+/// Returns whether the cap dropped any profile.
+fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) -> bool {
     let Ok(entries) = std::fs::read_dir(profiles_dir) else {
-        return;
+        return false;
     };
     let mut profiles = Vec::new();
     for entry in entries.flatten() {
@@ -281,6 +290,7 @@ fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) {
     // Sort before capping so a full directory always keeps the same
     // profiles regardless of read_dir order.
     profiles.sort();
+    let cap_hit = profiles.len() > 64;
     for profile in profiles.into_iter().take(64) {
         for layout in [
             profile.join("sessions"),
@@ -291,6 +301,7 @@ fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) {
             }
         }
     }
+    cap_hit
 }
 
 fn push_named_profile_roots(roots: &mut Vec<PathBuf>, config: &Path, xdg_base: &Path, name: &str) {
@@ -464,8 +475,14 @@ fn text_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .and_then(identifier)
 }
 
-fn counter(value: Option<&Value>) -> u64 {
-    value.and_then(Value::as_u64).unwrap_or(0)
+/// One consumed counter: absent reads as 0 (the harness omits it), a
+/// present-but-unreadable value makes the whole payload unreadable.
+fn strict_counter(usage: &Value, key: &str) -> Option<u64> {
+    match chain(usage, &[key]) {
+        Chain::Value(n) => Some(n),
+        Chain::Absent => Some(0),
+        Chain::Invalid => None,
+    }
 }
 
 enum Chain {
@@ -572,10 +589,18 @@ fn claude_line(bytes: &[u8]) -> LineOutcome<ClaudeRow> {
     let Some(usage) = message.get("usage").filter(|u| u.is_object()) else {
         return LineOutcome::Skipped;
     };
-    let input_tokens = counter(usage.get("input_tokens"));
-    let cache_read_tokens = counter(usage.get("cache_read_input_tokens"));
-    let cache_write_tokens = counter(usage.get("cache_creation_input_tokens"));
-    let output_tokens = counter(usage.get("output_tokens"));
+    let Some(input_tokens) = strict_counter(usage, "input_tokens") else {
+        return LineOutcome::Skipped;
+    };
+    let Some(cache_read_tokens) = strict_counter(usage, "cache_read_input_tokens") else {
+        return LineOutcome::Skipped;
+    };
+    let Some(cache_write_tokens) = strict_counter(usage, "cache_creation_input_tokens") else {
+        return LineOutcome::Skipped;
+    };
+    let Some(output_tokens) = strict_counter(usage, "output_tokens") else {
+        return LineOutcome::Skipped;
+    };
     if input_tokens == 0 && cache_read_tokens == 0 && cache_write_tokens == 0 && output_tokens == 0
     {
         return LineOutcome::Parsed;
@@ -656,6 +681,20 @@ fn keep_claude_row(
     }
 }
 
+/// The two cached-read spellings name one counter: the larger valid value
+/// wins, and any present-but-unreadable spelling spoils the payload.
+fn cached_counter(usage: &Value) -> Option<u64> {
+    let mut best = 0;
+    for key in ["cached_input_tokens", "cache_read_input_tokens"] {
+        match chain(usage, &[key]) {
+            Chain::Value(n) => best = best.max(n),
+            Chain::Absent => {}
+            Chain::Invalid => return None,
+        }
+    }
+    Some(best)
+}
+
 #[derive(Clone, Copy, Default)]
 struct CodexTotals {
     input: u64,
@@ -664,13 +703,12 @@ struct CodexTotals {
 }
 
 impl CodexTotals {
-    fn read(usage: &Value) -> Self {
-        Self {
-            input: counter(usage.get("input_tokens")),
-            cache_read: counter(usage.get("cached_input_tokens"))
-                .max(counter(usage.get("cache_read_input_tokens"))),
-            output: counter(usage.get("output_tokens")),
-        }
+    fn read(usage: &Value) -> Option<Self> {
+        Some(Self {
+            input: strict_counter(usage, "input_tokens")?,
+            cache_read: cached_counter(usage)?,
+            output: strict_counter(usage, "output_tokens")?,
+        })
     }
 
     fn is_zero(self) -> bool {
@@ -732,10 +770,13 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
             let Some(model) = model else {
                 return LineOutcome::Skipped;
             };
-            let total = info
-                .get("total_token_usage")
-                .filter(|t| t.is_object())
-                .map(CodexTotals::read);
+            let total = match info.get("total_token_usage").filter(|t| t.is_object()) {
+                Some(raw) => match CodexTotals::read(raw) {
+                    Some(total) => Some(total),
+                    None => return LineOutcome::Skipped,
+                },
+                None => None,
+            };
             let tokens = match total {
                 // A regressing total is a stale replay; the watermark
                 // keeps the high point so a replay never re-emits tokens.
@@ -761,7 +802,7 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
                 None => match info
                     .get("last_token_usage")
                     .filter(|l| l.is_object())
-                    .map(CodexTotals::read)
+                    .and_then(CodexTotals::read)
                 {
                     Some(last) => last,
                     None => return LineOutcome::Skipped,
