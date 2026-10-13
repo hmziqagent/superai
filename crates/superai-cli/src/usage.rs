@@ -1,15 +1,22 @@
 //! `superai usage` subcommands (USG-06): local-artifact scans composed
 //! into window and cost reports, one row per usage source.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Serialize;
 use superai_usage::cost::{
     CostEngine, CostPeriod, PeriodRange, PricingCache, RateTable, RecordedUsage, Spend, UsageEvent,
+    Usd,
 };
+use superai_usage::llmproxy::{
+    self, LedgerClient, RequestRow, RequestsQuery, load_admin_token, resolve_base_url,
+};
+use superai_usage::poller::PollLimits;
 use superai_usage::reader::jsonl::{
     PiSelectors, claude_projects_roots, codex_sessions_roots, pi_session_roots,
     scan_claude_transcripts, scan_codex_rollouts, scan_pi_sessions,
@@ -17,6 +24,10 @@ use superai_usage::reader::jsonl::{
 use superai_usage::reader::opencode::{OpenCodeError, history_db_path, scan_history};
 
 use crate::CliError;
+
+/// Raw ledger rows one usage query asks for; more would silently floor
+/// every total, so hitting the cap adds a note instead.
+const LEDGER_ROW_CAP: usize = 10_000;
 
 pub(crate) fn run(args: &[OsString], home: &Path) -> Result<(), CliError> {
     let (command, rest) = args.split_first().ok_or_else(|| CliError::Args {
@@ -347,29 +358,47 @@ fn zone_name(zone: &TimeZone) -> &str {
 #[serde(rename_all = "kebab-case")]
 enum TruthSource {
     LocalArtifacts,
+    Llmproxy,
 }
 
 impl TruthSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::LocalArtifacts => "local artifacts",
+            Self::Llmproxy => "llmproxy ledger",
         }
     }
 }
 
 /// One usage reader family: several harness ids can share a single
 /// artifact store (oh-my-codex reads codex's rollouts), so the store is
-/// scanned once and the row names every harness that shares it.
+/// scanned once and the row names every harness that shares it. The VPS
+/// ledger is a family too (subplan 16 VPS-03): account-level, so it serves
+/// no harness id and only joins unfiltered reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
     Claude,
     Codex,
     OpenCode,
     Pi,
+    Ledger,
 }
 
 impl Family {
-    const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::OpenCode, Self::Pi];
+    const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::OpenCode,
+        Self::Pi,
+        Self::Ledger,
+    ];
+
+    fn local_families() -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|family| *family != Self::Ledger)
+            .collect()
+    }
 
     fn id(self) -> &'static str {
         match self {
@@ -377,6 +406,7 @@ impl Family {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
+            Self::Ledger => "vps-ledger",
         }
     }
 
@@ -386,6 +416,14 @@ impl Family {
             Self::Codex => &["codex-cli", "oh-my-codex"],
             Self::OpenCode => &["opencode", "oh-my-opencode"],
             Self::Pi => &["pi", "omp"],
+            Self::Ledger => &[],
+        }
+    }
+
+    fn truth(self) -> TruthSource {
+        match self {
+            Self::Ledger => TruthSource::Llmproxy,
+            Self::Claude | Self::Codex | Self::OpenCode | Self::Pi => TruthSource::LocalArtifacts,
         }
     }
 }
@@ -394,7 +432,7 @@ fn select_families(harness: Option<&str>) -> Result<Vec<Family>, CliError> {
     let Some(harness) = harness else {
         return Ok(Family::ALL.to_vec());
     };
-    Family::ALL
+    Family::local_families()
         .into_iter()
         .find(|family| family.harnesses().contains(&harness))
         .map(|family| vec![family])
@@ -420,6 +458,8 @@ struct UsageEnv {
     omp_profile: Option<String>,
     pi_profile: Option<String>,
     xdg_cache_home: Option<PathBuf>,
+    llmproxy_url: Option<String>,
+    llmproxy_token: Option<String>,
 }
 
 impl UsageEnv {
@@ -436,6 +476,8 @@ impl UsageEnv {
             omp_profile: utf8_env("OMP_PROFILE")?,
             pi_profile: utf8_env("PI_PROFILE")?,
             xdg_cache_home: path_env("XDG_CACHE_HOME"),
+            llmproxy_url: utf8_env(llmproxy::PROXY_URL_ENV_VAR)?,
+            llmproxy_token: utf8_env(llmproxy::ADMIN_TOKEN_ENV_VAR)?,
         })
     }
 }
@@ -461,6 +503,8 @@ fn path_env(name: &str) -> Option<PathBuf> {
 struct SourceScan {
     recorded: RecordedUsage,
     notes: Vec<String>,
+    /// Raw ledger rows; empty for every local family.
+    ledger_rows: Vec<RequestRow>,
 }
 
 fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
@@ -474,6 +518,7 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
             SourceScan {
                 recorded: scan_claude_transcripts(&roots).into_recorded_usage(),
                 notes: Vec::new(),
+                ledger_rows: Vec::new(),
             }
         }
         Family::Codex => SourceScan {
@@ -483,6 +528,7 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
             ))
             .into_recorded_usage(),
             notes: Vec::new(),
+            ledger_rows: Vec::new(),
         },
         // The channel is not env-selectable, so only the default database
         // or an OPENCODE_DB override is read (docs/harness-configs/opencode.md §6).
@@ -496,6 +542,7 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
                 return SourceScan {
                     recorded: RecordedUsage::default(),
                     notes: vec!["usage database path could not be resolved".to_owned()],
+                    ledger_rows: Vec::new(),
                 };
             };
             // A missing, locked, drifted, or corrupt database means no
@@ -505,14 +552,17 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
                 Ok(recorded) => SourceScan {
                     recorded,
                     notes: Vec::new(),
+                    ledger_rows: Vec::new(),
                 },
                 Err(OpenCodeError::Open(e)) => SourceScan {
                     recorded: RecordedUsage::default(),
                     notes: vec![format!("history database could not be opened: {e}")],
+                    ledger_rows: Vec::new(),
                 },
                 Err(OpenCodeError::Scan(e)) => SourceScan {
                     recorded: RecordedUsage::default(),
                     notes: vec![format!("history database could not be scanned: {e}")],
+                    ledger_rows: Vec::new(),
                 },
             }
         }
@@ -532,6 +582,7 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
                 return SourceScan {
                     recorded: RecordedUsage::default(),
                     notes,
+                    ledger_rows: Vec::new(),
                 };
             }
             if roots.profile_cap_hit {
@@ -543,9 +594,157 @@ fn scan_family(family: Family, env: &UsageEnv) -> SourceScan {
             SourceScan {
                 recorded: scan_pi_sessions(&roots.roots).into_recorded_usage(),
                 notes,
+                ledger_rows: Vec::new(),
             }
         }
+        Family::Ledger => ledger_scan(env),
     }
+}
+
+/// The VPS ledger as a usage source (subplan 16 VPS-03): bounded raw rows
+/// whose recorded cost is the ledger's own, never a rate estimate. Any
+/// failure is a note on the row, never a failed report.
+fn ledger_scan(env: &UsageEnv) -> SourceScan {
+    let note = |reason: String| SourceScan {
+        recorded: RecordedUsage::default(),
+        notes: vec![reason],
+        ledger_rows: Vec::new(),
+    };
+    let base = match resolve_base_url(None, env.llmproxy_url.as_deref(), &[]) {
+        Ok(Some(base)) => base,
+        Ok(None) => {
+            return note(format!(
+                "set {} (or point it at the deployment's admin listener) to read the ledger",
+                llmproxy::PROXY_URL_ENV_VAR
+            ));
+        }
+        Err(error) => return note(format!("ledger base url refused: {error}")),
+    };
+    let token_file = env.home.join(".superai").join("llmproxy-admin-token");
+    let token = match load_admin_token(env.llmproxy_token.as_deref(), Some(&token_file)) {
+        Ok(token) => token,
+        Err(error) => return note(format!("ledger admin token unavailable: {error}")),
+    };
+    let limits = match PollLimits::new(Duration::from_secs(10), 1024 * 1024) {
+        Ok(limits) => limits,
+        Err(error) => return note(format!("ledger poll limits rejected: {error}")),
+    };
+    let client = match LedgerClient::new(&base, &token, limits) {
+        Ok(client) => client,
+        Err(error) => return note(format!("ledger client refused: {error}")),
+    };
+    let query = RequestsQuery {
+        since: None,
+        until: None,
+        provider: None,
+        limit: Some(u32::try_from(LEDGER_ROW_CAP).unwrap_or(u32::MAX)),
+    };
+    let rows = match client.requests(&query) {
+        Ok(page) => page.rows,
+        Err(error) => return note(format!("ledger could not be read: {error}")),
+    };
+    let capped = rows.len() >= LEDGER_ROW_CAP;
+    let mut recorded = RecordedUsage::default();
+    for row in &rows {
+        // Rows without a timestamp cannot enter any window; rows without
+        // provider or model cannot be attributed. Both stay counted skips.
+        match (&row.provider, &row.model, row.received_at) {
+            (Some(provider), Some(model), Some(at)) => recorded.events.push(UsageEvent {
+                timestamp: at,
+                provider: provider.clone(),
+                model: model.clone(),
+                input_tokens: row.input_tokens.unwrap_or(0),
+                output_tokens: row.output_tokens.unwrap_or(0),
+                cache_read_tokens: row.cache_read_tokens,
+                cache_write_tokens: row.cache_write_tokens,
+            }),
+            _ => recorded.unscanned_records += 1,
+        }
+    }
+    let mut notes = Vec::new();
+    if capped {
+        notes.push(format!(
+            "ledger returned its row cap of {LEDGER_ROW_CAP}; totals over the returned rows are a floor"
+        ));
+    }
+    SourceScan {
+        recorded,
+        notes,
+        ledger_rows: rows,
+    }
+}
+
+/// Ledger spend and per-model rows over one period: recorded costs only.
+fn ledger_report(
+    rows: &[RequestRow],
+    range: &PeriodRange,
+) -> Result<(Spend, Vec<ModelRow>), CliError> {
+    #[derive(Default)]
+    struct Group {
+        input: u64,
+        output: u64,
+        events: u64,
+        cost: Option<Usd>,
+    }
+    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
+    let mut missing: BTreeSet<String> = BTreeSet::new();
+    let mut total = Usd::ZERO;
+    let mut matched = false;
+    let overflow = || CliError::Scan {
+        reason: "ledger totals overflow".to_owned(),
+    };
+    for row in rows {
+        let Some(at) = row.received_at else {
+            continue;
+        };
+        if !range.contains(at) {
+            continue;
+        }
+        matched = true;
+        let (Some(provider), Some(model)) = (&row.provider, &row.model) else {
+            missing.insert("ledger/unattributed-row".to_owned());
+            continue;
+        };
+        let entry = groups.entry((provider.clone(), model.clone())).or_default();
+        entry.input = entry
+            .input
+            .checked_add(row.input_tokens.unwrap_or(0))
+            .ok_or_else(overflow)?;
+        entry.output = entry
+            .output
+            .checked_add(row.output_tokens.unwrap_or(0))
+            .ok_or_else(overflow)?;
+        entry.events = entry.events.checked_add(1).ok_or_else(overflow)?;
+        if let Some(cost) = row.cost_usd {
+            let sum = entry.cost.unwrap_or(Usd::ZERO);
+            entry.cost = Some(sum.checked_add(cost).ok_or_else(overflow)?);
+            total = total.checked_add(cost).ok_or_else(overflow)?;
+        } else {
+            entry.cost = None;
+            missing.insert(format!("{provider}/{model}"));
+        }
+    }
+    let spend = if !matched {
+        Spend::Zero
+    } else if missing.is_empty() {
+        Spend::Exact(total)
+    } else {
+        Spend::Unavailable {
+            missing_pricing: missing.into_iter().collect(),
+        }
+    };
+    let models = groups
+        .into_iter()
+        .map(|((provider, model), group)| ModelRow {
+            provider,
+            model,
+            input_tokens: group.input,
+            output_tokens: group.output,
+            events: group.events,
+            cost: group.cost.map(|cost| cost.to_string()),
+        })
+        .collect();
+    Ok((spend, models))
 }
 
 fn load_rates(env: &UsageEnv) -> Result<RateTable, CliError> {
@@ -693,23 +892,35 @@ fn build_show(
     let mut sources = Vec::new();
     for family in families {
         let scan = scan_family(*family, env);
-        let report = engine
-            .total(&period, now, zone_name(zone), &scan.recorded)
-            .map_err(|e| CliError::Pricing {
-                reason: e.to_string(),
-            })?;
+        // The ledger's cost is its own recorded sum; local rows are priced
+        // by the engine. The ledger endpoints report no quota lane at all.
+        let cost = if *family == Family::Ledger {
+            let (spend, _) = ledger_report(&scan.ledger_rows, &range)?;
+            SpendView::of(&spend)
+        } else {
+            let report = engine
+                .total(&period, now, zone_name(zone), &scan.recorded)
+                .map_err(|e| CliError::Pricing {
+                    reason: e.to_string(),
+                })?;
+            SpendView::of(&report.total.spend)
+        };
         sources.push(SourceRow {
             source: family.id(),
             harnesses: family.harnesses().to_vec(),
-            truth: TruthSource::LocalArtifacts,
+            truth: family.truth(),
             window: WindowRow {
-                lane: "provider-only",
+                lane: if *family == Family::Ledger {
+                    "unavailable"
+                } else {
+                    "provider-only"
+                },
                 resets_at: resets_at.clone(),
             },
             totals_scope: window.totals_scope(),
             tokens: token_totals(&scan.recorded, &range)?,
             coverage: CoverageView::of(&scan.recorded),
-            cost: SpendView::of(&report.total.spend),
+            cost,
             notes: scan.notes,
         });
     }
@@ -768,18 +979,16 @@ fn build_cost(
     let mut sources = Vec::new();
     for family in families {
         let scan = scan_family(*family, env);
-        let report = engine
-            .total(&period, now, zone_name(zone), &scan.recorded)
-            .map_err(|e| CliError::Pricing {
-                reason: e.to_string(),
-            })?;
-        sources.push(CostSourceRow {
-            source: family.id(),
-            harnesses: family.harnesses().to_vec(),
-            truth: TruthSource::LocalArtifacts,
-            total: SpendView::of(&report.total.spend),
-            coverage: CoverageView::of(&scan.recorded),
-            models: report
+        let (total, models) = if *family == Family::Ledger {
+            let (spend, models) = ledger_report(&scan.ledger_rows, &range)?;
+            (SpendView::of(&spend), models)
+        } else {
+            let report = engine
+                .total(&period, now, zone_name(zone), &scan.recorded)
+                .map_err(|e| CliError::Pricing {
+                    reason: e.to_string(),
+                })?;
+            let models = report
                 .models
                 .iter()
                 .map(|row| ModelRow {
@@ -790,7 +999,16 @@ fn build_cost(
                     events: row.events,
                     cost: row.cost.map(|amount| amount.to_string()),
                 })
-                .collect(),
+                .collect();
+            (SpendView::of(&report.total.spend), models)
+        };
+        sources.push(CostSourceRow {
+            source: family.id(),
+            harnesses: family.harnesses().to_vec(),
+            truth: family.truth(),
+            total,
+            coverage: CoverageView::of(&scan.recorded),
+            models,
             notes: scan.notes,
         });
     }
@@ -829,7 +1047,8 @@ fn render_show(report: &ShowReport) -> String {
             row.truth.as_str()
         ));
         lines.push(format!(
-            "  fill: provider-only; resets: {}",
+            "  fill: {}; resets: {}",
+            row.window.lane,
             row.window.resets_at.as_deref().unwrap_or("unknown")
         ));
         lines.push(format!("  totals: {}", row.totals_scope));
@@ -912,7 +1131,7 @@ mod tests {
     use std::fs;
     use std::hash::{Hash, Hasher};
 
-    use superai_usage::cost::{ModelRates, Usd};
+    use superai_usage::cost::ModelRates;
 
     // unused_crate_dependencies demands an ack for the dev-dependency.
     use rusqlite as _;
@@ -1056,7 +1275,11 @@ mod tests {
         }
 
         let all = select_families(None).unwrap_or_else(|e| panic!("select: {e}"));
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
+        assert!(
+            all.contains(&Family::Ledger),
+            "the ledger must join unfiltered reports"
+        );
 
         let unknown = err_text(select_families(Some("nope")));
         assert!(unknown.contains("unknown harness"));
@@ -1085,7 +1308,7 @@ mod tests {
         let env = UsageEnv::default();
         let report = build_show(
             &env,
-            &Family::ALL,
+            &Family::local_families(),
             WindowSel::Session,
             ts("2026-10-13T12:00:00Z"),
             &TimeZone::UTC,
@@ -1104,7 +1327,7 @@ mod tests {
         let env = UsageEnv::default();
         let report = build_show(
             &env,
-            &Family::ALL,
+            &Family::local_families(),
             WindowSel::Month,
             ts("2026-10-13T12:00:00Z"),
             &TimeZone::UTC,
@@ -1115,6 +1338,139 @@ mod tests {
             let reset = row.window.resets_at.as_deref().unwrap_or("missing");
             assert!(reset.starts_with("2026-11-01T00:00:00"), "{reset}");
         }
+    }
+
+    #[test]
+    fn an_unconfigured_ledger_joins_the_report_as_a_noted_row() {
+        let env = UsageEnv::default();
+        let report = build_show(
+            &env,
+            &Family::ALL,
+            WindowSel::Session,
+            ts("2026-10-13T12:00:00Z"),
+            &TimeZone::UTC,
+        )
+        .unwrap_or_else(|e| panic!("build: {e}"));
+
+        assert_eq!(report.sources.len(), 5);
+        let ledger = report
+            .sources
+            .iter()
+            .find(|row| row.source == "vps-ledger")
+            .unwrap_or_else(|| panic!("no ledger row: {:?}", report.sources));
+        assert_eq!(ledger.truth, TruthSource::Llmproxy);
+        assert_eq!(ledger.harnesses, Vec::<&str>::new());
+        assert_eq!(ledger.window.lane, "unavailable");
+        assert_eq!(ledger.tokens.events, 0);
+        assert_eq!(ledger.cost.state, "zero");
+        assert!(
+            ledger
+                .notes
+                .first()
+                .is_some_and(|note| note.contains("SUPERAI_LLMPROXY_URL")),
+            "unconfigured note missing: {:?}",
+            ledger.notes
+        );
+        assert!(
+            report
+                .sources
+                .iter()
+                .any(|row| row.truth == TruthSource::LocalArtifacts),
+            "local rows must still flow"
+        );
+    }
+
+    fn ledger_row(
+        at: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        input: u64,
+        output: u64,
+        cost: Option<&str>,
+    ) -> RequestRow {
+        RequestRow {
+            request_id: None,
+            received_at: Some(ts(at)),
+            completed_at: None,
+            provider: provider.map(str::to_owned),
+            model: model.map(str::to_owned),
+            upstream_model: None,
+            route_kind: None,
+            client_protocol: None,
+            streaming: None,
+            caller: None,
+            input_tokens: (input > 0).then_some(input),
+            output_tokens: (output > 0).then_some(output),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: cost
+                .map(|text| Usd::parse(text).unwrap_or_else(|e| panic!("cost `{text}`: {e}"))),
+            stop_reason: None,
+            error_kind: None,
+            http_status: None,
+            latency_ms: None,
+            body_hash: None,
+        }
+    }
+
+    #[test]
+    fn ledger_report_scopes_rows_and_keeps_recorded_costs_exact() {
+        let rows = vec![
+            ledger_row(
+                "2026-10-13T11:00:00Z",
+                Some("anthropic"),
+                Some("claude-sonnet-4-5"),
+                100,
+                50,
+                Some("0.001"),
+            ),
+            ledger_row(
+                "2026-01-15T09:00:00Z",
+                Some("openai"),
+                Some("gpt-5.1"),
+                10,
+                5,
+                Some("0.0005"),
+            ),
+            ledger_row("2026-01-15T09:06:00Z", None, None, 0, 0, None),
+        ];
+        let week = PeriodRange {
+            start: Some(ts("2026-10-07T00:00:00Z")),
+            end: ts("2026-10-13T12:00:00Z"),
+        };
+
+        let (spend, models) =
+            ledger_report(&rows, &week).unwrap_or_else(|e| panic!("ledger report: {e}"));
+
+        assert_eq!(
+            spend,
+            Spend::Exact(Usd::parse("0.001").unwrap_or_else(|e| panic!("sum: {e}")))
+        );
+        let row = models.first().unwrap_or_else(|| panic!("model row"));
+        assert_eq!(row.provider, "anthropic");
+        assert_eq!(row.input_tokens, 100);
+        assert_eq!(row.output_tokens, 50);
+        assert_eq!(row.events, 1);
+        assert_eq!(row.cost.as_deref(), Some("0.001"));
+
+        let all = PeriodRange {
+            start: None,
+            end: ts("2026-10-13T12:00:00Z"),
+        };
+        let (spend, models) =
+            ledger_report(&rows, &all).unwrap_or_else(|e| panic!("ledger report: {e}"));
+        assert_eq!(
+            spend,
+            Spend::Unavailable {
+                missing_pricing: vec!["ledger/unattributed-row".to_owned()]
+            }
+        );
+        assert_eq!(models.len(), 2);
+        let openai = models
+            .iter()
+            .find(|row| row.provider == "openai")
+            .unwrap_or_else(|| panic!("openai row: {models:?}"));
+        assert_eq!(openai.cost.as_deref(), Some("0.0005"));
     }
 
     #[test]

@@ -5,6 +5,8 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -784,5 +786,143 @@ mod tests {
                 "sentinel `{sentinel}` was never planted; the leak assertions would pass vacuously"
             );
         }
+    }
+
+    /// One-shot loopback HTTP server standing in for the VPS ledger's
+    /// admin listener; serves one canned body, then closes.
+    fn ledger_server(body: &'static str, connections: usize) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|e| panic!("bind: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("addr: {e}"));
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                serve_ledger_page(&listener, body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn serve_ledger_page(listener: &TcpListener, body: &str) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !(head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 16_384) {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        if stream
+            .write_all(response.as_bytes())
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
+            // The client vanished mid-page; the test fails on its own.
+        }
+    }
+
+    #[test]
+    fn the_vps_ledger_feeds_usage_rows_when_configured() {
+        let home = full_usage_home("ledger-fed");
+        let base = ledger_server(
+            r#"{"rows":[
+                {"received_at":"2026-01-15T09:00:00Z","provider":"anthropic","model":"claude-sonnet-4-5","input_tokens":100,"output_tokens":50,"cache_read_tokens":20,"cache_write_tokens":5,"cost_usd":"0.001"},
+                {"received_at":"2026-01-15T09:05:00Z","provider":"openai","model":"gpt-5.1","input_tokens":10,"output_tokens":5,"cost_usd":"0.0005"},
+                {"received_at":"2026-01-15T09:06:00Z"}
+            ]}"#,
+            2,
+        );
+
+        let show = run_with(
+            &home,
+            &["usage", "show", "--json"],
+            &[
+                ("SUPERAI_LLMPROXY_URL", base.as_str()),
+                ("SUPERAI_LLMPROXY_ADMIN_TOKEN", "test-admin-token"),
+            ],
+        );
+        assert!(show.status.success(), "{}", stderr(&show));
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout(&show)).unwrap_or_else(|e| panic!("json: {e}"));
+        let ledger = report["sources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sources array: {report}"))
+            .iter()
+            .find(|source| source["source"] == "vps-ledger")
+            .unwrap_or_else(|| panic!("no ledger row: {report}"))
+            .clone();
+        assert_eq!(ledger["truth"], "llmproxy");
+        assert_eq!(ledger["harnesses"], serde_json::json!([]));
+        assert_eq!(ledger["window"]["lane"], "unavailable");
+        assert_eq!(ledger["totals_scope"], "all-history");
+        assert_eq!(ledger["tokens"]["input"], 110);
+        assert_eq!(ledger["tokens"]["output"], 55);
+        assert_eq!(ledger["tokens"]["cache_read"], 20);
+        assert_eq!(ledger["tokens"]["cache_write"], 5);
+        assert_eq!(ledger["tokens"]["events"], 2);
+        assert_eq!(ledger["coverage"]["state"], "incomplete");
+        assert_eq!(ledger["coverage"]["unscanned_records"], 1);
+        // The unattributed row poisons the aggregate, never silently drops.
+        assert_eq!(ledger["cost"]["state"], "unavailable");
+        assert_eq!(
+            ledger["cost"]["missing_pricing"][0],
+            "ledger/unattributed-row"
+        );
+        assert!(
+            stdout(&show).contains("claude-code"),
+            "local families must still flow: {}",
+            stdout(&show)
+        );
+
+        let cost = run_with(
+            &home,
+            &["usage", "cost", "--period", "all", "--json"],
+            &[
+                ("SUPERAI_LLMPROXY_URL", base.as_str()),
+                ("SUPERAI_LLMPROXY_ADMIN_TOKEN", "test-admin-token"),
+            ],
+        );
+        assert!(cost.status.success(), "{}", stderr(&cost));
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout(&cost)).unwrap_or_else(|e| panic!("json: {e}"));
+        let ledger = report["sources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sources array: {report}"))
+            .iter()
+            .find(|source| source["source"] == "vps-ledger")
+            .unwrap_or_else(|| panic!("no ledger row: {report}"))
+            .clone();
+        assert_eq!(ledger["total"]["state"], "unavailable");
+        assert_eq!(
+            ledger["total"]["missing_pricing"][0],
+            "ledger/unattributed-row"
+        );
+        let models = ledger["models"]
+            .as_array()
+            .unwrap_or_else(|| panic!("models"));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["provider"], "anthropic");
+        assert_eq!(models[0]["cost"], "0.001");
+        assert_eq!(models[1]["provider"], "openai");
+        assert_eq!(models[1]["cost"], "0.0005");
+    }
+
+    #[test]
+    fn without_a_ledger_url_the_default_report_carries_an_unconfigured_note() {
+        let home = full_usage_home("ledger-off");
+        let output = run(&home, &["usage", "show"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = stdout(&output);
+        assert!(text.contains("vps-ledger"), "{text}");
+        assert!(text.contains("SUPERAI_LLMPROXY_URL"), "{text}");
+        assert!(text.contains("llmproxy ledger"), "{text}");
     }
 }
