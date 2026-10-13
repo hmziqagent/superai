@@ -1,7 +1,7 @@
-//! Abuse tests for the API-key pollers (USG-09): the `ClinePass` session
-//! file, wrapped credentials, and provider response bodies carrying planted
-//! secrets never reach snapshot output or poll errors. No live network:
-//! requests hit a closed loopback port.
+//! Abuse tests for the API-key pollers (USG-09): every poller's session
+//! file, wrapped credential, response body, and redirect refusal carries
+//! planted secrets that never reach snapshot output or poll errors. No live
+//! network: requests hit loopback ports only.
 
 #[cfg(test)]
 mod tests {
@@ -22,8 +22,10 @@ mod tests {
         assert_no_sentinel_json,
     };
     use superai_usage::poller::{
-        PollLimits, PollSecret, clinepass_session, parse_clinepass_limits, parse_deepseek_balance,
-        parse_openrouter_responses, poll_deepseek,
+        PollError, PollLimits, PollSecret, clinepass_session, parse_clinepass_limits,
+        parse_deepseek_balance, parse_factory_limits, parse_kilo_credits, parse_minimax_remains,
+        parse_mistral_credits, parse_openrouter_responses, parse_warp_graphql, parse_zed_billing,
+        poll_deepseek, poll_factory, poll_mistral, poll_zed,
     };
     use thiserror as _;
     use ureq as _;
@@ -187,5 +189,185 @@ mod tests {
         .unwrap_err();
         assert_no_sentinel_display(&error, "deepseek transport error");
         assert_no_sentinel_debug(&error, "deepseek transport error debug");
+    }
+
+    #[test]
+    fn six_more_parsers_with_planted_junk_stay_out_of_snapshots() {
+        let zed = parse_zed_billing(
+            &json!({
+                "plan": "Free",
+                "sessionCookie": COOKIE_SENTINEL,
+                "current_usage": {
+                    "edit_predictions": {"used": 3, "limit": 10, "junk": BEARER_SENTINEL},
+                },
+                "token_spend": {
+                    "spend_in_cents": 120,
+                    "limit_in_cents": 1000,
+                    "apiKey": API_KEY_SENTINEL
+                }
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("zed parse: {e:?}"));
+        assert_no_sentinel_debug(&zed, "zed billing snapshot");
+        assert_no_sentinel_json(&zed, "zed billing snapshot json");
+
+        let warp = parse_warp_graphql(
+            &json!({"data": {"user": {"user": {
+                "sessionCookie": COOKIE_SENTINEL,
+                "requestLimitInfo": {
+                    "isUnlimited": false,
+                    "requestLimit": 100,
+                    "requestsUsedSinceLastRefresh": 25,
+                    "nextRefreshTime": "2026-10-14T00:00:00Z",
+                    "junk": API_KEY_SENTINEL
+                },
+                "bonusGrants": [{
+                    "requestCreditsGranted": 10,
+                    "requestCreditsRemaining": 4,
+                    "note": BEARER_SENTINEL
+                }]
+            }}}})
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("warp parse: {e:?}"));
+        assert_no_sentinel_debug(&warp, "warp graphql snapshot");
+        assert_no_sentinel_json(&warp, "warp graphql snapshot json");
+
+        let factory = parse_factory_limits(
+            &json!({
+                "extraUsageBalanceCents": 5000,
+                "apiKey": API_KEY_SENTINEL,
+                "limits": {
+                    "standard": {
+                        "fiveHour": {"usedPercent": 40.0, "windowEnd": "2026-10-13T12:00:00Z", "secondsRemaining": 600},
+                        "weekly": {"usedPercent": 10.0},
+                        "monthly": {"usedPercent": 5.0}
+                    },
+                    "junk": COOKIE_SENTINEL
+                }
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("factory parse: {e:?}"));
+        assert_no_sentinel_debug(&factory, "factory limits snapshot");
+        assert_no_sentinel_json(&factory, "factory limits snapshot json");
+    }
+
+    #[test]
+    fn kilo_minimax_and_mistral_parsers_with_planted_junk_stay_out_of_snapshots() {
+        let kilo = parse_kilo_credits(
+            &json!([{"result": {"data": {"json": {"creditBlocks": [
+                {"amount_mUsd": 2_500_000, "balance_mUsd": 1_000_000, "apiKey": API_KEY_SENTINEL},
+                {"amount_mUsd": 500_000, "balance_mUsd": 250_000, "junk": COOKIE_SENTINEL}
+            ]}}}}])
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("kilo parse: {e:?}"));
+        assert_no_sentinel_debug(&kilo, "kilo credits snapshot");
+        assert_no_sentinel_json(&kilo, "kilo credits snapshot json");
+
+        let minimax = parse_minimax_remains(
+            &json!({"data": {
+                "baseResp": {"statusCode": 0, "statusMsg": API_KEY_SENTINEL},
+                "model_remains": [
+                    {
+                        "model_name": "MiniMax-M2",
+                        "current_interval_remaining_percent": 60.0,
+                        "current_interval_total_count": 100,
+                        "current_interval_usage_count": 40,
+                        "junk": COOKIE_SENTINEL
+                    },
+                    {
+                        "model_name": "MiniMax-M2.1",
+                        "current_interval_remaining_percent": 80.0,
+                        "sessionCookie": BEARER_SENTINEL
+                    }
+                ]
+            }})
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("minimax parse: {e:?}"));
+        assert_no_sentinel_debug(&minimax, "minimax remains snapshot");
+        assert_no_sentinel_json(&minimax, "minimax remains snapshot json");
+
+        let mistral = parse_mistral_credits(
+            &json!({
+                "wallet_amount": 10.0,
+                "credit_notes_amount": 2.0,
+                "ongoing_usage_balance": 1.0,
+                "currency": "eur",
+                "apiKey": API_KEY_SENTINEL,
+                "sessionCookie": COOKIE_SENTINEL
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|e| panic!("mistral parse: {e:?}"));
+        assert_no_sentinel_debug(&mistral, "mistral credits snapshot");
+        assert_no_sentinel_json(&mistral, "mistral credits snapshot json");
+    }
+
+    #[test]
+    fn cookie_and_bearer_poll_transports_with_planted_secrets_never_leak_them() {
+        let cookie = PollSecret::new(COOKIE_SENTINEL);
+        assert_no_sentinel_debug(&cookie, "wrapped cookie secret debug");
+        assert_no_sentinel_display(&cookie, "wrapped cookie secret display");
+
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+            listener
+                .local_addr()
+                .unwrap_or_else(|e| panic!("addr: {e}"))
+                .port()
+        };
+        let closed = format!("http://127.0.0.1:{port}");
+        for (label, error) in [
+            (
+                "zed cookie transport",
+                poll_zed(&format!("{closed}/usage"), &cookie, &limits()).unwrap_err(),
+            ),
+            (
+                "mistral cookie transport",
+                poll_mistral(&format!("{closed}/api/billing/credits"), &cookie, &limits())
+                    .unwrap_err(),
+            ),
+            (
+                "factory bearer transport",
+                poll_factory(
+                    &format!("{closed}/api/billing/limits"),
+                    &PollSecret::new(API_KEY_SENTINEL),
+                    &limits(),
+                )
+                .unwrap_err(),
+            ),
+        ] {
+            assert_no_sentinel_display(&error, label);
+            assert_no_sentinel_debug(&error, label);
+        }
+    }
+
+    #[test]
+    fn redirect_refusal_redacts_a_planted_query_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("addr: {e}"));
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                std::io::Write::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap_or_else(|e| panic!("write redirect response: {e}"));
+            }
+        });
+        let url = format!("http://{addr}/usage?api_key={COOKIE_SENTINEL}");
+        let error = poll_zed(&url, &PollSecret::new(COOKIE_SENTINEL), &limits()).unwrap_err();
+        assert!(
+            matches!(error, PollError::Redirect { .. }),
+            "the 302 must surface as a refused redirect: {error:?}"
+        );
+        assert_no_sentinel_display(&error, "redirect refusal error");
+        assert_no_sentinel_debug(&error, "redirect refusal error debug");
     }
 }
