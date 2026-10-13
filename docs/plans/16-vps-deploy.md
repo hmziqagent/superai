@@ -91,9 +91,11 @@ as a source.
 ## Unverified and excluded
 
 The VPS flow is fixture-proven only: preflight, previewed deploy and upgrade
-with backup-first commit and rollback journaling, read-only status with cert
-expiry, and the `/usage/summary` ledger probe all run against the `FixtureRemote`
-backend in crates/superai-core/src/vps/. Still blocked:
+with backup-first commit and rollback journaling, on-VPS interpolation of
+provider secrets and the wireguard key, and read-only status with cert expiry
+all run against the `FixtureRemote` backend in crates/superai-core/src/vps/;
+the `/usage/summary` ledger probe in `superai vps status` is proven separately,
+against a local mock HTTP server in the CLI suite. Still blocked:
 
 - The `/health` probe that VPS-03 and the exit gate name: the frozen llmproxy
   contract (docs/plans/export/llmproxy-usage-ledger.md) defines no `/health`
@@ -102,9 +104,6 @@ backend in crates/superai-core/src/vps/. Still blocked:
 - The geo-exit forward proxy on the exit VPS (VPS-02 step 5): only the
   per-provider `[egress]` table rendering exists; no step deploys the proxy
   itself. Owed here.
-- Provider-secret interpolation on the VPS (VPS-02 step 2): only the wireguard
-  key is interpolated today; provider TOMLs render with placeholders. Owed
-  here.
 - Live verification on a real host and on PRX-05 musl artifacts, and the
   toride 0.2 publishes that `TorideRemote` refuses every verb until: the
   companion plans own both.
