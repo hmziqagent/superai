@@ -50,12 +50,25 @@ fn safe_channel(channel: &str) -> bool {
 /// Errors from the opencode v2 history scan.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenCodeError {
-    /// The database could not be opened read-only (missing, unreadable, or locked).
+    /// The database could not be opened read-only (missing, unreadable,
+    /// locked, or not a regular file).
     #[error("opencode database open failed: {0}")]
-    Open(#[from] rusqlite::Error),
-    /// The history query failed.
+    Open(OpenDbFailure),
+    /// The history query failed before any row was read.
     #[error("opencode history query failed: {0}")]
     Scan(rusqlite::Error),
+}
+
+/// Why the read-only open was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenDbFailure {
+    /// Opening a FIFO or device node would block the scan forever, so the
+    /// path is refused before `SQLite` ever sees it.
+    #[error("{} is not a regular file", .0.display())]
+    NotRegularFile(PathBuf),
+    /// `SQLite` refused the open itself.
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 // Mirrors opencode's own usage scan (packages/core/src/session/stats.ts at
@@ -84,15 +97,35 @@ WHERE parsed.type = 'assistant'
 
 /// Scan the v2 history database into recorded usage, opening it read-only
 /// and never writing; unmappable rows are counted and all-zero rows are
-/// dropped, never fatal.
+/// dropped, never fatal. A failure after rows have folded keeps those rows
+/// and counts the unread remainder as one skip, so the result is a floor.
 pub fn scan_history(db_path: &Path) -> Result<RecordedUsage, OpenCodeError> {
-    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    match std::fs::metadata(db_path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(OpenCodeError::Open(OpenDbFailure::NotRegularFile(
+                db_path.to_path_buf(),
+            )));
+        }
+        // A failed stat is reported by the open below, which owns the reason.
+        Err(_) => {}
+    }
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|source| OpenCodeError::Open(OpenDbFailure::Sqlite(source)))?;
     let mut statement = connection
         .prepare(HISTORY_QUERY)
         .map_err(OpenCodeError::Scan)?;
     let mut rows = statement.query([]).map_err(OpenCodeError::Scan)?;
     let mut usage = RecordedUsage::default();
-    while let Some(row) = rows.next().map_err(OpenCodeError::Scan)? {
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(_) => {
+                usage.unscanned_records += 1;
+                break;
+            }
+        };
         match row_usage(row) {
             RowUsage::Event(event) => usage.events.push(event),
             RowUsage::Zero => {}
@@ -298,19 +331,14 @@ mod tests {
 
     #[test]
     fn history_query_selects_from_allowlisted_tables_only() {
-        let allowlist = ["session_message", "session_v2"];
-        let tokens: Vec<&str> = HISTORY_QUERY.split_whitespace().collect();
-        let tables: Vec<String> = tokens
+        let (refs, ctes) = referenced_tables(HISTORY_QUERY);
+        let cte_names: std::collections::BTreeSet<&str> = ctes.iter().map(String::as_str).collect();
+        let tables: std::collections::BTreeSet<&str> = refs
             .iter()
-            .enumerate()
-            .filter(|(i, _)| {
-                matches!(tokens.get(i.wrapping_sub(1)), Some(prev)
-                    if prev.eq_ignore_ascii_case("from") || prev.eq_ignore_ascii_case("join"))
-            })
-            .map(|(_, token)| token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
-            .filter(|table| !table.is_empty())
-            .map(str::to_owned)
+            .map(String::as_str)
+            .filter(|table| !cte_names.contains(table))
             .collect();
+        let allowlist: std::collections::BTreeSet<&str> = ["session_message", "session_v2"].into();
         assert_eq!(tables, allowlist, "reader SQL left the table allowlist");
 
         let words: std::collections::BTreeSet<String> = HISTORY_QUERY
@@ -331,6 +359,168 @@ mod tests {
                 !words.contains(forbidden),
                 "credential-adjacent table `{forbidden}` appears in the reader's SQL"
             );
+        }
+    }
+
+    #[test]
+    fn table_capture_flags_comma_lists_and_cte_bodies() {
+        let (comma_refs, _) =
+            referenced_tables("SELECT 1 FROM session_message AS m, credential WHERE m.id = 1");
+        assert!(
+            comma_refs.iter().any(|table| table == "credential"),
+            "a comma-joined table must be captured, not only the first token after FROM"
+        );
+
+        let (cte_refs, ctes) = referenced_tables(
+            "WITH leaked AS (SELECT * FROM credential) SELECT * FROM leaked JOIN session_v2",
+        );
+        assert_eq!(ctes, ["leaked"]);
+        let cte_names: std::collections::BTreeSet<&str> = ctes.iter().map(String::as_str).collect();
+        let real: Vec<&str> = cte_refs
+            .iter()
+            .map(String::as_str)
+            .filter(|table| !cte_names.contains(table))
+            .collect();
+        assert_eq!(real, ["credential", "session_v2"]);
+    }
+
+    const CLAUSE_KEYWORDS: [&str; 15] = [
+        "where", "on", "group", "order", "limit", "offset", "join", "left", "right", "inner",
+        "outer", "cross", "natural", "full", "union",
+    ];
+
+    /// Every table reference after FROM/JOIN (comma lists and aliases
+    /// included), plus every CTE name; a CTE is derived, so only its body's
+    /// FROMs count as real tables.
+    fn referenced_tables(sql: &str) -> (Vec<String>, Vec<String>) {
+        let words = sql_words(sql);
+        let mut refs = Vec::new();
+        let mut ctes = Vec::new();
+        let mut i = 0;
+        while let Some(word) = words.get(i) {
+            let keyword = word.to_ascii_lowercase();
+            if keyword == "from" || keyword == "join" {
+                i = tables_after_from(&words, i, &mut refs);
+            } else if keyword == "with" {
+                collect_cte_names(&words, i, &mut ctes);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        (refs, ctes)
+    }
+
+    /// Walk index just past one FROM/JOIN clause: the first table (a
+    /// subquery's inner FROMs are found by the caller's own walk), then any
+    /// comma-joined tables up to the next clause keyword.
+    fn tables_after_from(words: &[String], i: usize, refs: &mut Vec<String>) -> usize {
+        let Some(first) = words.get(i + 1) else {
+            return i + 1;
+        };
+        if first.as_str() != "(" {
+            refs.push(first.clone());
+        }
+        comma_joined_tables(words, i + 2, refs)
+    }
+
+    fn comma_joined_tables(words: &[String], start: usize, refs: &mut Vec<String>) -> usize {
+        let mut j = start;
+        while let Some(token) = words.get(j) {
+            let keyword = token.to_ascii_lowercase();
+            if keyword == "," {
+                push_unless_subquery(words, j + 1, refs);
+                j += 2;
+            } else if keyword == "as" {
+                j += 2;
+            } else if ends_from_list(&keyword, token) {
+                return j;
+            } else {
+                j += 1;
+            }
+        }
+        j
+    }
+
+    fn ends_from_list(keyword: &str, token: &str) -> bool {
+        keyword == "select" || token == "(" || token == ")" || CLAUSE_KEYWORDS.contains(&keyword)
+    }
+
+    fn push_unless_subquery(words: &[String], at: usize, refs: &mut Vec<String>) {
+        if let Some(name) = words.get(at).filter(|name| name.as_str() != "(") {
+            refs.push(name.clone());
+        }
+    }
+
+    fn collect_cte_names(words: &[String], with: usize, ctes: &mut Vec<String>) {
+        let mut j = with + 1;
+        if words
+            .get(j)
+            .is_some_and(|w| w.eq_ignore_ascii_case("recursive"))
+        {
+            j += 1;
+        }
+        while let Some(name) = words.get(j) {
+            ctes.push(name.clone());
+            let end = cte_body_end(words, j + 1);
+            match words.get(end).map(String::as_str) {
+                Some(",") => j = end + 1,
+                _ => break,
+            }
+        }
+    }
+
+    /// Walk index just past one CTE's optional column list, `AS`, and body.
+    fn cte_body_end(words: &[String], mut k: usize) -> usize {
+        if words.get(k).map(String::as_str) == Some("(") {
+            k = after_balanced_parens(words, k);
+        }
+        if words.get(k).is_some_and(|w| w.eq_ignore_ascii_case("as")) {
+            k += 1;
+        }
+        if words.get(k).map(String::as_str) == Some("(") {
+            k = after_balanced_parens(words, k);
+        }
+        k
+    }
+
+    fn after_balanced_parens(words: &[String], open: usize) -> usize {
+        let mut depth = 0usize;
+        for (i, word) in words.iter().enumerate().skip(open) {
+            if word.as_str() == "(" {
+                depth += 1;
+            } else if word.as_str() == ")" {
+                depth = depth.saturating_sub(1);
+            } else {
+                continue;
+            }
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        words.len()
+    }
+
+    fn sql_words(sql: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        for c in sql.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                current.push(c);
+                continue;
+            }
+            flush_word(&mut words, &mut current);
+            if matches!(c, ',' | '(' | ')') {
+                words.push(c.to_string());
+            }
+        }
+        flush_word(&mut words, &mut current);
+        words
+    }
+
+    fn flush_word(words: &mut Vec<String>, current: &mut String) {
+        if !current.is_empty() {
+            words.push(std::mem::take(current));
         }
     }
 }

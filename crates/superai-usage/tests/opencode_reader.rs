@@ -257,4 +257,115 @@ mod tests {
         assert!(matches!(result, Err(OpenCodeError::Open(_))));
         assert!(!path.exists());
     }
+
+    #[test]
+    fn directory_at_the_db_path_is_refused_before_open() {
+        let path = temp_dir("dir-db");
+
+        let Err(OpenCodeError::Open(failure)) = scan_history(&path) else {
+            panic!("a directory at the db path must be refused as an open failure");
+        };
+
+        let reason = failure.to_string();
+        assert!(
+            reason.contains("not a regular file"),
+            "refusal must name the hazard: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_at_the_db_path_is_refused_before_open() {
+        let path = temp_dir("fifo-db").join("opencode.db");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap_or_else(|e| panic!("spawn mkfifo: {e}"));
+        assert!(status.success(), "mkfifo(1) must exist to run this test");
+
+        let Err(OpenCodeError::Open(failure)) = scan_history(&path) else {
+            panic!("a FIFO at the db path must be refused, not opened");
+        };
+
+        let reason = failure.to_string();
+        assert!(
+            reason.contains("not a regular file"),
+            "refusal must name the hazard: {reason}"
+        );
+    }
+
+    #[test]
+    fn failure_mid_query_keeps_folded_rows_as_a_counted_floor() {
+        // Lean schema on purpose: the credential tables in Fixture would
+        // push message leaves onto the pages corrupted below.
+        let path = temp_dir("midquery").join("opencode.db");
+        let conn = Connection::open(&path).unwrap_or_else(|e| panic!("fixture open: {e}"));
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, fork_session_id TEXT, time_created INTEGER NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             INSERT INTO session_v2 VALUES ('s1', NULL, 1769989200000);",
+        )
+        .unwrap_or_else(|e| panic!("fixture schema: {e}"));
+        for n in 0..500u32 {
+            conn.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, data)
+                 VALUES (?1, 's1', 'assistant', ?2, ?3, ?4)",
+                params![
+                    format!("m{n}"),
+                    n,
+                    BASE_MS + i64::from(n) * 1_000,
+                    FULL_USAGE
+                ],
+            )
+            .unwrap_or_else(|e| panic!("message row {n}: {e}"));
+        }
+        drop(conn);
+        corrupt_pages_from(&path, 10);
+
+        let usage = scan_history(&path).unwrap_or_else(|e| panic!("partial scan: {e}"));
+
+        assert_eq!(
+            usage.unscanned_records, 1,
+            "the unread remainder is one counted skip, not a fatal error"
+        );
+        assert!(
+            !usage.events.is_empty(),
+            "rows folded before the failure must survive"
+        );
+        assert!(
+            usage.events.len() < 500,
+            "the scan must stop at the corrupt pages, not read everything"
+        );
+        for event in &usage.events {
+            assert_eq!(event.input_tokens, 120);
+        }
+    }
+
+    fn corrupt_pages_from(path: &std::path::Path, first_page: usize) {
+        let mut bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let header = [
+            *bytes
+                .get(16)
+                .unwrap_or_else(|| panic!("{} is too short to be a sqlite header", path.display())),
+            *bytes
+                .get(17)
+                .unwrap_or_else(|| panic!("{} is too short to be a sqlite header", path.display())),
+        ];
+        let page_size = usize::from(u16::from_be_bytes(header));
+        assert!(
+            page_size.is_power_of_two() && page_size >= 512,
+            "implausible sqlite page size {page_size}"
+        );
+        let pages = bytes.len() / page_size;
+        assert!(
+            pages > first_page,
+            "fixture must have pages beyond page {first_page} to corrupt"
+        );
+        for page in first_page..=pages {
+            if let Some(byte) = bytes.get_mut((page - 1) * page_size) {
+                *byte = 0x7f;
+            }
+        }
+        fs::write(path, bytes).unwrap_or_else(|e| panic!("rewrite {}: {e}", path.display()));
+    }
 }
