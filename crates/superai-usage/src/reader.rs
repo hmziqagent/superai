@@ -11,13 +11,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::cost::{RecordedUsage, UsageEvent};
 
 /// Defensive-scan tally for one scan (USG-03): unknown line shapes are
 /// skipped and counted, never fatal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScanCounts {
     /// Lines read as records of the expected format, usage-bearing or not.
     pub parsed: u64,
@@ -201,9 +199,12 @@ fn classify_entry(entry: &std::fs::DirEntry, files: &mut BTreeSet<PathBuf>) -> O
     if kind.is_dir() {
         return Some(path);
     }
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+    // Regular files only: opening a FIFO or device node would block the
+    // scan forever (verified: File::open on a writerless FIFO hangs).
+    if kind.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
     {
         files.insert(path);
     }

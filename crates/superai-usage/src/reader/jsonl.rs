@@ -256,17 +256,14 @@ pub fn scan_pi_sessions(roots: &[PathBuf]) -> ScanOutcome {
     outcome
 }
 
-/// On-disk profile discovery, capped at `CodexBar`'s 64 profiles per scan;
-/// symlinked profile entries are skipped like every other symlink.
+/// On-disk profile discovery, capped at 64 profiles per pass (`CodexBar`
+/// caps its own discovery at 64 roots); symlinked entries are skipped.
 fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(profiles_dir) else {
         return;
     };
     let mut profiles = Vec::new();
     for entry in entries.flatten() {
-        if profiles.len() == 64 {
-            break;
-        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -281,8 +278,10 @@ fn discover_profile_roots(profiles_dir: &Path, roots: &mut Vec<PathBuf>) {
             profiles.push(entry.path());
         }
     }
+    // Sort before capping so a full directory always keeps the same
+    // profiles regardless of read_dir order.
     profiles.sort();
-    for profile in profiles {
+    for profile in profiles.into_iter().take(64) {
         for layout in [
             profile.join("sessions"),
             profile.join("agent").join("sessions"),

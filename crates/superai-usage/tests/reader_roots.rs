@@ -274,6 +274,40 @@ mod tests {
     }
 
     #[test]
+    fn pi_profile_discovery_caps_deterministically_past_64_profiles() {
+        let home = temp_dir("pi-many-profiles");
+        for n in 0..70 {
+            fs::create_dir_all(
+                home.join(".omp")
+                    .join("profiles")
+                    .join(format!("p{n:02}"))
+                    .join("sessions"),
+            )
+            .unwrap_or_else(|e| panic!("profile dir: {e}"));
+        }
+        let resolved = pi_session_roots(&PiSelectors::default(), &home);
+        assert_eq!(resolved.refusal, None);
+        let discovered: Vec<String> = resolved
+            .roots
+            .iter()
+            .filter(|root| root.components().any(|c| c.as_os_str() == "profiles"))
+            .map(|root| {
+                root.parent()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        let expected: Vec<String> = (0..64).map(|n| format!("p{n:02}")).collect();
+        assert_eq!(discovered.len(), 64);
+        assert_eq!(
+            discovered, expected,
+            "the cap must keep the sorted-first profiles"
+        );
+    }
+
+    #[test]
     fn pi_invalid_selectors_refuse_instead_of_reading_the_wrong_tree() {
         let home = temp_dir("pi-refusals");
         let profile = PiSelectors {

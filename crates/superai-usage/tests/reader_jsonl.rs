@@ -476,6 +476,27 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_fifo_is_ignored_instead_of_wedging_the_scan() {
+        let dir = temp_dir("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.join("wedge.jsonl"))
+            .status()
+            .unwrap_or_else(|e| panic!("spawn mkfifo: {e}"));
+        assert!(status.success(), "mkfifo(1) must exist to run this test");
+        let real = dir.join("real.jsonl");
+        fs::write(
+            &real,
+            br#"{"type":"assistant","timestamp":"2026-10-13T09:00:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":3,"output_tokens":4}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("write real: {e}"));
+        let outcome = scan_claude_transcripts(std::slice::from_ref(&dir));
+        assert_eq!(outcome.counts.parsed, 1);
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(outcome.unreadable_artifacts, 0);
+    }
+
     #[test]
     fn line_caps_differ_per_surface() {
         let pad = "a".repeat(600 * 1024);
