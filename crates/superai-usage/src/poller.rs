@@ -1310,9 +1310,9 @@ fn minimax_window(entry: &Value) -> (Option<u32>, Option<String>) {
 pub fn parse_minimax_remains(body: &str) -> Result<ProviderUsageSnapshot, PollError> {
     let root = root_object(body)?;
     let data = obj_field(&root, "data").ok_or_else(|| parse_err("data must be an object"))?;
-    let base = data.get("baseResp").or_else(|| root.get("baseResp"));
+    let base = data.get("base_resp").or_else(|| root.get("base_resp"));
     if let Some(status) = base
-        .and_then(|base| base.get("statusCode"))
+        .and_then(|base| base.get("status_code"))
         .and_then(Value::as_i64)
         && status != 0
     {

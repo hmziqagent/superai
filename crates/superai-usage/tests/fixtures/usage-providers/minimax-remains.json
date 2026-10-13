@@ -1,7 +1,7 @@
 {
-  "baseResp": { "statusCode": 0, "statusMsg": "" },
+  "base_resp": { "status_code": 0, "status_msg": "" },
   "data": {
-    "baseResp": { "statusCode": 0, "statusMsg": "" },
+    "base_resp": { "status_code": 0, "status_msg": "" },
     "model_remains": [
       {
         "model_name": "abab6.5s-chat",

@@ -327,6 +327,33 @@ mod tests {
     }
 
     #[test]
+    fn minimax_nonzero_base_resp_status_is_an_error_before_any_lane_parsing() {
+        // The frozen contract spells these keys snake_case
+        // (MiniMaxUsageFetcher.swift CodingKeys: base_resp/status_code),
+        // and the status check must fire on that wire shape.
+        for body in [
+            r#"{"base_resp": {"status_code": 1004, "status_msg": "invalid api key"}, "data": {"model_remains": []}}"#,
+            r#"{"data": {"base_resp": {"status_code": 5, "status_msg": ""}, "model_remains": []}}"#,
+        ] {
+            let error = parse_minimax_remains(body)
+                .err()
+                .unwrap_or_else(|| panic!("non-zero base_resp status accepted: {body}"));
+            assert!(
+                format!("{error}").contains("non-zero status"),
+                "{body}: {error}"
+            );
+        }
+        // A zero status in either placement must not trip the check.
+        assert!(
+            parse_minimax_remains(
+                r#"{"base_resp": {"status_code": 0}, "data": {"model_remains": [
+                    {"model_name": "m", "current_interval_remaining_percent": 50.0}]}}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn mistral_credits_report_available_and_keep_lanes_provider_only() {
         let snapshot = parse_mistral_credits(&fixture("mistral-credits.json"))
             .unwrap_or_else(|e| panic!("fixture rejected: {e}"));
