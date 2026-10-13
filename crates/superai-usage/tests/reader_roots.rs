@@ -16,6 +16,7 @@ mod tests {
         PiSelectors, claude_projects_roots, codex_sessions_roots, pi_session_roots,
     };
     use thiserror as _;
+    use ureq as _;
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 

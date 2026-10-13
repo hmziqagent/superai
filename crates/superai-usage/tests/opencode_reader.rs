@@ -15,6 +15,7 @@ mod tests {
     use serde as _;
     use superai_core as _;
     use thiserror as _;
+    use ureq as _;
 
     use superai_usage::cost::UsageEvent;
     use superai_usage::reader::opencode::{OpenCodeError, scan_history};

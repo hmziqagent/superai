@@ -14,6 +14,7 @@ mod tests {
     use superai_core as _;
     use superai_usage::cost::{CostError, CostPeriod};
     use thiserror as _;
+    use ureq as _;
 
     fn ts_utc(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Timestamp {
         jiff::civil::date(year, month, day)

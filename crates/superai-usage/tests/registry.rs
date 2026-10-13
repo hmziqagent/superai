@@ -18,6 +18,7 @@ mod tests {
     use serde as _;
     use superai_core as _;
     use thiserror as _;
+    use ureq as _;
 
     fn fixtures_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/usage-providers")

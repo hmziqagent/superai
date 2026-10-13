@@ -1,0 +1,45 @@
+{
+  "rows": [
+    {
+      "request_id": "req_018f3a2b",
+      "received_at": "2026-10-13T07:59:57Z",
+      "completed_at": "2026-10-13T07:59:59Z",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "upstream_model": null,
+      "route_kind": "chat",
+      "client_protocol": "anthropic",
+      "streaming": true,
+      "caller": "superai",
+      "input_tokens": 38211,
+      "output_tokens": 9120,
+      "cache_read_tokens": 5000,
+      "cache_write_tokens": 1000,
+      "cost_usd": "0.0036455",
+      "stop_reason": "end_turn",
+      "error_kind": null,
+      "http_status": 200,
+      "latency_ms": 2140,
+      "body_hash": "sha256:9f2c1e"
+    },
+    {
+      "request_id": "req_018f3a31",
+      "received_at": 1760342397000,
+      "completed_at": null,
+      "provider": "openai",
+      "model": "gpt-5.1",
+      "route_kind": "completions",
+      "client_protocol": "openai",
+      "streaming": false,
+      "caller": "anonymous",
+      "input_tokens": 9000,
+      "output_tokens": 0,
+      "cost_usd": 0.000965675,
+      "stop_reason": null,
+      "error_kind": "upstream_timeout",
+      "http_status": 504,
+      "latency_ms": 30000,
+      "body_hash": null
+    }
+  ]
+}

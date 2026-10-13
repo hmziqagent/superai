@@ -15,6 +15,7 @@ mod tests {
     use serde_json as _;
     use superai_core as _;
     use thiserror as _;
+    use ureq as _;
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 

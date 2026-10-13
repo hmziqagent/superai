@@ -22,6 +22,7 @@ mod tests {
         scan_pi_sessions,
     };
     use thiserror as _;
+    use ureq as _;
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
