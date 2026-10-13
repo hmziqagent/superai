@@ -184,6 +184,7 @@ mod tests {
                 email: "ops@example.com".to_owned(),
             },
             geo_exit: None,
+            ack_geo_exit_proxy: false,
             binary_path: binary,
             providers: vec![ProviderToml {
                 name: "anthropic".to_owned(),

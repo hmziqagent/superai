@@ -81,6 +81,10 @@ pub struct DeployRequest {
     /// Optional forward proxy `host:port` reachable over the tunnel; adds
     /// `egress.proxy` entries to every provider TOML.
     pub geo_exit: Option<String>,
+    /// Operator confirmation that the geo-exit forward proxy already exists;
+    /// superai does not deploy it (llmproxy companion PRX-04), so an
+    /// unacknowledged geo-exit blocks execution instead of blackholing.
+    pub ack_geo_exit_proxy: bool,
     /// Local musl binary to upload.
     pub binary_path: PathBuf,
     /// Provider TOMLs for the remote skeleton.
@@ -196,6 +200,15 @@ impl std::fmt::Debug for Payload {
     }
 }
 
+/// A pre-existing remote link a step replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkState {
+    /// Who owned the link being replaced.
+    pub existing: Existing,
+    /// Where the link currently points.
+    pub target: String,
+}
+
 /// Who owned the remote file a step would replace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -250,12 +263,15 @@ pub enum StepPreview {
         /// Which service verb.
         verb: &'static str,
     },
-    /// Creates a symlink pointing at an uploaded site.
+    /// Creates a symlink pointing at an uploaded site; `current` names a
+    /// pre-existing link this step replaces (backed up first).
     Symlink {
         /// What the link points at.
         target: String,
         /// Where the link is created.
         link: String,
+        /// The link's current state, `None` when nothing is there.
+        current: Option<LinkState>,
     },
     /// Fills placeholders on the host; values never previewed.
     InterpolateEnv {
@@ -506,10 +522,14 @@ pub fn preflight(
 ) -> Result<PreflightReport, VpsError> {
     validate_host(host)?;
     let mut checks = Vec::new();
-    let reach = remote.exec(&["systemctl", "--version"]);
+    // Reachability is probed with a POSIX always-there file so a host that
+    // answers ssh but lacks systemd still reports systemd as its own failure.
+    let reach = remote.exec(&["cat", "/etc/os-release"]);
     let reach_detail = match &reach {
-        Ok(output) if output.success() => first_line(&output.stdout),
-        Ok(output) => format!("systemctl exited {:?}", output.exit),
+        Ok(output) if output.success() => {
+            format!("ssh answered; {}", os_detail(&output.stdout))
+        }
+        Ok(output) => format!("`cat /etc/os-release` exited {:?}", output.exit),
         Err(error) => error.to_string(),
     };
     let reachable = matches!(&reach, Ok(output) if output.success());
@@ -534,21 +554,21 @@ pub fn preflight(
         }
         return Ok(finish_report(host, remote, policy, checks));
     }
-    let os = remote.exec(&["cat", "/etc/os-release"]);
     checks.push(PreflightCheck {
         name: "os",
-        state: match os {
-            Ok(output) if output.success() => CheckState::Pass(os_detail(&output.stdout)),
-            Ok(output) => CheckState::Fail(format!("os-release unreadable ({:?})", output.exit)),
+        state: match &reach {
+            Ok(output) => CheckState::Pass(os_detail(&output.stdout)),
             Err(error) => CheckState::Fail(error.to_string()),
         },
     });
+    let systemd = remote.exec(&["systemctl", "--version"]);
     checks.push(PreflightCheck {
         name: "systemd",
-        state: CheckState::Pass(match &reach {
-            Ok(output) => first_line(&output.stdout),
-            Err(_) => String::new(),
-        }),
+        state: match systemd {
+            Ok(output) if output.success() => CheckState::Pass(first_line(&output.stdout)),
+            Ok(output) => CheckState::Fail(format!("systemctl exited {:?}", output.exit)),
+            Err(error) => CheckState::Fail(error.to_string()),
+        },
     });
     let disk = remote.exec(&["df", "-B1", "/"]);
     checks.push(PreflightCheck {
@@ -623,10 +643,27 @@ pub fn plan_deploy(
         None => None,
     };
     if let IngressMode::Tunnel(TunnelKind::Wireguard { .. }) = &request.ingress {
-        wg_private_key(env_bytes.as_deref())?;
+        require_wg_private_key(env_bytes.as_deref())?;
     }
     let mut pre = preflight(&request.host, request.policy, remote)?;
     pre.checks.extend(ingress_checks(remote, &request.ingress));
+    if let Some(address) = &request.geo_exit {
+        pre.checks.push(PreflightCheck {
+            name: "geo-exit-proxy",
+            state: if request.ack_geo_exit_proxy {
+                CheckState::Pass(format!(
+                    "operator confirmed the forward proxy at socks5://{address} exists; \
+                     superai does not deploy it (llmproxy companion PRX-04)"
+                ))
+            } else {
+                CheckState::Fail(format!(
+                    "provider traffic would route through socks5://{address}, but superai \
+                     does not deploy the forward proxy (llmproxy companion PRX-04); confirm \
+                     it exists to proceed"
+                ))
+            },
+        });
+    }
     let ours = owned_paths(remote)?;
 
     let mut steps = Vec::new();
@@ -848,19 +885,20 @@ fn ingress_steps(
     }
 }
 
-fn wg_private_key(env_bytes: Option<&[u8]>) -> Result<String, VpsError> {
+/// Validation-only presence check; the key value never leaves the env file.
+fn require_wg_private_key(env_bytes: Option<&[u8]>) -> Result<(), VpsError> {
     let refusal = |reason: &str| Err(validation("env_file", reason.to_owned()));
     let Some(bytes) = env_bytes else {
         return refusal("wireguard tunnel mode needs an env file carrying LLMPROXY_WG_PRIVATE_KEY");
     };
-    let env = String::from_utf8_lossy(bytes).into_owned();
-    let key = env
-        .lines()
-        .find_map(|line| line.strip_prefix("LLMPROXY_WG_PRIVATE_KEY="))
-        .map(str::trim);
-    match key {
-        Some(key) if !key.is_empty() => Ok(key.to_owned()),
-        _ => refusal("env file must carry a non-empty LLMPROXY_WG_PRIVATE_KEY"),
+    let present = String::from_utf8_lossy(bytes).lines().any(|line| {
+        line.strip_prefix("LLMPROXY_WG_PRIVATE_KEY=")
+            .is_some_and(|v| !v.trim().is_empty())
+    });
+    if present {
+        Ok(())
+    } else {
+        refusal("env file must carry a non-empty LLMPROXY_WG_PRIVATE_KEY")
     }
 }
 
@@ -1053,7 +1091,14 @@ fn symlink_step(
 ) -> Result<PlannedStep, VpsError> {
     ensure_remote_path(target)?;
     ensure_remote_path(link)?;
-    let _ = (remote, ours);
+    let current = remote.read_file(link)?.map(|bytes| LinkState {
+        existing: if ours.contains(&link.to_owned()) {
+            Existing::Ours
+        } else {
+            Existing::Foreign
+        },
+        target: String::from_utf8_lossy(&bytes).into_owned(),
+    });
     Ok(PlannedStep {
         step: DeployStep::Symlink {
             target: target.to_owned(),
@@ -1062,6 +1107,7 @@ fn symlink_step(
         preview: StepPreview::Symlink {
             target: target.to_owned(),
             link: link.to_owned(),
+            current,
         },
         payload: Payload::Bare,
     })
@@ -1154,6 +1200,7 @@ mod tests {
                 email: "ops@example.com".to_owned(),
             },
             geo_exit: None,
+            ack_geo_exit_proxy: false,
             binary_path: binary,
             providers: vec![ProviderToml {
                 name: "anthropic".to_owned(),
@@ -1363,6 +1410,7 @@ mod tests {
         let dir = temp_dir("geo");
         let mut request = tls_request(&dir);
         request.geo_exit = Some("10.7.0.1:3128".to_owned());
+        request.ack_geo_exit_proxy = true;
         let remote = FixtureRemote::new("root@host");
         let plan = plan_deploy(&request, &remote).unwrap();
         let provider_step = plan
@@ -1498,6 +1546,67 @@ mod tests {
                 .to_string()
                 .contains("absent")
         );
+    }
+
+    #[test]
+    fn geo_exit_blocks_until_the_operator_confirms_the_proxy() {
+        let dir = temp_dir("geo-gate");
+        let mut request = tls_request(&dir);
+        request.geo_exit = Some("10.7.0.1:3128".to_owned());
+        let remote = FixtureRemote::new("root@host");
+
+        let blocked = plan_deploy(&request, &remote).unwrap();
+        assert!(blocked.blocked());
+        let failure = blocked.preflight.first_failure().unwrap_or_default();
+        assert!(
+            failure.contains("geo-exit-proxy") && failure.contains("PRX-04"),
+            "the gap must be the stated reason: {failure}"
+        );
+
+        request.ack_geo_exit_proxy = true;
+        let plan = plan_deploy(&request, &remote).unwrap();
+        assert!(!plan.blocked(), "{:?}", plan.preflight.first_failure());
+        assert!(plan.preflight.checks.iter().any(|check| check.name == "geo-exit-proxy"
+            && matches!(&check.state, CheckState::Pass(detail) if detail.contains("does not deploy"))));
+    }
+
+    #[test]
+    fn symlink_previews_read_the_remote_link_tree() {
+        let dir = temp_dir("symlink-preview");
+        let remote = FixtureRemote::new("root@host");
+        let plan = plan_deploy(&tls_request(&dir), &remote).unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| matches!(step.step, DeployStep::Symlink { .. }))
+            .unwrap();
+        match &step.preview {
+            StepPreview::Symlink { current: None, .. } => {}
+            other => panic!("fresh host has no link: {other:?}"),
+        }
+
+        let occupied = FixtureRemote::new("root@host");
+        occupied.insert_file(
+            "/etc/nginx/sites-enabled/llmproxy.conf",
+            b"/etc/nginx/sites-available/other.conf",
+            0o777,
+        );
+        let plan = plan_deploy(&tls_request(&dir), &occupied).unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| matches!(step.step, DeployStep::Symlink { .. }))
+            .unwrap();
+        match &step.preview {
+            StepPreview::Symlink {
+                current: Some(state),
+                ..
+            } => {
+                assert_eq!(state.existing, Existing::Foreign);
+                assert_eq!(state.target, "/etc/nginx/sites-available/other.conf");
+            }
+            other => panic!("foreign link must be announced: {other:?}"),
+        }
     }
 
     #[test]

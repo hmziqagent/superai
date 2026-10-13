@@ -494,6 +494,7 @@ mod tests {
                 email: "ops@example.com".to_owned(),
             },
             geo_exit: None,
+            ack_geo_exit_proxy: false,
             binary_path: binary,
             providers: vec![ProviderToml {
                 name: "anthropic".to_owned(),
@@ -611,6 +612,34 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_enabled_link_is_backed_up_and_rollback_restores_it() {
+        let dir = temp_dir("link-rollback");
+        let remote = FixtureRemote::new("root@host");
+        remote.insert_file(
+            "/etc/nginx/sites-enabled/llmproxy.conf",
+            b"/etc/nginx/sites-available/other.conf",
+            0o777,
+        );
+        let plan = plan_deploy(&tls_request(&dir, &sentinel_env()), &remote).unwrap();
+        remote.fail_next(Fault::Enable);
+        let journal = execute_deploy(&plan, &remote).unwrap();
+        assert!(journal.rolled_back.is_some());
+        assert!(
+            journal
+                .backups
+                .iter()
+                .any(|record| record.path == "/etc/nginx/sites-enabled/llmproxy.conf"),
+            "{:?}",
+            journal.backups
+        );
+        assert_eq!(
+            remote.file("/etc/nginx/sites-enabled/llmproxy.conf"),
+            Some(b"/etc/nginx/sites-available/other.conf".to_vec()),
+            "rollback restores the link the preview announced replacing"
+        );
+    }
+
+    #[test]
     fn blocked_preflight_refuses_execution_typed() {
         let dir = temp_dir("blocked");
         let remote = FixtureRemote::new("root@host");
@@ -721,6 +750,7 @@ mod tests {
                 client_public_key: "clientpubkey=".to_owned(),
             }),
             geo_exit: Some("10.7.0.1:3128".to_owned()),
+            ack_geo_exit_proxy: true,
             binary_path: binary,
             providers: vec![ProviderToml {
                 name: "openai".to_owned(),

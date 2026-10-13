@@ -162,28 +162,61 @@ pub(crate) fn redact_sensitive_lines(text: &str) -> String {
 }
 
 fn redact_line(line: &str) -> String {
-    let Some(key) = setting_key(line) else {
+    let Some((key, value)) = split_setting(line) else {
         return line.to_owned();
     };
-    let lowered = key.to_ascii_lowercase();
-    if SECRET_KEY_MARKERS
+    let lowered = unquote(key).to_ascii_lowercase();
+    let secret_key = SECRET_KEY_MARKERS
         .iter()
-        .any(|marker| lowered.contains(marker))
-    {
+        .any(|marker| lowered.contains(marker));
+    if secret_key || inline_table_carries_secret(value) {
         format!("{key}=[REDACTED]")
     } else {
         line.to_owned()
     }
 }
 
-/// The trimmed key of a `key = value` line, when it looks like a setting.
-fn setting_key(line: &str) -> Option<&str> {
-    let (key, _) = line.split_once('=')?;
+/// The trimmed key and value of a `key = value` line, when it looks like a
+/// setting; quoted keys (`"api-key"`) count.
+fn split_setting(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once('=')?;
     let key = key.trim();
-    if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    let bare = unquote(key);
+    if bare.is_empty()
+        || !bare
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
         return None;
     }
-    Some(key)
+    Some((key, value.trim()))
+}
+
+fn unquote(key: &str) -> &str {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next_back()) {
+        (Some(open), Some(close)) if open == close && (open == '"' || open == '\'') => {
+            key.get(1..key.len() - 1).unwrap_or(key)
+        }
+        _ => key,
+    }
+}
+
+/// A value that is an inline table (`headers = { Authorization = ... }`) is
+/// redacted whole when any inner key names a credential.
+fn inline_table_carries_secret(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    trimmed.split(',').any(|entry| {
+        entry.split_once('=').is_some_and(|(inner_key, _)| {
+            let lowered = unquote(inner_key.trim()).to_ascii_lowercase();
+            SECRET_KEY_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker))
+        })
+    })
 }
 
 /// The ownership manifest body: the paths superai created, the ingress mode
@@ -306,10 +339,29 @@ mod tests {
     }
 
     #[test]
-    fn split_setting_ignores_non_setting_lines() {
-        assert_eq!(setting_key("plain line"), None);
-        assert_eq!(setting_key("=value"), None);
-        assert_eq!(setting_key("[section]"), None);
-        assert_eq!(setting_key("api_key = \"x\""), Some("api_key"));
+    fn split_setting_accepts_plain_and_quoted_keys() {
+        assert_eq!(split_setting("plain line"), None);
+        assert_eq!(split_setting("=value"), None);
+        assert_eq!(split_setting("[section]"), None);
+        assert_eq!(split_setting("api_key = \"x\""), Some(("api_key", "\"x\"")));
+        assert_eq!(
+            split_setting("\"api-key\" = \"x\""),
+            Some(("\"api-key\"", "\"x\""))
+        );
+    }
+
+    #[test]
+    fn redaction_covers_quoted_keys_and_inline_table_credentials() {
+        let toml = "\"api-key\" = \"sk-live-abcdef\"\n\
+                    headers = { Authorization = \"Bearer abcdef\" }\n\
+                    host = \"api.example.com\"\n";
+        let redacted = redact_sensitive_lines(toml);
+        assert!(redacted.contains("\"api-key\"=[REDACTED]"), "{redacted}");
+        assert!(redacted.contains("headers=[REDACTED]"), "{redacted}");
+        assert!(
+            redacted.contains("host = \"api.example.com\""),
+            "{redacted}"
+        );
+        assert!(!redacted.contains("abcdef"), "{redacted}");
     }
 }
