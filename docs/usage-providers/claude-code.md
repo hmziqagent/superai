@@ -12,10 +12,12 @@ One JSON object per line in session transcripts under the project roots,
 resolved in this order (`claude_projects_roots` in
 `crates/superai-usage/src/reader/jsonl.rs:64`):
 
-- `CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is set and non-empty.
-- Otherwise `~/.config/claude/projects`, then `~/.claude/projects`, plus any
-  cswap slot roots present on disk: `~/.claude-swap-backup/sessions/<N>-*/projects`
-  and `$XDG_DATA_HOME/claude-swap/sessions/<N>-*/projects` (default
+- `CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is set and
+  non-empty; otherwise `~/.config/claude/projects`, then
+  `~/.claude/projects`.
+- Cswap slot roots, appended either way:
+  `~/.claude-swap-backup/sessions/<N>-*/projects` and
+  `$XDG_DATA_HOME/claude-swap/sessions/<N>-*/projects` (default
   `~/.local/share`). Slot directories must start with a positive number.
 
 Every `*.jsonl` file under the roots is scanned, deduplicated by canonical
@@ -38,11 +40,13 @@ the top level unless noted:
   checked per source in order line then `message`, each source trying
   `sessionId`, `session_id`, then `metadata.sessionId`.
 
-Streaming chunks repeat cumulative usage per message; the reader keeps the
-largest chunk per key, so a copied transcript under two roots counts once.
-Rows with all four counters at zero parse but emit nothing. A proxy-era
-estimate (`stop_reason` null, input only, no cache counters) keeps its tokens
-but flags the scan as a coverage gap (`unscanned_records`).
+Streaming chunks repeat cumulative usage per message; per dedup key the
+reader keeps the most complete row, so a copied transcript under two roots
+counts once. Rows with all four counters at zero parse but emit nothing. A
+proxy-era estimate (`stop_reason` null, input only, no cache counters)
+never displaces a full row for its key whatever the totals; it keeps its
+tokens and flags the scan as a coverage gap (`unscanned_records`). Within
+one class the row with the larger token total wins.
 
 Fixture example: `tests/fixtures/claude/projects/home-project/session-one.jsonl`.
 

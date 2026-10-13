@@ -56,8 +56,11 @@ nothing in this repo polls it.
 `provider-only` fill: the database carries no quota denominator. `resets_at`
 is computed only for the month window (first instant of the next month, system
 zone); session and week report null. Failures degrade, never fail the report:
-a missing, locked, or corrupt database renders an empty row plus a note and
-the command still exits 0, so the other families keep flowing.
+a database that cannot be opened or queried before any row arrives (missing,
+locked, corrupt) renders an empty row plus a note, while corruption
+mid-query keeps the rows already folded and counts the unread remainder as
+one unscanned record, so the totals stay as an incomplete-coverage floor.
+Either way the command still exits 0, so the other families keep flowing.
 
 ## Pricing
 

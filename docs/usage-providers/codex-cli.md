@@ -29,18 +29,23 @@ Three line kinds matter:
   top-level `timestamp` (RFC 3339) and `payload.info` with token counters.
   Model resolution tries `info.model`, `info.model_name`, the payload, the
   line, then the file-scoped `turn_context` model.
-- `token_usage_record` lines are skipped whole (legacy shape).
+- `token_usage_record`: the ledger record. Needs top-level `timestamp`
+  (RFC 3339) and a `payload.thread_token_usage` object. Model resolution
+  tries the payload, the line, then the file-scoped `turn_context` model.
 
-Token counters under `info.total_token_usage` (cumulative) or, when absent,
-`info.last_token_usage`: `input_tokens`, `output_tokens`, and cached reads
-under either spelling `cached_input_tokens` or `cache_read_input_tokens` (the
-larger valid value wins; any present-but-unreadable spelling spoils the
-payload). Usage is the per-file delta of the cumulative total against a
-watermark, so repeated records count once and a regressing total is treated as
-a stale replay that re-emits nothing. Codex records cached reads as a subset
-of `input_tokens`; the event splits them, so the input rate covers only the
-uncached remainder and cache reads price at the cache-read rate. Events are
-tagged provider `openai`. Records cap at 256 KiB.
+Token counters sit in one of three places: `info.total_token_usage`
+(cumulative) or, when absent, `info.last_token_usage` (used as-is, no
+watermark) on `token_count` events, and `payload.thread_token_usage`
+(cumulative) on `token_usage_record` lines. The counters are `input_tokens`,
+`output_tokens`, and cached reads under either spelling
+`cached_input_tokens` or `cache_read_input_tokens` (the larger valid value
+wins; any present-but-unreadable spelling spoils the payload). Both
+cumulative shapes fold through one per-file watermark, so event and ledger
+records of the same thread count it once and a regressing total is treated
+as a stale replay that re-emits nothing. Codex records cached reads as a
+subset of `input_tokens`; the event splits them, so the input rate covers
+only the uncached remainder and cache reads price at the cache-read rate.
+Events are tagged provider `openai`. Records cap at 256 KiB.
 
 Fixture example: `tests/fixtures/codex/sessions/2026/10/13/rollout-main.jsonl`.
 
