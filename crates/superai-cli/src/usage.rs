@@ -8,7 +8,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Serialize;
 use superai_usage::cost::{
-    CostEngine, CostPeriod, PricingCache, RateTable, RecordedUsage, Spend, UsageEvent,
+    CostEngine, CostPeriod, PeriodRange, PricingCache, RateTable, RecordedUsage, Spend, UsageEvent,
 };
 use superai_usage::reader::jsonl::{
     PiSelectors, claude_projects_roots, codex_sessions_roots, pi_session_roots,
@@ -251,6 +251,28 @@ impl WindowSel {
             Self::Session => "session",
             Self::Week => "week",
             Self::Month => "month",
+        }
+    }
+
+    /// Local artifacts cannot define a session boundary (USG-04), so the
+    /// session window reports every recorded event and says so.
+    fn totals_scope(self) -> &'static str {
+        match self {
+            Self::Session => "all-history",
+            Self::Week => "last-7-days",
+            Self::Month => "month-to-date",
+        }
+    }
+
+    fn cost_period(self, zone: &TimeZone) -> Result<CostPeriod, CliError> {
+        match self {
+            Self::Session => Ok(CostPeriod::AllHistory),
+            Self::Week => CostPeriod::rolling(7).map_err(|e| CliError::Pricing {
+                reason: e.to_string(),
+            }),
+            Self::Month => Ok(CostPeriod::MonthToDate {
+                time_zone: zone_name(zone).to_owned(),
+            }),
         }
     }
 }
@@ -552,6 +574,7 @@ struct SourceRow {
     harnesses: Vec<&'static str>,
     truth: TruthSource,
     window: WindowRow,
+    totals_scope: &'static str,
     tokens: TokenTotals,
     coverage: CoverageView,
     cost: SpendView,
@@ -624,22 +647,27 @@ impl SpendView {
     }
 }
 
-fn token_totals(usage: &RecordedUsage) -> Result<TokenTotals, CliError> {
-    fn sum(usage: &RecordedUsage, select: impl Fn(&UsageEvent) -> u64) -> Result<u64, CliError> {
-        usage.events.iter().try_fold(0u64, |acc, event| {
+fn token_totals(usage: &RecordedUsage, range: &PeriodRange) -> Result<TokenTotals, CliError> {
+    fn sum(events: &[&UsageEvent], select: impl Fn(&UsageEvent) -> u64) -> Result<u64, CliError> {
+        events.iter().try_fold(0u64, |acc, event| {
             acc.checked_add(select(event)).ok_or(CliError::Scan {
                 reason: "token totals overflow".to_owned(),
             })
         })
     }
-    let events = u64::try_from(usage.events.len()).map_err(|_count| CliError::Scan {
+    let scoped: Vec<&UsageEvent> = usage
+        .events
+        .iter()
+        .filter(|event| range.contains(event.timestamp))
+        .collect();
+    let events = u64::try_from(scoped.len()).map_err(|_count| CliError::Scan {
         reason: "event count overflow".to_owned(),
     })?;
     Ok(TokenTotals {
-        input: sum(usage, |event| event.input_tokens)?,
-        output: sum(usage, |event| event.output_tokens)?,
-        cache_read: sum(usage, |event| event.cache_read_tokens.unwrap_or(0))?,
-        cache_write: sum(usage, |event| event.cache_write_tokens.unwrap_or(0))?,
+        input: sum(&scoped, |event| event.input_tokens)?,
+        output: sum(&scoped, |event| event.output_tokens)?,
+        cache_read: sum(&scoped, |event| event.cache_read_tokens.unwrap_or(0))?,
+        cache_write: sum(&scoped, |event| event.cache_write_tokens.unwrap_or(0))?,
         events,
     })
 }
@@ -656,16 +684,17 @@ fn build_show(
         WindowSel::Month => Some(next_month_start(now, zone)?),
         WindowSel::Session | WindowSel::Week => None,
     };
+    let period = window.cost_period(zone)?;
+    let range = period
+        .range(now, zone_name(zone))
+        .map_err(|e| CliError::Pricing {
+            reason: e.to_string(),
+        })?;
     let mut sources = Vec::new();
     for family in families {
         let scan = scan_family(*family, env);
         let report = engine
-            .total(
-                &CostPeriod::AllHistory,
-                now,
-                zone_name(zone),
-                &scan.recorded,
-            )
+            .total(&period, now, zone_name(zone), &scan.recorded)
             .map_err(|e| CliError::Pricing {
                 reason: e.to_string(),
             })?;
@@ -677,7 +706,8 @@ fn build_show(
                 lane: "provider-only",
                 resets_at: resets_at.clone(),
             },
-            tokens: token_totals(&scan.recorded)?,
+            totals_scope: window.totals_scope(),
+            tokens: token_totals(&scan.recorded, &range)?,
             coverage: CoverageView::of(&scan.recorded),
             cost: SpendView::of(&report.total.spend),
             notes: scan.notes,
@@ -796,12 +826,13 @@ fn render_show(report: &ShowReport) -> String {
             "{} [{}] {}",
             row.source,
             row.harnesses.join(", "),
-            TruthSource::LocalArtifacts.as_str()
+            row.truth.as_str()
         ));
         lines.push(format!(
             "  fill: provider-only; resets: {}",
             row.window.resets_at.as_deref().unwrap_or("unknown")
         ));
+        lines.push(format!("  totals: {}", row.totals_scope));
         lines.push(format!(
             "  tokens: in {} out {} cache-read {} cache-write {} events {}",
             row.tokens.input,
@@ -833,7 +864,7 @@ fn render_cost(report: &CostReport) -> String {
             "{} [{}] {}",
             row.source,
             row.harnesses.join(", "),
-            TruthSource::LocalArtifacts.as_str()
+            row.truth.as_str()
         ));
         lines.extend(spend_lines(&row.total, &row.coverage));
         for model in &row.models {
@@ -1124,6 +1155,7 @@ mod tests {
         let row = report.sources.first().unwrap_or_else(|| panic!("row"));
         assert_eq!(row.source, "claude-code");
         assert_eq!(row.truth, TruthSource::LocalArtifacts);
+        assert_eq!(row.totals_scope, "all-history");
         assert_eq!(row.tokens.input, 100);
         assert_eq!(row.tokens.output, 200);
         assert_eq!(row.tokens.cache_read, 50);
@@ -1133,6 +1165,56 @@ mod tests {
         assert_eq!(row.cost.usd.as_deref(), Some("0.0033525"));
         assert_eq!(row.coverage.state, "incomplete");
         assert_eq!(row.coverage.unscanned_records, 1);
+    }
+
+    #[test]
+    fn week_and_month_windows_scope_totals_while_session_reads_history() {
+        let home = temp_home("window-scope");
+        let corpus = home
+            .join(".claude")
+            .join("projects")
+            .join("p")
+            .join("s.jsonl");
+        fs::create_dir_all(corpus.parent().unwrap_or_else(|| panic!("parent")))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(
+            &corpus,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-10-13T11:00:00Z","sessionId":"s1","#,
+                r#""message":{"id":"m1","model":"claude-sonnet-4-5","stop_reason":"end_turn","#,
+                r#""usage":{"input_tokens":100,"cache_read_input_tokens":50,"#,
+                r#""cache_creation_input_tokens":10,"output_tokens":200}}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-09-01T00:00:00Z","sessionId":"s1","#,
+                r#""message":{"id":"m2","model":"claude-sonnet-4-5","stop_reason":"end_turn","#,
+                r#""usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap_or_else(|e| panic!("corpus: {e}"));
+        let env = UsageEnv {
+            home,
+            ..UsageEnv::default()
+        };
+        let now = ts("2026-10-13T12:00:00Z");
+
+        for (window, scope, events, cost) in [
+            (WindowSel::Session, "all-history", 2, "0.0033705"),
+            (WindowSel::Week, "last-7-days", 1, "0.0033525"),
+            (WindowSel::Month, "month-to-date", 1, "0.0033525"),
+        ] {
+            let report = build_show(&env, &[Family::Claude], window, now, &TimeZone::UTC)
+                .unwrap_or_else(|e| panic!("build {window}: {e}"));
+            let row = report
+                .sources
+                .first()
+                .unwrap_or_else(|| panic!("row for {window}"));
+            assert_eq!(row.totals_scope, scope, "window {window}");
+            assert_eq!(row.tokens.events, events, "window {window}");
+            assert_eq!(row.tokens.input, if events == 2 { 101 } else { 100 });
+            assert_eq!(row.cost.state, "exact", "window {window}");
+            assert_eq!(row.cost.usd.as_deref(), Some(cost), "window {window}");
+        }
     }
 
     #[test]
@@ -1229,6 +1311,11 @@ mod tests {
             cache_write_tokens: None,
         });
 
-        assert!(err_text(token_totals(&usage)).contains("overflow"));
+        let range = PeriodRange {
+            start: None,
+            end: ts("2026-10-13T13:00:00Z"),
+        };
+
+        assert!(err_text(token_totals(&usage, &range)).contains("overflow"));
     }
 }

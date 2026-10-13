@@ -13,7 +13,6 @@ mod tests {
     use superai_usage::abuse::SENTINELS;
 
     // unused_crate_dependencies demands an ack per unreferenced extern.
-    use jiff as _;
     use serde as _;
     use superai_core as _;
     use thiserror as _;
@@ -317,6 +316,7 @@ mod tests {
         assert_eq!(report["window"], "session");
         assert_eq!(source["harnesses"], serde_json::json!(["claude-code"]));
         assert_eq!(source["truth"], "local-artifacts");
+        assert_eq!(source["totals_scope"], "all-history");
         assert_eq!(source["window"]["lane"], "provider-only");
         assert_eq!(source["window"]["resets_at"], serde_json::Value::Null);
         assert_eq!(source["tokens"]["input"], 101);
@@ -669,5 +669,120 @@ mod tests {
             text.contains("claude-code"),
             "other families must still flow: {text}"
         );
+    }
+
+    #[test]
+    fn window_scoping_separates_recent_events_from_old_ones() {
+        let home = full_usage_home("window-scoping");
+        let corpus = home
+            .join(".claude")
+            .join("projects")
+            .join("proj")
+            .join("session.jsonl");
+        let fresh_at = jiff::Timestamp::now()
+            .checked_sub(jiff::Span::new().hours(1))
+            .unwrap_or_else(|e| panic!("clock: {e}"));
+        let fresh = format!(
+            r#"{{"type":"assistant","timestamp":"{fresh_at}","sessionId":"s1","requestId":"r2","message":{{"id":"m9","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{{"input_tokens":10,"output_tokens":10}}}}}}"#
+        );
+        let mut text = fs::read_to_string(&corpus)
+            .unwrap_or_else(|e| panic!("corpus {}: {e}", corpus.display()));
+        text.push_str(&fresh);
+        text.push('\n');
+        fs::write(&corpus, text).unwrap_or_else(|e| panic!("corpus: {e}"));
+
+        for (window, scope, events) in [
+            ("session", "all-history", 3),
+            ("week", "last-7-days", 1),
+            ("month", "month-to-date", 1),
+        ] {
+            let output = run(
+                &home,
+                &[
+                    "usage",
+                    "show",
+                    "--harness",
+                    "claude-code",
+                    "--window",
+                    window,
+                    "--json",
+                ],
+            );
+            assert!(
+                output.status.success(),
+                "window {window} failed: {}",
+                stderr(&output)
+            );
+            let report: serde_json::Value =
+                serde_json::from_str(&stdout(&output)).unwrap_or_else(|e| panic!("json: {e}"));
+            let source = &report["sources"][0];
+            assert_eq!(source["totals_scope"], scope, "window {window}");
+            assert_eq!(source["tokens"]["events"], events, "window {window}");
+            assert_eq!(
+                source["tokens"]["input"],
+                if events == 3 { 111 } else { 10 }
+            );
+        }
+
+        let month = run(
+            &home,
+            &[
+                "usage",
+                "show",
+                "--harness",
+                "claude-code",
+                "--window",
+                "month",
+                "--json",
+            ],
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout(&month)).unwrap_or_else(|e| panic!("json: {e}"));
+        assert!(
+            report["sources"][0]["window"]["resets_at"].is_string(),
+            "month reset must survive scoping"
+        );
+    }
+
+    #[test]
+    fn every_sentinel_is_planted_in_the_fixture_home_before_output_is_asserted() {
+        let home = full_usage_home("plant-audit");
+        let paths = [
+            home.join(".claude")
+                .join("projects")
+                .join("proj")
+                .join("session.jsonl"),
+            home.join(".codex")
+                .join("sessions")
+                .join("2026")
+                .join("10")
+                .join("13")
+                .join("rollout.jsonl"),
+            home.join(".pi")
+                .join("agent")
+                .join("sessions")
+                .join("alpha.jsonl"),
+            home.join(".omp")
+                .join("agent")
+                .join("sessions")
+                .join("omp.jsonl"),
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("opencode.db"),
+        ];
+        let mut corpus: Vec<u8> = Vec::new();
+        for path in paths {
+            let bytes =
+                fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
+            corpus.extend_from_slice(&bytes);
+        }
+        let text = String::from_utf8_lossy(&corpus).into_owned();
+        for sentinel in SENTINELS {
+            assert!(
+                text.contains(sentinel),
+                "sentinel `{sentinel}` was never planted; the leak assertions would pass vacuously"
+            );
+        }
     }
 }
