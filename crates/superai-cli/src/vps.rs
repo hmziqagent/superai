@@ -65,13 +65,69 @@ fn run_deploy(args: &[OsString]) -> Result<(), CliError> {
     let request = build_request(&parsed)?;
     let remote = core_vps::TorideRemote::new(&parsed.host, parsed.policy);
     let plan = core_vps::plan_deploy(&request, &remote).map_err(CliError::from)?;
-    if parsed.json {
-        write_json(&deploy_json(&plan))?;
-    } else {
+    if !parsed.json {
         crate::write_stdout(&render_plan(&plan))?;
     }
     let journal = core_vps::execute_deploy(&plan, &remote).map_err(CliError::from)?;
-    report_journal(&journal, parsed.json)
+    let pointing = point_harness_configs(&plan, &request)?;
+    if parsed.json {
+        write_json(&deploy_report_json(&plan, &journal, &pointing))?;
+    } else {
+        crate::write_stdout(&render_journal(&journal))?;
+        render_pointing(&pointing)?;
+    }
+    if journal.rolled_back.is_some() {
+        return Err(CliError::Args {
+            reason: "deploy failed and rolled back; see the output above".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Point every recorded instance the request named at the deployment base.
+fn point_harness_configs(
+    plan: &DeployPlan,
+    request: &DeployRequest,
+) -> Result<Vec<core_vps::PointOutcome>, CliError> {
+    if plan.point_instances.is_empty() {
+        return Ok(Vec::new());
+    }
+    let registry_path = superai_core::Registry::default_path()?;
+    let provider_ids: Vec<&str> = request
+        .providers
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .collect();
+    plan.point_instances
+        .iter()
+        .map(|name| {
+            core_vps::point_recorded_instance(
+                &registry_path,
+                name,
+                &provider_ids,
+                &plan.harness_base,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CliError::from)
+        .map(|batches| batches.into_iter().flatten().collect())
+}
+
+fn render_pointing(outcomes: &[core_vps::PointOutcome]) -> Result<(), CliError> {
+    for outcome in outcomes {
+        let applied = if outcome.applied.is_empty() {
+            "no changes needed".to_owned()
+        } else {
+            outcome.applied.join("; ")
+        };
+        crate::write_stdout(&format!(
+            "pointed {} provider {} at deployment ({}): {applied}\n",
+            outcome.instance,
+            outcome.provider,
+            outcome.path.display()
+        ))?;
+    }
+    Ok(())
 }
 
 fn run_upgrade(args: &[OsString]) -> Result<(), CliError> {
@@ -83,20 +139,27 @@ fn run_upgrade(args: &[OsString]) -> Result<(), CliError> {
     };
     let remote = core_vps::TorideRemote::new(&parsed.host, parsed.policy);
     let plan = core_vps::plan_upgrade(&request, &remote).map_err(CliError::from)?;
-    if parsed.json {
-        write_json(&deploy_json(&plan))?;
-    } else {
+    if !parsed.json {
         crate::write_stdout(&render_plan(&plan))?;
     }
     let journal = core_vps::execute_upgrade(&plan, &remote).map_err(CliError::from)?;
-    report_journal(&journal, parsed.json)
+    if parsed.json {
+        write_json(&deploy_report_json(&plan, &journal, &[]))?;
+    } else {
+        crate::write_stdout(&render_journal(&journal))?;
+    }
+    if journal.rolled_back.is_some() {
+        return Err(CliError::Args {
+            reason: "upgrade failed and rolled back; see the output above".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn run_status(args: &[OsString], home: &Path) -> Result<(), CliError> {
     let parsed = StatusArgs::parse(args)?;
     let remote = core_vps::TorideRemote::new(&parsed.host, parsed.policy);
-    let report =
-        core_vps::remote_status(&parsed.host, parsed.policy, &remote).map_err(CliError::from)?;
+    let report = core_vps::remote_status(&parsed.host, &remote).map_err(CliError::from)?;
     let ledger = LedgerView::probe(home);
     if parsed.json {
         write_json(&StatusJson::of(&report, &ledger))?;
@@ -138,6 +201,7 @@ fn build_request(args: &DeployArgs) -> Result<DeployRequest, CliError> {
         binary_path: args.binary.clone(),
         providers,
         env_file: args.env_file.clone(),
+        point_instances: args.point.clone(),
         policy: args.policy,
     })
 }
@@ -154,24 +218,6 @@ fn read_provider(path: &Path) -> Result<ProviderToml, CliError> {
         reason: format!("provider file `{}` unreadable: {e}", path.display()),
     })?;
     Ok(ProviderToml { name, content })
-}
-
-fn report_journal(journal: &DeployJournal, json: bool) -> Result<(), CliError> {
-    if json {
-        write_json(
-            &serde_json::to_value(journal).map_err(|e| CliError::Report {
-                reason: e.to_string(),
-            })?,
-        )?;
-    } else {
-        crate::write_stdout(&render_journal(journal))?;
-    }
-    if journal.rolled_back.is_some() {
-        return Err(CliError::Args {
-            reason: "deploy failed and rolled back; see the journal above".to_owned(),
-        });
-    }
-    Ok(())
 }
 
 fn not_utf8() -> CliError {
@@ -244,6 +290,7 @@ struct DeployArgs {
     binary: PathBuf,
     providers: Vec<PathBuf>,
     env_file: Option<PathBuf>,
+    point: Vec<String>,
     json: bool,
 }
 
@@ -260,6 +307,7 @@ impl DeployArgs {
         let mut binary: Option<PathBuf> = None;
         let mut providers: Vec<PathBuf> = Vec::new();
         let mut env_file: Option<PathBuf> = None;
+        let mut point: Vec<String> = Vec::new();
         let mut json = false;
         let mut words = args.iter();
         while let Some(word) = words.next() {
@@ -300,6 +348,7 @@ impl DeployArgs {
                     "--env-file",
                     PathBuf::from(value_of(&mut words, "--env-file")?),
                 )?,
+                "--point" => point.push(value_of(&mut words, "--point")?),
                 other => return Err(unknown_flag(other)),
             }
         }
@@ -342,6 +391,7 @@ impl DeployArgs {
             binary,
             providers,
             env_file,
+            point,
             json,
         })
     }
@@ -611,13 +661,31 @@ fn write_json(value: &impl Serialize) -> Result<(), CliError> {
 }
 
 #[derive(Debug, Serialize)]
-struct DeployJson {
+struct DeployReportJson {
     plan: serde_json::Value,
+    journal: serde_json::Value,
+    pointing: Vec<serde_json::Value>,
 }
 
-fn deploy_json(plan: &DeployPlan) -> DeployJson {
-    DeployJson {
+fn deploy_report_json(
+    plan: &DeployPlan,
+    journal: &DeployJournal,
+    pointing: &[core_vps::PointOutcome],
+) -> DeployReportJson {
+    DeployReportJson {
         plan: serde_json::to_value(PlanJson::of(plan)).unwrap_or(serde_json::Value::Null),
+        journal: serde_json::to_value(journal).unwrap_or(serde_json::Value::Null),
+        pointing: pointing
+            .iter()
+            .map(|outcome| {
+                serde_json::json!({
+                    "instance": outcome.instance,
+                    "provider": outcome.provider,
+                    "path": outcome.path.display().to_string(),
+                    "applied": outcome.applied,
+                })
+            })
+            .collect(),
     }
 }
 
@@ -696,7 +764,6 @@ fn preview_text(preview: &StepPreview) -> String {
         } => format!(
             "replace {path} ({}):\n{diff}{}",
             match existing {
-                superai_core::vps::Existing::Absent => "absent",
                 superai_core::vps::Existing::Ours => "ours",
                 superai_core::vps::Existing::Foreign => "foreign, backs up first",
             },
@@ -712,6 +779,10 @@ fn preview_text(preview: &StepPreview) -> String {
         StepPreview::Run { argv } => format!("run `{}`", argv.join(" ")),
         StepPreview::DaemonsReload => "daemon-reload".to_owned(),
         StepPreview::Service { name, verb } => format!("{verb} service {name}"),
+        StepPreview::Symlink { target, link } => format!("link {link} -> {target}"),
+        StepPreview::InterpolateEnv { target, env } => {
+            format!("fill ${{...}} in {target} from {env} on the host")
+        }
     }
 }
 
@@ -732,6 +803,10 @@ fn step_line(step: &DeployStep) -> String {
         DeployStep::EnableService { name } => format!("enable {name}.service"),
         DeployStep::StartService { name } => format!("start {name}.service"),
         DeployStep::RestartService { name } => format!("restart {name}.service"),
+        DeployStep::Symlink { target, link } => format!("link {link} -> {target}"),
+        DeployStep::InterpolateEnv { target, env } => {
+            format!("interpolate {target} from {env}")
+        }
     }
 }
 
@@ -745,7 +820,7 @@ fn render_plan(plan: &DeployPlan) -> String {
             superai_core::vps::CheckState::Pass(detail) => ("pass", detail.clone()),
             superai_core::vps::CheckState::Fail(detail) => ("FAIL", detail.clone()),
         };
-        lines.push(format!("  {}: {verdict} — {detail}", check.name));
+        lines.push(format!("  {}: {verdict}: {detail}", check.name));
     }
     lines.push(format!(
         "ingress: {}{}; address: {}",
@@ -774,7 +849,7 @@ fn render_journal(journal: &DeployJournal) -> String {
     let mut lines = vec![format!("journal: committed via {}", journal.backend)];
     for entry in &journal.entries {
         lines.push(format!(
-            "  done: {} — {}",
+            "  done: {}: {}",
             step_line(&entry.step),
             entry.detail
         ));
@@ -787,7 +862,7 @@ fn render_journal(journal: &DeployJournal) -> String {
     }
     if let Some(rollback) = &journal.rolled_back {
         lines.push(format!(
-            "rolled back at: {} — {}",
+            "rolled back at: {}: {}",
             step_line(&rollback.failed_step),
             rollback.reason
         ));
@@ -960,6 +1035,40 @@ mod tests {
         assert_eq!(
             ok.unwrap_or_else(|e| panic!("parse: {e}")).policy,
             HostKeyPolicy::AcceptNew
+        );
+    }
+
+    #[test]
+    fn deploy_args_take_repeatable_point_and_provider_flags() {
+        let parsed = DeployArgs::parse(&os(&[
+            "--host",
+            "root@h",
+            "--binary",
+            "/tmp/x",
+            "--domain",
+            "d.example.com",
+            "--email",
+            "ops@example.com",
+            "--point",
+            "work",
+            "--point",
+            "scratch",
+        ]))
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        assert_eq!(parsed.point, vec!["work".to_owned(), "scratch".to_owned()]);
+        assert!(
+            err_text(DeployArgs::parse(&os(&[
+                "--host",
+                "root@h",
+                "--binary",
+                "/tmp/x",
+                "--domain",
+                "d.example.com",
+                "--email",
+                "ops@example.com",
+                "--point"
+            ])))
+            .contains("needs a value")
         );
     }
 

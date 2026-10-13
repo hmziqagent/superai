@@ -23,6 +23,9 @@ pub(crate) const REMOTE_PROVIDERS_DIR: &str = "/etc/llmproxy/providers";
 pub(crate) const REMOTE_UNIT_PATH: &str = "/etc/systemd/system/llmproxy.service";
 /// Remote nginx site for TLS ingress.
 pub(crate) const REMOTE_NGINX_SITE_PATH: &str = "/etc/nginx/sites-available/llmproxy.conf";
+/// Remote nginx sites-enabled link that activates the site; Debian/Ubuntu
+/// nginx includes only this directory.
+pub(crate) const REMOTE_NGINX_ENABLED_PATH: &str = "/etc/nginx/sites-enabled/llmproxy.conf";
 /// Remote wireguard interface conf (tunnel mode).
 pub(crate) const REMOTE_WG_CONF_PATH: &str = "/etc/wireguard/wg0.conf";
 /// Remote superai ownership manifest; lists paths this tool created.
@@ -45,6 +48,17 @@ pub(crate) const WG_CLIENT_TUNNEL_ADDRESS: &str = "10.7.0.2";
 pub(crate) const MIN_DISK_FREE_BYTES: u64 = 512 * 1024 * 1024;
 /// The local proxy listener nginx forwards to.
 pub(crate) const PROXY_UPSTREAM: &str = "127.0.0.1:8080";
+/// The port the proxy listener itself speaks.
+pub(crate) const PROXY_PORT: u16 = 8080;
+
+/// Host part of the wireguard tunnel address harness configs point at.
+pub(crate) fn wireguard_tunnel_host() -> String {
+    WG_SERVER_ADDRESS
+        .split('/')
+        .next()
+        .unwrap_or("10.7.0.1")
+        .to_owned()
+}
 
 /// The hardened unit (VPS-02 item 2): dynamic user, no new privileges, a
 /// strict read-only system surface, and one writable state directory.
@@ -126,7 +140,15 @@ pub(crate) fn render_wireguard_conf(
 }
 
 /// Key-name markers whose values are redacted from every preview.
-const SECRET_KEY_MARKERS: &[&str] = &["key", "token", "secret", "password", "credential"];
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "auth",
+    "bearer",
+];
 
 /// Redact `key = value` / `KEY=value` lines whose key names a credential.
 /// Over-redaction is fine; leaking a provider key is not.
@@ -177,6 +199,18 @@ pub(crate) fn render_manifest(mode: &str, address: &str, paths: &[String]) -> St
          \"address\":{address},\"paths\":[{}]}}\n",
         listed.join(",")
     )
+}
+
+/// The base URL local harness configs point at for a deployed ingress:
+/// TLS serves https on the public domain, tunnels speak plain http to the
+/// proxy listener on the tunnel address.
+pub(crate) fn harness_base_url(mode: &str, address: &str) -> String {
+    match mode {
+        "tls" => format!("https://{address}"),
+        "tunnel-wireguard" => format!("http://{}:{PROXY_PORT}", wireguard_tunnel_host()),
+        "tunnel-tailscale" => format!("http://{address}:{PROXY_PORT}"),
+        other => format!("{other}:{address}"),
+    }
 }
 
 /// Host-key policy line for plan echoes.

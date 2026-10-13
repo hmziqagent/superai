@@ -4,8 +4,7 @@
 
 use toride_proxy::certs_parse::{days_until, parse_openssl_enddate_epoch};
 
-use crate::vps::plan::{parse_disk_available, preflight, validate_host};
-use crate::vps::remote::HostKeyPolicy;
+use crate::vps::plan::{parse_disk_available, validate_host};
 use crate::vps::render::{REMOTE_MANIFEST_PATH, SERVICE_NAME, cert_dir};
 use crate::vps::{RemoteHost, VpsError};
 
@@ -54,13 +53,8 @@ pub struct VpsStatusReport {
 
 /// Collect the status facts from `remote`. Read-only: no uploads, no exec
 /// that mutates, no service verbs.
-pub fn remote_status(
-    host: &str,
-    policy: HostKeyPolicy,
-    remote: &dyn RemoteHost,
-) -> Result<VpsStatusReport, VpsError> {
+pub fn remote_status(host: &str, remote: &dyn RemoteHost) -> Result<VpsStatusReport, VpsError> {
     validate_host(host)?;
-    preflight(host, policy, remote)?;
     let mut notes = Vec::new();
     let service = ServiceView {
         name: SERVICE_NAME.to_owned(),
@@ -183,6 +177,7 @@ mod tests {
         let env_file = dir.join("secrets.env");
         std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=x\n").unwrap();
         DeployRequest {
+            point_instances: Vec::new(),
             host: "root@203.0.113.10".to_owned(),
             ingress: IngressMode::Tls {
                 domain: "proxy.example.com".to_owned(),
@@ -195,7 +190,7 @@ mod tests {
                 content: "api_key = \"PLACEHOLDER\"\n".to_owned(),
             }],
             env_file: Some(env_file),
-            policy: HostKeyPolicy::Strict,
+            policy: crate::vps::HostKeyPolicy::Strict,
         }
     }
 
@@ -214,7 +209,7 @@ mod tests {
         let plan = plan_deploy(&tls_request(&dir), &remote).unwrap();
         execute_deploy(&plan, &remote).unwrap();
 
-        let report = remote_status("root@203.0.113.10", HostKeyPolicy::Strict, &remote).unwrap();
+        let report = remote_status("root@203.0.113.10", &remote).unwrap();
         assert!(report.service.active);
         assert!(report.disk_free_bytes.is_some_and(|bytes| bytes > 0));
         assert!(report.loadavg.is_some());
@@ -240,7 +235,7 @@ mod tests {
     #[test]
     fn status_on_an_undeployed_host_is_reported_not_failed() {
         let remote = FixtureRemote::new("root@host");
-        let report = remote_status("root@host", HostKeyPolicy::Strict, &remote).unwrap();
+        let report = remote_status("root@host", &remote).unwrap();
         assert!(!report.service.active);
         assert_eq!(report.mode, None);
         assert_eq!(report.cert, None);
@@ -249,10 +244,7 @@ mod tests {
     #[test]
     fn status_refuses_a_bad_host() {
         let remote = FixtureRemote::new("root@host");
-        assert!(
-            remote_status("host", HostKeyPolicy::Strict, &remote).is_err(),
-            "bad host"
-        );
+        assert!(remote_status("host", &remote).is_err(), "bad host");
     }
 
     #[test]
@@ -267,13 +259,13 @@ mod tests {
             &UpgradeRequest {
                 host: "root@203.0.113.10".to_owned(),
                 binary_path: new_binary,
-                policy: HostKeyPolicy::Strict,
+                policy: crate::vps::HostKeyPolicy::Strict,
             },
             &remote,
         )
         .unwrap();
         crate::vps::execute::execute_upgrade(&upgrade, &remote).unwrap();
-        let report = remote_status("root@203.0.113.10", HostKeyPolicy::Strict, &remote).unwrap();
+        let report = remote_status("root@203.0.113.10", &remote).unwrap();
         assert!(report.service.active);
         assert_eq!(report.mode.as_deref(), Some("tls"));
     }

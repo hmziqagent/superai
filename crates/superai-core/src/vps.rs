@@ -6,6 +6,7 @@
 
 mod execute;
 mod plan;
+mod point;
 mod remote;
 mod render;
 mod status;
@@ -19,6 +20,7 @@ pub use plan::{
     PreflightCheck, PreflightReport, ProviderToml, StepPreview, TunnelKind, plan_deploy, preflight,
     validate_host,
 };
+pub use point::{PointOutcome, point_instance_at, point_recorded_instance};
 pub use remote::{
     ExecOutput, Fault, FixtureHost, FixtureRemote, HostKeyPolicy, RemoteError, RemoteHost,
     TorideRemote,
@@ -55,6 +57,9 @@ pub enum VpsError {
         /// Why the state blocks the operation.
         reason: String,
     },
+    /// A superai-core operation the vps flow composes failed.
+    #[error("{0}")]
+    Core(#[from] crate::error::CoreError),
 }
 
 pub(crate) fn validation(field: &str, reason: String) -> VpsError {

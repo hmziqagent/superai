@@ -8,9 +8,10 @@ use serde::Serialize;
 use crate::vps::remote::{HostKeyPolicy, RemoteHost, ensure_exec_argv, ensure_remote_path};
 use crate::vps::render::{
     MIN_DISK_FREE_BYTES, REMOTE_BIN_PATH, REMOTE_ENV_PATH, REMOTE_MANIFEST_PATH,
-    REMOTE_NGINX_SITE_PATH, REMOTE_PROVIDERS_DIR, REMOTE_UNIT_PATH, REMOTE_WG_CONF_PATH,
-    SERVICE_NAME, WG_SERVER_ADDRESS, policy_note, redact_sensitive_lines, render_manifest,
-    render_nginx_site, render_systemd_unit, render_wireguard_conf,
+    REMOTE_NGINX_ENABLED_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_PROVIDERS_DIR, REMOTE_UNIT_PATH,
+    REMOTE_WG_CONF_PATH, SERVICE_NAME, WG_SERVER_ADDRESS, harness_base_url, policy_note,
+    redact_sensitive_lines, render_manifest, render_nginx_site, render_systemd_unit,
+    render_wireguard_conf,
 };
 use crate::vps::{VpsError, validation};
 
@@ -86,6 +87,9 @@ pub struct DeployRequest {
     pub providers: Vec<ProviderToml>,
     /// Local env file with the secrets the unit loads; uploaded 0600.
     pub env_file: Option<PathBuf>,
+    /// Recorded instance names to point at the deployment address after a
+    /// successful commit.
+    pub point_instances: Vec<String>,
     /// Host-key acceptance policy for the ssh backend.
     pub policy: HostKeyPolicy,
 }
@@ -131,6 +135,21 @@ pub enum DeployStep {
     RestartService {
         /// Unit name without extension.
         name: String,
+    },
+    /// Create a symlink (nginx site enable).
+    Symlink {
+        /// What the link points at.
+        target: String,
+        /// Where the link is created.
+        link: String,
+    },
+    /// Fill `${NAME}` placeholders in a remote file from the remote env
+    /// file; secret values never transit this process.
+    InterpolateEnv {
+        /// File whose placeholders are filled in place (mode 0600).
+        target: String,
+        /// Remote env file carrying the values.
+        env: String,
     },
 }
 
@@ -181,8 +200,6 @@ impl std::fmt::Debug for Payload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Existing {
-    /// Nothing is there yet.
-    Absent,
     /// A previous superai deploy created it (manifest says so).
     Ours,
     /// The user (or someone else) created it; it gets backed up first.
@@ -232,6 +249,20 @@ pub enum StepPreview {
         name: String,
         /// Which service verb.
         verb: &'static str,
+    },
+    /// Creates a symlink pointing at an uploaded site.
+    Symlink {
+        /// What the link points at.
+        target: String,
+        /// Where the link is created.
+        link: String,
+    },
+    /// Fills placeholders on the host; values never previewed.
+    InterpolateEnv {
+        /// File being interpolated.
+        target: String,
+        /// Remote env file carrying the values.
+        env: String,
     },
 }
 
@@ -306,6 +337,10 @@ pub struct DeployPlan {
     pub service: &'static str,
     /// Ingress mode echo: `tls`, `tunnel-wireguard`, `tunnel-tailscale`.
     pub mode: String,
+    /// The base URL local harness configs get pointed at.
+    pub harness_base: String,
+    /// Recorded instances the commit step points at `harness_base`.
+    pub point_instances: Vec<String>,
     /// Public domain or tunnel address harnesses point at.
     pub address: String,
     /// Geo-exit forward proxy, when configured.
@@ -590,7 +625,8 @@ pub fn plan_deploy(
     if let IngressMode::Tunnel(TunnelKind::Wireguard { .. }) = &request.ingress {
         wg_private_key(env_bytes.as_deref())?;
     }
-    let pre = preflight(&request.host, request.policy, remote)?;
+    let mut pre = preflight(&request.host, request.policy, remote)?;
+    pre.checks.extend(ingress_checks(remote, &request.ingress));
     let ours = owned_paths(remote)?;
 
     let mut steps = Vec::new();
@@ -612,31 +648,29 @@ pub fn plan_deploy(
             &ours,
         )?);
     }
-    for provider in &request.providers {
-        let path = format!("{REMOTE_PROVIDERS_DIR}/{}.toml", provider.name);
-        let content = provider.effective(request.geo_exit.as_deref());
-        steps.push(upload_step(
-            remote,
-            &path,
-            content.into_bytes(),
-            0o600,
-            false,
-            &ours,
-        )?);
-    }
+    provider_steps(
+        &request.providers,
+        request.geo_exit.as_deref(),
+        env_bytes.is_some(),
+        remote,
+        &ours,
+    )?
+    .into_iter()
+    .for_each(|step| steps.push(step));
     steps.push(unit_step(remote, &render_systemd_unit())?);
     steps.push(PlannedStep {
         step: DeployStep::ReloadDaemons,
         preview: StepPreview::DaemonsReload,
         payload: Payload::Bare,
     });
-    steps.extend(ingress_steps(remote, request, env_bytes.as_deref(), &ours)?);
+    steps.extend(ingress_steps(remote, request, &ours)?);
     steps.push(service_step("enable"));
     steps.push(service_step("start"));
     let created: Vec<String> = steps
         .iter()
         .filter_map(|step| match &step.step {
             DeployStep::UploadFile { path, .. } => Some(path.clone()),
+            DeployStep::Symlink { link, .. } => Some(link.clone()),
             _ => None,
         })
         .chain(std::iter::once(REMOTE_UNIT_PATH.to_owned()))
@@ -656,6 +690,8 @@ pub fn plan_deploy(
         backend: remote.describe(),
         service: SERVICE_NAME,
         mode: mode.to_owned(),
+        harness_base: harness_base_url(mode, &address),
+        point_instances: request.point_instances.clone(),
         address,
         geo_exit: request.geo_exit.clone(),
         preflight: pre,
@@ -688,10 +724,58 @@ fn service_step(verb: &'static str) -> PlannedStep {
     }
 }
 
+/// Upload each provider TOML (placeholders only) and, when it carries
+/// `${NAME}` placeholders, schedule the on-VPS interpolation step.
+fn provider_steps(
+    providers: &[ProviderToml],
+    geo_exit: Option<&str>,
+    env_present: bool,
+    remote: &dyn RemoteHost,
+    ours: &[String],
+) -> Result<Vec<PlannedStep>, VpsError> {
+    let mut steps = Vec::new();
+    for provider in providers {
+        let path = format!("{REMOTE_PROVIDERS_DIR}/{}.toml", provider.name);
+        let content = provider.effective(geo_exit);
+        let carries_placeholders = content.contains("${");
+        if carries_placeholders && !env_present {
+            return Err(validation(
+                "env_file",
+                format!(
+                    "provider `{}` carries ${{...}} placeholders; an env file with their \
+                     values is required",
+                    provider.name
+                ),
+            ));
+        }
+        steps.push(upload_step(
+            remote,
+            &path,
+            content.into_bytes(),
+            0o600,
+            false,
+            ours,
+        )?);
+        if carries_placeholders {
+            steps.push(PlannedStep {
+                step: DeployStep::InterpolateEnv {
+                    target: path.clone(),
+                    env: REMOTE_ENV_PATH.to_owned(),
+                },
+                preview: StepPreview::InterpolateEnv {
+                    target: path,
+                    env: REMOTE_ENV_PATH.to_owned(),
+                },
+                payload: Payload::Bare,
+            });
+        }
+    }
+    Ok(steps)
+}
+
 fn ingress_steps(
     remote: &dyn RemoteHost,
     request: &DeployRequest,
-    env_bytes: Option<&[u8]>,
     ours: &[String],
 ) -> Result<Vec<PlannedStep>, VpsError> {
     match &request.ingress {
@@ -717,31 +801,43 @@ fn ingress_steps(
                     "--agree-tos",
                     "--non-interactive",
                 ])?,
+                symlink_step(
+                    REMOTE_NGINX_SITE_PATH,
+                    REMOTE_NGINX_ENABLED_PATH,
+                    remote,
+                    ours,
+                )?,
                 exec_step(&["nginx", "-t"])?,
                 exec_step(&["systemctl", "reload", "nginx"])?,
             ])
         }
         IngressMode::Tunnel(TunnelKind::Wireguard { client_public_key }) => {
-            let env = env_bytes.ok_or_else(|| {
-                validation(
-                    "env_file",
-                    "wireguard tunnel mode needs an env file carrying \
-                     LLMPROXY_WG_PRIVATE_KEY"
-                        .to_owned(),
-                )
-            })?;
-            let conf = interpolate_wg_key(
-                &render_wireguard_conf(WG_SERVER_ADDRESS, client_public_key, Some("__WG_KEY__")),
-                env,
-            )?;
-            Ok(vec![upload_step(
-                remote,
-                REMOTE_WG_CONF_PATH,
-                conf.into_bytes(),
-                0o600,
-                true,
-                ours,
-            )?])
+            let conf = render_wireguard_conf(
+                WG_SERVER_ADDRESS,
+                client_public_key,
+                Some("${LLMPROXY_WG_PRIVATE_KEY}"),
+            );
+            Ok(vec![
+                upload_step(
+                    remote,
+                    REMOTE_WG_CONF_PATH,
+                    conf.into_bytes(),
+                    0o600,
+                    false,
+                    ours,
+                )?,
+                PlannedStep {
+                    step: DeployStep::InterpolateEnv {
+                        target: REMOTE_WG_CONF_PATH.to_owned(),
+                        env: REMOTE_ENV_PATH.to_owned(),
+                    },
+                    preview: StepPreview::InterpolateEnv {
+                        target: REMOTE_WG_CONF_PATH.to_owned(),
+                        env: REMOTE_ENV_PATH.to_owned(),
+                    },
+                    payload: Payload::Bare,
+                },
+            ])
         }
         IngressMode::Tunnel(TunnelKind::Tailscale { tailnet_host }) => Ok(vec![exec_step(&[
             "tailscale",
@@ -750,13 +846,6 @@ fn ingress_steps(
             tailnet_host,
         ])?]),
     }
-}
-
-/// Swap the wireguard key placeholder for the env file's private key; the
-/// placeholder keeps the secret out of every preview.
-fn interpolate_wg_key(conf: &str, env_bytes: &[u8]) -> Result<String, VpsError> {
-    let key = wg_private_key(Some(env_bytes))?;
-    Ok(conf.replace("__WG_KEY__", &key))
 }
 
 fn wg_private_key(env_bytes: Option<&[u8]>) -> Result<String, VpsError> {
@@ -775,7 +864,7 @@ fn wg_private_key(env_bytes: Option<&[u8]>) -> Result<String, VpsError> {
     }
 }
 
-fn read_binary(path: &Path) -> Result<Vec<u8>, VpsError> {
+pub(crate) fn read_binary(path: &Path) -> Result<Vec<u8>, VpsError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| VpsError::LocalArtifact {
         path: path.to_owned(),
         reason: format!("unreadable: {e}"),
@@ -874,18 +963,28 @@ fn upload_step(
             } else {
                 Existing::Foreign
             };
-            let diff = match (String::from_utf8(old).ok(), new_text.as_ref()) {
-                (Some(old_text), Some(new_text)) => line_diff(
-                    &redact_sensitive_lines(&old_text),
-                    &redact_sensitive_lines(new_text),
-                ),
-                (Some(old_text), None) => {
-                    format!(
-                        "-binary payload replaced (was {} text bytes)",
-                        old_text.len()
-                    )
+            // A secret payload never enters a diff: both sides are replaced
+            // by byte counts, so an old value can never leak into a preview.
+            let diff = if secret {
+                format!(
+                    "-secret payload ({} bytes)\n+secret payload ({} bytes)",
+                    old.len(),
+                    bytes.len()
+                )
+            } else {
+                match (String::from_utf8(old).ok(), new_text.as_ref()) {
+                    (Some(old_text), Some(new_text)) => line_diff(
+                        &redact_sensitive_lines(&old_text),
+                        &redact_sensitive_lines(new_text),
+                    ),
+                    (Some(old_text), None) => {
+                        format!(
+                            "-binary payload replaced (was {} text bytes)",
+                            old_text.len()
+                        )
+                    }
+                    (None, _) => format!("+binary payload ({} bytes)", bytes.len()),
                 }
-                (None, _) => format!("+binary payload ({} bytes)", bytes.len()),
             };
             StepPreview::Replace {
                 path: path.to_owned(),
@@ -946,6 +1045,57 @@ fn exec_step(argv: &[&str]) -> Result<PlannedStep, VpsError> {
     })
 }
 
+fn symlink_step(
+    target: &str,
+    link: &str,
+    remote: &dyn RemoteHost,
+    ours: &[String],
+) -> Result<PlannedStep, VpsError> {
+    ensure_remote_path(target)?;
+    ensure_remote_path(link)?;
+    let _ = (remote, ours);
+    Ok(PlannedStep {
+        step: DeployStep::Symlink {
+            target: target.to_owned(),
+            link: link.to_owned(),
+        },
+        preview: StepPreview::Symlink {
+            target: target.to_owned(),
+            link: link.to_owned(),
+        },
+        payload: Payload::Bare,
+    })
+}
+
+/// Ingress-tooling preflight (VPS-02 item 3): TLS needs nginx, certbot, and
+/// openssl on the host; tunnels need their transport binary.
+fn ingress_checks(remote: &dyn RemoteHost, ingress: &IngressMode) -> Vec<PreflightCheck> {
+    let probes: &[(&'static str, &[&str])] = match ingress {
+        IngressMode::Tls { .. } => &[
+            ("ingress-nginx", &["nginx", "-v"]),
+            ("ingress-certbot", &["certbot", "--version"]),
+            ("ingress-openssl", &["openssl", "version"]),
+        ],
+        IngressMode::Tunnel(TunnelKind::Wireguard { .. }) => {
+            &[("ingress-wireguard", &["wg", "--version"])]
+        }
+        IngressMode::Tunnel(TunnelKind::Tailscale { .. }) => {
+            &[("ingress-tailscale", &["tailscale", "version"])]
+        }
+    };
+    probes
+        .iter()
+        .map(|(name, argv)| {
+            let state = match remote.exec(argv) {
+                Ok(output) if output.success() => CheckState::Pass(first_line(&output.stdout)),
+                Ok(output) => CheckState::Fail(format!("exited {:?}", output.exit)),
+                Err(error) => CheckState::Fail(error.to_string()),
+            };
+            PreflightCheck { name, state }
+        })
+        .collect()
+}
+
 /// Minimal line diff: common prefix and suffix are dropped, the changed
 /// middle renders as `-old` and `+new` lines. Both callers pass redacted
 /// text; this function never sees a secret.
@@ -998,6 +1148,7 @@ mod tests {
         std::fs::write(&env_file, "LLMPROXY_ADMIN_TOKEN=fixture-token\n").unwrap();
         DeployRequest {
             host: "root@203.0.113.10".to_owned(),
+            point_instances: Vec::new(),
             ingress: IngressMode::Tls {
                 domain: "proxy.example.com".to_owned(),
                 email: "ops@example.com".to_owned(),
@@ -1030,6 +1181,8 @@ mod tests {
             DeployStep::EnableService { .. } => "enable-service",
             DeployStep::StartService { .. } => "start-service",
             DeployStep::RestartService { .. } => "restart-service",
+            DeployStep::Symlink { .. } => "symlink",
+            DeployStep::InterpolateEnv { .. } => "interpolate-env",
         }
     }
 
@@ -1271,19 +1424,33 @@ mod tests {
             })
             .unwrap();
         match &wg_step.preview {
-            StepPreview::Create { content, .. } => assert!(content.is_none(), "wg conf is secret"),
-            other => panic!("{other:?}"),
+            StepPreview::Create {
+                content: Some(content),
+                ..
+            } => {
+                assert!(
+                    !content.contains("LLMPROXY_WG_PRIVATE_KEY"),
+                    "the key placeholder never previews: {content}"
+                );
+                assert!(content.contains("[REDACTED]"), "{content}");
+            }
+            other => panic!("wg preview: {other:?}"),
         }
         match &wg_step.payload {
             Payload::Upload { bytes, .. } => {
                 let text = String::from_utf8(bytes.clone()).unwrap();
                 assert!(
-                    text.contains("wg-server-secret"),
-                    "upload carries the real key"
+                    text.contains("${LLMPROXY_WG_PRIVATE_KEY}"),
+                    "upload carries only the placeholder"
                 );
+                assert!(!text.contains("wg-server-secret"));
             }
             other => panic!("{other:?}"),
         }
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.step,
+            DeployStep::InterpolateEnv { target, .. } if target == REMOTE_WG_CONF_PATH
+        )));
 
         request.env_file = None;
         let err = plan_deploy(&request, &remote).unwrap_err();

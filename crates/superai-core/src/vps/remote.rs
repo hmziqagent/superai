@@ -42,6 +42,15 @@ pub enum RemoteError {
         /// Why it was refused.
         reason: String,
     },
+    /// On-VPS placeholder interpolation failed; the reason names the
+    /// placeholder, never a value.
+    #[error("interpolating `{path}` failed: {reason}")]
+    Interpolate {
+        /// The file that was being interpolated.
+        path: String,
+        /// Why it failed.
+        reason: String,
+    },
 }
 
 /// Result of one remote command: exit code plus captured stdout only.
@@ -115,6 +124,14 @@ pub trait RemoteHost: std::fmt::Debug {
     /// Remove a remote file this deploy created; refuses a file that is
     /// still present afterwards.
     fn remove_file(&self, path: &str) -> Result<(), RemoteError>;
+
+    /// Create a symlink at `link` pointing at `target` (nginx site enable).
+    fn symlink(&self, target: &str, link: &str) -> Result<(), RemoteError>;
+
+    /// Fill `${NAME}` placeholders in `target` from the remote env file at
+    /// `env_path`, writing the result back at mode 0600. Values never leave
+    /// the host; the error names missing placeholders only.
+    fn interpolate_env(&self, target: &str, env_path: &str) -> Result<(), RemoteError>;
 
     /// Mode bits at `path`, `None` when absent (exact rollback restores).
     fn file_mode(&self, path: &str) -> Result<Option<u32>, RemoteError>;
@@ -274,6 +291,18 @@ impl RemoteHost for TorideRemote {
     fn service_stop(&self, _name: &str) -> Result<(), RemoteError> {
         Err(self.pending("unit-install"))
     }
+
+    fn symlink(&self, target: &str, link: &str) -> Result<(), RemoteError> {
+        ensure_remote_path(target)?;
+        ensure_remote_path(link)?;
+        Err(self.pending("upload"))
+    }
+
+    fn interpolate_env(&self, target: &str, env_path: &str) -> Result<(), RemoteError> {
+        ensure_remote_path(target)?;
+        ensure_remote_path(env_path)?;
+        Err(self.pending("upload"))
+    }
 }
 
 /// Facts the fixture host answers probes with; tests mutate them to force
@@ -288,6 +317,9 @@ pub struct FixtureHost {
     pub disk_free_bytes: u64,
     /// Contents served for `/proc/loadavg`.
     pub loadavg: String,
+    /// Program names whose version probes report failure; forces the
+    /// matching ingress preflight check to block.
+    pub missing_tools: Vec<String>,
 }
 
 impl Default for FixtureHost {
@@ -297,6 +329,7 @@ impl Default for FixtureHost {
             systemd_version: Some("systemd 255".to_owned()),
             disk_free_bytes: 10 * 1024 * 1024 * 1024,
             loadavg: "0.30 0.25 0.20 1/900 4321".to_owned(),
+            missing_tools: Vec::new(),
         }
     }
 }
@@ -422,6 +455,36 @@ impl FixtureRemote {
         self.state.borrow().host.clone().unwrap_or_default()
     }
 
+    fn issue_certificate(&self, domain: &str) {
+        let cert_dir = format!("/etc/letsencrypt/live/{domain}");
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\nnotAfter={FIXTURE_CERT_NOT_AFTER}\n\
+             -----END CERTIFICATE-----\n"
+        );
+        let mut state = self.state.borrow_mut();
+        state.files.insert(
+            format!("{cert_dir}/fullchain.pem"),
+            (pem.into_bytes(), 0o644),
+        );
+        state.files.insert(
+            format!("{cert_dir}/privkey.pem"),
+            (b"fixture-key\n".to_vec(), 0o600),
+        );
+    }
+
+    fn tool_probe(&self, program: &str, version: &str) -> ExecOutput {
+        if self
+            .host()
+            .missing_tools
+            .iter()
+            .any(|missing| missing == program)
+        {
+            ExecOutput::fail(1)
+        } else {
+            ExecOutput::ok(version)
+        }
+    }
+
     fn pop_fault(cell: &RefCell<FixtureState>, matches: impl Fn(&Fault) -> bool) -> bool {
         let mut state = cell.borrow_mut();
         match state.faults.iter().position(matches) {
@@ -508,31 +571,43 @@ impl RemoteHost for FixtureRemote {
                     None => Ok(ExecOutput::fail(1)),
                 };
             }
-            "certbot" => {
+            "certbot" if argv.get(1) == Some(&"certonly") => {
                 let domain = value_after("-d").unwrap_or_else(|| "fixture".to_owned());
-                let cert_dir = format!("/etc/letsencrypt/live/{domain}");
-                let pem = format!(
-                    "-----BEGIN CERTIFICATE-----\nnotAfter={FIXTURE_CERT_NOT_AFTER}\n\
-                     -----END CERTIFICATE-----\n"
-                );
-                let mut state = self.state.borrow_mut();
-                state.files.insert(
-                    format!("{cert_dir}/fullchain.pem"),
-                    (pem.into_bytes(), 0o644),
-                );
-                state.files.insert(
-                    format!("{cert_dir}/privkey.pem"),
-                    (b"fixture-key\n".to_vec(), 0o600),
-                );
+                self.issue_certificate(&domain);
                 return Ok(ExecOutput::ok(""));
             }
             "nginx" if argv.get(1) == Some(&"-t") => {
-                return Ok(ExecOutput::ok("syntax is ok"));
+                let enabled = self
+                    .state
+                    .borrow()
+                    .files
+                    .keys()
+                    .any(|path| path.starts_with("/etc/nginx/sites-enabled/"));
+                return if enabled {
+                    Ok(ExecOutput::ok("syntax is ok"))
+                } else {
+                    Ok(ExecOutput::fail(1))
+                };
             }
             "systemctl" if argv.get(1) == Some(&"reload") => {
                 return Ok(ExecOutput::ok(""));
             }
-            "tailscale" => {
+            "tailscale" if argv.get(1) == Some(&"version") => {
+                return Ok(self.tool_probe("tailscale", "1.0"));
+            }
+            "wg" if argv.get(1) == Some(&"--version") => {
+                return Ok(self.tool_probe("wg", "wireguard-tools 1.0"));
+            }
+            "nginx" if argv.get(1) == Some(&"-v") => {
+                return Ok(self.tool_probe("nginx", "nginx version: 1.24.0"));
+            }
+            "certbot" if argv.get(1) == Some(&"--version") => {
+                return Ok(self.tool_probe("certbot", "certbot 2.9.0"));
+            }
+            "openssl" if argv.get(1) == Some(&"version") => {
+                return Ok(self.tool_probe("openssl", "OpenSSL 3.0.13"));
+            }
+            "tailscale" if argv.get(1) == Some(&"up") => {
                 return Ok(ExecOutput::ok(""));
             }
             _ => {}
@@ -606,6 +681,45 @@ impl RemoteHost for FixtureRemote {
         Ok(self.state.borrow().files.get(path).map(|(_, mode)| *mode))
     }
 
+    fn symlink(&self, target: &str, link: &str) -> Result<(), RemoteError> {
+        ensure_remote_path(target)?;
+        ensure_remote_path(link)?;
+        if Self::pop_fault(&self.state, |fault| matches!(fault, Fault::Upload)) {
+            return Err(RemoteError::Unreachable {
+                reason: "injected fixture fault".to_owned(),
+            });
+        }
+        self.state
+            .borrow_mut()
+            .files
+            .insert(link.to_owned(), (target.as_bytes().to_vec(), 0o777));
+        Ok(())
+    }
+
+    fn interpolate_env(&self, target: &str, env_path: &str) -> Result<(), RemoteError> {
+        ensure_remote_path(target)?;
+        ensure_remote_path(env_path)?;
+        let refused = |reason: String| RemoteError::Interpolate {
+            path: target.to_owned(),
+            reason,
+        };
+        let mut state = self.state.borrow_mut();
+        let Some((env_bytes, _)) = state.files.get(env_path).cloned() else {
+            return Err(refused(format!("env file `{env_path}` is not on the host")));
+        };
+        let Some((text, _)) = state.files.get(target).cloned() else {
+            return Err(refused("target file is not on the host".to_owned()));
+        };
+        let body = String::from_utf8_lossy(&text).into_owned();
+        let env_text = String::from_utf8_lossy(&env_bytes).into_owned();
+        let substituted = substitute_env_placeholders(&body, &env_text)
+            .map_err(|missing| refused(format!("no value for placeholder `{missing}`")))?;
+        state
+            .files
+            .insert(target.to_owned(), (substituted.into_bytes(), 0o600));
+        Ok(())
+    }
+
     fn daemon_reload(&self) -> Result<(), RemoteError> {
         if Self::pop_fault(&self.state, |fault| matches!(fault, Fault::Reload)) {
             return Err(RemoteError::Unreachable {
@@ -677,6 +791,38 @@ impl RemoteHost for FixtureRemote {
         }
         Ok(())
     }
+}
+
+/// Replace every `${NAME}` in `text` using `NAME=VALUE` lines from `env`;
+/// the error names the first placeholder without a value, never a value.
+pub(crate) fn substitute_env_placeholders(text: &str, env: &str) -> Result<String, String> {
+    let value_of = |name: &str| -> Option<&str> {
+        env.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::trim)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((head, tail)) = rest.split_once("${") {
+        out.push_str(head);
+        let Some((name, after)) = tail.split_once('}') else {
+            let shown: String = tail.chars().take(40).collect();
+            return Err(shown);
+        };
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            match value_of(name) {
+                Some(value) => out.push_str(value),
+                None => return Err(name.to_owned()),
+            }
+        } else {
+            out.push_str("${");
+            out.push_str(name);
+            out.push('}');
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// The `notAfter=` marker line the fixture's certificate PEMs carry.
@@ -912,6 +1058,127 @@ mod tests {
             "{}",
             enddate.stdout
         );
+    }
+
+    #[test]
+    fn substitution_fills_known_names_and_names_the_missing_one() {
+        let env = "ANTHROPIC_API_KEY=sk-live\nWG_PORT=51820\n";
+        assert_eq!(
+            substitute_env_placeholders("key = \"${ANTHROPIC_API_KEY}\"\n", env).unwrap(),
+            "key = \"sk-live\"\n"
+        );
+        assert_eq!(
+            substitute_env_placeholders("no placeholders here", env).unwrap(),
+            "no placeholders here"
+        );
+        assert_eq!(
+            substitute_env_placeholders("literal ${not an id} stays", env).unwrap(),
+            "literal ${not an id} stays"
+        );
+        assert_eq!(
+            substitute_env_placeholders("p = ${MISSING}", env).unwrap_err(),
+            "MISSING"
+        );
+    }
+
+    #[test]
+    fn interpolate_env_fills_placeholders_on_the_host_at_0600() {
+        let remote = FixtureRemote::new("root@host");
+        remote
+            .upload(
+                "/etc/llmproxy/llmproxy.env",
+                b"ANTHROPIC_API_KEY=sk-live-secret\n",
+                0o600,
+            )
+            .unwrap();
+        remote
+            .upload(
+                "/etc/llmproxy/providers/anthropic.toml",
+                b"api_key = \"${ANTHROPIC_API_KEY}\"\n",
+                0o600,
+            )
+            .unwrap();
+        remote
+            .interpolate_env(
+                "/etc/llmproxy/providers/anthropic.toml",
+                "/etc/llmproxy/llmproxy.env",
+            )
+            .unwrap();
+        let filled = remote
+            .file("/etc/llmproxy/providers/anthropic.toml")
+            .unwrap();
+        assert_eq!(filled, b"api_key = \"sk-live-secret\"\n".to_vec());
+        assert_eq!(
+            remote.file_mode("/etc/llmproxy/providers/anthropic.toml"),
+            Some(0o600)
+        );
+        assert_eq!(
+            remote.file("/etc/llmproxy/llmproxy.env").unwrap(),
+            b"ANTHROPIC_API_KEY=sk-live-secret\n".to_vec(),
+            "the env file itself is untouched"
+        );
+
+        remote
+            .upload("/etc/x.toml", b"v = \"${NOPE}\"\n", 0o600)
+            .unwrap();
+        let err = remote
+            .interpolate_env("/etc/x.toml", "/etc/llmproxy/llmproxy.env")
+            .unwrap_err();
+        assert!(err.to_string().contains("NOPE"), "{err}");
+        assert!(!err.to_string().contains("sk-live"), "{err}");
+
+        let err = remote
+            .interpolate_env("/etc/x.toml", "/etc/llmproxy/absent.env")
+            .unwrap_err();
+        assert!(err.to_string().contains("absent.env"), "{err}");
+    }
+
+    #[test]
+    fn symlink_creates_the_link_and_nginx_t_needs_an_enabled_site() {
+        let remote = FixtureRemote::new("root@host");
+        assert!(
+            !remote.exec(&["nginx", "-t"]).unwrap().success(),
+            "no enabled site means nginx -t fails"
+        );
+        remote
+            .upload(
+                "/etc/nginx/sites-available/llmproxy.conf",
+                b"server {}\n",
+                0o644,
+            )
+            .unwrap();
+        remote
+            .symlink(
+                "/etc/nginx/sites-available/llmproxy.conf",
+                "/etc/nginx/sites-enabled/llmproxy.conf",
+            )
+            .unwrap();
+        assert!(remote.exec(&["nginx", "-t"]).unwrap().success());
+        assert_eq!(
+            remote
+                .file("/etc/nginx/sites-enabled/llmproxy.conf")
+                .unwrap(),
+            b"/etc/nginx/sites-available/llmproxy.conf".to_vec()
+        );
+        assert!(remote.symlink("/etc/x", "relative-link").is_err());
+    }
+
+    #[test]
+    fn version_probes_honor_missing_tools() {
+        let remote = FixtureRemote::new("root@host");
+        assert!(remote.exec(&["nginx", "-v"]).unwrap().success());
+        assert!(remote.exec(&["certbot", "--version"]).unwrap().success());
+        assert!(remote.exec(&["openssl", "version"]).unwrap().success());
+        assert!(remote.exec(&["wg", "--version"]).unwrap().success());
+        assert!(remote.exec(&["tailscale", "version"]).unwrap().success());
+
+        let bare = FixtureRemote::new("root@host");
+        bare.set_host(FixtureHost {
+            missing_tools: vec!["certbot".to_owned()],
+            ..FixtureHost::default()
+        });
+        assert!(!bare.exec(&["certbot", "--version"]).unwrap().success());
+        assert!(bare.exec(&["nginx", "-v"]).unwrap().success());
     }
 
     #[test]

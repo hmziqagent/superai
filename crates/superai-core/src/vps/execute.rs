@@ -88,6 +88,7 @@ pub fn execute_deploy(
         backups: Vec::new(),
         created: Vec::new(),
         touched_service: None,
+        unit_touched: false,
     };
     match commit_all(&plan.steps, remote, &mut run, &owned) {
         Ok(()) => Ok(finish(run, None)),
@@ -137,16 +138,7 @@ pub fn plan_upgrade(
             reason: "no deployed binary to upgrade".to_owned(),
         });
     }
-    let binary = std::fs::read(&request.binary_path).map_err(|e| VpsError::LocalArtifact {
-        path: request.binary_path.clone(),
-        reason: format!("unreadable: {e}"),
-    })?;
-    if binary.is_empty() {
-        return Err(VpsError::LocalArtifact {
-            path: request.binary_path.clone(),
-            reason: "empty binary".to_owned(),
-        });
-    }
+    let binary = crate::vps::plan::read_binary(&request.binary_path)?;
     let echo = |key: &str| {
         parsed
             .get(key)
@@ -186,12 +178,16 @@ pub fn plan_upgrade(
         },
     ];
     let pre = preflight(&request.host, request.policy, remote)?;
+    let address = echo("address");
+    let mode = echo("mode");
     Ok(DeployPlan {
         host: request.host.clone(),
         backend: remote.describe(),
         service: SERVICE_NAME,
         mode: "upgrade".to_owned(),
-        address: echo("address"),
+        harness_base: crate::vps::render::harness_base_url(&mode, &address),
+        point_instances: Vec::new(),
+        address,
         geo_exit: None,
         preflight: pre,
         steps,
@@ -212,6 +208,7 @@ struct Run {
     backups: Vec<BackupRecord>,
     created: Vec<String>,
     touched_service: Option<&'static str>,
+    unit_touched: bool,
 }
 
 fn finish(run: Run, rolled_back: Option<RollbackInfo>) -> DeployJournal {
@@ -261,23 +258,7 @@ fn commit_one(
             });
         }
         (DeployStep::InstallUnit { name }, Payload::Unit { content }) => {
-            let origin = if owned.contains(&REMOTE_UNIT_PATH.to_owned()) {
-                Existing::Ours
-            } else {
-                Existing::Foreign
-            };
-            if let Some(backup_path) = remote.install_unit(name, content).map_err(fail)? {
-                run.backups.push(BackupRecord {
-                    path: REMOTE_UNIT_PATH.to_owned(),
-                    backup_path,
-                    mode: 0o644,
-                    origin,
-                });
-            }
-            run.entries.push(JournalEntry {
-                step: planned.step.clone(),
-                detail: format!("installed {name}.service with pre-write backup"),
-            });
+            commit_unit(name, content, planned, remote, run, owned).map_err(fail)?;
         }
         (DeployStep::ReloadDaemons, Payload::Bare) => {
             remote.daemon_reload().map_err(fail)?;
@@ -324,12 +305,64 @@ fn commit_one(
                 detail: format!("{name} restarted"),
             });
         }
+        (DeployStep::Symlink { target, link }, Payload::Bare) => {
+            backup_or_track(link, remote, run, owned).map_err(fail)?;
+            remote.symlink(target, link).map_err(fail)?;
+            run.entries.push(JournalEntry {
+                step: planned.step.clone(),
+                detail: format!("linked {link} -> {target}"),
+            });
+        }
+        (DeployStep::InterpolateEnv { target, env }, Payload::Bare) => {
+            remote.interpolate_env(target, env).map_err(fail)?;
+            run.entries.push(JournalEntry {
+                step: planned.step.clone(),
+                detail: format!(
+                    "filled placeholders in {target} from {env} on the host (values never \
+                     printed)"
+                ),
+            });
+        }
         (step, payload) => {
             return Err(format!(
                 "plan carried a step/payload mismatch: {step:?} with {payload:?}"
             ));
         }
     }
+    Ok(())
+}
+
+/// Install the unit backup-first: a pre-existing unit is backed up at its
+/// original mode, a fresh host records the unit as created so rollback
+/// removes it.
+fn commit_unit(
+    name: &str,
+    content: &str,
+    planned: &PlannedStep,
+    remote: &dyn RemoteHost,
+    run: &mut Run,
+    owned: &[String],
+) -> Result<(), RemoteError> {
+    let origin = if owned.contains(&REMOTE_UNIT_PATH.to_owned()) {
+        Existing::Ours
+    } else {
+        Existing::Foreign
+    };
+    let mode_before = remote.file_mode(REMOTE_UNIT_PATH)?.unwrap_or(0o644);
+    match remote.install_unit(name, content)? {
+        Some(backup_path) => run.backups.push(BackupRecord {
+            path: REMOTE_UNIT_PATH.to_owned(),
+            backup_path,
+            mode: mode_before,
+            origin,
+        }),
+        None => run.created.push(REMOTE_UNIT_PATH.to_owned()),
+    }
+    run.unit_touched = true;
+    run.entries.push(JournalEntry {
+        step: planned.step.clone(),
+        detail: format!("installed {name}.service with pre-write backup"),
+    });
     Ok(())
 }
 
@@ -384,7 +417,7 @@ fn rollback(run: &Run, remote: &dyn RemoteHost) -> Result<Vec<String>, VpsError>
         remote.remove_file(path)?;
         notes.push(format!("removed {path} (created by this run)"));
     }
-    if !run.backups.is_empty() {
+    if !run.backups.is_empty() || run.unit_touched {
         remote.daemon_reload()?;
         notes.push("daemon-reload completed after rollback".to_owned());
     }
@@ -438,7 +471,7 @@ mod tests {
     use crate::abuse;
     use crate::vps::plan::{DeployRequest, IngressMode, ProviderToml, TunnelKind, plan_deploy};
     use crate::vps::remote::{Fault, FixtureHost, FixtureRemote, HostKeyPolicy as Policy};
-    use crate::vps::render::{REMOTE_ENV_PATH, REMOTE_NGINX_SITE_PATH};
+    use crate::vps::render::{REMOTE_ENV_PATH, REMOTE_NGINX_SITE_PATH, REMOTE_WG_CONF_PATH};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
@@ -455,6 +488,7 @@ mod tests {
         std::fs::write(&env_file, secret_env).unwrap();
         DeployRequest {
             host: "root@203.0.113.10".to_owned(),
+            point_instances: Vec::new(),
             ingress: IngressMode::Tls {
                 domain: "proxy.example.com".to_owned(),
                 email: "ops@example.com".to_owned(),
@@ -682,6 +716,7 @@ mod tests {
         .unwrap();
         let request = DeployRequest {
             host: "root@203.0.113.10".to_owned(),
+            point_instances: Vec::new(),
             ingress: IngressMode::Tunnel(TunnelKind::Wireguard {
                 client_public_key: "clientpubkey=".to_owned(),
             }),
@@ -703,5 +738,170 @@ mod tests {
         let provider = remote.file("/etc/llmproxy/providers/openai.toml").unwrap();
         let text = String::from_utf8(provider).unwrap();
         assert!(text.contains("socks5://10.7.0.1:3128"), "{text}");
+        let wg = remote.file(REMOTE_WG_CONF_PATH).unwrap();
+        let wg_text = String::from_utf8(wg).unwrap();
+        assert!(
+            wg_text.contains(abuse::SENTINEL) && !wg_text.contains("${"),
+            "the VPS-side interpolation filled the private key: {wg_text}"
+        );
+        assert_eq!(remote.file_mode(REMOTE_WG_CONF_PATH), Some(0o600));
+    }
+
+    #[test]
+    fn rollback_removes_a_unit_the_failed_run_itself_created() {
+        let dir = temp_dir("unit-rollback");
+        let remote = FixtureRemote::new("root@host");
+        let plan = plan_deploy(&tls_request(&dir, &sentinel_env()), &remote).unwrap();
+        let reloads_before = remote.reload_count();
+        remote.fail_next(Fault::Enable);
+        let journal = execute_deploy(&plan, &remote).unwrap();
+        assert!(journal.rolled_back.is_some());
+        assert!(
+            remote.file(REMOTE_UNIT_PATH).is_none(),
+            "a unit this run installed must not survive rollback"
+        );
+        assert!(
+            remote.reload_count() > reloads_before,
+            "rollback reloads the init system after removing the unit"
+        );
+    }
+
+    #[test]
+    fn redeploy_diff_of_a_secret_file_never_shows_either_value() {
+        let dir = temp_dir("secret-diff");
+        let remote = FixtureRemote::new("root@host");
+        let first = plan_deploy(&tls_request(&dir, &sentinel_env()), &remote).unwrap();
+        execute_deploy(&first, &remote).unwrap();
+
+        let rotated = dir.join("rotated.env");
+        std::fs::write(
+            &rotated,
+            format!(
+                "LLMPROXY_ADMIN_TOKEN={}
+",
+                abuse::SENTINEL
+            ),
+        )
+        .unwrap();
+        let mut second_request = tls_request(&dir, &sentinel_env());
+        second_request.env_file = Some(rotated);
+        let second = plan_deploy(&second_request, &remote).unwrap();
+        abuse::assert_no_sentinel_in_debug(&second, "redeploy plan");
+        let env_step = second
+            .steps
+            .iter()
+            .find(|step| match &step.step {
+                DeployStep::UploadFile {
+                    path, secret: true, ..
+                } => path == REMOTE_ENV_PATH,
+                _ => false,
+            })
+            .unwrap();
+        match &env_step.preview {
+            StepPreview::Replace { diff, .. } => {
+                assert!(diff.contains("secret payload"), "{diff}");
+                assert!(!diff.contains(abuse::SENTINEL), "{diff}");
+            }
+            other => panic!("env re-upload must be a replace: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_placeholders_are_interpolated_on_the_host_not_in_plan() {
+        let dir = temp_dir("interpolate");
+        let mut request = tls_request(&dir, &sentinel_env());
+        request.providers = vec![ProviderToml {
+            name: "anthropic".to_owned(),
+            content: "api_key = \"${ANTHROPIC_API_KEY}\"\n".to_owned(),
+        }];
+        let env_with_key = dir.join("with-key.env");
+        std::fs::write(
+            &env_with_key,
+            format!(
+                "ANTHROPIC_API_KEY={}
+LLMPROXY_ADMIN_TOKEN=x
+",
+                abuse::SENTINEL
+            ),
+        )
+        .unwrap();
+        request.env_file = Some(env_with_key);
+
+        let remote = FixtureRemote::new("root@host");
+        let plan = plan_deploy(&request, &remote).unwrap();
+        abuse::assert_no_sentinel_in_debug(&plan, "interpolating plan");
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.step,
+            DeployStep::InterpolateEnv { target, .. }
+                if target == "/etc/llmproxy/providers/anthropic.toml"
+        )));
+        let journal = execute_deploy(&plan, &remote).unwrap();
+        assert!(journal.rolled_back.is_none(), "{journal:?}");
+        abuse::assert_no_sentinel_in_debug(&journal, "interpolating journal");
+        let deployed = remote
+            .file("/etc/llmproxy/providers/anthropic.toml")
+            .unwrap();
+        let text = String::from_utf8(deployed).unwrap();
+        assert!(
+            text.contains(abuse::SENTINEL) && !text.contains("${"),
+            "the deployed config carries the real key: {text}"
+        );
+
+        request.env_file = None;
+        request.providers = vec![ProviderToml {
+            name: "anthropic".to_owned(),
+            content: "api_key = \"${ANTHROPIC_API_KEY}\"\n".to_owned(),
+        }];
+        let err = plan_deploy(&request, &remote).unwrap_err();
+        assert!(
+            err.to_string().contains("placeholders"),
+            "placeholders without an env file refuse at plan time: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_plans_enable_the_site_and_preflight_the_ingress_tools() {
+        let dir = temp_dir("tls-tools");
+        let remote = FixtureRemote::new("root@host");
+        let plan = plan_deploy(&tls_request(&dir, &sentinel_env()), &remote).unwrap();
+        for name in ["ingress-nginx", "ingress-certbot", "ingress-openssl"] {
+            assert!(
+                plan.preflight.checks.iter().any(|check| check.name == name),
+                "missing {name} in {:?}",
+                plan.preflight.checks
+            );
+        }
+        assert!(!plan.blocked(), "{:?}", plan.preflight.first_failure());
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.step,
+            DeployStep::Symlink { target, link }
+                if link == "/etc/nginx/sites-enabled/llmproxy.conf"
+                    && target == "/etc/nginx/sites-available/llmproxy.conf"
+        )));
+        assert!(plan.steps.iter().any(|step| matches!(
+            &step.step,
+            DeployStep::Exec { argv } if argv.first().is_some_and(|p| p == "certbot")
+        )));
+        assert_eq!(
+            plan.harness_base, "https://proxy.example.com",
+            "{}",
+            plan.harness_base
+        );
+
+        let bare = FixtureRemote::new("root@host");
+        bare.set_host(FixtureHost {
+            missing_tools: vec!["nginx".to_owned(), "certbot".to_owned()],
+            ..FixtureHost::default()
+        });
+        let blocked = plan_deploy(&tls_request(&dir, &sentinel_env()), &bare).unwrap();
+        assert!(blocked.blocked());
+        assert!(
+            blocked
+                .preflight
+                .first_failure()
+                .is_some_and(|text| text.contains("ingress-nginx")),
+            "{:?}",
+            blocked.preflight.checks
+        );
     }
 }
