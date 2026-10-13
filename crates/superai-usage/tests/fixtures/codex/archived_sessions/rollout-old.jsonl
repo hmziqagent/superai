@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-01T08:00:00.000Z","type":"session_meta","payload":{"id":"rollout-old","cwd":"/tmp","originator":"codex_cli_rs"}}
+{"timestamp":"2026-09-01T08:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5-mini","last_token_usage":{"input_tokens":8,"cache_read_input_tokens":2,"output_tokens":4}}}}

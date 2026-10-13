@@ -1,0 +1,3 @@
+{"type":"session","id":"work-s1"}
+{"type":"model_change","provider":"anthropic","modelId":"claude-opus-4-5"}
+{"type":"message","id":"w1","message":{"role":"assistant","timestamp":1760000200,"usage":{"input":3,"cacheRead":1,"cacheWrite":0,"output":5,"cacheWrite1h":0}}}

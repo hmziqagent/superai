@@ -1,0 +1,13 @@
+{"type":"summary","summary":"session start","leafUuid":"a1"}
+{"type":"user","uuid":"u1","timestamp":"2026-10-13T09:00:00Z","sessionId":"sess-1","message":{"role":"user","content":"hello 🌍"}}
+{"type":"assistant","timestamp":"2026-10-13T09:00:05.123Z","sessionId":"sess-1","requestId":"req_01","message":{"id":"msg_01","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":10,"output_tokens":200,"cache_creation":{"ephemeral_1h_input_tokens":4}}}}
+{"type":"assistant","timestamp":"2026-10-13T09:00:04.000Z","sessionId":"sess-1","requestId":"req_01","message":{"id":"msg_01","model":"claude-sonnet-4-5","usage":{"input_tokens":40,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":80}}}
+{"type":"assistant","timestamp":"yesterday","message":{"id":"msg_02","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5}}}
+this line is {broken
+{"foo":1}
+{"type":"assistant","timestamp":"2026-10-13T09:00:10Z","message":{"id":"msg_03","model":"claude-sonnet-4-5","usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"assistant","ts":"2026-10-13T09:00:11Z","message":{"id":"msg_04","modelId":"claude-sonnet-4-5","usage":{"inputTokens":7,"outputTokens":9}}}
+{"type":"assistant","timestamp":"2026-10-13T09:00:12Z","sessionId":"sess-1","message":{"id":"msg_05","model":"claude-sonnet-4-5","stop_reason":null,"usage":{"input_tokens":33,"output_tokens":0}}}
+{"type":"assistant","timestamp":"2026-10-13T09:00:13Z","message":{"id":"msg_06","usage":{"input_tokens":5,"output_tokens":5}}}
+{"type":"assistant","timestamp":"2026-10-13T09:00:14Z","sessionId":"sess-1","message":{"model":"claude-haiku-4-5","stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":20}}}
+{"type":"assistant","timestamp":"2026-10-13T09:00:15Z","sessionId":"sess-1","message":{"id":"msg_07","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"apiKey":"usage-test-token-4f2a9c-fake"}}
