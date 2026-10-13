@@ -29,9 +29,8 @@ impl RateWindow {
     }
 }
 
-/// One quota lane's reading; `CodexBar`'s `isSyntheticPlaceholder` bool
-/// and `usageKnown` flag are variants here, so an unmeasured window can
-/// never pose as a real zero.
+/// One quota lane's reading; the unreported-lane placeholder is its own
+/// variant, so an unmeasured window can never pose as a real zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaneReading {
