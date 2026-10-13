@@ -170,6 +170,27 @@ mod tests {
     }
 
     #[test]
+    fn bundled_seed_is_the_checked_in_data_file() {
+        let asset = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/usage-providers.json");
+        let dir = temp_dir("bundled-data");
+        fs::copy(&asset, dir.join("bundled.json"))
+            .unwrap_or_else(|e| panic!("copy {}: {e}", asset.display()));
+        let from_data = UsageRegistry::load_dir(&dir)
+            .unwrap_or_else(|e| panic!("bundled data file rejected: {e:?}"));
+        drop(fs::remove_dir_all(&dir));
+        let bundled =
+            UsageRegistry::bundled().unwrap_or_else(|e| panic!("bundled seed invalid: {e:?}"));
+        assert_eq!(
+            from_data
+                .entries()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            bundled.entries().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            "bundled() must be exactly what the checked-in data file loads through load_dir"
+        );
+    }
+
+    #[test]
     fn data_only_adding_provider_requires_no_code_change() {
         let dir = temp_dir("data-only");
         for fixture in [
