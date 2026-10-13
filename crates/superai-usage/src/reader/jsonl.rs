@@ -1049,17 +1049,18 @@ fn pi_assistant(line: &Value, message: &Value, file: &PiFile) -> LineOutcome<PiR
     if !has_counter {
         return LineOutcome::Skipped;
     }
-    match one_hour_chain(usage) {
+    let cache_write_1h = match one_hour_chain(usage) {
         Chain::Invalid => return LineOutcome::Skipped,
         Chain::Value(n) if n > cache_write => return LineOutcome::Skipped,
-        Chain::Value(_) | Chain::Absent => {}
-    }
+        Chain::Value(n) => Some(n),
+        Chain::Absent => None,
+    };
     // No openai cache-write tariff exists here, so codex-backend writes fold
     // into input at the input rate; CodexBar's own 1.25x write tariff runs higher.
-    let (input_tokens, cache_write_tokens) = if provider == OPENAI {
-        (input.saturating_add(cache_write), None)
+    let (input_tokens, cache_write_tokens, cache_write_1h_tokens) = if provider == OPENAI {
+        (input.saturating_add(cache_write), None, None)
     } else {
-        (input, Some(cache_write))
+        (input, Some(cache_write), cache_write_1h)
     };
     let event = UsageEvent {
         timestamp,
@@ -1069,7 +1070,7 @@ fn pi_assistant(line: &Value, message: &Value, file: &PiFile) -> LineOutcome<PiR
         output_tokens: output,
         cache_read_tokens: Some(cache_read),
         cache_write_tokens,
-        cache_write_1h_tokens: None,
+        cache_write_1h_tokens,
     };
     let entry = text_field(line, &["id"]);
     let key = match (&file.session, entry) {

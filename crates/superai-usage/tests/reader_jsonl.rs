@@ -464,6 +464,16 @@ mod tests {
     #[test]
     fn pi_events_price_exactly_through_the_cost_engine() {
         let outcome = scan_pi_sessions(&default_pi_roots());
+        let sonnet = outcome
+            .events
+            .iter()
+            .find(|event| event.input_tokens == 20 && event.cache_write_tokens == Some(2))
+            .unwrap_or_else(|| panic!("fixture row e1 missing from scan"));
+        assert_eq!(
+            sonnet.cache_write_1h_tokens,
+            Some(1),
+            "the 1h sub-lane must survive the reader for anthropic-backed rows"
+        );
         let engine = CostEngine::new(
             RateTable::bundled().unwrap_or_else(|e| panic!("bundled rates: {e:?}")),
         );
@@ -475,7 +485,8 @@ mod tests {
                 &outcome.into_recorded_usage(),
             )
             .unwrap_or_else(|e| panic!("total: {e:?}"));
-        let expected = Usd::parse("0.000950025").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
+        // Row e1's two writes split 1x3.75 + 1x(2*3) per MTok, not 2x3.75.
+        let expected = Usd::parse("0.000952275").unwrap_or_else(|e| panic!("expected sum: {e:?}"));
         assert_eq!(report.total.spend, Spend::Exact(expected));
     }
 
