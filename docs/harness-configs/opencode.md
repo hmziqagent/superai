@@ -307,6 +307,61 @@ Not verified upstream: whether v2 keeps the v1 managed-config dirs (`/etc/openco
 
 ---
 
+## 7. v2 history schema (frozen at v2.0.27)
+
+Frozen 2026-10-13 against `anomalyco/opencode` tag `v2.0.27` (commit `1f4d07a4a519`). The superai reader (`crates/superai-usage/src/reader/opencode.rs`) mirrors one upstream query: `SessionStats.get` in `packages/core/src/session/stats.ts`, which reads the two tables defined in `packages/core/src/session/sql.ts` (baseline DDL in `packages/core/src/database/schema.gen.ts`; all at v2.0.27).
+
+### `session_message` (source: `packages/core/src/session/sql.ts` at v2.0.27)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text, PK | message id, `msg_` prefix |
+| `session_id` | text, NOT NULL | FK to `session_v2.id`, ON DELETE CASCADE |
+| `type` | text, NOT NULL | message tag, union below |
+| `seq` | integer, NOT NULL | per-session order, unique with `session_id` |
+| `time_created` | integer, NOT NULL | epoch milliseconds |
+| `time_updated` | integer, NOT NULL | epoch milliseconds |
+| `data` | text, NOT NULL | JSON payload, shape below |
+
+### `session_v2` (same source)
+
+Columns the usage query reads:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text, PK | session id |
+| `fork_session_id` | text | set when this session forked another |
+| `time_created` | integer, NOT NULL | epoch milliseconds; stats.ts compares forked rows against this column, not the separate `fork_boundary` column |
+
+The table also carries `parent_id` (set on subagent sessions), project/workspace binding, directory, title, per-session `cost` and `tokens_*` summaries (all `DEFAULT 0 NOT NULL`), and lifecycle timestamps; the usage query reads none of those.
+
+### Payload paths (`session_message.data`)
+
+`data` stores the encoded `SessionMessage.Info` with `type` and `id` stripped into their own columns (`SessionMessageData` in `session/sql.ts`). The message union (`packages/schema/src/session-message.ts`): `agent-switched`, `model-switched`, `location-switched`, `user`, `synthetic`, `system`, `skill`, `shell`, `assistant`, `compaction`, `idle`. Only `assistant` rows carry a model and tokens:
+
+- `$.model.providerID` and `$.model.id`: `model` is required on assistant rows and encodes as `{id, providerID, variant?}` (`Model.Ref` in `packages/schema/src/model.ts`); the keys are camelCase in the stored JSON.
+- `$.tokens.input`, `$.tokens.output`, `$.tokens.reasoning`, `$.tokens.cache.read`, `$.tokens.cache.write`: `tokens` is optional; when present, all five fields are finite numbers (`TokenUsage.Info` in `packages/schema/src/token-usage.ts`).
+- `$.model.variant`: optional, upstream uses it to group models; superai does not read it.
+- `$.cost`: optional USD number; superai does not read it either.
+
+### Fork rule
+
+Every query in stats.ts joins `session_v2` on `session.id = message.session_id` and keeps a row only when
+
+```sql
+(session.fork_session_id IS NULL OR message.time_created >= session.time_created)
+```
+
+A fork copies the parent's history, so pre-fork rows would otherwise count twice; rows older than the fork session's own `time_created` stay attributed to the parent. The same predicate appears in all four stats queries (minimum-time, message scan, both tool queries).
+
+### Type filter and compaction usage
+
+The message scan filters `type IN ('user', 'assistant')` and aggregates tokens and cost from assistant rows only; user rows just feed the prompt count. Compaction usage never enters that scan: upstream reads it from durable `event` rows of type `session.usage.recorded` where `json_extract(data, '$.source') = 'compaction'` (stats.ts lines 288-315; `UsageRecorded` in `packages/schema/src/session-event.ts` carries `source` (`title` or `compaction`), `cost`, and the same token object). Title-generation usage is excluded upstream. Compaction also writes a `session_message` row of type `compaction` carrying its own `tokens` and `cost`, which the `type` filter drops.
+
+The superai reader selects the same two tables with `type = 'assistant'` and the same fork predicate, extracts `$.model.providerID`, `$.model.id`, and the five token paths, folds `reasoning` into `output_tokens`, and wraps `data` in a `json_valid` check so a malformed payload counts as skipped rather than failing the scan. It does not read the `event` table, so compaction usage is outside superai's totals.
+
+---
+
 ## Quick gotchas
 
 - `theme`, `keybinds`, TUI toggles belong in `tui.json` now; leaving them in `opencode.json` works only until migration fails. On the v2 line the same settings live in `cli.json` and migrate automatically.
