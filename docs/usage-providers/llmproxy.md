@@ -20,10 +20,14 @@ Three admin endpoints on a deployed llmproxy, read-only:
   ever.
 - `GET /usage/keys` (`KEYS_PATH`): caller list with last-seen.
 
-Base URL discovery (`resolve_base_url`): an explicit flag, then the
-`SUPERAI_LLMPROXY_URL` env var, then the first valid base among instance
-provider configs already known to route through llmproxy. A base may carry a
-known `/usage` path, which is stripped. Validation cannot tell an llmproxy
+Base URL discovery (`resolve_base_url`) accepts three tiers: an explicit
+flag, the `SUPERAI_LLMPROXY_URL` env var, then the first valid base among
+instance provider configs already known to route through llmproxy. Only the
+env-var tier is fed today: both shipped call sites (the `usage` ledger row
+and the `vps` ledger probe) pass no flag and no routed bases, so without the
+env var the row carries a "set `SUPERAI_LLMPROXY_URL`" note. A base may
+carry a known `/usage` path, which is stripped. Validation cannot tell an
+llmproxy
 base from any other https URL, so callers must pass only bases known to be
 routed through llmproxy: the client sends the admin token to whatever base it
 is given. https is required, plain http only on an exact loopback host;
@@ -55,7 +59,8 @@ response loudly.
 ## Auth material
 
 An admin bearer token, read by `load_admin_token`: a non-empty trimmed
-`SUPERAI_LLMPROXY_ADMIN_TOKEN` env value wins, else a token file that must be
+`SUPERAI_LLMPROXY_ADMIN_TOKEN` env value wins, else the token file both
+shipped readers default to, `~/.superai/llmproxy-admin-token`, which must be
 a regular file, mode 0600, at most 4096 bytes, non-empty (symlinks, FIFOs,
 directories, wrong modes, oversize, and empty are all refused; mode and size
 come from the open fd's own stat). The token is held in `AdminToken`, whose

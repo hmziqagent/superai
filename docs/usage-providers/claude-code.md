@@ -34,8 +34,9 @@ the top level unless noted:
   `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`.
   An absent counter reads as 0; a present-but-unreadable one spoils the whole
   payload into the skipped count.
-- Dedup key: `message.id` plus `requestId` when present, else `sessionId`
-  (checked on the line, then `message`, then `metadata.sessionId`).
+- Dedup key: `message.id` plus `requestId` when present, else `sessionId`,
+  checked per source in order line then `message`, each source trying
+  `sessionId`, `session_id`, then `metadata.sessionId`.
 
 Streaming chunks repeat cumulative usage per message; the reader keeps the
 largest chunk per key, so a copied transcript under two roots counts once.
