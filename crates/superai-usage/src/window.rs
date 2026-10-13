@@ -1,5 +1,5 @@
 //! Quota window model (USG-04), porting `CodexBar`'s `RateWindow`
-//! (`UsageFetcher.swift:3-15`): raw values, explicit lane states.
+//! (`UsageFetcher.swift:3-21`): raw values, explicit lane states.
 
 use serde::{Deserialize, Serialize};
 
