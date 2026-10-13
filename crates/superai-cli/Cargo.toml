@@ -17,6 +17,14 @@ path = "src/main.rs"
 
 [dependencies]
 superai-core = { workspace = true }
+superai-usage = { path = "../superai-usage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true
