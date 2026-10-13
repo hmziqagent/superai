@@ -252,13 +252,15 @@
   {
     "id": "minimax",
     "label": "MiniMax",
-    "locators": [],
+    "locators": [
+      { "kind": "endpoint", "url": "https://www.minimax.io/v1/api/openplatform/coding_plan/remains" }
+    ],
     "auth_material": [
       { "kind": "env_var", "name": "MINIMAX_CODING_API_KEY" },
       { "kind": "env_var", "name": "MINIMAX_API_KEY" },
       { "kind": "browser_session" }
     ],
-    "window_strategy": "provider_only",
+    "window_strategy": "endpoint",
     "pricing": "subscription",
     "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
     "schema_version": 1,
@@ -323,6 +325,22 @@
     "window_strategy": "endpoint",
     "pricing": "unverified",
     "documentation_url": "docs/plans/14-usage-and-proxy.md#overlap-table-codexbar-provider--superai-harness-ids",
+    "schema_version": 1,
+    "verified_at": "2026-10-13"
+  },
+  {
+    "id": "openrouter",
+    "label": "OpenRouter",
+    "locators": [
+      { "kind": "endpoint", "url": "https://openrouter.ai/api/v1/key" },
+      { "kind": "endpoint", "url": "https://openrouter.ai/api/v1/credits" }
+    ],
+    "auth_material": [
+      { "kind": "env_var", "name": "OPENROUTER_API_KEY" }
+    ],
+    "window_strategy": "endpoint",
+    "pricing": "subscription",
+    "documentation_url": "docs/plans/15-usage-sources.md#usg-09--api-key-pollers-for-the-overlap-table",
     "schema_version": 1,
     "verified_at": "2026-10-13"
   },

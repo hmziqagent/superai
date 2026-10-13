@@ -8,7 +8,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use superai_usage::registry::{
-        USAGE_PROVIDER_SCHEMA_VERSION, UsageProviderEntry, UsageRegistry,
+        USAGE_PROVIDER_SCHEMA_VERSION, UsageLocator, UsageProviderEntry, UsageRegistry,
     };
 
     // Lib deps that ride along as externs of this target without being
@@ -59,6 +59,20 @@ mod tests {
         "warp",
         "windsurf",
         "workbuddy",
+        "zed",
+    ];
+
+    // Subplan 15 USG-09: one id per `poll_*` function in poller.rs. A
+    // provider the crate polls must declare where its usage truth lives.
+    const POLLED_PROVIDERS: &[&str] = &[
+        "cline-pass",
+        "deepseek",
+        "factory",
+        "kilo",
+        "minimax",
+        "mistral",
+        "openrouter",
+        "warp",
         "zed",
     ];
 
@@ -145,6 +159,33 @@ mod tests {
             assert!(
                 ids.contains(expected),
                 "overlap-table provider `{expected}` missing from the bundled seed: {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_polled_provider_declares_an_endpoint_in_the_bundled_seed() {
+        let registry =
+            UsageRegistry::bundled().unwrap_or_else(|e| panic!("bundled seed invalid: {e:?}"));
+        for id in POLLED_PROVIDERS {
+            let entry = registry
+                .entries()
+                .find(|e| e.id.as_str() == *id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "polled provider `{id}` has no bundled entry (ids: {:?})",
+                        registry
+                            .entries()
+                            .map(|e| e.id.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                entry
+                    .locators
+                    .iter()
+                    .any(|locator| matches!(locator, UsageLocator::Endpoint { .. })),
+                "polled provider `{id}` declares no endpoint locator: {entry:?}"
             );
         }
     }
