@@ -26,6 +26,8 @@ duct = { version = "1", features = ["timeout"] }
 toride-apps = { version = "0.1", default-features = false }
 toride-runner = { version = "0.1" }
 toride-registry = { version = "0.1", default-features = false }
+toride-proxy = { version = "0.1", default-features = false }
+toride-wireguard = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 criterion = { workspace = true }

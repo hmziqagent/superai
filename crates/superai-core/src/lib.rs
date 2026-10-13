@@ -101,6 +101,9 @@ pub mod alias;
 /// harnesses that cannot relocate.
 pub mod profile;
 
+/// VPS deploy planning/execution and read-only status (subplan 16).
+pub mod vps;
+
 #[cfg(test)]
 mod test_util;
 

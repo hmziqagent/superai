@@ -2,6 +2,7 @@
 //! nothing below this crate knows an interface exists.
 
 mod usage;
+mod vps;
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -24,6 +25,8 @@ enum CliError {
     Pricing { reason: String },
     #[error("usage report failed: {reason}")]
     Report { reason: String },
+    #[error("vps: {0}")]
+    Vps(#[from] superai_core::vps::VpsError),
     #[error("failed printing to stdout: {reason}")]
     Output { reason: String },
 }
@@ -57,9 +60,10 @@ fn run(args: &[OsString]) -> Result<(), CliError> {
     match args.split_first() {
         None => list_instances(),
         Some((command, rest)) if command == "usage" => usage::run(rest, &home),
+        Some((command, rest)) if command == "vps" => vps::run(rest, &home),
         Some((command, _)) => Err(CliError::Args {
             reason: format!(
-                "unknown command `{}`; available: usage",
+                "unknown command `{}`; available: usage, vps",
                 bounded(command.to_string_lossy().as_ref())
             ),
         }),
