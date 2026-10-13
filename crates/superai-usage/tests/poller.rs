@@ -159,8 +159,6 @@ mod tests {
         endpoint
     }
 
-    // ----- parse-level fixtures, one per provider -----
-
     #[test]
     fn clinepass_limits_map_their_three_windows_raw() {
         let snapshot = parse_clinepass_limits(&fixture("clinepass-limits.json"))
@@ -382,8 +380,6 @@ mod tests {
         }
     }
 
-    // ----- loopback transport under the PRV-07 bounds -----
-
     #[test]
     fn clinepass_poll_sends_bearer_and_renders_a_snapshot() {
         let served = serve_once(ok_json(&fixture("clinepass-limits.json")));
@@ -555,8 +551,6 @@ mod tests {
         }
     }
 
-    // ----- the MiniMax host policy -----
-
     #[test]
     fn minimax_policy_accepts_clean_https_and_refuses_everything_sketchy() {
         assert_eq!(
@@ -593,8 +587,6 @@ mod tests {
         assert!(validate_minimax_endpoint_override("https://api.minimaxi.com", true).is_ok());
         assert!(validate_minimax_endpoint_override("https://proxy.example.com", true).is_err());
     }
-
-    // ----- the ClinePass session-file mode -----
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -729,7 +721,22 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    // ----- the structural no-background-polling rule -----
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_fifo_is_refused_without_opening_it() {
+        let dir = temp_dir("clinepass-fifo");
+        let path = dir.join("providers.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap_or_else(|e| panic!("spawn mkfifo: {e}"));
+        assert!(status.success(), "mkfifo(1) must exist to run this test");
+        // Opening a FIFO with no writer wedges forever; the stat-first
+        // refusal must answer before any open.
+        let error = clinepass_session(&path, 64).expect_err("a FIFO must be refused");
+        assert!(matches!(error, PollError::Invalid { .. }), "got {error:?}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
 
     #[test]
     fn poller_source_carries_no_background_machinery() {
@@ -762,20 +769,9 @@ mod tests {
     fn poll_functions_are_one_shot_by_signature() {
         // A watcher or recurring handle could not satisfy these fn-pointer
         // types: each poll returns an owned snapshot for one explicit call.
-        let clinepass: fn(
-            &str,
-            &PollSecret,
-            &PollLimits,
-        ) -> Result<ProviderUsageSnapshot, PollError> = poll_clinepass;
-        let warp: fn(&str, &PollSecret, &PollLimits) -> Result<ProviderUsageSnapshot, PollError> =
+        let _: fn(&str, &PollSecret, &PollLimits) -> Result<ProviderUsageSnapshot, PollError> =
+            poll_clinepass;
+        let _: fn(&str, &PollSecret, &PollLimits) -> Result<ProviderUsageSnapshot, PollError> =
             poll_warp;
-        assert_eq!(
-            size_of_val(&clinepass),
-            size_of::<fn(&str, &PollSecret, &PollLimits)>()
-        );
-        assert_eq!(
-            size_of_val(&warp),
-            size_of::<fn(&str, &PollSecret, &PollLimits)>()
-        );
     }
 }

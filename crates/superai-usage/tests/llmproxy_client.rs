@@ -33,8 +33,9 @@ mod tests {
     };
     use superai_usage::poller::PollLimits;
 
-    // abuse.rs sentinel: planted as the admin token everywhere.
-    const TOKEN: &str = "usage-test-token-4f2a9c-fake";
+    // abuse.rs sentinel: planted as the admin token everywhere, so
+    // assert_clean fails if any path echoes it.
+    const TOKEN: &str = superai_usage::abuse::LLMPROXY_ADMIN_SENTINEL;
 
     enum Reply {
         Respond { status: &'static str, body: String },
