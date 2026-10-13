@@ -116,6 +116,13 @@ pub enum CostError {
         /// Display-safe reason.
         reason: String,
     },
+    /// No absolute `XDG_CACHE_HOME` or `HOME`, so no cache root can be
+    /// pinned; a relative one would write into the working directory.
+    #[error("no absolute cache root: {reason}")]
+    InvalidCacheRoot {
+        /// Display-safe reason.
+        reason: String,
+    },
 }
 
 /// Result alias for cost-engine and pricing operations.
@@ -885,11 +892,20 @@ impl PricingCache {
         }
     }
 
-    /// superai's own cache root: `$XDG_CACHE_HOME/superai` else
-    /// `$HOME/.cache/superai`. Never inside a harness config dir.
-    pub fn default_root(xdg_cache_home: Option<&Path>, home: &Path) -> PathBuf {
-        let base = xdg_cache_home.unwrap_or(&home.join(".cache")).to_path_buf();
-        base.join("superai")
+    /// superai's cache root: an absolute `$XDG_CACHE_HOME/superai`, else
+    /// `$HOME/.cache/superai`; errs when neither base is absolute.
+    pub fn default_root(xdg_cache_home: Option<&Path>, home: &Path) -> CostResult<PathBuf> {
+        let base = match xdg_cache_home {
+            // XDG rule: a relative or empty XDG_CACHE_HOME is ignored.
+            Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+            _ if home.is_absolute() => home.join(".cache"),
+            _ => {
+                return Err(CostError::InvalidCacheRoot {
+                    reason: "XDG_CACHE_HOME and HOME are both non-absolute".to_owned(),
+                });
+            }
+        };
+        Ok(base.join("superai"))
     }
 
     /// The cache file path.

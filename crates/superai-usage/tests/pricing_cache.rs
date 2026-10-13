@@ -305,14 +305,21 @@ mod tests {
         let xdg = Path::new("/tmp/xdg-cache-home-fixture");
         let home = Path::new("/home fixture/user");
         assert_eq!(
-            PricingCache::default_root(Some(xdg), home),
+            PricingCache::default_root(Some(xdg), home).unwrap(),
             xdg.join("superai")
         );
         assert_eq!(
-            PricingCache::default_root(None, home),
+            PricingCache::default_root(None, home).unwrap(),
             home.join(".cache").join("superai")
         );
-        let cache = PricingCache::new(&PricingCache::default_root(Some(xdg), home));
+        for ignored_xdg in [Path::new("relative/xdg"), Path::new("")] {
+            assert_eq!(
+                PricingCache::default_root(Some(ignored_xdg), home).unwrap(),
+                home.join(".cache").join("superai"),
+                "a relative or empty XDG_CACHE_HOME must be ignored per the XDG rule"
+            );
+        }
+        let cache = PricingCache::new(&PricingCache::default_root(Some(xdg), home).unwrap());
         let path = cache.path();
         assert!(path.starts_with(xdg.join("superai")));
         assert_eq!(
@@ -328,6 +335,21 @@ mod tests {
             "the cache path must never climb out of its root: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn a_cache_root_never_resolves_relative_to_the_working_directory() {
+        for home in [Path::new(""), Path::new("relative-home")] {
+            let err = PricingCache::default_root(None, home).unwrap_err();
+            assert!(
+                matches!(err, CostError::InvalidCacheRoot { .. }),
+                "home `{:?}`: {err:?}",
+                home.display()
+            );
+        }
+        let err =
+            PricingCache::default_root(Some(Path::new("relative/xdg")), Path::new("")).unwrap_err();
+        assert!(matches!(err, CostError::InvalidCacheRoot { .. }), "{err:?}");
     }
 
     #[test]
