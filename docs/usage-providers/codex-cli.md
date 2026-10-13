@@ -22,8 +22,9 @@ family is `codex = [codex-cli, oh-my-codex]` because oh-my-codex inherits
 
 Three line kinds matter:
 
-- `turn_context`: sets the file-scoped model from `payload.model`
-  (or `payload.model_name`, or `payload.info.model`).
+- `turn_context`: sets the file-scoped model from `payload.model`,
+  `payload.model_name`, `payload.info.model`, or `payload.info.model_name`,
+  in that order.
 - `event_msg` with `payload.type == "token_count"`: the usage record. Needs
   top-level `timestamp` (RFC 3339) and `payload.info` with token counters.
   Model resolution tries `info.model`, `info.model_name`, the payload, the
