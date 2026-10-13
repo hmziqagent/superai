@@ -107,8 +107,14 @@ that use them, using plan 07 provider ids as the join key.
 
 ## Unverified and excluded
 
-Nothing new beyond subplan 14's list. CodexBar's per-provider docs stay a starting
-index, not the authority; every onboarding doc records its own verification date.
+The llmproxy `/usage` response schemas are assumed, not verified: PRX-03 has not
+shipped, so the fixtures in `crates/superai-usage/tests/fixtures/llmproxy/` are
+the baseline the client parses, not captures from a live ledger. Checking them
+against a deployed PRX-03 is owed when it ships; the punt is tracked as an
+`#[ignore]`d repro in `crates/superai-usage/tests/abuse_punted_leaks.rs`.
+Otherwise nothing new beyond subplan 14's list. CodexBar's per-provider docs
+stay a starting index, not the authority; every onboarding doc records its own
+verification date.
 
 ## Open questions
 

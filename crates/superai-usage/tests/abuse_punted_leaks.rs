@@ -1,4 +1,4 @@
-//! Punted leak ledger: known leaks verified against this tree, recorded as
+//! Punted-items ledger: known leaks and unverified wire schemas, recorded as
 //! `#[ignore]`d repros so the loop can read and act on them. Each test
 //! asserts the clean state its owning slice owes; run the repro with
 //! `cargo test -p superai-usage --test abuse_punted_leaks -- --ignored`
@@ -7,7 +7,7 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use jiff as _;
@@ -68,5 +68,39 @@ mod tests {
         let error = scan_history(&missing).unwrap_err();
         assert_no_sentinel_display(&error, "opencode open error display");
         assert_no_sentinel_debug(&error, "opencode open error debug");
+    }
+
+    #[ignore = "PUNTED, owning slice: the llmproxy client (USG-08, src/llmproxy.rs). PRX-03 is not deployed, so the /usage shapes in tests/fixtures/llmproxy/ are assumptions from the module doc, never checked against live endpoints. When PRX-03 ships: verify every fixture against the deployed endpoints, record one verified-date line per fixture in tests/fixtures/llmproxy/VERIFICATION.md, then drop this ignore"]
+    #[test]
+    fn llmproxy_fixture_shapes_must_carry_a_verification_record() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llmproxy");
+        let record = fs::read_to_string(dir.join("VERIFICATION.md")).unwrap_or_else(|e| {
+            panic!("no verification record for the assumed /usage shapes: {e}")
+        });
+        let fixtures = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read fixture dir: {e}"))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|e| panic!("read fixture dir entry: {e}"))
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        assert!(
+            !fixtures.is_empty(),
+            "fixture dir emptied; this ledger entry is stale"
+        );
+        for fixture in fixtures {
+            let entry = record
+                .lines()
+                .find(|line| line.contains(fixture.as_str()))
+                .unwrap_or_else(|| panic!("no verification entry for {fixture}"));
+            assert!(
+                entry.contains("verified"),
+                "entry for {fixture} carries no verification date: {entry}"
+            );
+        }
     }
 }
