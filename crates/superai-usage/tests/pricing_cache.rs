@@ -10,6 +10,7 @@ mod tests {
     // Lib deps that ride along as externs of this target without being
     // referenced directly.
     use jiff::Timestamp;
+    use rusqlite as _;
     use serde as _;
     use serde_json as _;
     use superai_core as _;

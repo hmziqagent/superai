@@ -6,6 +6,7 @@
 #[cfg(test)]
 mod tests {
     use jiff as _;
+    use rusqlite as _;
     use serde as _;
     use serde_json as _;
     use superai_core as _;

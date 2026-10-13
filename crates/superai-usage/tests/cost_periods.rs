@@ -8,6 +8,7 @@
 mod tests {
     use jiff::tz::TimeZone;
     use jiff::{Timestamp, Zoned};
+    use rusqlite as _;
     use serde as _;
     use serde_json as _;
     use superai_core as _;

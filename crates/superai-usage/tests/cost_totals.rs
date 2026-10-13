@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod tests {
     use jiff::Timestamp;
+    use rusqlite as _;
     use serde as _;
     use superai_core as _;
     use superai_usage::cost::{

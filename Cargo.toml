@@ -27,6 +27,7 @@ thiserror = "2"
 yaml-serde = { package = "yaml_serde", version = "0.10" }
 criterion = "0.8"
 jiff = { version = "0.2", features = ["serde"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
