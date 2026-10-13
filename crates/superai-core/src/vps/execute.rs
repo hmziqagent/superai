@@ -361,19 +361,24 @@ fn commit_unit(
         Existing::Foreign
     };
     let mode_before = remote.file_mode(REMOTE_UNIT_PATH)?.unwrap_or(0o644);
-    match remote.install_unit(name, content)? {
-        Some(backup_path) => run.backups.push(BackupRecord {
+    // The detail says which of the two things happened: a backup the
+    // rollback restores, or a fresh unit the rollback removes.
+    let detail = if let Some(backup_path) = remote.install_unit(name, content)? {
+        run.backups.push(BackupRecord {
             path: REMOTE_UNIT_PATH.to_owned(),
             backup_path,
             mode: mode_before,
             origin,
-        }),
-        None => run.created.push(REMOTE_UNIT_PATH.to_owned()),
-    }
+        });
+        format!("installed {name}.service with pre-write backup")
+    } else {
+        run.created.push(REMOTE_UNIT_PATH.to_owned());
+        format!("installed {name}.service; no prior unit, rollback removes it")
+    };
     run.unit_touched = true;
     run.entries.push(JournalEntry {
         step: planned.step.clone(),
-        detail: format!("installed {name}.service with pre-write backup"),
+        detail,
     });
     Ok(())
 }
@@ -538,6 +543,15 @@ mod tests {
         }));
         let manifest = remote.file(REMOTE_MANIFEST_PATH).unwrap();
         assert!(String::from_utf8_lossy(&manifest).contains("llmproxy.env"));
+        let unit_detail = journal.entries.iter().find_map(|entry| match &entry.step {
+            DeployStep::InstallUnit { name } if name == "llmproxy" => Some(entry.detail.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            unit_detail,
+            Some("installed llmproxy.service; no prior unit, rollback removes it"),
+            "a fresh-host install must not claim a backup"
+        );
     }
 
     #[test]
@@ -587,6 +601,15 @@ mod tests {
             remote
                 .file(REMOTE_UNIT_PATH)
                 .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains("DynamicUser=yes"))
+        );
+        let unit_detail = journal.entries.iter().find_map(|entry| match &entry.step {
+            DeployStep::InstallUnit { name } if name == "llmproxy" => Some(entry.detail.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            unit_detail,
+            Some("installed llmproxy.service with pre-write backup"),
+            "the journal names the backup it took"
         );
     }
 
