@@ -59,8 +59,8 @@ const PI_OUTPUT_KEYS: &[&str] = &[
 
 /// Claude transcript roots (`CodexBar`'s `ClaudeConfigPaths.costProjectsRoots`):
 /// the configured root's `projects/` when `CLAUDE_CONFIG_DIR` is set, else
-/// `~/.config/claude/projects` ahead of `~/.claude/projects`, plus any cswap
-/// slot roots present on disk.
+/// `~/.config/claude/projects` ahead of `~/.claude/projects`. Cswap slot
+/// roots join either way; upstream's slot loop sits outside the env guard.
 pub fn claude_projects_roots(
     claude_config_dir: Option<&str>,
     xdg_data_home: Option<&Path>,
@@ -72,11 +72,11 @@ pub fn claude_projects_roots(
     } else {
         roots.push(home.join(".config").join("claude").join("projects"));
         roots.push(home.join(".claude").join("projects"));
-        let legacy = home.join(".claude-swap-backup").join("sessions");
-        push_swap_slots(&legacy, &mut roots);
-        let xdg_base = absolute_or(xdg_data_home, &home.join(".local").join("share"));
-        push_swap_slots(&xdg_base.join("claude-swap").join("sessions"), &mut roots);
     }
+    let legacy = home.join(".claude-swap-backup").join("sessions");
+    push_swap_slots(&legacy, &mut roots);
+    let xdg_base = absolute_or(xdg_data_home, &home.join(".local").join("share"));
+    push_swap_slots(&xdg_base.join("claude-swap").join("sessions"), &mut roots);
     dedup_roots(roots)
 }
 
@@ -180,11 +180,12 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
 }
 
 /// Scan claude-code transcript JSONL under the resolved project roots.
-/// Streaming chunks repeat cumulative usage; the largest chunk per message
-/// is kept and a copied transcript under two roots counts once.
+/// Streaming chunks repeat cumulative usage; the most complete chunk per
+/// message wins, totals only break ties within one completeness class, and
+/// a copied transcript under two roots counts once.
 pub fn scan_claude_transcripts(roots: &[PathBuf]) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
-    let mut keyed: BTreeMap<ClaudeKey, UsageEvent> = BTreeMap::new();
+    let mut keyed: BTreeMap<ClaudeKey, KeptClaude> = BTreeMap::new();
     let mut unkeyed = Vec::new();
     for path in jsonl_files(roots, &mut outcome.unreadable_artifacts) {
         for_each_line(
@@ -205,13 +206,19 @@ pub fn scan_claude_transcripts(roots: &[PathBuf]) -> ScanOutcome {
             },
         );
     }
-    outcome.events = keyed.into_values().chain(unkeyed).collect();
+    outcome.events = keyed
+        .into_values()
+        .map(|kept| kept.event)
+        .chain(unkeyed)
+        .collect();
     outcome
 }
 
 /// Scan codex-cli rollout JSONL under the resolved session roots. Usage is
-/// the per-file delta of each record's cumulative `total_token_usage`
-/// (falling back to `last_token_usage`), so repeated records count once.
+/// the per-file delta of cumulative token totals (`total_token_usage`, the
+/// `last_token_usage` fallback, or a `token_usage_record` ledger line's
+/// `thread_token_usage`), so replays and token-count/ledger mirror pairs
+/// count once.
 /// Codex records cached reads as a subset of `input_tokens`; events split
 /// them so the input rate covers only the uncached remainder.
 pub fn scan_codex_rollouts(roots: &[PathBuf]) -> ScanOutcome {
@@ -539,6 +546,12 @@ enum LineOutcome<Row> {
 struct ClaudeRow {
     event: UsageEvent,
     key: Option<ClaudeKey>,
+    estimate_only: bool,
+}
+
+struct KeptClaude {
+    event: UsageEvent,
+    estimate_only: bool,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -648,7 +661,11 @@ fn claude_line(bytes: &[u8]) -> LineOutcome<ClaudeRow> {
                 }),
             }
         });
-    let row = ClaudeRow { event, key };
+    let row = ClaudeRow {
+        event,
+        key,
+        estimate_only,
+    };
     if estimate_only {
         LineOutcome::RowWithGap(row)
     } else {
@@ -664,20 +681,32 @@ fn event_total(event: &UsageEvent) -> u128 {
 }
 
 fn keep_claude_row(
-    keyed: &mut BTreeMap<ClaudeKey, UsageEvent>,
+    keyed: &mut BTreeMap<ClaudeKey, KeptClaude>,
     unkeyed: &mut Vec<UsageEvent>,
     row: ClaudeRow,
 ) {
-    match row.key {
-        Some(key) => {
-            let larger = keyed
-                .get(&key)
-                .is_none_or(|existing| event_total(existing) < event_total(&row.event));
-            if larger {
-                keyed.insert(key, row.event);
-            }
-        }
-        None => unkeyed.push(row.event),
+    let ClaudeRow {
+        key,
+        event,
+        estimate_only,
+    } = row;
+    let Some(key) = key else {
+        unkeyed.push(event);
+        return;
+    };
+    let keep = keyed.get(&key).is_none_or(|kept| {
+        (!estimate_only && kept.estimate_only)
+            || (estimate_only == kept.estimate_only
+                && event_total(&kept.event) < event_total(&event))
+    });
+    if keep {
+        keyed.insert(
+            key,
+            KeptClaude {
+                event,
+                estimate_only,
+            },
+        );
     }
 }
 
@@ -722,6 +751,40 @@ struct CodexFile {
     watermark: Option<CodexTotals>,
 }
 
+/// A regressing total is a stale replay; the watermark holds the high
+/// point so a replay or a mirrored ledger record re-emits nothing.
+fn advance(watermark: &mut Option<CodexTotals>, total: CodexTotals) -> CodexTotals {
+    let Some(prev) = *watermark else {
+        *watermark = Some(total);
+        return total;
+    };
+    *watermark = Some(CodexTotals {
+        input: prev.input.max(total.input),
+        cache_read: prev.cache_read.max(total.cache_read),
+        output: prev.output.max(total.output),
+    });
+    CodexTotals {
+        input: total.input.saturating_sub(prev.input),
+        cache_read: total.cache_read.saturating_sub(prev.cache_read),
+        output: total.output.saturating_sub(prev.output),
+    }
+}
+
+fn codex_row(timestamp: Timestamp, model: &str, tokens: CodexTotals) -> LineOutcome<UsageEvent> {
+    if tokens.is_zero() {
+        return LineOutcome::Parsed;
+    }
+    LineOutcome::Row(UsageEvent {
+        timestamp,
+        provider: OPENAI.to_owned(),
+        model: model.to_owned(),
+        input_tokens: tokens.input.saturating_sub(tokens.cache_read),
+        output_tokens: tokens.output,
+        cache_read_tokens: Some(tokens.cache_read),
+        cache_write_tokens: None,
+    })
+}
+
 fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
     let Some(line) = parse_object(bytes) else {
         return LineOutcome::Skipped;
@@ -731,7 +794,32 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
     };
     let payload = line.get("payload");
     match kind {
-        "token_usage_record" => LineOutcome::Skipped,
+        "token_usage_record" => {
+            let Some(payload) = payload.filter(|p| p.is_object()) else {
+                return LineOutcome::Skipped;
+            };
+            let Some(timestamp) = line
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(rfc3339)
+            else {
+                return LineOutcome::Skipped;
+            };
+            let model = text_field(payload, &["model", "model_name"])
+                .or(text_field(&line, &["model", "model_name"]))
+                .or(file.model.as_deref());
+            let Some(model) = model else {
+                return LineOutcome::Skipped;
+            };
+            let Some(total) = payload
+                .get("thread_token_usage")
+                .filter(|t| t.is_object())
+                .and_then(CodexTotals::read)
+            else {
+                return LineOutcome::Skipped;
+            };
+            codex_row(timestamp, model, advance(&mut file.watermark, total))
+        }
         "turn_context" => {
             let model = payload
                 .and_then(|payload| text_field(payload, &["model", "model_name"]))
@@ -778,27 +866,7 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
                 None => None,
             };
             let tokens = match total {
-                // A regressing total is a stale replay; the watermark
-                // keeps the high point so a replay never re-emits tokens.
-                Some(total) => {
-                    let (delta, next) = match file.watermark {
-                        Some(prev) => (
-                            CodexTotals {
-                                input: total.input.saturating_sub(prev.input),
-                                cache_read: total.cache_read.saturating_sub(prev.cache_read),
-                                output: total.output.saturating_sub(prev.output),
-                            },
-                            CodexTotals {
-                                input: prev.input.max(total.input),
-                                cache_read: prev.cache_read.max(total.cache_read),
-                                output: prev.output.max(total.output),
-                            },
-                        ),
-                        None => (total, total),
-                    };
-                    file.watermark = Some(next);
-                    delta
-                }
+                Some(total) => advance(&mut file.watermark, total),
                 None => match info
                     .get("last_token_usage")
                     .filter(|l| l.is_object())
@@ -808,18 +876,7 @@ fn codex_line(bytes: &[u8], file: &mut CodexFile) -> LineOutcome<UsageEvent> {
                     None => return LineOutcome::Skipped,
                 },
             };
-            if tokens.is_zero() {
-                return LineOutcome::Parsed;
-            }
-            LineOutcome::Row(UsageEvent {
-                timestamp,
-                provider: OPENAI.to_owned(),
-                model: model.to_owned(),
-                input_tokens: tokens.input.saturating_sub(tokens.cache_read),
-                output_tokens: tokens.output,
-                cache_read_tokens: Some(tokens.cache_read),
-                cache_write_tokens: None,
-            })
+            codex_row(timestamp, model, tokens)
         }
         _ => LineOutcome::Parsed,
     }

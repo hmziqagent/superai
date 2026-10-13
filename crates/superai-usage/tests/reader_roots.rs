@@ -93,6 +93,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_swap_slots_join_the_roots_even_when_claude_config_dir_is_set() {
+        let home = temp_dir("claude-env-swap-home");
+        let xdg = temp_dir("claude-env-swap-xdg");
+        let legacy = home.join(".claude-swap-backup").join("sessions");
+        fs::create_dir_all(legacy.join("7-live").join("projects"))
+            .unwrap_or_else(|e| panic!("legacy slot: {e}"));
+        let xdg_slot = xdg.join("claude-swap").join("sessions").join("2-two");
+        fs::create_dir_all(xdg_slot.join("projects")).unwrap_or_else(|e| panic!("xdg slot: {e}"));
+        assert_eq!(
+            claude_projects_roots(Some("/custom/claude"), Some(&xdg), &home),
+            vec![
+                PathBuf::from("/custom/claude/projects"),
+                canonical(&legacy.join("7-live").join("projects")),
+                canonical(&xdg_slot.join("projects")),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn claude_symlinked_duplicate_roots_collapse_to_one() {
