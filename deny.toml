@@ -12,7 +12,18 @@ multiple-versions = "warn"
 
 [licenses]
 version = 2
-allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "CDLA-Permissive-2.0", "MPL-2.0"]
+# Zlib: foldhash (via hashbrown under rusqlite), OSI-approved permissive;
+# reviewed 2026-10-13, same rationale as option-ext/MPL-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "BSD-3-Clause",
+    "ISC",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "Zlib",
+]
 
 [sources]
 unknown-registry = "deny"
