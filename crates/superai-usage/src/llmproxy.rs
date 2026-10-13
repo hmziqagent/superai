@@ -1,9 +1,10 @@
 //! Client for a deployed llmproxy's `/usage` ledger (USG-08, subplan 15;
 //! endpoint semantics frozen in docs/plans/export/llmproxy-usage-ledger.md
 //! PRX-03). PRX-03 fixes semantics, not JSON keys: the shapes recorded in
-//! `tests/fixtures/llmproxy/` are the assumed baseline for drift checking,
-//! unknown fields are ignored, and missing or off-format fields surface as
-//! `None` rather than failing the response.
+//! `tests/fixtures/llmproxy/` are the assumed baseline for drift checking.
+//! Unknown fields are ignored, missing fields surface as `None`, and a
+//! field present with an unusable type fails the whole response loudly
+//! (cost and timestamps additionally tolerate off-format values as `None`).
 
 use std::fmt;
 use std::fs::File;
@@ -413,7 +414,7 @@ impl LedgerClient {
         ];
         let bytes = self.get_bounded(SUMMARY_PATH, &query)?;
         serde_json::from_slice(&bytes).map_err(|e| LedgerError::Parse {
-            reason: bound_reason(&e.to_string()),
+            reason: shape_reason(&e),
         })
     }
 
@@ -439,7 +440,7 @@ impl LedgerClient {
         }
         let bytes = self.get_bounded(REQUESTS_PATH, &pairs)?;
         serde_json::from_slice(&bytes).map_err(|e| LedgerError::Parse {
-            reason: bound_reason(&e.to_string()),
+            reason: shape_reason(&e),
         })
     }
 
@@ -447,7 +448,7 @@ impl LedgerClient {
     pub fn keys(&self) -> Result<UsageKeys, LedgerError> {
         let bytes = self.get_bounded(KEYS_PATH, &[])?;
         serde_json::from_slice(&bytes).map_err(|e| LedgerError::Parse {
-            reason: bound_reason(&e.to_string()),
+            reason: shape_reason(&e),
         })
     }
 
@@ -547,8 +548,9 @@ fn read_token_file(path: &Path) -> Result<AdminToken, LedgerError> {
         path: path.display().to_string(),
         reason,
     };
-    // Pre-open stat refuses FIFOs and symlinks without following; the open
-    // fd's own metadata stays the authority on mode and size.
+    // Pre-open stat refuses FIFOs and symlinks without following; matching
+    // dev/ino against the open fd proves nothing swapped the path in between,
+    // and the fd's own metadata stays the authority on mode and size.
     let stat = std::fs::symlink_metadata(path).map_err(|e| refused(format!("unreadable: {e}")))?;
     if !stat.is_file() {
         return Err(refused("not a regular file".to_owned()));
@@ -559,7 +561,10 @@ fn read_token_file(path: &Path) -> Result<AdminToken, LedgerError> {
         .map_err(|e| refused(format!("stat failed: {e}")))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if (stat.dev(), stat.ino()) != (meta.dev(), meta.ino()) {
+            return Err(refused("path changed between checks".to_owned()));
+        }
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Err(refused(format!("mode {mode:o} is not 0600")));
@@ -626,9 +631,9 @@ fn redirect_target(
     resolve_redirect(current, &location)
 }
 
-/// Resolve a redirect `Location`: absolute http(s), or an absolute path on
-/// the current origin; anything else is refused. The target re-passes
-/// endpoint validation, queries allowed, before the next request.
+/// Resolve a redirect `Location` (absolute http(s) or a same-origin path).
+/// The target re-passes endpoint validation and must stay on the ledger's
+/// origin, so the admin token is never re-sent to a host the ledger names.
 fn resolve_redirect(base: &str, location: &str) -> Result<String, LedgerError> {
     let refused = |reason: String| LedgerError::InvalidBase {
         reason: format!("redirect target `{location}` refused: {reason}"),
@@ -644,13 +649,18 @@ fn resolve_redirect(base: &str, location: &str) -> Result<String, LedgerError> {
     } else {
         return Err(refused("location must be absolute".to_owned()));
     };
+    if origin_of(base) != origin_of(&resolved) {
+        return Err(refused("leaves the ledger origin".to_owned()));
+    }
     endpoint_url_reason(&resolved).map_or(Ok(resolved), |reason| Err(refused(reason)))
 }
 
+/// Scheme plus authority of a URL, the part a redirect must preserve.
 fn origin_of(url: &str) -> Option<&str> {
-    let rest = url.get(url.find("://")? + 3..)?;
+    let scheme_end = url.find("://")?;
+    let rest = url.get(scheme_end + 3..)?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest.get(..authority_end)
+    url.get(..scheme_end + 3 + authority_end)
 }
 
 fn normalize_base(raw: &str) -> Result<String, LedgerError> {
@@ -721,8 +731,15 @@ fn strip_port(authority: &str) -> &str {
     authority.split(':').next().unwrap_or_default()
 }
 
-fn bound_reason(reason: &str) -> String {
-    reason.chars().take(160).collect()
+/// serde's own message quotes response-body values, which must never reach
+/// a log; only the error category and position survive here.
+fn shape_reason(error: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
 }
 
 fn deserialize_cost_option<'de, D>(deserializer: D) -> Result<Option<Usd>, D::Error>

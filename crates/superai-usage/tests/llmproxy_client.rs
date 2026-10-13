@@ -371,6 +371,10 @@ mod tests {
             },
             Reply::Respond {
                 status: "200 OK",
+                body: format!("{{\"rows\":[{{\"requests\":\"{TOKEN}\"}}]}}"),
+            },
+            Reply::Respond {
+                status: "200 OK",
                 body: "not json".to_owned(),
             },
         ]);
@@ -401,14 +405,36 @@ mod tests {
         assert_eq!(empty.rows.len(), 0);
         assert_eq!(empty.total_cost(), Some(Usd::ZERO));
 
-        assert!(matches!(
-            client.summary("24h", SummaryGroupBy::Provider),
-            Err(LedgerError::Parse { .. })
-        ));
-        assert!(matches!(
-            client.summary("24h", SummaryGroupBy::Provider),
-            Err(LedgerError::Parse { .. })
-        ));
+        let missing_rows = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("a summary without rows should not parse"));
+        assert!(
+            matches!(missing_rows, LedgerError::Parse { .. }),
+            "{missing_rows:?}"
+        );
+
+        let wrong_typed = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("a sentinel-typed count should not parse"));
+        assert!(
+            matches!(wrong_typed, LedgerError::Parse { .. }),
+            "{wrong_typed:?}"
+        );
+        let reason = wrong_typed.to_string();
+        assert_clean("parse error", &reason);
+        assert_clean("parse error debug", &format!("{wrong_typed:?}"));
+        assert!(
+            reason.contains("line"),
+            "the reason should still locate the drift: {reason}"
+        );
+
+        let garbage = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("garbage should not parse"));
+        assert!(matches!(garbage, LedgerError::Parse { .. }), "{garbage:?}");
     }
 
     #[test]
@@ -512,7 +538,7 @@ mod tests {
 
     #[test]
     fn oversize_responses_are_refused_by_the_byte_cap() {
-        let oversized: String = "x".repeat(4096);
+        let oversized = format!("{}{TOKEN}", "x".repeat(4096));
         let mock = MockLedger::start(vec![Reply::Respond {
             status: "200 OK",
             body: oversized,
@@ -530,32 +556,82 @@ mod tests {
             matches!(error, LedgerError::TooLarge { max_bytes: 128 }),
             "{error:?}"
         );
+        assert_clean("byte-cap error", &error.to_string());
+        assert_clean("byte-cap error debug", &format!("{error:?}"));
     }
 
     #[test]
-    fn redirects_are_followed_only_after_revalidation() {
-        let target = MockLedger::start(vec![Reply::Respond {
-            status: "200 OK",
-            body: fixture("summary-provider.json"),
-        }]);
-        let hop = MockLedger::start(vec![Reply::Redirect {
-            location: format!("{}/usage/summary", target.base_url()),
-        }]);
-        let client = make_client(&hop.base_url());
+    fn redirects_stay_on_the_ledger_origin_or_are_refused() {
+        let mock = MockLedger::start(vec![
+            Reply::Redirect {
+                location: "/usage/summary?retry=1".to_owned(),
+            },
+            Reply::Respond {
+                status: "200 OK",
+                body: fixture("summary-provider.json"),
+            },
+        ]);
+        let client = make_client(&mock.base_url());
         let summary = client
             .summary("24h", SummaryGroupBy::Provider)
-            .unwrap_or_else(|e| panic!("redirected summary failed: {e:?}"));
+            .unwrap_or_else(|e| panic!("same-origin redirect failed: {e:?}"));
         assert_eq!(summary.rows.len(), 2);
-        for (label, mock) in [("hop", hop), ("target", target)] {
-            let sent = mock.sent();
+        let sent = mock.sent();
+        assert_eq!(sent.len(), 2);
+        for request in &sent {
             assert_eq!(
-                sent.first()
-                    .unwrap_or_else(|| panic!("{label}: no request"))
-                    .authorization
-                    .as_deref(),
-                Some(format!("Bearer {TOKEN}").as_str())
+                request.authorization.as_deref(),
+                Some(format!("Bearer {TOKEN}").as_str()),
+                "same-origin redirect must keep the admin auth"
             );
+            assert!(request.target.starts_with("/usage/summary"));
         }
+
+        let off_origin = MockLedger::start(vec![Reply::Respond {
+            status: "200 OK",
+            body: "{\"rows\":[]}".to_owned(),
+        }]);
+        let malicious = MockLedger::start(vec![Reply::Redirect {
+            location: format!("{}/usage/summary", off_origin.base_url()),
+        }]);
+        let client = make_client(&malicious.base_url());
+        let error = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("cross-origin redirect must be refused"));
+        assert!(
+            matches!(error, LedgerError::InvalidBase { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("origin"),
+            "reason should name the origin rule: {error}"
+        );
+        assert_eq!(
+            off_origin.sent().len(),
+            0,
+            "the token must never reach the off-origin host"
+        );
+        assert_eq!(malicious.sent().len(), 1);
+        assert_clean("cross-origin redirect", &error.to_string());
+
+        let collector = MockLedger::start(vec![Reply::Redirect {
+            location: "https://collector.example/usage/summary".to_owned(),
+        }]);
+        let client = make_client(&collector.base_url());
+        let error = client
+            .summary("24h", SummaryGroupBy::Provider)
+            .err()
+            .unwrap_or_else(|| panic!("a shape-valid foreign https target must still be refused"));
+        assert!(
+            matches!(error, LedgerError::InvalidBase { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("origin"),
+            "reason should name the origin rule: {error}"
+        );
+        assert_eq!(collector.sent().len(), 1);
 
         let refused = MockLedger::start(vec![Reply::Redirect {
             location: "http://user:secret@127.0.0.1:9/usage/summary".to_owned(),
@@ -564,7 +640,7 @@ mod tests {
         let error = client
             .summary("24h", SummaryGroupBy::Provider)
             .err()
-            .unwrap_or_else(|| panic!("cross-origin redirect should be refused"));
+            .unwrap_or_else(|| panic!("userinfo-bearing redirect should be refused"));
         assert!(
             matches!(error, LedgerError::InvalidBase { .. }),
             "{error:?}"
