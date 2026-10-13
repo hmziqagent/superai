@@ -1185,4 +1185,20 @@ mod tests {
             assert!(res.compatible);
         }
     }
+
+    #[test]
+    fn usage_surface_keeps_desktop_locator_recorded_as_not_modeled() {
+        let surface = adapter()
+            .usage_surface()
+            .expect("claude-code declares a usage surface");
+        assert!(
+            surface.not_modeled_roots.iter().any(|note| {
+                note.contains("local-agent-mode-sessions")
+                    && note.contains("claude-code-sessions")
+                    && note.contains(".claude/projects")
+            }),
+            "the desktop locator roots must stay recorded, got {:?}",
+            surface.not_modeled_roots
+        );
+    }
 }
