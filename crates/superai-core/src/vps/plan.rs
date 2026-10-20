@@ -658,7 +658,7 @@ pub fn plan_deploy(
         false,
         &ours,
     )?);
-    if let Some(bytes) = env_bytes.clone() {
+    if let Some(bytes) = env_bytes {
         steps.push(upload_step(
             remote,
             REMOTE_ENV_PATH,
@@ -672,7 +672,7 @@ pub fn plan_deploy(
     provider_steps(
         &request.providers,
         request.geo_exit.as_deref(),
-        env_bytes.is_some(),
+        request.env_file.is_some(),
         remote,
         &ours,
     )?
