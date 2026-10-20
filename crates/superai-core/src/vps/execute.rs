@@ -273,11 +273,10 @@ fn commit_one(
             let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
             let output = remote.exec(&borrowed).map_err(fail)?;
             if !output.success() {
-                return Err(format!(
-                    "`{}` exited {:?}",
-                    argv.first().map_or("", String::as_str),
-                    output.exit
-                ));
+                return Err(fail(RemoteError::ExecFailed {
+                    program: argv.first().cloned().unwrap_or_default(),
+                    exit: output.exit,
+                }));
             }
             run.entries.push(JournalEntry {
                 step: planned.step.clone(),
@@ -696,6 +695,37 @@ mod tests {
             start_detail,
             Some("llmproxy already active; start reconfirmed it"),
             "the start step must record the pre-existing state"
+        );
+    }
+
+    #[test]
+    fn a_nonzero_remote_exec_fails_the_step_through_the_typed_error() {
+        // A fresh fixture has no enabled site, so its `nginx -t` exits 1.
+        let remote = FixtureRemote::new("root@host");
+        let argv = vec!["nginx".to_owned(), "-t".to_owned()];
+        let planned = PlannedStep {
+            step: DeployStep::Exec { argv: argv.clone() },
+            preview: StepPreview::Run { argv },
+            payload: Payload::Bare,
+        };
+        let mut run = Run {
+            backend: remote.describe(),
+            entries: Vec::new(),
+            backups: Vec::new(),
+            created: Vec::new(),
+            started: Vec::new(),
+            restarted: Vec::new(),
+            unit_touched: false,
+        };
+        let reason = commit_one(&planned, &remote, &mut run, &[]).unwrap_err();
+        assert_eq!(
+            VpsError::from(RemoteError::ExecFailed {
+                program: "nginx".to_owned(),
+                exit: Some(1),
+            })
+            .to_string(),
+            reason,
+            "a nonzero exec must surface as the typed ExecFailed error"
         );
     }
 
