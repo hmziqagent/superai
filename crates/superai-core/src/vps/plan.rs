@@ -56,16 +56,19 @@ pub struct ProviderToml {
 
 impl ProviderToml {
     fn carries_egress_table(&self) -> bool {
-        self.content.lines().any(|line| line.trim() == "[egress]")
+        self.content
+            .lines()
+            .any(|line| line.trim() == "[provider.egress]")
     }
 
     /// Content as deployed: the user TOML plus the egress table when a
-    /// geo-exit forward proxy was requested.
+    /// geo-exit forward proxy was requested. The `[provider.egress]`
+    /// spelling is the frozen contract's own example (llmproxy plan PRX-04).
     fn effective(&self, geo_exit: Option<&str>) -> String {
         match geo_exit {
             None => self.content.clone(),
             Some(address) => format!(
-                "{}\n[egress]\nproxy = \"socks5h://{address}\"\n",
+                "{}\n[provider.egress]\nproxy = \"socks5h://{address}\"\n",
                 self.content.trim_end()
             ),
         }
@@ -506,7 +509,8 @@ fn validate_providers(request: &DeployRequest) -> Result<(), VpsError> {
             return Err(validation(
                 "geo_exit",
                 format!(
-                    "provider `{}` already carries an [egress] table; remove it or drop geo-exit",
+                    "provider `{}` already carries a [provider.egress] table; remove it or drop \
+                     geo-exit",
                     provider.name
                 ),
             ));
@@ -1615,7 +1619,7 @@ mod tests {
             ) => {
                 let text = String::from_utf8(bytes.clone()).unwrap();
                 assert!(
-                    text.contains("[egress]\nproxy = \"socks5h://10.7.0.1:3128\""),
+                    text.contains("[provider.egress]\nproxy = \"socks5h://10.7.0.1:3128\""),
                     "{text}"
                 );
                 assert!(content.contains("proxy = \"socks5h://10.7.0.1:3128\""));
@@ -1627,11 +1631,11 @@ mod tests {
         let mut dupe = tls_request(&dir);
         dupe.providers = vec![ProviderToml {
             name: "anthropic".to_owned(),
-            content: "[egress]\nproxy = \"x\"\n".to_owned(),
+            content: "[provider.egress]\nproxy = \"x\"\n".to_owned(),
         }];
         dupe.geo_exit = Some("10.7.0.1:3128".to_owned());
         let err = plan_deploy(&dupe, &remote).unwrap_err();
-        assert!(err.to_string().contains("[egress]"), "{err}");
+        assert!(err.to_string().contains("[provider.egress]"), "{err}");
     }
 
     #[test]

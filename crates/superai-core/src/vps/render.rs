@@ -281,9 +281,11 @@ pub(crate) fn harness_base_url(mode: &str, address: &str) -> String {
 }
 
 /// The llmproxy server config: binds and auth, secret values as `${NAME}`
-/// placeholders the deploy interpolates on the VPS. Table and key spellings
-/// follow docs/plans/export/llmproxy-usage-ledger.md (PRX-01/PRX-03); the
-/// main `bind` key name is an assumption pending that contract's own fixes.
+/// placeholders the deploy interpolates on the VPS. `[auth.admin]` and
+/// `[auth.clients]` match the frozen contract (llmproxy plan PRX-01/03);
+/// the `bind` and `admin_bind` spellings under `[server]` are this repo's
+/// assumption — the contract's `[server.admin_bind]` names the mount but
+/// no inner key, so the shape waits on that contract's own implementation.
 /// Client keys are mandatory because both deploy modes expose the listener
 /// beyond loopback (nginx in TLS mode, the tunnel interface otherwise).
 pub(crate) fn render_server_conf(main_bind: &str, admin_bind: &str) -> String {
