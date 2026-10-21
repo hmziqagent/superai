@@ -51,7 +51,7 @@ fn safe_channel(channel: &str) -> bool {
 #[derive(Debug, thiserror::Error)]
 pub enum OpenCodeError {
     /// The database could not be opened read-only (missing, unreadable,
-    /// locked, or not a regular file).
+    /// locked, or not a regular file; symlinks are refused too).
     #[error("opencode database open failed: {0}")]
     Open(OpenDbFailure),
     /// The history query failed before any row was read.
@@ -100,7 +100,10 @@ WHERE parsed.type = 'assistant'
 /// dropped, never fatal. A failure after rows have folded keeps those rows
 /// and counts the unread remainder as one skip, so the result is a floor.
 pub fn scan_history(db_path: &Path) -> Result<RecordedUsage, OpenCodeError> {
-    match std::fs::metadata(db_path) {
+    // Symlink-aware stat before open: a symlink, FIFO, or device node is
+    // refused before SQLite can block on it (the JSONL walk and llmproxy
+    // loader guard the same hazard).
+    match std::fs::symlink_metadata(db_path) {
         Ok(meta) if meta.is_file() => {}
         Ok(_) => {
             return Err(OpenCodeError::Open(OpenDbFailure::NotRegularFile(
@@ -330,6 +333,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_database_is_refused_before_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "superai-opencode-symlink-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.db");
+        std::fs::write(&real, b"sqlite bytes").unwrap();
+        let linked = dir.join("opencode.db");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        match scan_history(&linked) {
+            Err(OpenCodeError::Open(OpenDbFailure::NotRegularFile(path))) => {
+                assert_eq!(path, linked);
+            }
+            other => panic!("a symlinked database must be refused, got {other:?}"),
+        }
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     #[test]
     fn history_query_selects_from_allowlisted_tables_only() {
         let (refs, ctes) = referenced_tables(HISTORY_QUERY);
@@ -385,6 +410,21 @@ mod tests {
         assert_eq!(real, ["credential", "session_v2"]);
     }
 
+    #[test]
+    fn table_capture_continues_the_comma_scan_past_a_derived_table() {
+        let (refs, _) = referenced_tables(
+            "SELECT x FROM (SELECT y FROM session_message) AS parsed, credential",
+        );
+        assert!(
+            refs.iter().any(|table| table == "credential"),
+            "the table comma-joined after a derived table's alias must be captured: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|table| table == "session_message"),
+            "the derived table's inner FROM must still be captured: {refs:?}"
+        );
+    }
+
     const CLAUSE_KEYWORDS: [&str; 15] = [
         "where", "on", "group", "order", "limit", "offset", "join", "left", "right", "inner",
         "outer", "cross", "natural", "full", "union",
@@ -398,31 +438,34 @@ mod tests {
         let mut refs = Vec::new();
         let mut ctes = Vec::new();
         let mut i = 0;
+        // The walk visits every word so a derived table's inner FROM gets its
+        // own clause pass; each pass only pushes, never skips ahead.
         while let Some(word) = words.get(i) {
             let keyword = word.to_ascii_lowercase();
             if keyword == "from" || keyword == "join" {
-                i = tables_after_from(&words, i, &mut refs);
+                table_clause_refs(&words, i, &mut refs);
             } else if keyword == "with" {
                 collect_cte_names(&words, i, &mut ctes);
-                i += 1;
-            } else {
-                i += 1;
             }
+            i += 1;
         }
         (refs, ctes)
     }
 
-    /// Walk index just past one FROM/JOIN clause: the first table (a
-    /// subquery's inner FROMs are found by the caller's own walk), then any
-    /// comma-joined tables up to the next clause keyword.
-    fn tables_after_from(words: &[String], i: usize, refs: &mut Vec<String>) -> usize {
+    /// Push the tables of the clause starting at the FROM/JOIN at `i`: the
+    /// first table (none for a derived table, whose body the main walk
+    /// revisits), then comma-joined tables up to the next clause keyword.
+    fn table_clause_refs(words: &[String], i: usize, refs: &mut Vec<String>) {
         let Some(first) = words.get(i + 1) else {
-            return i + 1;
+            return;
         };
-        if first.as_str() != "(" {
+        let start = if first.as_str() == "(" {
+            after_balanced_parens(words, i + 1)
+        } else {
             refs.push(first.clone());
-        }
-        comma_joined_tables(words, i + 2, refs)
+            i + 2
+        };
+        comma_joined_tables(words, start, refs);
     }
 
     fn comma_joined_tables(words: &[String], start: usize, refs: &mut Vec<String>) -> usize {
@@ -434,6 +477,8 @@ mod tests {
                 j += 2;
             } else if keyword == "as" {
                 j += 2;
+            } else if token.as_str() == "(" {
+                j = after_balanced_parens(words, j);
             } else if ends_from_list(&keyword, token) {
                 return j;
             } else {
@@ -444,7 +489,7 @@ mod tests {
     }
 
     fn ends_from_list(keyword: &str, token: &str) -> bool {
-        keyword == "select" || token == "(" || token == ")" || CLAUSE_KEYWORDS.contains(&keyword)
+        keyword == "select" || token == ")" || CLAUSE_KEYWORDS.contains(&keyword)
     }
 
     fn push_unless_subquery(words: &[String], at: usize, refs: &mut Vec<String>) {
