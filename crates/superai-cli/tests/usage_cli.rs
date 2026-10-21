@@ -159,6 +159,22 @@ mod tests {
             .env_clear()
             .env("HOME", home)
             .env("USERPROFILE", home);
+        // WinSock cannot load mswsock.dll without SYSTEMROOT, so a cleared
+        // env makes every child TCP connect fail with os error 10106.
+        #[cfg(windows)]
+        for name in [
+            "SYSTEMROOT",
+            "SYSTEMDRIVE",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+        ] {
+            if let Ok(value) = std::env::var(name) {
+                command.env(name, value);
+            }
+        }
         for (name, value) in extra_env {
             command.env(name, value);
         }
