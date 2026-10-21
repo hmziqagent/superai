@@ -372,11 +372,18 @@ mod tests {
         // never anything that could hide a redaction miss.
         let mut transport: Option<PollError> = None;
         let error = 'attempts: {
-            for _ in 0..2 {
-                let url = format!(
-                    "http://{}/usage?api_key={COOKIE_SENTINEL}",
-                    redirect_listener()
-                );
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                let addr = redirect_listener();
+                // Split std networking from the ureq path: this probe names
+                // the raw OS error when the binary cannot do loopback at all.
+                match std::net::TcpStream::connect(addr) {
+                    Ok(probe) => drop(probe),
+                    Err(raw) => panic!("raw loopback connect failed: {raw}"),
+                }
+                let url = format!("http://{addr}/usage?api_key={COOKIE_SENTINEL}");
                 match poll_zed(&url, &PollSecret::new(COOKIE_SENTINEL), &limits()) {
                     Err(error @ PollError::Redirect { .. }) => break 'attempts error,
                     Err(error @ PollError::Transport { .. }) => transport = Some(error),
