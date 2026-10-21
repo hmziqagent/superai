@@ -866,21 +866,64 @@ mod decl_tests {
 
     /// `version_resolution()` equals deriving from a fresh detection, so a
     /// caller holding one may substitute `version_resolution_from` and skip
-    /// the second probe cycle. Only pinned when two probes agree.
+    /// the second probe cycle. Ambient harness binaries (claude, pi, gh, ...)
+    /// make `detection()` a budgeted probe that flaps under parallel load, so
+    /// the check runs in a child whose PATH resolves nothing: every detection
+    /// is probe-free and the equality is deterministic.
     #[test]
     fn version_resolution_matches_derivation_from_a_fresh_detection() {
-        for adapter in harness_catalog::all_adapters() {
-            let id = adapter.id().as_str().to_owned();
-            let first = adapter.detection();
-            let second = adapter.detection();
-            if first == second {
+        const PINNED: &str = "SUPERAI_VERSION_RESOLUTION_PINNED";
+        const PINNED_OUT: &str = "SUPERAI_VERSION_RESOLUTION_PINNED_OUT";
+        if std::env::var_os(PINNED).is_some() {
+            let mut checked = 0usize;
+            for adapter in harness_catalog::all_adapters() {
+                let id = adapter.id().as_str().to_owned();
+                let first = adapter.detection();
+                assert_eq!(
+                    first,
+                    adapter.detection(),
+                    "{id}: probe-free detection must be reproducible"
+                );
                 assert_eq!(
                     adapter.version_resolution_from(&first),
                     adapter.version_resolution(),
                     "{id}: derivation diverged from the probing path"
                 );
+                checked += 1;
             }
+            if let Some(out) = std::env::var_os(PINNED_OUT) {
+                std::fs::write(&out, checked.to_string())
+                    .unwrap_or_else(|e| panic!("report checked count: {e}"));
+            }
+            return;
         }
+        let proof_root = crate::test_util::temp_dir_unique("version-resolution-pinned");
+        let proof = proof_root.join("checked");
+        let child = std::process::Command::new(
+            std::env::current_exe().unwrap_or_else(|e| panic!("current exe: {e}")),
+        )
+        .arg("--exact")
+        .arg("adapters::decl_tests::version_resolution_matches_derivation_from_a_fresh_detection")
+        .env("PATH", "")
+        .env(PINNED, "1")
+        .env(PINNED_OUT, &proof)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn pinned child: {e}"));
+        assert!(
+            child.status.success(),
+            "pinned child failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let checked: usize = std::fs::read_to_string(&proof)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        assert!(
+            checked == harness_catalog::all_adapters().len(),
+            "pinned child checked {checked} adapters"
+        );
+        drop(std::fs::remove_dir_all(&proof_root));
     }
 
     /// An adapter overriding neither resolution method terminates in the
