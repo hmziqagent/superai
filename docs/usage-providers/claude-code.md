@@ -79,7 +79,11 @@ merged with any loadable models.dev cache under
 `$HOME/.cache/superai/...`). Units are USD per 1M tokens, input, output,
 cache-read, and cache-write each priced where the catalog prices them. These
 are estimates, never a bill. Unpriced model ids surface as `missing_pricing`;
-skipped lines and unreadable artifacts make every total a floor.
+skipped lines and unreadable artifacts make every total a floor. No
+long-context threshold tier is priced: the dossier records one upstream
+(CostUsagePricing.swift:763-794), but neither the bundled table nor the
+models.dev catalog publishes threshold rates, so such events estimate at the
+base rate until a rate source exists.
 
 ## Upstream links
 

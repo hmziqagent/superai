@@ -494,11 +494,13 @@ fn text_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 /// `usage.cache_creation.ephemeral_1h_input_tokens`, clamped to
 /// `[0, cache_write_tokens]`; absent reads as 0, unreadable spoils the payload.
 fn claude_one_hour(usage: &Value, cache_write_tokens: u64) -> Option<u64> {
-    let found = usage
-        .get("cache_creation")
-        .filter(|c| c.is_object())
-        .and_then(|c| c.get("ephemeral_1h_input_tokens"));
-    match found {
+    let Some(container) = usage.get("cache_creation") else {
+        return Some(0);
+    };
+    if !container.is_object() {
+        return None;
+    }
+    match container.get("ephemeral_1h_input_tokens") {
         None => Some(0),
         Some(value) => value.as_u64().map(|n| n.min(cache_write_tokens)),
     }

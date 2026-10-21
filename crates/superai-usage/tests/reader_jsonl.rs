@@ -819,9 +819,14 @@ mod tests {
             br#"{"type":"assistant","timestamp":"2026-10-13T09:00:00Z","message":{"id":"m2","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":"4"}}}}"#,
         )
         .unwrap_or_else(|e| panic!("claude 1h corpus: {e}"));
+        fs::write(
+            claude_dir.join("c.jsonl"),
+            br#"{"type":"assistant","timestamp":"2026-10-13T09:00:00Z","message":{"id":"m3","model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":5,"cache_creation":"x"}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("claude 1h container corpus: {e}"));
         let claude = scan_claude_transcripts(&[claude_dir]);
         assert_eq!(claude.counts.parsed, 0);
-        assert_eq!(claude.counts.skipped, 2);
+        assert_eq!(claude.counts.skipped, 3);
         assert_eq!(claude.events.len(), 0);
 
         let codex_dir = dir.join("codex");
