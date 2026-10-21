@@ -356,14 +356,11 @@ mod tests {
             // Serve every connection until the test binary exits: a client
             // reconnect must meet the same 302, not a dead listener.
             while let Ok((mut stream, _)) = listener.accept() {
-                if std::io::Write::write_all(
+                std::io::Write::write_all(
                     &mut stream,
                     b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
-                .is_err()
-                {
-                    continue;
-                }
+                .unwrap_or_else(|e| panic!("write redirect response: {e}"));
             }
         });
         let url = format!("http://{addr}/usage?api_key={COOKIE_SENTINEL}");
