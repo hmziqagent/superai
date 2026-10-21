@@ -60,7 +60,8 @@ const PI_OUTPUT_KEYS: &[&str] = &[
 /// Claude transcript roots (`CodexBar`'s `ClaudeConfigPaths.costProjectsRoots`):
 /// the configured root's `projects/` when `CLAUDE_CONFIG_DIR` is set, else
 /// `~/.config/claude/projects` ahead of `~/.claude/projects`. Cswap slot
-/// roots join either way; upstream's slot loop sits outside the env guard.
+/// roots join either way, on the platforms upstream guards them: legacy is
+/// linux+macos, the XDG family linux only (`ClaudeConfigPaths.swift:39-46`).
 pub fn claude_projects_roots(
     claude_config_dir: Option<&str>,
     xdg_data_home: Option<&Path>,
@@ -73,10 +74,18 @@ pub fn claude_projects_roots(
         roots.push(home.join(".config").join("claude").join("projects"));
         roots.push(home.join(".claude").join("projects"));
     }
-    let legacy = home.join(".claude-swap-backup").join("sessions");
-    push_swap_slots(&legacy, &mut roots);
-    let xdg_base = absolute_or(xdg_data_home, &home.join(".local").join("share"));
-    push_swap_slots(&xdg_base.join("claude-swap").join("sessions"), &mut roots);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    push_swap_slots(
+        &home.join(".claude-swap-backup").join("sessions"),
+        &mut roots,
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let xdg_base = absolute_or(xdg_data_home, &home.join(".local").join("share"));
+        push_swap_slots(&xdg_base.join("claude-swap").join("sessions"), &mut roots);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = xdg_data_home;
     dedup_roots(roots)
 }
 
@@ -634,16 +643,10 @@ fn claude_line(bytes: &[u8]) -> LineOutcome<ClaudeRow> {
     {
         return LineOutcome::Parsed;
     }
-    let cache_counters_absent = usage.as_object().is_some_and(|usage| {
-        !usage.contains_key("cache_read_input_tokens")
-            && !usage.contains_key("cache_creation_input_tokens")
-    });
-    // A proxy-era estimate carries input only and never a stop reason;
-    // its tokens stay but the scan must stay a flagged floor.
-    let estimate_only = message.get("stop_reason") == Some(&Value::Null)
-        && input_tokens > 0
-        && output_tokens == 0
-        && cache_counters_absent;
+    // The dossier's incomplete row: stop_reason null with input tokens and
+    // zero output (+Claude.swift:220); cache counters play no part.
+    let estimate_only =
+        message.get("stop_reason") == Some(&Value::Null) && input_tokens > 0 && output_tokens == 0;
     let event = UsageEvent {
         timestamp,
         provider: ANTHROPIC.to_owned(),

@@ -15,9 +15,9 @@ resolved in this order (`claude_projects_roots` in
 - `CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is set and
   non-empty; otherwise `~/.config/claude/projects`, then
   `~/.claude/projects`.
-- Cswap slot roots, appended either way:
-  `~/.claude-swap-backup/sessions/<N>-*/projects` and
-  `$XDG_DATA_HOME/claude-swap/sessions/<N>-*/projects` (default
+- Cswap slot roots, appended either way on their platforms:
+  `~/.claude-swap-backup/sessions/<N>-*/projects` (linux and macos) and
+  `$XDG_DATA_HOME/claude-swap/sessions/<N>-*/projects` (linux only, default
   `~/.local/share`). Slot directories must start with a positive number.
 
 Every `*.jsonl` file under the roots is scanned, deduplicated by canonical
@@ -42,11 +42,12 @@ the top level unless noted:
 
 Streaming chunks repeat cumulative usage per message; per dedup key the
 reader keeps the most complete row, so a copied transcript under two roots
-counts once. Rows with all four counters at zero parse but emit nothing. A
-proxy-era estimate (`stop_reason` null, input only, no cache counters)
-never displaces a full row for its key whatever the totals; it keeps its
-tokens and flags the scan as a coverage gap (`unscanned_records`). Within
-one class the row with the larger token total wins.
+counts once. Rows with all four counters at zero parse but emit nothing. An
+incomplete row (`stop_reason` null with input tokens and zero output, the
+dossier's predicate; cache counters play no part) never displaces a complete
+row for its key whatever the totals; it keeps its tokens and flags the scan
+as a coverage gap (`unscanned_records`). Within one class the row with the
+larger token total wins.
 
 Fixture example: `tests/fixtures/claude/projects/home-project/session-one.jsonl`.
 

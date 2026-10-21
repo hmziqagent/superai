@@ -71,6 +71,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn claude_swap_slots_with_positive_numeric_prefixes_join_the_roots() {
         let home = temp_dir("claude-swap-home");
@@ -93,6 +94,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn claude_swap_slots_join_the_roots_even_when_claude_config_dir_is_set() {
         let home = temp_dir("claude-env-swap-home");

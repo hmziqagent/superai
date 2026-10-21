@@ -176,6 +176,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unfinished_row_with_cache_counters_is_still_an_estimate() {
+        let with_cache_counters = json!({
+            "type": "assistant",
+            "timestamp": "2026-10-13T09:30:00Z",
+            "sessionId": "sess-merge",
+            "requestId": "req-merge",
+            "message": {
+                "id": "msg-merge",
+                "model": "claude-sonnet-4-5",
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": 500,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 5,
+                    "output_tokens": 0
+                },
+            },
+        });
+        let corpus = write_corpus(
+            "claude-estimate-cache-counters",
+            &[
+                with_cache_counters.to_string().into_bytes(),
+                claude_complete(10, 5).into_bytes(),
+            ],
+        );
+        let root = corpus.parent().unwrap_or_else(|| Path::new("."));
+        let outcome = scan_claude_transcripts(&[root.to_path_buf()]);
+        assert_eq!(
+            event_summary(&outcome),
+            vec![("anthropic", "claude-sonnet-4-5", 10, 5, 0, 0)],
+            "the dossier's predicate is stop_reason/input/output only, so cache counters must not exempt the row"
+        );
+        assert_eq!(outcome.counts.skipped, 1);
+    }
+
+    #[test]
     fn claude_events_price_exactly_through_the_cost_engine() {
         let outcome = scan_claude_transcripts(&[fixtures().join("claude/projects")]);
         let engine = CostEngine::new(
