@@ -346,22 +346,43 @@ mod tests {
         }
     }
 
+    fn read_request_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !(head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 8192) {
+            match std::io::Read::read(stream, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        }
+        head
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the listener moves into the server thread and dies with it"
+    )]
+    fn serve_redirects(listener: TcpListener) {
+        // Serve every connection until the test binary exits; aborted or
+        // probe connections consume an accept and are simply dropped.
+        while let Ok((mut stream, _)) = listener.accept() {
+            if read_request_head(&mut stream).is_empty() {
+                continue;
+            }
+            drop(std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ));
+            drop(std::io::Write::flush(&mut stream));
+        }
+    }
+
     fn redirect_listener() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
         let addr = listener
             .local_addr()
             .unwrap_or_else(|e| panic!("addr: {e}"));
-        std::thread::spawn(move || {
-            // Serve every connection until the test binary exits: a client
-            // reconnect must meet the same 302, not a dead listener.
-            while let Ok((mut stream, _)) = listener.accept() {
-                std::io::Write::write_all(
-                    &mut stream,
-                    b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap_or_else(|e| panic!("write redirect response: {e}"));
-            }
-        });
+        std::thread::spawn(move || serve_redirects(listener));
         addr
     }
 
