@@ -239,48 +239,37 @@ mod tests {
 
     #[test]
     fn empty_override_is_treated_as_unset() {
+        let xdg = std::env::temp_dir();
         assert_eq!(
-            history_db_path(
-                Some(Path::new("")),
-                Some(Path::new("/data")),
-                Path::new("/home/u"),
-                None
-            ),
-            Some(Path::new("/data").join("opencode").join("opencode.db"))
+            history_db_path(Some(Path::new("")), Some(&xdg), Path::new("/home/u"), None),
+            Some(xdg.join("opencode").join("opencode.db"))
         );
     }
 
     #[test]
     fn default_channel_uses_the_plain_file_name() {
+        let xdg = std::env::temp_dir();
         assert_eq!(
-            history_db_path(None, Some(Path::new("/data")), Path::new("/home/u"), None),
-            Some(Path::new("/data").join("opencode").join("opencode.db"))
+            history_db_path(None, Some(&xdg), Path::new("/home/u"), None),
+            Some(xdg.join("opencode").join("opencode.db"))
         );
     }
 
     #[test]
     fn blank_channel_is_the_default_channel() {
+        let xdg = std::env::temp_dir();
         assert_eq!(
-            history_db_path(
-                None,
-                Some(Path::new("/data")),
-                Path::new("/home/u"),
-                Some("  ")
-            ),
-            Some(Path::new("/data").join("opencode").join("opencode.db"))
+            history_db_path(None, Some(&xdg), Path::new("/home/u"), Some("  ")),
+            Some(xdg.join("opencode").join("opencode.db"))
         );
     }
 
     #[test]
     fn non_default_channel_suffixed_file_name() {
+        let xdg = std::env::temp_dir();
         assert_eq!(
-            history_db_path(
-                None,
-                Some(Path::new("/data")),
-                Path::new("/home/u"),
-                Some("beta")
-            ),
-            Some(Path::new("/data").join("opencode").join("opencode-beta.db"))
+            history_db_path(None, Some(&xdg), Path::new("/home/u"), Some("beta")),
+            Some(xdg.join("opencode").join("opencode-beta.db"))
         );
     }
 
