@@ -8,7 +8,9 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output, Stdio};
+    #[cfg(unix)]
+    use std::process::Stdio;
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rusqlite::{Connection, params};
