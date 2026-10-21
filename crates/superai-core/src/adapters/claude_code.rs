@@ -506,7 +506,8 @@ impl Adapter for ClaudeCodeAdapter {
                 )
                 .with_not_modeled_root(
                     "~/Library/Application Support/Claude/{local-agent-mode-sessions,\
-                     claude-code-sessions} desktop locator: BFS depth<=4 to .claude/projects",
+                     claude-code-sessions} desktop locator (joins only while CLAUDE_CONFIG_DIR\
+                     is unset or empty): BFS depth<=4 to .claude/projects",
                 ),
         )
     }

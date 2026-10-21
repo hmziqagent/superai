@@ -216,6 +216,15 @@ mod tests {
             ),
             ("home/.pi/agent/sessions/pi.jsonl", b"pi session bytes"),
             ("home/.omp/agent/sessions/omp.jsonl", b"omp session bytes"),
+            ("data/omp/sessions/omp.jsonl", b"omp xdg store bytes"),
+            (
+                "home/.omp/profiles/work/sessions/omp.jsonl",
+                b"omp profile session bytes",
+            ),
+            (
+                "data/omp/profiles/team/sessions/omp.jsonl",
+                b"omp xdg profile session bytes",
+            ),
             (
                 "home/Library/Application Support/Windsurf/User/globalStorage/state.vscdb",
                 b"windsurf plan-cache bytes",

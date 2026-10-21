@@ -455,15 +455,43 @@ impl Adapter for PiAdapter {
     }
     fn usage_surface(&self) -> Option<UsageSurface> {
         Some(
-            UsageSurface::new(UsageReaderKind::TranscriptJsonl, None).with_artifact(
-                "sessions",
-                PathResolver::new(
-                    Some("$PI_CODING_AGENT_DIR/sessions"),
-                    Some("$PI_CODING_AGENT_DIR/sessions"),
-                    Some("%PI_CODING_AGENT_DIR%\\sessions"),
-                    "~/.pi/agent/sessions (PI_CODING_AGENT_SESSION_DIR overrides)",
+            UsageSurface::new(UsageReaderKind::TranscriptJsonl, None)
+                .with_artifact(
+                    "sessions",
+                    PathResolver::new(
+                        Some("$PI_CODING_AGENT_DIR/sessions"),
+                        Some("$PI_CODING_AGENT_DIR/sessions"),
+                        Some("%PI_CODING_AGENT_DIR%\\sessions"),
+                        "~/.pi/agent/sessions (PI_CODING_AGENT_SESSION_DIR overrides)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-agent-sessions",
+                    PathResolver::fallback_only(
+                        "~/.omp/agent/sessions (PI_CONFIG_DIR relocates ~/.omp)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-xdg-sessions",
+                    PathResolver::new(
+                        Some("$XDG_DATA_HOME/omp/sessions"),
+                        Some("$XDG_DATA_HOME/omp/sessions"),
+                        None,
+                        "$XDG_DATA_HOME/omp/sessions (default ~/.local/share/omp/sessions)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-profile-sessions",
+                    PathResolver::fallback_only(
+                        "~/.omp/profiles/<profile>/{sessions,agent/sessions} (OMP_PROFILE-selected)",
+                    ),
+                )
+                .with_artifact(
+                    "omp-xdg-profile-sessions",
+                    PathResolver::fallback_only(
+                        "$XDG_DATA_HOME/omp/profiles/<profile>/{sessions,agent/sessions}",
+                    ),
                 ),
-            ),
         )
     }
 }
