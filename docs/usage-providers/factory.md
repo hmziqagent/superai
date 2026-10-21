@@ -17,8 +17,8 @@ a Bearer key. Shape (`parse_factory_limits`):
   standard lanes (5 h, 7 day, monthly). Each window is `{usedPercent,
   windowEnd, secondsRemaining}`; `usedPercent` is required when the window is
   present, `windowEnd` may be an RFC 3339 string or an epoch number (seconds
-  versus milliseconds split at `> 1e12`), and `secondsRemaining > 0` renders a
-  "resets in Ns" description.
+  versus milliseconds split at `> 1e12`; anything else is a parse refusal),
+  and `secondsRemaining > 0` renders a "resets in Ns" description.
 - `limits.core`: the same three windows, emitted as named extras with ids
   `factory-core-fiveHour`, `factory-core-weekly`, and
   `factory-core-monthly` (titled "Core 5h", "Core 7-day", "Core monthly"),

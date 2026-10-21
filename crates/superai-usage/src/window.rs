@@ -1,6 +1,7 @@
 //! Quota window model (USG-04), porting `CodexBar`'s `RateWindow`
 //! (`UsageFetcher.swift:3-21`): raw values, explicit lane states.
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// One provider-reported quota window; values stay raw, over-quota
@@ -11,8 +12,9 @@ pub struct RateWindow {
     pub used_percent: f64,
     /// Window length in minutes, when the provider reports it.
     pub window_minutes: Option<u32>,
-    /// Provider-reported reset time, when available.
-    pub resets_at: Option<String>,
+    /// Provider-reported reset instant, when available (`UsageFetcher.swift`
+    /// decodes a typed date, never a raw string).
+    pub resets_at: Option<Timestamp>,
     /// Provider-supplied reset description, when available.
     pub reset_description: Option<String>,
     /// Percent restored on the next regeneration tick, for
@@ -23,8 +25,11 @@ pub struct RateWindow {
 impl RateWindow {
     /// Provider-reported `resets_at` wins; a reset computed from local
     /// logs fills in only when the provider reported none.
-    pub fn resolved_resets_at<'a>(&'a self, computed: Option<&'a str>) -> Option<&'a str> {
-        self.resets_at.as_deref().or(computed)
+    pub fn resolved_resets_at<'a>(
+        &'a self,
+        computed: Option<&'a Timestamp>,
+    ) -> Option<&'a Timestamp> {
+        self.resets_at.as_ref().or(computed)
     }
 }
 
@@ -89,8 +94,11 @@ mod tests {
     }
 
     fn window_with_reset(used_percent: f64, resets_at: &str) -> RateWindow {
+        let resets_at = resets_at
+            .parse()
+            .unwrap_or_else(|e| panic!("test reset {resets_at} is not an instant: {e}"));
         RateWindow {
-            resets_at: Some(resets_at.to_owned()),
+            resets_at: Some(resets_at),
             ..window(used_percent)
         }
     }
@@ -118,8 +126,11 @@ mod tests {
         assert!(zero.window().is_some());
         assert!(incomplete.used_percent().is_none());
         assert_eq!(
-            incomplete.window().map(|w| w.resets_at.as_deref()),
-            Some(Some("2026-10-13T10:00:00Z"))
+            incomplete
+                .window()
+                .and_then(|w| w.resets_at.as_ref())
+                .map(Timestamp::to_string),
+            Some("2026-10-13T10:00:00Z".to_owned())
         );
 
         assert_ne!(unavailable, zero);
@@ -158,24 +169,32 @@ mod tests {
     #[test]
     fn provider_reported_reset_is_preferred_over_a_computed_one() {
         let window = window_with_reset(40.0, "2026-10-13T10:00:00Z");
+        let computed = "2026-10-13T09:00:00Z"
+            .parse()
+            .unwrap_or_else(|e| panic!("computed instant rejected: {e}"));
+        let same = window.resets_at;
 
         assert_eq!(
-            window.resolved_resets_at(Some("2026-10-13T09:00:00Z")),
-            Some("2026-10-13T10:00:00Z")
+            window
+                .resolved_resets_at(Some(&computed))
+                .map(Timestamp::to_string),
+            Some("2026-10-13T10:00:00Z".to_owned())
         );
-        assert_eq!(
-            window.resolved_resets_at(None),
-            Some("2026-10-13T10:00:00Z")
-        );
+        assert_eq!(window.resolved_resets_at(None), same.as_ref());
     }
 
     #[test]
     fn computed_reset_fills_in_only_when_the_provider_reported_none() {
         let window = window(40.0);
+        let computed = "2026-10-13T11:30:00Z"
+            .parse()
+            .unwrap_or_else(|e| panic!("computed instant rejected: {e}"));
 
         assert_eq!(
-            window.resolved_resets_at(Some("2026-10-13T11:30:00Z")),
-            Some("2026-10-13T11:30:00Z")
+            window
+                .resolved_resets_at(Some(&computed))
+                .map(Timestamp::to_string),
+            Some("2026-10-13T11:30:00Z".to_owned())
         );
         assert_eq!(window.resolved_resets_at(None), None);
     }

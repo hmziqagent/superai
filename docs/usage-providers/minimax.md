@@ -31,7 +31,8 @@ Shape (`parse_minimax_remains`): `data.model_remains[]`, one entry per model:
   `(current_interval_total_count - current_interval_usage_count) /
   current_interval_total_count` when the percent field is absent.
 - Window length from `start_time`/`end_time` epochs (seconds versus
-  milliseconds split at `> 1e12`); reset instant from `end_time`.
+  milliseconds split at `> 1e12`); reset instant from `end_time`, a malformed
+  epoch refused rather than dropped.
 - A non-zero `base_resp.status_code`, at the data level or the root, is an
   error, not a zero reading.
 

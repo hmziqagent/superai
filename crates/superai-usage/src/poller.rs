@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use superai_core::health::{MAX_RESPONSE_BYTES, redact_url, validate_timeout};
@@ -188,7 +189,7 @@ impl ProviderUsageSnapshot {
     fn empty(provider: &'static str) -> Self {
         Self {
             provider,
-            fetched_at: jiff::Timestamp::now().to_string(),
+            fetched_at: Timestamp::now().to_string(),
             primary: LaneReading::Unavailable,
             secondary: LaneReading::Unavailable,
             tertiary: LaneReading::Unavailable,
@@ -208,7 +209,7 @@ fn parse_err(reason: &str) -> PollError {
 fn lane(
     used_percent: f64,
     window_minutes: Option<u32>,
-    resets_at: Option<String>,
+    resets_at: Option<Timestamp>,
     reset_description: Option<String>,
 ) -> LaneReading {
     LaneReading::Measured(RateWindow {
@@ -286,26 +287,32 @@ fn coerce_int(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-/// ISO-8601 for a provider-reported epoch, keeping MiniMax/Factory's
-/// seconds-versus-milliseconds heuristic (`> 1e12` means milliseconds).
+/// Parse a provider-reported reset stamp; a malformed one is a parse
+/// refusal, never a silently dropped window boundary.
+fn reset_instant(text: &str) -> Result<Timestamp, PollError> {
+    text.trim()
+        .parse()
+        .map_err(|_error| parse_err("reset time must be an RFC 3339 timestamp"))
+}
+
+/// ISO-8601 instant for a provider-reported epoch, keeping MiniMax/Factory's
+/// seconds-versus-milliseconds heuristic (`> 1e12` means milliseconds). An
+/// epoch outside both ranges is a parse refusal, not a silent None.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "epoch magnitudes are bounded by the heuristic before the cast"
 )]
-fn epoch_iso(epoch: f64) -> Option<String> {
+fn epoch_iso(epoch: f64) -> Result<Timestamp, PollError> {
+    let out_of_range = || parse_err("epoch reset time is outside the second or millisecond ranges");
     if !epoch.is_finite() || epoch <= 0.0 {
-        return None;
+        return Err(out_of_range());
     }
     if epoch > 1e12 {
-        jiff::Timestamp::from_millisecond(epoch as i64)
-            .ok()
-            .map(|stamp| stamp.to_string())
+        Timestamp::from_millisecond(epoch as i64).map_err(|_error| out_of_range())
     } else if epoch > 1e9 {
-        jiff::Timestamp::from_second(epoch as i64)
-            .ok()
-            .map(|stamp| stamp.to_string())
+        Timestamp::from_second(epoch as i64).map_err(|_error| out_of_range())
     } else {
-        None
+        Err(out_of_range())
     }
 }
 
@@ -595,12 +602,12 @@ pub fn clinepass_session(
     path: &Path,
     max_bytes: usize,
 ) -> Result<Option<ClinePassSession>, PollError> {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Ok(None);
     };
     // Stat before open, never the reverse: opening a FIFO blocks before any
-    // read exists to bound, so non-regular paths are refused first (the
-    // registry loader guards the same hazard for *.json data files).
+    // read exists to bound, so non-regular paths (symlinks included) are
+    // refused first (the registry loader guards the same hazard).
     if !meta.is_file() {
         return Err(PollError::Invalid {
             reason: format!("{} is not a regular file", path.display()),
@@ -669,8 +676,10 @@ pub fn parse_clinepass_limits(body: &str) -> Result<ProviderUsageSnapshot, PollE
         };
         let reading = match raw.get("resetsAt") {
             None | Some(Value::Null) => lane(percent, Some(*minutes), None, None),
-            Some(Value::String(reset)) => lane(percent, Some(*minutes), Some(reset.clone()), None),
-            Some(_) => return Err(parse_err("resetsAt must be a string or null")),
+            Some(Value::String(reset)) => {
+                lane(percent, Some(*minutes), Some(reset_instant(reset)?), None)
+            }
+            Some(_) => return Err(parse_err("resetsAt must be a timestamp or null")),
         };
         windows.push((kind, reading));
     }
@@ -949,8 +958,8 @@ pub fn parse_warp_graphql(body: &str) -> Result<ProviderUsageSnapshot, PollError
     let requests_used = coerce_int(info.get("requestsUsedSinceLastRefresh")).unwrap_or(0);
     let reset = match info.get("nextRefreshTime") {
         None | Some(Value::Null) => None,
-        Some(Value::String(reset)) => Some(reset.clone()),
-        Some(_) => return Err(parse_err("nextRefreshTime must be a string or null")),
+        Some(Value::String(reset)) => Some(reset_instant(reset)?),
+        Some(_) => return Err(parse_err("nextRefreshTime must be a timestamp or null")),
     };
     let percent = if unlimited || limit <= 0 {
         0.0
@@ -1041,9 +1050,13 @@ fn factory_lane(window: Option<&Value>, minutes: Option<u32>) -> Result<LaneRead
         .ok_or_else(|| parse_err("usedPercent must be a finite number"))?;
     let resets_at = match window.get("windowEnd") {
         None | Some(Value::Null) => None,
-        Some(Value::String(reset)) => Some(reset.clone()),
-        Some(Value::Number(number)) => number.as_f64().and_then(finite_f64).and_then(epoch_iso),
-        Some(_) => return Err(parse_err("windowEnd must be a string or epoch number")),
+        Some(Value::String(reset)) => Some(reset_instant(reset)?),
+        Some(Value::Number(number)) => number
+            .as_f64()
+            .and_then(finite_f64)
+            .map(epoch_iso)
+            .transpose()?,
+        Some(_) => return Err(parse_err("windowEnd must be a timestamp or epoch number")),
     };
     let description = number_field(window, "secondsRemaining")
         .filter(|seconds| *seconds > 0.0)
@@ -1290,16 +1303,14 @@ fn minimax_percent(entry: &Value) -> Option<f64> {
     }
 }
 
-fn minimax_window(entry: &Value) -> (Option<u32>, Option<String>) {
-    let minutes = number_field(entry, "start_time")
-        .zip(number_field(entry, "end_time"))
-        .and_then(|(start, end)| epoch_minutes(start, end));
+fn minimax_window(entry: &Value) -> Result<(Option<u32>, Option<Timestamp>), PollError> {
+    let Some(end) = number_field(entry, "end_time") else {
+        return Ok((None, None));
+    };
+    let minutes = number_field(entry, "start_time").and_then(|start| epoch_minutes(start, end));
     match minutes {
-        Some(minutes) => (
-            Some(minutes),
-            number_field(entry, "end_time").and_then(epoch_iso),
-        ),
-        None => (None, None),
+        Some(minutes) => Ok((Some(minutes), Some(epoch_iso(end)?))),
+        None => Ok((None, None)),
     }
 }
 
@@ -1327,7 +1338,7 @@ pub fn parse_minimax_remains(body: &str) -> Result<ProviderUsageSnapshot, PollEr
     };
     let mut snapshot = ProviderUsageSnapshot::empty("minimax");
     if let Some(percent) = minimax_percent(first) {
-        let (minutes, reset) = minimax_window(first);
+        let (minutes, reset) = minimax_window(first)?;
         snapshot.primary = lane(percent, minutes, reset, None);
     }
     for model in models.iter().skip(1) {
@@ -1335,7 +1346,7 @@ pub fn parse_minimax_remains(body: &str) -> Result<ProviderUsageSnapshot, PollEr
             continue;
         };
         if let Some(percent) = minimax_percent(model) {
-            let (minutes, reset) = minimax_window(model);
+            let (minutes, reset) = minimax_window(model)?;
             snapshot.extras.push(NamedLane {
                 id: name.to_owned(),
                 title: name.to_owned(),

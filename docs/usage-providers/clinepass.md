@@ -16,8 +16,9 @@ One documented endpoint, GET
 array; each entry is `{type, percentUsed, resetsAt}` with `type` one of
 `five_hour`, `weekly`, `monthly`. The three types map onto the three standard
 lanes with fixed window lengths (5 h, 7 day, 30 day); `percentUsed` is taken
-raw, over-quota magnitudes included, and `resetsAt` (string or null) becomes
-the lane's reset instant. Unknown window types are skipped.
+raw, over-quota magnitudes included, and `resetsAt` (RFC 3339 string or null)
+becomes the lane's reset instant; a malformed stamp is a parse refusal.
+Unknown window types are skipped.
 
 Session-file mode reads Cline's own settings, read-only. File resolution
 (`clinepass_providers_path`): `CLINE_PROVIDER_SETTINGS_PATH` (a file), then

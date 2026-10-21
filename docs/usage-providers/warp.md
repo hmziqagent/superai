@@ -23,8 +23,8 @@ Shape (`parse_warp_graphql`):
   requestsUsedSinceLastRefresh, nextRefreshTime}`. The primary lane fills
   with `requestsUsedSinceLastRefresh / requestLimit * 100` and a
   `"N / M credits"` description; `isUnlimited` renders an unlimited lane at
-  0 percent. `nextRefreshTime` (string or null) becomes the lane's reset
-  instant.
+  0 percent. `nextRefreshTime` (RFC 3339 string or null) becomes the lane's
+  reset instant; a malformed stamp is a parse refusal.
 - Bonus grants: `data.user.user.bonusGrants[]` plus
   `workspaces[].bonusGrantsInfo.grants[]`, each `{requestCreditsGranted,
   requestCreditsRemaining, expiration}`. All grants combine into one secondary

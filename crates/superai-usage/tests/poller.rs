@@ -21,7 +21,6 @@ use superai_usage::poller::{
 };
 use superai_usage::window::LaneReading;
 
-use jiff as _;
 use rusqlite as _;
 use serde as _;
 use superai_core as _;
@@ -37,6 +36,11 @@ mod tests {
     use super::*;
 
     const SENTINEL: &str = "sk-superai-test-sentinel-12345-fake";
+
+    fn instant(iso: &str) -> jiff::Timestamp {
+        iso.parse()
+            .unwrap_or_else(|e| panic!("test instant {iso} rejected: {e}"))
+    }
 
     fn limits() -> PollLimits {
         PollLimits::new(Duration::from_secs(5), 1_048_576)
@@ -175,7 +179,46 @@ mod tests {
         let LaneReading::Measured(five_hour) = &snapshot.primary else {
             panic!("five-hour lane missing");
         };
-        assert_eq!(five_hour.resets_at.as_deref(), Some("2026-10-13T18:00:00Z"));
+        assert_eq!(five_hour.resets_at, Some(instant("2026-10-13T18:00:00Z")));
+    }
+
+    #[test]
+    fn a_malformed_reset_stamp_is_a_parse_refusal() {
+        // clinepass: resetsAt not a timestamp.
+        assert!(
+            parse_clinepass_limits(
+                r#"{"success": true, "data": {"limits": [
+                {"type": "five_hour", "percentUsed": 1.0, "resetsAt": "next tuesday"}
+            ]}}"#
+            )
+            .is_err()
+        );
+        // warp: nextRefreshTime not a timestamp.
+        assert!(
+            parse_warp_graphql(
+                r#"{"data": {"user": {"user": {"requestLimitInfo": {
+                "isUnlimited": false, "nextRefreshTime": "whenever",
+                "requestLimit": 10, "requestsUsedSinceLastRefresh": 1
+            }}}}}"#
+            )
+            .is_err()
+        );
+        // factory: epoch below the seconds range is refused, not dropped.
+        assert!(
+            parse_factory_limits(
+                r#"{"limits": {"standard": {"fiveHour":
+                {"usedPercent": 1.0, "windowEnd": 123}}}}"#
+            )
+            .is_err()
+        );
+        // factory: windowEnd neither timestamp nor epoch.
+        assert!(
+            parse_factory_limits(
+                r#"{"limits": {"standard": {"fiveHour":
+                {"usedPercent": 1.0, "windowEnd": true}}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -255,11 +298,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("fixture rejected: {e}"));
         assert!(close(used_percent_of(&snapshot.primary), 25.0));
         assert_eq!(
-            snapshot
-                .primary
-                .window()
-                .and_then(|w| w.resets_at.as_deref()),
-            Some("2026-11-01T00:00:00Z")
+            snapshot.primary.window().and_then(|w| w.resets_at),
+            Some(instant("2026-11-01T00:00:00Z"))
         );
         assert!(close(used_percent_of(&snapshot.secondary), 40.0));
     }
@@ -283,9 +323,9 @@ mod tests {
             panic!("weekly lane missing");
         };
         assert_eq!(
-            weekly.resets_at.as_deref(),
-            Some("2025-10-19T02:40:00Z"),
-            "epoch seconds windowEnd must render as ISO-8601"
+            weekly.resets_at.map(|at| at.to_string()),
+            Some("2025-10-19T02:40:00Z".to_owned()),
+            "epoch seconds windowEnd must parse into a typed instant"
         );
         let LaneReading::Measured(monthly) = &snapshot.tertiary else {
             panic!("monthly lane missing");
@@ -811,6 +851,20 @@ mod tests {
         // Opening a FIFO with no writer wedges forever; the stat-first
         // refusal must answer before any open.
         let error = clinepass_session(&path, 64).expect_err("a FIFO must be refused");
+        assert!(matches!(error, PollError::Invalid { .. }), "got {error:?}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_providers_file_is_refused() {
+        let dir = temp_dir("clinepass-symlink");
+        let real = dir.join("real.json");
+        std::fs::write(&real, fixture("clinepass-providers.json"))
+            .unwrap_or_else(|e| panic!("write fixture: {e}"));
+        let linked = dir.join("providers.json");
+        std::os::unix::fs::symlink(&real, &linked).unwrap_or_else(|e| panic!("symlink: {e}"));
+        let error = clinepass_session(&linked, 64).expect_err("a symlink must be refused");
         assert!(matches!(error, PollError::Invalid { .. }), "got {error:?}");
         drop(std::fs::remove_dir_all(&dir));
     }
