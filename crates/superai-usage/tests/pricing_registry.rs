@@ -171,12 +171,16 @@ mod tests {
             "the bundled table must carry priced models"
         );
         for (provider, model, rates) in &rows {
-            for (label, rate) in [
-                ("input", rates.input),
-                ("output", rates.output),
-                ("cache_read", rates.cache_read.unwrap_or_default()),
-                ("cache_write", rates.cache_write.unwrap_or_default()),
-            ] {
+            let lanes = [
+                ("input", Some(rates.input)),
+                ("output", Some(rates.output)),
+                ("cache_read", rates.cache_read),
+                ("cache_write", rates.cache_write),
+            ];
+            for (label, rate) in lanes
+                .into_iter()
+                .filter_map(|(label, rate)| rate.map(|rate| (label, rate)))
+            {
                 let text = rate.to_string();
                 assert_eq!(
                     Usd::parse(&text).ok(),
