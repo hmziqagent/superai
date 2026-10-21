@@ -361,6 +361,7 @@ fn keep_pi_row(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn push_swap_slots(sessions: &Path, roots: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(sessions) else {
         return;
@@ -381,6 +382,9 @@ fn push_swap_slots(sessions: &Path, roots: &mut Vec<PathBuf>) {
     slots.sort();
     for slot in slots {
         let projects = slot.join("projects");
+        // Canonical so a symlinked temp home (macOS /var -> /private/var)
+        // dedups against the same root spelled the other way.
+        let projects = projects.canonicalize().unwrap_or(projects);
         if projects.is_dir() {
             roots.push(projects);
         }

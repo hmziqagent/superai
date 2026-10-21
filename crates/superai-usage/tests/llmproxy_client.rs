@@ -728,6 +728,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn token_files_outside_the_0600_discipline_are_refused() {
         use std::os::unix::fs::PermissionsExt;
 
