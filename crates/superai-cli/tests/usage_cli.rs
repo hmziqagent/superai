@@ -613,24 +613,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_closed_stdout_pipe_fails_cleanly_instead_of_panicking() {
+        use std::os::unix::net::UnixStream;
         let home = full_usage_home("broken-pipe");
+        // The read end dies before spawn, so the child's first write meets a
+        // closed peer instead of racing the pipe buffer.
+        let (write_end, read_end) =
+            UnixStream::pair().unwrap_or_else(|e| panic!("socketpair: {e}"));
+        drop(read_end);
+        let write_end: std::os::fd::OwnedFd = write_end.into();
         let mut command = Command::new(env!("CARGO_BIN_EXE_superai"));
         command
             .args(["usage", "show"])
             .env_clear()
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::from(write_end))
             .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn superai: {e}"));
-        drop(child.stdout.take());
-        let output = child
-            .wait_with_output()
-            .unwrap_or_else(|e| panic!("wait superai: {e}"));
+        let output = command
+            .output()
+            .unwrap_or_else(|e| panic!("run superai: {e}"));
 
         assert_ne!(
             output.status.code(),
