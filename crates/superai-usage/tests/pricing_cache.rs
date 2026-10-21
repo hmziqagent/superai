@@ -382,24 +382,27 @@ mod tests {
 
     #[test]
     fn the_default_cache_root_is_superai_owned_never_a_harness_dir() {
-        let xdg = Path::new("/tmp/xdg-cache-home-fixture");
-        let home = Path::new("/home fixture/user");
+        // Absolute bases must be absolute on the platform under test, so
+        // the fixtures come from the real temp dir, not unix literals.
+        let base = std::env::temp_dir();
+        let xdg = base.join("superai-xdg-cache-home-fixture");
+        let home = base.join("superai-home-fixture");
         assert_eq!(
-            PricingCache::default_root(Some(xdg), home).unwrap(),
+            PricingCache::default_root(Some(&xdg), &home).unwrap(),
             xdg.join("superai")
         );
         assert_eq!(
-            PricingCache::default_root(None, home).unwrap(),
+            PricingCache::default_root(None, &home).unwrap(),
             home.join(".cache").join("superai")
         );
         for ignored_xdg in [Path::new("relative/xdg"), Path::new("")] {
             assert_eq!(
-                PricingCache::default_root(Some(ignored_xdg), home).unwrap(),
+                PricingCache::default_root(Some(ignored_xdg), &home).unwrap(),
                 home.join(".cache").join("superai"),
                 "a relative or empty XDG_CACHE_HOME must be ignored per the XDG rule"
             );
         }
-        let cache = PricingCache::new(&PricingCache::default_root(Some(xdg), home).unwrap());
+        let cache = PricingCache::new(&PricingCache::default_root(Some(&xdg), &home).unwrap());
         let path = cache.path();
         assert!(path.starts_with(xdg.join("superai")));
         assert_eq!(
