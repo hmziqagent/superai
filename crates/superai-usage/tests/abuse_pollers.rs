@@ -346,8 +346,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn redirect_refusal_redacts_a_planted_query_secret() {
+    fn redirect_listener() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
         let addr = listener
             .local_addr()
@@ -363,12 +362,32 @@ mod tests {
                 .unwrap_or_else(|e| panic!("write redirect response: {e}"));
             }
         });
-        let url = format!("http://{addr}/usage?api_key={COOKIE_SENTINEL}");
-        let error = poll_zed(&url, &PollSecret::new(COOKIE_SENTINEL), &limits()).unwrap_err();
-        assert!(
-            matches!(error, PollError::Redirect { .. }),
-            "the 302 must surface as a refused redirect: {error:?}"
-        );
+        addr
+    }
+
+    #[test]
+    fn redirect_refusal_redacts_a_planted_query_secret() {
+        // The macOS runners intermittently fail the loopback connect with a
+        // transport error before any response; only that class is retried,
+        // never anything that could hide a redaction miss.
+        let mut transport: Option<PollError> = None;
+        let error = 'attempts: {
+            for _ in 0..2 {
+                let url = format!(
+                    "http://{}/usage?api_key={COOKIE_SENTINEL}",
+                    redirect_listener()
+                );
+                match poll_zed(&url, &PollSecret::new(COOKIE_SENTINEL), &limits()) {
+                    Err(error @ PollError::Redirect { .. }) => break 'attempts error,
+                    Err(error @ PollError::Transport { .. }) => transport = Some(error),
+                    Err(error) => {
+                        panic!("unexpected poll error: {error:?} (transport: {transport:?})")
+                    }
+                    Ok(snapshot) => panic!("the 302 must not surface as a snapshot: {snapshot:?}"),
+                }
+            }
+            panic!("loopback connect kept failing: {transport:?}");
+        };
         assert_no_sentinel_display(&error, "redirect refusal error");
         assert_no_sentinel_debug(&error, "redirect refusal error debug");
     }
