@@ -27,9 +27,11 @@ mod tests {
     use superai_usage::cost::{
         CostEngine, CostPeriod, RateTable, RecordedUsage, Spend, UsageEvent, Usd,
     };
+    #[cfg(unix)]
+    use superai_usage::llmproxy::load_admin_token;
     use superai_usage::llmproxy::{
         AdminToken, LedgerClient, LedgerCost, LedgerCrossCheck, LedgerError, RequestsQuery,
-        SummaryGroupBy, load_admin_token,
+        SummaryGroupBy,
     };
     use superai_usage::poller::PollLimits;
 
@@ -715,6 +717,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
