@@ -182,10 +182,19 @@ pub fn pi_session_roots(selectors: &PiSelectors<'_>, home: &Path) -> PiSessionRo
         }
     }
     PiSessionRoots {
-        roots: dedup_roots(roots),
+        roots: canonical_roots(roots),
         refusal: None,
         profile_cap_hit,
     }
+}
+
+/// Canonical spelling for every root that exists, so mixed-separator inputs
+/// cannot produce two spellings of one directory.
+fn canonical_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let canonicalized = roots
+        .into_iter()
+        .map(|root| root.canonicalize().unwrap_or(root));
+    dedup_roots(canonicalized.collect())
 }
 
 /// Scan claude-code transcript JSONL under the resolved project roots.
