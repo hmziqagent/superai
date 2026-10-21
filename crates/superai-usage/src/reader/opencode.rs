@@ -246,7 +246,7 @@ mod tests {
                 Path::new("/home/u"),
                 None
             ),
-            Some(PathBuf::from("/data/opencode/opencode.db"))
+            Some(Path::new("/data").join("opencode").join("opencode.db"))
         );
     }
 
@@ -254,7 +254,7 @@ mod tests {
     fn default_channel_uses_the_plain_file_name() {
         assert_eq!(
             history_db_path(None, Some(Path::new("/data")), Path::new("/home/u"), None),
-            Some(PathBuf::from("/data/opencode/opencode.db"))
+            Some(Path::new("/data").join("opencode").join("opencode.db"))
         );
     }
 
@@ -267,7 +267,7 @@ mod tests {
                 Path::new("/home/u"),
                 Some("  ")
             ),
-            Some(PathBuf::from("/data/opencode/opencode.db"))
+            Some(Path::new("/data").join("opencode").join("opencode.db"))
         );
     }
 
@@ -280,7 +280,7 @@ mod tests {
                 Path::new("/home/u"),
                 Some("beta")
             ),
-            Some(PathBuf::from("/data/opencode/opencode-beta.db"))
+            Some(Path::new("/data").join("opencode").join("opencode-beta.db"))
         );
     }
 

@@ -96,16 +96,40 @@ mod tests {
     ) {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let Some(reply) = queue.pop_front() else {
-                break;
-            };
-            serve(&mut stream, captured, reply);
+            serve_connection(&mut stream, captured, &mut queue);
         }
     }
 
-    fn serve(stream: &mut TcpStream, captured: &Mutex<Vec<Captured>>, reply: Reply) {
+    fn serve_connection(
+        stream: &mut TcpStream,
+        captured: &Mutex<Vec<Captured>>,
+        queue: &mut VecDeque<Reply>,
+    ) {
+        // One reply per arrived request head: a connection that closes
+        // without sending anything must not consume one.
+        while queue.front().is_some() {
+            let raw = read_head(stream);
+            if raw.trim().is_empty() {
+                break;
+            }
+            let Some(reply) = queue.pop_front() else {
+                break;
+            };
+            let drops = reply_drops(&reply);
+            serve(stream, captured, &raw, reply);
+            if drops {
+                break;
+            }
+        }
+    }
+
+    fn reply_drops(reply: &Reply) -> bool {
+        matches!(reply, Reply::Stall | Reply::Reset)
+    }
+
+    fn serve(stream: &mut TcpStream, captured: &Mutex<Vec<Captured>>, raw: &str, reply: Reply) {
         drop(stream.set_read_timeout(Some(Duration::from_secs(5))));
-        let raw = read_head(stream);
+        let raw = raw.to_owned();
         let target = raw
             .lines()
             .next()
@@ -513,14 +537,9 @@ mod tests {
 
     #[test]
     fn a_dead_port_is_unreachable_and_never_leaks_the_token() {
-        let port = {
-            let listener = TcpListener::bind(("127.0.0.1", 0))
-                .unwrap_or_else(|e| panic!("bind loopback: {e:?}"));
-            listener
-                .local_addr()
-                .unwrap_or_else(|e| panic!("addr: {e:?}"))
-                .port()
-        };
+        // A freed ephemeral port can be sniped by a parallel test's listener;
+        // loopback port 1 is closed and unbindable by the test user.
+        let port = 1u16;
         let client = LedgerClient::new(
             &format!("http://127.0.0.1:{port}"),
             &AdminToken::new(TOKEN),
@@ -893,14 +912,9 @@ mod tests {
     #[test]
     fn unreachable_proxy_leaves_local_numbers_standing_alone() {
         let local = local_spend_usd(&routed_local_usage());
-        let port = {
-            let listener = TcpListener::bind(("127.0.0.1", 0))
-                .unwrap_or_else(|e| panic!("bind loopback: {e:?}"));
-            listener
-                .local_addr()
-                .unwrap_or_else(|e| panic!("addr: {e:?}"))
-                .port()
-        };
+        // A freed ephemeral port can be sniped by a parallel test's listener;
+        // loopback port 1 is closed and unbindable by the test user.
+        let port = 1u16;
         let client = LedgerClient::new(
             &format!("http://127.0.0.1:{port}"),
             &AdminToken::new(TOKEN),
