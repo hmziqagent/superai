@@ -869,11 +869,21 @@ mod tests {
         assert_eq!(ledger["harnesses"], serde_json::json!([]));
         assert_eq!(ledger["window"]["lane"], "unavailable");
         assert_eq!(ledger["totals_scope"], "all-history");
-        assert_eq!(ledger["tokens"]["input"], 110);
-        assert_eq!(ledger["tokens"]["output"], 55);
-        assert_eq!(ledger["tokens"]["cache_read"], 20);
-        assert_eq!(ledger["tokens"]["cache_write"], 5);
-        assert_eq!(ledger["tokens"]["events"], 2);
+        // The row is emitted even when the ledger read fails, so every
+        // assertion below must show the notes that name the failure.
+        let ledger_debug = format!("row: {ledger}\nreport: {report}");
+        for (field, want) in [
+            ("input", serde_json::json!(110)),
+            ("output", serde_json::json!(55)),
+            ("cache_read", serde_json::json!(20)),
+            ("cache_write", serde_json::json!(5)),
+            ("events", serde_json::json!(2)),
+        ] {
+            assert_eq!(
+                ledger["tokens"][field], want,
+                "tokens.{field}: {ledger_debug}"
+            );
+        }
         assert_eq!(ledger["coverage"]["state"], "incomplete");
         assert_eq!(ledger["coverage"]["unscanned_records"], 1);
         // The unattributed row poisons the aggregate, never silently drops.
