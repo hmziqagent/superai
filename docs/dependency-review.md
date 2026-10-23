@@ -27,6 +27,7 @@ Tooling that enforces this at CI time (see `.github/workflows/ci.yml`):
 
 | Dependency | Version | Role | Owner / maintenance | build.rs | Notes |
 |---|---|---|---|---|---|
+| memchr | 2.x (2.8.3 in the lock) | SIMD byte scans for the JSONC comment and trailing-comma strip (jsonc.rs:7) | BurntSushi (Andrew Gallant) and bluss, crates.io `memchr`; 2.8.1/2.8.2/2.8.3 released 2026-05-27/06-12/07-08 | no (`build = false` in the published manifest) | pure Rust, SIMD via core arch, no C; MIT OR Unlicense, the MIT arm satisfies the deny.toml allowlist |
 | serde | 1.x (derive) | value model for every codec | dtolnay, crates.io `serde`, one of the most-maintained Rust crates | YES (feature probing only, no external code) | derive macro only; no I/O |
 | serde_json | 1.x (preserve_order) | StrictJson codec, catalog/registry serialization | dtolnay/serde-rs, crates.io `serde_json` | YES (limbs detection) | `preserve_order` keeps unmodelled-key order stable (goal: round-trip) |
 | toml_edit | 0.23 | TOML codec with decor preservation | toml-rs org, crates.io `toml_edit` | no | the only crate that can edit TOML without reformatting — the reason it exists in-tree |
@@ -89,11 +90,21 @@ above), plus:
 | Dependency | Version | Role | Notes |
 |---|---|---|---|
 | superai-core | path (workspace) | L2 layer | an upward dependency, as superai-usage also has; no interface types exist below this crate |
+| superai-usage | path (../superai-usage) | L3 layer: usage readers, cost engine, llmproxy client and poller behind `superai usage` and `superai vps` | landed 4058227; the interface crate may depend on every layer below it |
+| serde | 1.x (derive; workspace) | typed structs for `--json` reports (vps.rs:10) | reviewed under superai-config; no new lockfile participant |
+| serde_json | 1.x (workspace) | `--json` rendering via `to_string_pretty` (vps.rs:751) | reviewed under superai-config and superai-usage; 1.0.151 in the lock |
+| thiserror | 2.x (workspace) | `CliError` taxonomy (main.rs:14) | reviewed under superai-config; 2.0.20 in the lock |
+| jiff | 0.2.x (workspace) | window and period timestamps for `superai usage` (usage.rs:9) | reviewed under superai-usage; 0.2.38 in the lock |
+
+Dev-only: rusqlite (workspace) lets tests/usage_cli.rs build the opencode
+history-db fixture (tests/usage_cli.rs:16); tests/vps_cli.rs acks it for
+`unused_crate_dependencies`. Not in the shipped binary graph.
 
 ## Dev/tooling dependencies (not in the shipped graph)
 
 | Tool | How it enters | Review |
 |---|---|---|
+| criterion | [dev-dependencies] of superai-config (hot_lanes benches) and superai-core (drift/render/mcp lanes) | bench-only, workspace-pinned, never in the shipped graph |
 | cargo-mutants 27.1.0 | `cargo install cargo-mutants --locked`, CI `mutation-testing` job | installed from crates.io with `--locked`; scope pinned by `.cargo/mutants.toml` |
 | cargo-hack / cargo-shear / cargo-deny | CI supply-chain job, `--locked` installs | same discipline; deny.toml policy in-repo |
 
@@ -105,4 +116,8 @@ re-reviewed 2026-10-13 for the USG-03 reader dependencies (serde_json with
 raw_value, jiff with serde, rusqlite 0.40 bundled) at the 193-package lock;
 re-reviewed 2026-10-13 again for the VPS deploy dependencies (toride-proxy
 and toride-wireguard, 0.1, first-party) and superai-usage's landed ureq, at
-the 206-package lock. Re-verify on every lockfile diff.
+the 206-package lock; re-reviewed 2026-10-23 after a drift check caught two
+omissions, superai-config's memchr (landed d5e7044, 2026-10-02) and
+superai-cli's usage-subcommand dependencies (landed 4058227, 2026-10-13);
+rows added, the lockfile still at 206 packages with no new participants.
+Re-verify on every lockfile diff.

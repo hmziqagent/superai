@@ -28,3 +28,9 @@ transactional creation of missing files. No editor widget or interface code exis
 > RAW-07 (reopen/rebase with manual-rebase guidance, no auto-apply) closed by area 7
 > (judge-verified). Era/version gates at the commit boundary come from area 3's
 > surface_gates_for_adapter (era conflict → UnsupportedVersion before any disk mutation).
+
+Decisive test for RAW-02: `cargo test -p superai-core --all-features
+validate_draft_runs_schema_and_version_gate_without_disk`
+(crates/superai-core/src/raw_editor.rs:1219) asserts the schema blocking
+diagnostic, the version-gate refusal, and the oversize size diagnostic through
+`validate_draft` with no disk access. Re-run 2026-10-23, passing.
