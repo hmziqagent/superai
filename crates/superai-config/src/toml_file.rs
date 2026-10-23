@@ -101,10 +101,10 @@ impl std::fmt::Write for RenderedEq<'_> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, std::path::PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-toml");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
     #[test]
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn edit_preserves_comments_and_untouched_keys() {
-        let path = scratch("comment.toml");
+        let (_dir, path) = scratch("comment.toml");
         std::fs::write(
             &path,
             "# keep me\nmodel = \"opus\"\n\n[other]\nkeep = true\n",
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn preserves_arrays_of_tables() {
-        let path = scratch("aot.toml");
+        let (_dir, path) = scratch("aot.toml");
         std::fs::write(
             &path,
             "[[servers]]\nname = \"a\"\n[[servers]]\nname = \"b\"\n",
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn preserves_inline_tables() {
-        let path = scratch("inline.toml");
+        let (_dir, path) = scratch("inline.toml");
         std::fs::write(&path, "point = { x = 1, y = 2 }\nmodel = \"opus\"\n").unwrap();
         edit(&path, |d| {
             d["model"] = toml_edit::value("sonnet");
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn preserves_dotted_keys() {
-        let path = scratch("dotted.toml");
+        let (_dir, path) = scratch("dotted.toml");
         std::fs::write(&path, "a.b.c = 1\nmodel = \"opus\"\n").unwrap();
         edit(&path, |d| {
             d["model"] = toml_edit::value("sonnet");
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn preserves_quoted_keys() {
-        let path = scratch("quoted.toml");
+        let (_dir, path) = scratch("quoted.toml");
         std::fs::write(&path, "\"quoted key\" = 1\nmodel = \"opus\"\n").unwrap();
         edit(&path, |d| {
             d["model"] = toml_edit::value("sonnet");
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn duplicate_key_is_error() {
-        let path = scratch("dup.toml");
+        let (_dir, path) = scratch("dup.toml");
         std::fs::write(&path, "a = 1\na = 2\n").unwrap();
         let err = load(&path).unwrap_err();
         match err {
@@ -214,14 +214,14 @@ mod tests {
 
     #[test]
     fn invalid_toml_is_error() {
-        let path = scratch("invalid.toml");
+        let (_dir, path) = scratch("invalid.toml");
         std::fs::write(&path, "a = [\n").unwrap();
         load(&path).unwrap_err();
     }
 
     #[test]
     fn handles_crlf_input() {
-        let path = scratch("crlf.toml");
+        let (_dir, path) = scratch("crlf.toml");
         std::fs::write(&path, "model = \"opus\"\r\nother = 1\r\n").unwrap();
         let doc = load(&path).unwrap();
         assert_eq!(doc["model"].as_str(), Some("opus"));
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn handles_missing_final_newline() {
-        let path = scratch("no_nl.toml");
+        let (_dir, path) = scratch("no_nl.toml");
         std::fs::write(&path, "model = \"opus\"").unwrap();
         let doc = load(&path).unwrap();
         assert_eq!(doc["model"].as_str(), Some("opus"));
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn no_op_preserves_byte_identity_for_toml() {
-        let path = scratch("noop.toml");
+        let (_dir, path) = scratch("noop.toml");
         let original = "# keep me\nmodel = \"opus\"\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn missing_file_loads_as_empty() {
-        let path = scratch("absent.toml");
+        let (_dir, path) = scratch("absent.toml");
         drop(std::fs::remove_file(&path));
         let doc = load(&path).unwrap();
         assert!(doc.is_empty());
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn table_decor_preserved() {
-        let path = scratch("decor.toml");
+        let (_dir, path) = scratch("decor.toml");
         std::fs::write(
             &path,
             "[table]\n# comment inside\nkey = 1\n\n[other]\nval = 2\n",

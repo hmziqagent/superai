@@ -260,22 +260,22 @@ where
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, std::path::PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-yaml");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
     #[test]
     fn missing_file_loads_as_empty() {
-        let path = scratch("absent.yaml");
+        let (_dir, path) = scratch("absent.yaml");
         drop(std::fs::remove_file(&path));
         assert!(load(&path).unwrap().is_empty());
     }
 
     #[test]
     fn load_value_missing_is_empty_object() {
-        let path = scratch("absent_value.yaml");
+        let (_dir, path) = scratch("absent_value.yaml");
         drop(std::fs::remove_file(&path));
         assert_eq!(load_value(&path).unwrap(), Value::Object(Map::new()));
     }
@@ -305,7 +305,7 @@ mod tests {
         let v = parse_strict_raw(yaml).unwrap();
         assert_eq!(v["key"], Value::String("value".into()));
         // Comments parse fine on read ...
-        let path = scratch("comments.yaml");
+        let (_dir, path) = scratch("comments.yaml");
         std::fs::write(&path, yaml).unwrap();
         let map = load(&path).unwrap();
         assert_eq!(map["key"], Value::String("value".into()));
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn anchors_and_block_scalars_refuse_changing_writes() {
         let anchored = "base: &base\n  x: 1\nderived: *base\n";
-        let path = scratch("anchor.yaml");
+        let (_dir, path) = scratch("anchor.yaml");
         std::fs::write(&path, anchored).unwrap();
         let result = edit(&path, |m| {
             m.insert("new".into(), Value::Number(1.into()));
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), anchored);
 
         let block = "description: |\n  hello\n  world\n";
-        let path2 = scratch("block.yaml");
+        let (_dir, path2) = scratch("block.yaml");
         std::fs::write(&path2, block).unwrap();
         let result2 = edit(&path2, |m| {
             m.insert("new".into(), Value::Number(1.into()));
@@ -354,7 +354,7 @@ mod tests {
             "a: \"unclosed\n# real comment\nb: 2\n",
         ];
         for yaml in cases {
-            let path = scratch("plain_quote.yaml");
+            let (_dir, path) = scratch("plain_quote.yaml");
             std::fs::write(&path, yaml).unwrap();
             let mut map = Map::new();
             map.insert("new".into(), Value::Number(1.into()));
@@ -374,7 +374,7 @@ mod tests {
     fn plain_scalar_apostrophe_edit_refuses_and_keeps_comments() {
         // The file parses, so only the write gate stands between the comments and destruction.
         let yaml = "title: it's fine\n# real comment\nb: 2\n";
-        let path = scratch("apostrophe.yaml");
+        let (_dir, path) = scratch("apostrophe.yaml");
         std::fs::write(&path, yaml).unwrap();
         let result = edit(&path, |m| {
             m.insert("new".into(), Value::Number(1.into()));
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn quoted_scalars_refuse_changing_writes() {
         let yaml = "a: \"quoted\"\nb: 2\n";
-        let path = scratch("quoted.yaml");
+        let (_dir, path) = scratch("quoted.yaml");
         std::fs::write(&path, yaml).unwrap();
         let result = edit(&path, |m| {
             m.insert("c".into(), Value::Number(3.into()));
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn flow_style_file_refuses_changing_write() {
         let yaml = "a: [&one 1, &two 2]\nb: 2\n";
-        let path = scratch("flow_anchor.yaml");
+        let (_dir, path) = scratch("flow_anchor.yaml");
         std::fs::write(&path, yaml).unwrap();
         let mut map = Map::new();
         map.insert("c".into(), Value::Number(3.into()));
@@ -432,7 +432,7 @@ mod tests {
             "a: 1\u{2029}# comment\u{2029}b: 2\u{2029}",
         ];
         for original in cases {
-            let path = scratch("store.yaml");
+            let (_dir, path) = scratch("store.yaml");
             std::fs::write(&path, original).unwrap();
             let mut map = Map::new();
             map.insert("a".into(), Value::Number(2.into()));
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn store_refuses_non_utf8_target_with_lossy_write() {
-        let path = scratch("non_utf8.yaml");
+        let (_dir, path) = scratch("non_utf8.yaml");
         std::fs::write(&path, [0xFF, 0xFE, b'a']).unwrap();
         let mut map = Map::new();
         map.insert("a".into(), Value::Number(2.into()));
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn store_refuses_directory_target_with_lossy_write() {
-        let path = scratch("as_dir.yaml");
+        let (_dir, path) = scratch("as_dir.yaml");
         std::fs::create_dir_all(&path).unwrap();
         let mut map = Map::new();
         map.insert("a".into(), Value::Number(2.into()));
@@ -481,7 +481,7 @@ mod tests {
         // libyaml accepts lone CR as a line break, so this file loads fine;
         // the edit must still refuse rather than destroy the comment.
         let yaml = "a: 1\r# real user comment\rb: 2\r";
-        let path = scratch("lone_cr.yaml");
+        let (_dir, path) = scratch("lone_cr.yaml");
         std::fs::write(&path, yaml).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded["a"], Value::Number(1.into()));
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn edit_value_refused_on_existing_target() {
         let yaml = "a: 1 # keep\n";
-        let path = scratch("edit_value.yaml");
+        let (_dir, path) = scratch("edit_value.yaml");
         std::fs::write(&path, yaml).unwrap();
         let result = edit_value(&path, |v| {
             if let Value::Object(m) = v {
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn store_allows_missing_target() {
-        let path = scratch("created.yaml");
+        let (_dir, path) = scratch("created.yaml");
         let mut map = Map::new();
         map.insert("a".into(), Value::Number(1.into()));
         store(&path, &map).unwrap();
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn load_rejects_duplicate_keys_on_disk() {
-        let path = scratch("dup.yaml");
+        let (_dir, path) = scratch("dup.yaml");
         std::fs::write(&path, "a: 1\na: 2\n").unwrap();
         let err = load(&path).unwrap_err();
         match err {
@@ -590,7 +590,7 @@ mod tests {
                 || err.to_string().contains("document"),
             "{err}"
         );
-        let path = scratch("multi.yaml");
+        let (_dir, path) = scratch("multi.yaml");
         std::fs::write(&path, yaml).unwrap();
         load(&path).unwrap_err();
     }
@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(v["a"], Value::String("123".into()));
         assert_eq!(v["b"], Value::Number(123.into()));
         assert_eq!(v["c"], Value::String("123".into()));
-        let path = scratch("quoted.yaml");
+        let (_dir, path) = scratch("quoted.yaml");
         std::fs::write(&path, "a: \"123\"\nb: 123\n").unwrap();
         let map = load(&path).unwrap();
         assert_eq!(map["a"], Value::String("123".into()));
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn changing_edit_refused_but_unmodelled_keys_still_readable() {
         // Preservation is expressed the only honest way: nothing is written.
-        let path = scratch("roundtrip.yaml");
+        let (_dir, path) = scratch("roundtrip.yaml");
         let original = "zzz: 1\nmodel: opus\naaa:\n  nested: true\n";
         std::fs::write(&path, original).unwrap();
 
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn no_op_preserves_byte_identity() {
-        let path = scratch("noop.yaml");
+        let (_dir, path) = scratch("noop.yaml");
         let original = "a: 1\nb: 2\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn store_and_load_value_preserve_arbitrary_root() {
-        let path = scratch("root_array.yaml");
+        let (_dir, path) = scratch("root_array.yaml");
         std::fs::write(&path, "- 1\n- 2\n- 3\n").unwrap();
         let v = load_value(&path).unwrap();
         assert_eq!(
@@ -678,7 +678,7 @@ mod tests {
             ])
         );
 
-        let path2 = scratch("store_raw.yaml");
+        let (_dir, path2) = scratch("store_raw.yaml");
         drop(std::fs::remove_file(&path2));
         let val = Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]);
         store_value(&path2, &val).unwrap();
@@ -688,17 +688,17 @@ mod tests {
 
     #[test]
     fn empty_file_loads_as_empty() {
-        let path = scratch("empty.yaml");
+        let (_dir, path) = scratch("empty.yaml");
         std::fs::write(&path, "").unwrap();
         assert!(load(&path).unwrap().is_empty());
-        let path2 = scratch("whitespace.yaml");
+        let (_dir, path2) = scratch("whitespace.yaml");
         std::fs::write(&path2, "   \n  \n").unwrap();
         assert!(load(&path2).unwrap().is_empty());
     }
 
     #[test]
     fn refused_write_leaves_no_backup() {
-        let path = scratch("backed.yaml");
+        let (_dir, path) = scratch("backed.yaml");
         let original = "model: opus\n";
         std::fs::write(&path, original).unwrap();
         let result = edit(&path, |c| {
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn bom_is_stripped() {
-        let path = scratch("bom.yaml");
+        let (_dir, path) = scratch("bom.yaml");
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(b"a: 1\n");
         std::fs::write(&path, bytes).unwrap();

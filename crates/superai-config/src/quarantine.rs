@@ -682,7 +682,8 @@ mod tests {
     #[test]
     fn move_to_quarantine_and_restore_file() {
         let op = unique_op("move-file");
-        let src = crate::test_util::temp_dir_unique("quarantine-src").join(&op);
+        let src_dir = crate::test_util::temp_dir_unique("quarantine-src");
+        let src = src_dir.join(&op);
         std::fs::write(&src, b"quarantine content").unwrap();
 
         let entry = move_to_quarantine(&src, &op).unwrap();
@@ -709,7 +710,8 @@ mod tests {
     #[test]
     fn move_to_quarantine_and_restore_directory() {
         let op = unique_op("move-dir");
-        let src = crate::test_util::temp_dir_unique("quarantine-dir").join(&op);
+        let src_dir = crate::test_util::temp_dir_unique("quarantine-dir");
+        let src = src_dir.join(&op);
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("file.txt"), b"hello").unwrap();
         std::fs::write(src.join("sub").join("nested.txt"), b"nested").unwrap();
@@ -742,7 +744,8 @@ mod tests {
     #[test]
     fn quarantine_reports_recoverability_and_retention() {
         let op = unique_op("report");
-        let src = crate::test_util::temp_dir_unique("quarantine-report").join(&op);
+        let src_dir = crate::test_util::temp_dir_unique("quarantine-report");
+        let src = src_dir.join(&op);
         std::fs::write(&src, b"report test").unwrap();
         let entry = move_to_quarantine(&src, &op).unwrap();
         let report = entry.recoverability_report();
@@ -914,7 +917,8 @@ mod tests {
         for i in 1..100 {
             std::fs::write(qdir.join(format!("victim.{i}")), b"occupied").unwrap();
         }
-        let src = crate::test_util::temp_dir_unique("quarantine-collide-src").join("victim");
+        let src_dir = crate::test_util::temp_dir_unique("quarantine-collide-src");
+        let src = src_dir.join("victim");
         std::fs::write(&src, b"colliding content").unwrap();
 
         let entry = move_to_quarantine_with_dest(&src, &dest, &op).unwrap();
@@ -936,7 +940,8 @@ mod tests {
         for i in 1..=100 {
             std::fs::write(qdir.join(format!("victim.{i}")), b"occupied").unwrap();
         }
-        let src = crate::test_util::temp_dir_unique("quarantine-collide-full").join("victim");
+        let src_dir = crate::test_util::temp_dir_unique("quarantine-collide-full");
+        let src = src_dir.join("victim");
         std::fs::write(&src, b"never moved").unwrap();
 
         let err = move_to_quarantine_with_dest(&src, &dest, &op).unwrap_err();

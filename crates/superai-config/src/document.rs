@@ -1114,7 +1114,8 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        let empty_path = crate::test_util::temp_dir_unique("config-doc").join("empty.json");
+        let empty_dir = crate::test_util::temp_dir_unique("config-doc");
+        let empty_path = empty_dir.join("empty.json");
         std::fs::write(&empty_path, b"").unwrap();
         let doc = SourceDocument::load(&empty_path).unwrap();
         assert!(doc.is_empty());

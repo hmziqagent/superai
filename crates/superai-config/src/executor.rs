@@ -1329,10 +1329,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn scratch(name: &str, ext: &str) -> std::path::PathBuf {
+    fn scratch(name: &str, ext: &str) -> (crate::test_util::TempDir, std::path::PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-executor");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{name}{ext}"))
+        let path = dir.join(format!("{name}{ext}"));
+        (dir, path)
     }
 
     fn set_op(selector: &str, value: Value) -> Operation {
@@ -1853,7 +1853,7 @@ mod tests {
 
     #[test]
     fn file_apply_strict_json_set_and_noop_byte_identity() {
-        let path = scratch("apply-json", ".json");
+        let (_dir, path) = scratch("apply-json", ".json");
         std::fs::write(&path, b"{\"model\":\"opus\",\"foreign\":1}").unwrap();
 
         let op = set_op("key:model", json!("sonnet"))
@@ -1878,7 +1878,7 @@ mod tests {
 
     #[test]
     fn file_apply_conflict_leaves_file_untouched() {
-        let path = scratch("apply-conflict", ".json");
+        let (_dir, path) = scratch("apply-conflict", ".json");
         std::fs::write(&path, b"{\"model\":\"opus\"}").unwrap();
         let before = std::fs::read(&path).unwrap();
 
@@ -1893,7 +1893,7 @@ mod tests {
 
     #[test]
     fn file_apply_jsonc_lossy_write_gate_stays_intact() {
-        let path = scratch("apply-jsonc", ".jsonc");
+        let (_dir, path) = scratch("apply-jsonc", ".jsonc");
         let original = b"{\n  // comment\n  \"model\": \"opus\"\n}";
         std::fs::write(&path, original).unwrap();
 
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn file_apply_toml_preserves_comments() {
-        let path = scratch("apply-toml", ".toml");
+        let (_dir, path) = scratch("apply-toml", ".toml");
         std::fs::write(
             &path,
             "# keep me\nmodel = \"opus\"\n\n[other]\nkeep = true\n",
@@ -1937,7 +1937,7 @@ mod tests {
 
     #[test]
     fn file_apply_toml_null_value_is_typed_error_and_leaves_file_intact() {
-        let path = scratch("apply-toml-null", ".toml");
+        let (_dir, path) = scratch("apply-toml-null", ".toml");
         std::fs::write(&path, b"a = 1\n").unwrap();
 
         let op = set_op("key:a", Value::Null).with_owned_keys(vec!["a".into()]);
@@ -1954,7 +1954,7 @@ mod tests {
 
     #[test]
     fn file_apply_env_preserves_comments_and_neighbours() {
-        let path = scratch("apply-env", ".env");
+        let (_dir, path) = scratch("apply-env", ".env");
         std::fs::write(&path, "# top comment\nMODEL=opus\nOTHER=1\n").unwrap();
 
         let op = set_op("key:MODEL", json!("sonnet"))
@@ -1971,7 +1971,7 @@ mod tests {
 
     #[test]
     fn file_apply_env_typed_noop_writes_nothing() {
-        let path = scratch("apply-env-noop", ".env");
+        let (_dir, path) = scratch("apply-env-noop", ".env");
         let before = b"# keep\nA=true\nN=42\n";
         std::fs::write(&path, before).unwrap();
 
@@ -1990,7 +1990,7 @@ mod tests {
 
     #[test]
     fn file_apply_env_rejects_nested_paths() {
-        let path = scratch("apply-env-nested", ".env");
+        let (_dir, path) = scratch("apply-env-nested", ".env");
         std::fs::write(&path, "A=1\n").unwrap();
         let op = set_op("key:a.b", json!(1))
             .with_owned_keys(vec!["a".into()])
@@ -2002,7 +2002,7 @@ mod tests {
 
     #[test]
     fn file_apply_opaque_document_is_refused() {
-        let path = scratch("apply-bin", ".bin");
+        let (_dir, path) = scratch("apply-bin", ".bin");
         std::fs::write(&path, b"raw").unwrap();
         let op = set_op("key:x", json!(1)).with_owned_keys(vec!["x".into()]);
         let err = apply(&path, DocumentKind::Opaque, &op).unwrap_err();
@@ -2012,7 +2012,7 @@ mod tests {
 
     #[test]
     fn file_apply_text_fragment_span_lifecycle() {
-        let path = scratch("apply-frag", ".txt");
+        let (_dir, path) = scratch("apply-frag", ".txt");
         drop(std::fs::remove_file(&path));
 
         let owned = vec!["span:managed".to_owned()];
@@ -2065,7 +2065,7 @@ mod tests {
 
     #[test]
     fn file_apply_text_fragment_requires_owned_span() {
-        let path = scratch("apply-frag-owned", ".txt");
+        let (_dir, path) = scratch("apply-frag-owned", ".txt");
         std::fs::write(&path, "# superai:begin:x\nb\n# superai:end:x\n").unwrap();
         let op = Operation::new(EditOperation::Set {
             selector: Selector::ManagedSpan("x".into()),
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn file_apply_text_fragment_rejects_non_span_selectors() {
-        let path = scratch("apply-frag-key", ".txt");
+        let (_dir, path) = scratch("apply-frag-key", ".txt");
         std::fs::write(&path, "text\n").unwrap();
         let op = set_op("key:model", json!(1)).with_owned_keys(vec!["model".into()]);
         let err = apply(&path, DocumentKind::TextFragment, &op).unwrap_err();

@@ -268,13 +268,13 @@ pub fn is_symlink_loop(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
-    fn unique_scratch(prefix: &str) -> PathBuf {
+    fn unique_scratch(prefix: &str) -> (crate::test_util::TempDir, PathBuf) {
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn snapshot_with_bytes_matches_snapshot_on_a_quiescent_file() {
-        let path = unique_scratch("parity");
+        let (_dir, path) = unique_scratch("parity");
         std::fs::write(&path, b"token parity bytes").unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -297,8 +297,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn snapshot_with_bytes_matches_snapshot_through_a_symlink() {
-        let target = unique_scratch("parity-target");
-        let link = unique_scratch("parity-link");
+        let (_dir, target) = unique_scratch("parity-target");
+        let (_dir, link) = unique_scratch("parity-link");
         std::fs::write(&target, b"through the link").unwrap();
         drop(std::fs::remove_file(&link));
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn snapshot_missing_vs_exists() {
-        let path = unique_scratch("missing");
+        let (_dir, path) = unique_scratch("missing");
         drop(std::fs::remove_file(&path));
         let snap = snapshot(&path);
         assert!(!snap.exists);
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn is_modified_detects_digest_and_size_changes() {
-        let path = unique_scratch("modified");
+        let (_dir, path) = unique_scratch("modified");
         std::fs::write(&path, b"v1").unwrap();
         let s1 = snapshot(&path);
         std::fs::write(&path, b"v2 longer").unwrap();
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn is_modified_detects_creation_and_deletion() {
-        let path = unique_scratch("create-delete");
+        let (_dir, path) = unique_scratch("create-delete");
         drop(std::fs::remove_file(&path));
         let s_missing = snapshot(&path);
         std::fs::write(&path, b"x").unwrap();
@@ -355,8 +355,8 @@ mod tests {
     fn snapshot_captures_symlink() {
         #[cfg(unix)]
         {
-            let target = unique_scratch("symlink-target");
-            let link = unique_scratch("symlink-link");
+            let (_dir, target) = unique_scratch("symlink-target");
+            let (_dir, link) = unique_scratch("symlink-link");
             std::fs::write(&target, b"target").unwrap();
             drop(std::fs::remove_file(&link));
             std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -373,8 +373,8 @@ mod tests {
     fn symlink_loop_detection_placeholder() {
         #[cfg(unix)]
         {
-            let a = unique_scratch("loop-a");
-            let b = unique_scratch("loop-b");
+            let (_dir, a) = unique_scratch("loop-a");
+            let (_dir, b) = unique_scratch("loop-b");
             drop(std::fs::remove_file(&a));
             drop(std::fs::remove_file(&b));
             std::os::unix::fs::symlink(&b, &a).unwrap();
@@ -387,8 +387,8 @@ mod tests {
             assert!(snap.is_symlink);
             assert!(snap.digest.is_none());
 
-            let target = unique_scratch("loop-target-real");
-            let link_ok = unique_scratch("loop-ok");
+            let (_dir, target) = unique_scratch("loop-target-real");
+            let (_dir, link_ok) = unique_scratch("loop-ok");
             std::fs::write(&target, b"ok").unwrap();
             drop(std::fs::remove_file(&link_ok));
             std::os::unix::fs::symlink(&target, &link_ok).unwrap();
@@ -402,7 +402,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let path = unique_scratch("loop-placeholder");
+            let (_dir, path) = unique_scratch("loop-placeholder");
             std::fs::write(&path, b"x").unwrap();
             assert!(!is_symlink_loop(&path));
             drop(std::fs::remove_file(&path));
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn snapshot_mtime_hint_present_for_existing_file() {
-        let path = unique_scratch("mtime");
+        let (_dir, path) = unique_scratch("mtime");
         std::fs::write(&path, b"mtime test").unwrap();
         let snap = snapshot(&path);
         assert!(snap.exists);
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn conflict_detection_via_snapshot() {
-        let path = unique_scratch("conflict");
+        let (_dir, path) = unique_scratch("conflict");
         std::fs::write(&path, b"original").unwrap();
         let s1 = snapshot(&path);
         std::fs::write(&path, b"concurrent edit").unwrap();
@@ -472,9 +472,9 @@ mod tests {
     fn retargeted_symlink_is_a_modification() {
         #[cfg(unix)]
         {
-            let target_a = unique_scratch("retarget-a");
-            let target_b = unique_scratch("retarget-b");
-            let link = unique_scratch("retarget-link");
+            let (_dir, target_a) = unique_scratch("retarget-a");
+            let (_dir, target_b) = unique_scratch("retarget-b");
+            let (_dir, link) = unique_scratch("retarget-link");
             std::fs::write(&target_a, b"same-bytes").unwrap();
             std::fs::write(&target_b, b"same-bytes").unwrap();
             std::os::unix::fs::symlink(&target_a, &link).unwrap();
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn is_missing_reports_existence() {
-        let path = unique_scratch("missing-flag");
+        let (_dir, path) = unique_scratch("missing-flag");
         drop(std::fs::remove_file(&path));
         let absent = snapshot(&path);
         assert!(absent.is_missing(), "an absent path reports missing");
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn snapshot_detects_same_size_content_changes() {
-        let path = unique_scratch("same-size");
+        let (_dir, path) = unique_scratch("same-size");
         std::fs::write(&path, b"aaa").unwrap();
         let before = snapshot(&path);
         std::fs::write(&path, b"bbb").unwrap();
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn snapshot_records_target_permission_bits() {
         use std::os::unix::fs::PermissionsExt;
-        let path = unique_scratch("perm-bits");
+        let (_dir, path) = unique_scratch("perm-bits");
         std::fs::write(&path, b"perms").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let snap = snapshot(&path);
@@ -553,7 +553,7 @@ mod tests {
     fn snapshot_ctime_is_a_plausible_recent_instant() {
         const SECS_AT_2020: u64 = 1_577_836_800;
         const DAY_SECS: u64 = 24 * 60 * 60;
-        let path = unique_scratch("ctime-window");
+        let (_dir, path) = unique_scratch("ctime-window");
         std::fs::write(&path, b"ctime").unwrap();
         let snap = snapshot(&path);
         let ctime = snap.ctime.expect("ctime recorded on unix");
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn is_symlink_loop_is_false_for_missing_path() {
-        let path = unique_scratch("loop-missing");
+        let (_dir, path) = unique_scratch("loop-missing");
         drop(std::fs::remove_file(&path));
         assert!(!is_symlink_loop(&path), "a missing path is not a loop");
     }

@@ -2287,7 +2287,7 @@ mod tests {
         }
     }
 
-    fn tmp_root() -> PathBuf {
+    fn tmp_root() -> crate::test_util::TempDir {
         crate::test_util::temp_dir_unique("txn")
     }
 
@@ -3082,7 +3082,7 @@ mod tests {
         let a = root.join("a.json");
         std::fs::write(&a, b"pre-op").unwrap();
         let inj = Arc::new(TamperStagedTempsAtStageJournal {
-            dir: root.clone(),
+            dir: root.path().to_path_buf(),
             bytes: b"foreign bytes".to_vec(),
         });
         let id = OperationId::new("op-staged-tamper").unwrap();
@@ -3992,10 +3992,8 @@ mod tests {
         drop(std::fs::remove_dir_all(&root2));
     }
 
-    fn boundary_scratch(tag: &str) -> PathBuf {
-        let dir = crate::test_util::temp_dir_unique(&format!("tx-boundary-{tag}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn boundary_scratch(tag: &str) -> crate::test_util::TempDir {
+        crate::test_util::temp_dir_unique(&format!("tx-boundary-{tag}"))
     }
 
     #[test]
@@ -4680,7 +4678,7 @@ mod tests {
         let target = root.join("w.cfg");
         std::fs::write(&target, b"v1").unwrap();
         let inj = SabotageParentAtSync {
-            parent: root.clone(),
+            parent: root.path().to_path_buf(),
             action: ParentSabotage::Loop,
         };
         let id = OperationId::new("op-sync-eloop").unwrap();
@@ -4699,7 +4697,11 @@ mod tests {
             .expect_err("the parent sync must surface the ELOOP");
         match err {
             ConfigError::Io { path, source } => {
-                assert_eq!(path, root, "the error must be attributed to the parent");
+                assert_eq!(
+                    path,
+                    root.path(),
+                    "the error must be attributed to the parent"
+                );
                 // ELOOP has no stable ErrorKind (errno 40 Linux, 62 macOS):
                 // require an OS error; pin errno 40 on Linux.
                 assert!(
@@ -4733,7 +4735,7 @@ mod tests {
         let target = root.join("w.cfg");
         std::fs::write(&target, b"v1").unwrap();
         let inj = SabotageParentAtSync {
-            parent: root.clone(),
+            parent: root.path().to_path_buf(),
             action: ParentSabotage::DenyRead,
         };
         let id = OperationId::new("op-sync-eacces").unwrap();
@@ -4761,7 +4763,7 @@ mod tests {
         let target = root.join("w.cfg");
         std::fs::write(&target, b"v1").unwrap();
         let inj = SabotageParentAtSync {
-            parent: root,
+            parent: root.path().to_path_buf(),
             action: ParentSabotage::Vanish,
         };
         let id = OperationId::new("op-sync-vanish").unwrap();
@@ -4876,7 +4878,9 @@ mod tests {
 
     /// Stage siblings until readdir puts the minimum strictly interior; only
     /// that kills `best`-update mutants on any host (None on case-insensitive fs).
-    fn discriminating_case_variant_fixture(tag: &str) -> Option<(PathBuf, String)> {
+    fn discriminating_case_variant_fixture(
+        tag: &str,
+    ) -> Option<(crate::test_util::TempDir, String)> {
         let dir = boundary_scratch(tag);
         std::fs::write(dir.join("case-probe-a"), b"{}").unwrap();
         let case_insensitive = dir.join("CASE-PROBE-A").exists();

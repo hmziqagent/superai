@@ -784,13 +784,13 @@ mod tests {
         );
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-backup");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
-    fn unique_scratch(prefix: &str) -> PathBuf {
+    fn unique_scratch(prefix: &str) -> (crate::test_util::TempDir, PathBuf) {
         let millis = timestamp_millis_now();
         let suffix = generate_random_suffix(millis);
         scratch(&format!("{prefix}-{millis}-{suffix}"))
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn backup_returns_none_for_missing_file() {
-        let path = scratch("missing-for-backup.json");
+        let (_dir, path) = scratch("missing-for-backup.json");
         drop(std::fs::remove_file(&path));
         let entry = backup(&path).unwrap();
         assert!(entry.is_none(), "missing file should return None");
@@ -806,7 +806,7 @@ mod tests {
 
     #[test]
     fn backup_creates_catalog_entry_with_digest_and_verifies() {
-        let path = unique_scratch("digest-verify");
+        let (_dir, path) = unique_scratch("digest-verify");
         std::fs::write(&path, b"hello backbone").unwrap();
         let entry = backup(&path).unwrap().expect("should create backup");
         assert!(!entry.digest.is_empty());
@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn backup_preserves_permissions_where_supported() {
-        let path = unique_scratch("perms");
+        let (_dir, path) = unique_scratch("perms");
         std::fs::write(&path, b"perms test").unwrap();
 
         #[cfg(unix)]
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn backup_of_readonly_source_keeps_readonly_attribute_and_flushes() {
-        let path = unique_scratch("perms-ro-win");
+        let (_dir, path) = unique_scratch("perms-ro-win");
         std::fs::write(&path, b"readonly source").unwrap();
         let mut src_perm = std::fs::metadata(&path).unwrap().permissions();
         src_perm.set_readonly(true);
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn backup_suffix_is_collision_resistant() {
-        let path = unique_scratch("collision");
+        let (_dir, path) = unique_scratch("collision");
         std::fs::write(&path, b"v1").unwrap();
         let e1 = backup(&path).unwrap().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -903,7 +903,8 @@ mod tests {
 
     #[test]
     fn pick_backup_path_takes_the_first_free_name() {
-        let path = scratch("steer-free").with_file_name("cfg.json");
+        let (steer_dir, _) = scratch("steer-free");
+        let path = steer_dir.join("cfg.json");
         let mut probes: Vec<PathBuf> = Vec::new();
         let (target, millis, suffix) = pick_backup_path(&path, |c| {
             probes.push(c.to_path_buf());
@@ -947,7 +948,8 @@ mod tests {
 
     #[test]
     fn pick_backup_path_steers_to_the_first_free_name() {
-        let path = scratch("steer-busy").with_file_name("cfg.json");
+        let (busy_dir, _) = scratch("steer-busy");
+        let path = busy_dir.join("cfg.json");
         let (probes, taken) = busy_prober(2);
         let (target, _, _) = pick_backup_path(&path, taken);
         let candidates = probes.borrow().clone();
@@ -958,7 +960,8 @@ mod tests {
 
     #[test]
     fn pick_backup_path_gives_up_after_five_busy_candidates() {
-        let path = scratch("steer-full").with_file_name("cfg.json");
+        let (full_dir, _) = scratch("steer-full");
+        let path = full_dir.join("cfg.json");
         let (probes, taken) = busy_prober(usize::MAX);
         let (target, _, _) = pick_backup_path(&path, taken);
         let candidates = probes.borrow().clone();
@@ -974,7 +977,7 @@ mod tests {
     #[test]
     fn write_backup_exclusive_lands_at_most_the_recorded_mode_bits() {
         use std::os::unix::fs::PermissionsExt;
-        let path = unique_scratch("exclusive-mode");
+        let (_dir, path) = unique_scratch("exclusive-mode");
         write_backup_exclusive(&path, b"backup bytes", Some(0)).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0, "a zero mode must not be widened at create");
@@ -1000,7 +1003,7 @@ mod tests {
 
     #[test]
     fn list_backups_filters_and_sorts() {
-        let path = unique_scratch("list-filter");
+        let (_dir, path) = unique_scratch("list-filter");
         std::fs::write(&path, b"base").unwrap();
         let e1 = backup(&path).unwrap().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1012,7 +1015,7 @@ mod tests {
         assert!(ids.contains(&e1.id.to_string()));
         assert!(ids.contains(&e2.id.to_string()));
 
-        let unrelated = scratch("unrelated.json");
+        let (_dir, unrelated) = scratch("unrelated.json");
         std::fs::write(&unrelated, b"x").unwrap();
         let list2 = list_backups(&unrelated).unwrap();
         for e in list2 {
@@ -1058,7 +1061,7 @@ mod tests {
 
     #[test]
     fn backup_with_operation_stores_operation_id() {
-        let path = unique_scratch("op-id");
+        let (_dir, path) = unique_scratch("op-id");
         std::fs::write(&path, b"op").unwrap();
         let entry = backup_with_operation(&path, Some("op-123"), "test")
             .unwrap()
@@ -1071,7 +1074,7 @@ mod tests {
 
     #[test]
     fn no_auto_delete_listing_supports_filtering() {
-        let path = unique_scratch("retention");
+        let (_dir, path) = unique_scratch("retention");
         std::fs::write(&path, b"a").unwrap();
         let mut ids = Vec::new();
         for i in 0..3 {
@@ -1110,7 +1113,7 @@ mod tests {
 
     #[test]
     fn restore_replaces_target_by_rename_never_in_place_truncation() {
-        let path = unique_scratch("atomic-restore");
+        let (_dir, path) = unique_scratch("atomic-restore");
         std::fs::write(&path, b"original bytes that were backed up").unwrap();
         #[cfg(unix)]
         {
@@ -1193,7 +1196,7 @@ mod tests {
 
     #[test]
     fn restore_verified_round_trips_and_recreates_missing_target() {
-        let path = unique_scratch("verified-restore");
+        let (_dir, path) = unique_scratch("verified-restore");
         std::fs::write(&path, b"v1").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         std::fs::write(&path, b"v2 which is longer than v1").unwrap();
@@ -1276,7 +1279,7 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
 
-        let path = unique_scratch("restore-readonly");
+        let (_dir, path) = unique_scratch("restore-readonly");
         std::fs::write(&path, b"backed up bytes").unwrap();
         set_mode(&path, 0o400);
 
@@ -1369,7 +1372,7 @@ mod tests {
 
     #[test]
     fn backup_with_injector_runs_the_real_pipeline_and_copies_the_file() {
-        let path = unique_scratch("injector-none");
+        let (_dir, path) = unique_scratch("injector-none");
         std::fs::write(&path, b"payload for injector").unwrap();
         let entry = backup_with_injector(&path, Some("op-1"), "reason", None)
             .unwrap()
@@ -1391,7 +1394,7 @@ mod tests {
             Point::BackupFlush,
             Point::BackupVerify,
         ] {
-            let path = unique_scratch(&format!("injector-{point}"));
+            let (_dir, path) = unique_scratch(&format!("injector-{point}"));
             std::fs::write(&path, b"boundaries").unwrap();
             let injector = FailAt(point);
             let res = backup_with_injector(&path, None, "reason", Some(&injector));
@@ -1430,7 +1433,7 @@ mod tests {
         if !Path::new("/dev/null").exists() {
             return;
         }
-        let path = unique_scratch("flush-einval");
+        let (_dir, path) = unique_scratch("flush-einval");
         std::fs::write(&path, b"flushable").unwrap();
         let injector = SwapBackupForDevNull {
             dir: path.parent().unwrap().to_path_buf(),
@@ -1453,7 +1456,7 @@ mod tests {
 
     #[test]
     fn backup_entry_and_file_name_embed_recent_millis_and_compact_hex_suffix() {
-        let path = unique_scratch("naming");
+        let (_dir, path) = unique_scratch("naming");
         std::fs::write(&path, b"naming").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         assert!(
@@ -1582,7 +1585,8 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         match res {
             Err(ConfigError::Io { path, .. }) => assert_eq!(
-                path, dir,
+                path,
+                dir.path(),
                 "the read_dir failure is reported against the parent"
             ),
             other => panic!("expected io error for an unreadable parent, got {other:?}"),
@@ -1592,7 +1596,7 @@ mod tests {
 
     #[test]
     fn list_backups_lists_only_regular_backup_files() {
-        let path = unique_scratch("list-nonfile");
+        let (_dir, path) = unique_scratch("list-nonfile");
         std::fs::write(&path, b"real").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         let decoy = path.parent().unwrap().join(format!(
@@ -1611,7 +1615,7 @@ mod tests {
 
     #[test]
     fn verify_backup_requires_both_digest_and_size_to_match() {
-        let path = unique_scratch("verify-parts");
+        let (_dir, path) = unique_scratch("verify-parts");
         std::fs::write(&path, b"verify me").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         assert!(verify_backup(&entry).unwrap(), "the fresh entry verifies");
@@ -1712,7 +1716,7 @@ mod tests {
 
     #[test]
     fn find_backup_by_id_resolves_only_known_ids() {
-        let path = unique_scratch("find-by-id");
+        let (_dir, path) = unique_scratch("find-by-id");
         std::fs::write(&path, b"findable").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         let found = find_backup_by_id(&path, &entry.id)
@@ -1914,7 +1918,7 @@ mod tests {
 
     #[test]
     fn restore_refuses_a_corrupted_backup_and_keeps_the_target() {
-        let path = unique_scratch("restore-corrupt");
+        let (_dir, path) = unique_scratch("restore-corrupt");
         std::fs::write(&path, b"backed up").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         std::fs::write(&path, b"current").unwrap();
@@ -1967,7 +1971,7 @@ mod tests {
     #[test]
     fn restore_verified_aborts_when_the_current_target_cannot_be_read() {
         use std::os::unix::fs::PermissionsExt;
-        let path = unique_scratch("verified-unreadable");
+        let (_dir, path) = unique_scratch("verified-unreadable");
         std::fs::write(&path, b"backed up").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         std::fs::write(&path, b"current secret").unwrap();
@@ -2053,7 +2057,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_verified_surfaces_is_a_directory_when_the_original_became_a_directory() {
-        let path = unique_scratch("verified-isdir");
+        let (_dir, path) = unique_scratch("verified-isdir");
         std::fs::write(&path, b"backed up").unwrap();
         let entry = backup(&path).unwrap().expect("backup");
         drop(std::fs::remove_file(&path));

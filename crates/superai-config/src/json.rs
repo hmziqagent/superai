@@ -296,29 +296,29 @@ impl std::io::Write for CanonicalPretty<'_> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, std::path::PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-json");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
     #[test]
     fn missing_file_loads_as_empty() {
-        let path = scratch("absent.json");
+        let (_dir, path) = scratch("absent.json");
         drop(std::fs::remove_file(&path));
         assert!(load(&path).unwrap().is_empty());
     }
 
     #[test]
     fn load_value_missing_is_empty_object() {
-        let path = scratch("absent_value.json");
+        let (_dir, path) = scratch("absent_value.json");
         drop(std::fs::remove_file(&path));
         assert_eq!(load_value(&path).unwrap(), Value::Object(Map::new()));
     }
 
     #[test]
     fn edit_preserves_unmodelled_keys_and_their_order() {
-        let path = scratch("roundtrip.json");
+        let (_dir, path) = scratch("roundtrip.json");
         std::fs::write(&path, r#"{"zzz":1,"model":"opus","aaa":{"nested":true}}"#).unwrap();
 
         edit(&path, |c| {
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn writing_leaves_a_backup_of_the_previous_contents() {
-        let path = scratch("backed-up.json");
+        let (_dir, path) = scratch("backed-up.json");
         std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
 
         edit(&path, |c| {
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn load_rejects_duplicate_keys_on_disk() {
-        let path = scratch("dup.json");
+        let (_dir, path) = scratch("dup.json");
         std::fs::write(&path, r#"{"a":1,"a":2}"#).unwrap();
         let err = load(&path).unwrap_err();
         match err {
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn deterministic_insertion_appends() {
-        let path = scratch("insertion.json");
+        let (_dir, path) = scratch("insertion.json");
         std::fs::write(&path, r#"{"a":1,"b":2}"#).unwrap();
         edit(&path, |c| {
             c.insert("c".into(), Value::Number(Number::from(3)));
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn load_value_preserves_arbitrary_root_types() {
-        let path = scratch("root_array.json");
+        let (_dir, path) = scratch("root_array.json");
         std::fs::write(&path, "[1,2,3]").unwrap();
         let v = load_value(&path).unwrap();
         assert_eq!(
@@ -448,22 +448,22 @@ mod tests {
             ])
         );
 
-        let path2 = scratch("root_string.json");
+        let (_dir, path2) = scratch("root_string.json");
         std::fs::write(&path2, r#""hello""#).unwrap();
         assert_eq!(load_value(&path2).unwrap(), Value::String("hello".into()));
 
-        let path3 = scratch("root_number.json");
+        let (_dir, path3) = scratch("root_number.json");
         std::fs::write(&path3, "42").unwrap();
         assert_eq!(load_value(&path3).unwrap(), Value::Number(Number::from(42)));
 
-        let path4 = scratch("root_bool.json");
+        let (_dir, path4) = scratch("root_bool.json");
         std::fs::write(&path4, "true").unwrap();
         assert_eq!(load_value(&path4).unwrap(), Value::Bool(true));
     }
 
     #[test]
     fn load_rejects_non_object_root() {
-        let path = scratch("non_object.json");
+        let (_dir, path) = scratch("non_object.json");
         std::fs::write(&path, "[1,2,3]").unwrap();
         let err = load(&path).unwrap_err();
         match err {
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn no_op_preserves_byte_identity() {
-        let path = scratch("noop.json");
+        let (_dir, path) = scratch("noop.json");
         let original = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn no_op_with_minified_input_is_preserved() {
-        let path = scratch("noop_min.json");
+        let (_dir, path) = scratch("noop_min.json");
         let original = r#"{"zz":1,"aa":2}"#;
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn store_value_preserves_root_type() {
-        let path = scratch("store_raw.json");
+        let (_dir, path) = scratch("store_raw.json");
         drop(std::fs::remove_file(&path));
         let val = Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]);
         store_value(&path, &val).unwrap();
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn bom_is_not_stripped_in_strict_json() {
-        let path = scratch("bom.json");
+        let (_dir, path) = scratch("bom.json");
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(b"{\"a\":1}");
         std::fs::write(&path, bytes).unwrap();

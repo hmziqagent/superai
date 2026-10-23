@@ -1433,14 +1433,14 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_scratch(prefix: &str, suffix: &str) -> PathBuf {
+    fn unique_scratch(prefix: &str, suffix: &str) -> (crate::test_util::TempDir, PathBuf) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let pid = std::process::id();
         let dir = crate::test_util::temp_dir_unique("config-raw-editor");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{prefix}-{now}-{pid}{suffix}"))
+        let path = dir.join(format!("{prefix}-{now}-{pid}{suffix}"));
+        (dir, path)
     }
 
     #[test]
@@ -1458,7 +1458,7 @@ mod tests {
 
     #[test]
     fn raw_document_debug_is_redacted() {
-        let path = unique_scratch("raw-doc", ".json");
+        let (_dir, path) = unique_scratch("raw-doc", ".json");
         std::fs::write(&path, br#"{"api_key":"super-secret"}"#).unwrap();
         let doc = read(&path).unwrap();
         let dbg = format!("{doc:?}");
@@ -1506,7 +1506,7 @@ mod tests {
 
     #[test]
     fn bom_json_commit_refusal_is_a_json_error() {
-        let path = raw_scratch("bom-commit", "settings.json");
+        let (_dir, path) = raw_scratch("bom-commit", "settings.json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let err = commit(&path, b"\xef\xbb\xbf{\"a\":2}", None).unwrap_err();
         assert!(
@@ -1518,7 +1518,7 @@ mod tests {
 
     #[test]
     fn snapshot_with_bytes_matches_a_fresh_snapshot() {
-        let path = raw_scratch("snap-parity", "doc.json");
+        let (_dir, path) = raw_scratch("snap-parity", "doc.json");
         std::fs::write(&path, br#"{"a":"payload"}"#).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(snapshot_with_bytes(&path, &bytes), snapshot(&path));
@@ -1580,19 +1580,19 @@ mod tests {
 
     #[test]
     fn read_detects_kind_via_extension() {
-        let json_path = unique_scratch("detect", ".json");
+        let (_dir, json_path) = unique_scratch("detect", ".json");
         std::fs::write(&json_path, br#"{"a":1}"#).unwrap();
         let doc = read(&json_path).unwrap();
         assert_eq!(doc.kind, DocumentKind::StrictJson);
         drop(std::fs::remove_file(&json_path));
 
-        let toml_path = unique_scratch("detect", ".toml");
+        let (_dir, toml_path) = unique_scratch("detect", ".toml");
         std::fs::write(&toml_path, b"a = 1\n").unwrap();
         let doc2 = read(&toml_path).unwrap();
         assert_eq!(doc2.kind, DocumentKind::Toml);
         drop(std::fs::remove_file(&toml_path));
 
-        let yaml_path = unique_scratch("detect", ".yaml");
+        let (_dir, yaml_path) = unique_scratch("detect", ".yaml");
         std::fs::write(&yaml_path, b"a: 1\n").unwrap();
         let doc3 = read(&yaml_path).unwrap();
         assert_eq!(doc3.kind, DocumentKind::Yaml);
@@ -1601,7 +1601,7 @@ mod tests {
 
     #[test]
     fn read_is_fresh_and_produces_snapshot() {
-        let path = unique_scratch("fresh", ".json");
+        let (_dir, path) = unique_scratch("fresh", ".json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let doc1 = read(&path).unwrap();
         std::fs::write(&path, br#"{"a":2}"#).unwrap();
@@ -1613,7 +1613,7 @@ mod tests {
 
     #[test]
     fn invalid_json_rejected_without_touching_disk() {
-        let path = unique_scratch("invalid-commit", ".json");
+        let (_dir, path) = unique_scratch("invalid-commit", ".json");
         let original = br#"{"model":"opus"}"#;
         std::fs::write(&path, original).unwrap();
         let before_bytes = std::fs::read(&path).unwrap();
@@ -1654,7 +1654,7 @@ mod tests {
 
     #[test]
     fn invalid_yaml_rejected_without_touching_disk() {
-        let path = unique_scratch("invalid-yaml", ".yaml");
+        let (_dir, path) = unique_scratch("invalid-yaml", ".yaml");
         let original = b"a: 1\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -1672,7 +1672,7 @@ mod tests {
 
     #[test]
     fn invalid_toml_rejected_without_touching_disk() {
-        let path = unique_scratch("invalid-toml", ".toml");
+        let (_dir, path) = unique_scratch("invalid-toml", ".toml");
         let original = b"a = 1\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn commit_noop_creates_no_backup() {
-        let path = unique_scratch("noop", ".json");
+        let (_dir, path) = unique_scratch("noop", ".json");
         let content = br#"{"a":1}"#;
         std::fs::write(&path, content).unwrap();
         let snap = snapshot(&path);
@@ -1712,7 +1712,7 @@ mod tests {
 
     #[test]
     fn external_edit_after_open_causes_conflict() {
-        let path = unique_scratch("conflict", ".json");
+        let (_dir, path) = unique_scratch("conflict", ".json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let snap = snapshot(&path);
         let digest = snap.digest.as_deref().unwrap_or_default().to_owned();
@@ -1733,7 +1733,7 @@ mod tests {
 
     #[test]
     fn commit_with_snapshot_detects_conflict() {
-        let path = unique_scratch("snap-conflict", ".yaml");
+        let (_dir, path) = unique_scratch("snap-conflict", ".yaml");
         std::fs::write(&path, b"a: 1\n").unwrap();
         let snap = snapshot(&path);
         std::fs::write(&path, b"a: 2\n").unwrap();
@@ -1747,7 +1747,7 @@ mod tests {
 
     #[test]
     fn unknown_key_survives_commit() {
-        let path = unique_scratch("unknown", ".json");
+        let (_dir, path) = unique_scratch("unknown", ".json");
         let original = br#"{"known":"a","foreign":"keep"}"#;
         std::fs::write(&path, original).unwrap();
         let snap = snapshot(&path);
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn opaque_is_read_only() {
-        let path = unique_scratch("opaque", ".bin");
+        let (_dir, path) = unique_scratch("opaque", ".bin");
         std::fs::write(&path, b"binary content").unwrap();
         let err = commit(&path, b"new", None).unwrap_err();
         match err {
@@ -1875,7 +1875,7 @@ mod tests {
 
     #[test]
     fn create_missing_file_and_commit() {
-        let path = unique_scratch("create", ".json");
+        let (_dir, path) = unique_scratch("create", ".json");
         drop(std::fs::remove_file(&path));
         let content = br#"{"a":1}"#;
         let report = commit(&path, content, None).unwrap();
@@ -1894,7 +1894,7 @@ mod tests {
 
     #[test]
     fn invalid_content_does_not_create_missing_file() {
-        let path = unique_scratch("create-invalid", ".json");
+        let (_dir, path) = unique_scratch("create-invalid", ".json");
         drop(std::fs::remove_file(&path));
         let invalid = b"{ bad }";
         let err = commit(&path, invalid, None).unwrap_err();
@@ -1907,26 +1907,26 @@ mod tests {
 
     #[test]
     fn raw_editor_service_open_detects_kind() {
-        let path = unique_scratch("svc-open", ".json");
+        let (_dir, path) = unique_scratch("svc-open", ".json");
         std::fs::write(&path, br#"{"a":1}"#).unwrap();
         let doc = crate::document::SourceDocument::load(&path).unwrap();
         assert_eq!(doc.kind, DocumentKind::StrictJson);
         assert!(!doc.has_diagnostics());
         drop(std::fs::remove_file(&path));
 
-        let toml_path = unique_scratch("svc-open-toml", ".toml");
+        let (_dir, toml_path) = unique_scratch("svc-open-toml", ".toml");
         std::fs::write(&toml_path, b"a = 1\n").unwrap();
         let doc2 = crate::document::SourceDocument::load(&toml_path).unwrap();
         assert_eq!(doc2.kind, DocumentKind::Toml);
         drop(std::fs::remove_file(&toml_path));
 
-        let yaml_path = unique_scratch("svc-open-yaml", ".yaml");
+        let (_dir, yaml_path) = unique_scratch("svc-open-yaml", ".yaml");
         std::fs::write(&yaml_path, b"a: 1\n").unwrap();
         let doc3 = crate::document::SourceDocument::load(&yaml_path).unwrap();
         assert_eq!(doc3.kind, DocumentKind::Yaml);
         drop(std::fs::remove_file(&yaml_path));
 
-        let env_path = unique_scratch("svc-open-env", ".env");
+        let (_dir, env_path) = unique_scratch("svc-open-env", ".env");
         std::fs::write(&env_path, b"API_KEY=val\n").unwrap();
         let doc4 = crate::document::SourceDocument::load(&env_path).unwrap();
         assert_eq!(doc4.kind, DocumentKind::Env);
@@ -1973,7 +1973,7 @@ mod tests {
 
     #[test]
     fn raw_editor_service_invalid_never_written_per_kind() {
-        let path_json = unique_scratch("svc-invalid-json", ".json");
+        let (_dir, path_json) = unique_scratch("svc-invalid-json", ".json");
         std::fs::write(&path_json, br#"{"a":1}"#).unwrap();
         let snap = snapshot(&path_json);
         let err = commit(&path_json, b"{ bad }", snap.digest.as_deref()).unwrap_err();
@@ -1983,7 +1983,7 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path_json).unwrap(), br#"{"a":1}"#);
         drop(std::fs::remove_file(&path_json));
-        let path_toml = unique_scratch("svc-invalid-toml", ".toml");
+        let (_dir, path_toml) = unique_scratch("svc-invalid-toml", ".toml");
         std::fs::write(&path_toml, b"a = 1\n").unwrap();
         let snap = snapshot(&path_toml);
         let err = commit(&path_toml, b"a = [\n", snap.digest.as_deref()).unwrap_err();
@@ -1993,7 +1993,7 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path_toml).unwrap(), b"a = 1\n");
         drop(std::fs::remove_file(&path_toml));
-        let path_yaml = unique_scratch("svc-invalid-yaml", ".yaml");
+        let (_dir, path_yaml) = unique_scratch("svc-invalid-yaml", ".yaml");
         std::fs::write(&path_yaml, b"a: 1\n").unwrap();
         let snap = snapshot(&path_yaml);
         let err = commit(&path_yaml, b"a: [unclosed\n", snap.digest.as_deref()).unwrap_err();
@@ -2003,7 +2003,7 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path_yaml).unwrap(), b"a: 1\n");
         drop(std::fs::remove_file(&path_yaml));
-        let path_env = unique_scratch("svc-invalid-env", ".env");
+        let (_dir, path_env) = unique_scratch("svc-invalid-env", ".env");
         std::fs::write(&path_env, b"API_KEY=val\n").unwrap();
         let snap = snapshot(&path_env);
         let err = commit(&path_env, b"INVALID LINE\n", snap.digest.as_deref()).unwrap_err();
@@ -2017,7 +2017,7 @@ mod tests {
 
     #[test]
     fn raw_editor_service_jsonc_and_text_fragment_commit() {
-        let path_jsonc = unique_scratch("svc-jsonc", ".jsonc");
+        let (_dir, path_jsonc) = unique_scratch("svc-jsonc", ".jsonc");
         drop(std::fs::remove_file(&path_jsonc));
         let content = b"{\"a\": 1, // comment\n}";
         let report = commit(&path_jsonc, content, None).unwrap();
@@ -2029,7 +2029,7 @@ mod tests {
             drop(std::fs::remove_file(b.backup_path));
         }
 
-        let path_txt = unique_scratch("svc-txt", ".txt");
+        let (_dir, path_txt) = unique_scratch("svc-txt", ".txt");
         drop(std::fs::remove_file(&path_txt));
         // Plain whole-file creation is opaque and refused.
         let txt_content = b"hello text fragment\nsecond line\n";
@@ -2404,23 +2404,15 @@ mod tests {
         }
     }
 
-    fn raw_scratch(prefix: &str, name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "superai-raw-create-{}-{}-{now}",
-            prefix,
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    fn raw_scratch(prefix: &str, name: &str) -> (crate::test_util::TempDir, PathBuf) {
+        let dir = crate::test_util::temp_dir_unique(&format!("config-raw-create-{prefix}"));
+        let path = dir.join(name);
+        (dir, path)
     }
 
     #[test]
     fn create_file_creates_missing_with_owned_parents() {
-        let base = raw_scratch("ok", "");
+        let (_dir, base) = raw_scratch("ok", "");
         let target = base.join("nested/owned/settings.json");
         let report = create_file(&target, br#"{"model":"opus"}"#).unwrap();
         assert!(!report.is_noop);
@@ -2437,7 +2429,7 @@ mod tests {
 
     #[test]
     fn create_file_refuses_existing_target_as_conflict() {
-        let base = raw_scratch("exists", "settings.json");
+        let (_dir, base) = raw_scratch("exists", "settings.json");
         std::fs::write(&base, br#"{"a":1}"#).unwrap();
         let err = create_file(&base, br#"{"a":2}"#).unwrap_err();
         assert!(
@@ -2450,7 +2442,7 @@ mod tests {
 
     #[test]
     fn create_file_jsonc_trailing_comma_draft_refuses_at_staging() {
-        let path = raw_scratch("trailing", "settings.jsonc");
+        let (_dir, path) = raw_scratch("trailing", "settings.jsonc");
         let _err = create_file(&path, b"{\"a\":1,\n}").unwrap_err();
         assert!(
             !path.exists(),
@@ -2461,7 +2453,7 @@ mod tests {
 
     #[test]
     fn create_file_empty_buffer_is_not_an_empty_json_object() {
-        let base = raw_scratch("empty", "settings.json");
+        let (_dir, base) = raw_scratch("empty", "settings.json");
         let err = create_file(&base, b"   ").unwrap_err();
         assert!(
             format!("{err}").contains("empty buffer") || format!("{err}").contains("invalid json"),
@@ -2473,7 +2465,7 @@ mod tests {
 
     #[test]
     fn failed_create_rolls_back_owned_empty_parents_and_leaves_no_file() {
-        let base = raw_scratch("rollback", "");
+        let (_dir, base) = raw_scratch("rollback", "");
         // Foreign sibling content that must survive the rollback.
         std::fs::create_dir_all(base.join("nested")).unwrap();
         std::fs::write(base.join("nested/foreign.txt"), b"keep me").unwrap();

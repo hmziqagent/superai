@@ -356,10 +356,10 @@ pub fn formatting_change_warning(text: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, std::path::PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-jsonc");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
     fn scalar_strip_jsonc(text: &str) -> String {
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn bom_is_not_stripped_in_jsonc() {
-        let path = scratch("bom.jsonc");
+        let (_dir, path) = scratch("bom.jsonc");
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(b"{\"a\": 1}");
         std::fs::write(&path, bytes).unwrap();
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn load_accepts_jsonc_with_comments_and_trailing_commas() {
-        let path = scratch("with_comments.jsonc");
+        let (_dir, path) = scratch("with_comments.jsonc");
         std::fs::write(
             &path,
             "{\n  // line comment\n  \"model\": \"opus\", /* block */\n  \"x\": 1,\n}\n",
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn load_rejects_duplicate_keys_even_in_jsonc() {
-        let path = scratch("dup.jsonc");
+        let (_dir, path) = scratch("dup.jsonc");
         std::fs::write(&path, r#"{"a": 1, "a": 2}"#).unwrap();
         let err = load(&path).unwrap_err();
         match err {
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn no_op_preserves_comments_byte_identity() {
-        let path = scratch("noop.jsonc");
+        let (_dir, path) = scratch("noop.jsonc");
         let original = "{\n  // keep me\n  \"a\": 1, // comment\n  \"b\": 2,\n}\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn changing_edit_refused_preserving_comments() {
-        let path = scratch("change.jsonc");
+        let (_dir, path) = scratch("change.jsonc");
         let original = "{\"a\":1, // c\n}";
         std::fs::write(&path, original).unwrap();
         let result = edit(&path, |m| {
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn changing_edit_value_refused_on_comments() {
-        let path = scratch("value.jsonc");
+        let (_dir, path) = scratch("value.jsonc");
         let original = "// header\n{\"a\": 1,}\n";
         std::fs::write(&path, original).unwrap();
         let result = edit_value(&path, |v| {
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn store_refused_when_target_carries_jsonc_extensions() {
-        let path = scratch("store.jsonc");
+        let (_dir, path) = scratch("store.jsonc");
         let original = "{\n  // keep me\n  \"a\": 1,\n}\n";
         std::fs::write(&path, original).unwrap();
         let mut map = Map::new();
@@ -715,14 +715,14 @@ mod tests {
     #[test]
     fn store_allows_missing_target_and_extension_free_target() {
         // Creation: there is no lexical material to destroy.
-        let path = scratch("new.jsonc");
+        let (_dir, path) = scratch("new.jsonc");
         let mut map = Map::new();
         map.insert("a".into(), Value::Number(1.into()));
         store(&path, &map).unwrap();
         assert_eq!(load(&path).unwrap()["a"], Value::Number(1.into()));
         drop(std::fs::remove_file(&path));
 
-        let clean = scratch("clean.json");
+        let (_dir, clean) = scratch("clean.json");
         std::fs::write(&clean, "{\"a\":1}").unwrap();
         map.insert("b".into(), Value::Number(2.into()));
         store(&clean, &map).unwrap();
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn missing_file_loads_as_empty() {
-        let path = scratch("absent.jsonc");
+        let (_dir, path) = scratch("absent.jsonc");
         drop(std::fs::remove_file(&path));
         assert!(load(&path).unwrap().is_empty());
     }
@@ -759,7 +759,7 @@ mod tests {
     /* nested */ "temperature": 0.7,
   },
 }"#;
-        let path = scratch("fixture.jsonc");
+        let (_dir, path) = scratch("fixture.jsonc");
         std::fs::write(&path, input).unwrap();
         let map = load(&path).unwrap();
         assert_eq!(map["provider"], Value::String("glm".into()));

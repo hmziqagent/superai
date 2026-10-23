@@ -688,10 +688,10 @@ fn new_entry_line(key: &str, value: &str) -> ParsedLine {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, std::path::PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-env");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
     #[test]
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn edit_removing_every_key_writes_the_skeleton_back() {
-        let path = scratch("remove-all.env");
+        let (_dir, path) = scratch("remove-all.env");
         std::fs::write(&path, "# header\nA=1\n\nB=2\n").unwrap();
         edit(&path, |map| {
             map.remove("A");
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn preserves_comments_and_blank_lines_on_edit() {
-        let path = scratch("preserve.env");
+        let (_dir, path) = scratch("preserve.env");
         let original = "# header comment\nFOO=bar\n\n# middle\nBAZ=qux\n";
         std::fs::write(&path, original).unwrap();
         edit(&path, |m| {
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn handles_duplicate_keys_last_wins_and_edit_updates_last() {
-        let path = scratch("dup.env");
+        let (_dir, path) = scratch("dup.env");
         std::fs::write(&path, "FOO=first\nFOO=second\n").unwrap();
         let map = load(&path).unwrap();
         assert_eq!(map["FOO"], "second");
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn never_silently_dedup_on_no_change() {
-        let path = scratch("dedup.env");
+        let (_dir, path) = scratch("dedup.env");
         std::fs::write(&path, "FOO=first\nFOO=second\n").unwrap();
         edit(&path, |_| {}).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn handles_crlf() {
-        let path = scratch("crlf.env");
+        let (_dir, path) = scratch("crlf.env");
         std::fs::write(&path, "FOO=bar\r\nBAZ=qux\r\n").unwrap();
         let map = load(&path).unwrap();
         assert_eq!(map["FOO"], "bar");
@@ -818,14 +818,14 @@ mod tests {
 
     #[test]
     fn missing_file_loads_as_empty() {
-        let path = scratch("absent.env");
+        let (_dir, path) = scratch("absent.env");
         drop(std::fs::remove_file(&path));
         assert!(load(&path).unwrap().is_empty());
     }
 
     #[test]
     fn no_op_preserves_byte_identity() {
-        let path = scratch("noop.env");
+        let (_dir, path) = scratch("noop.env");
         let original = "FOO=bar\n# comment\nBAZ=qux\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn store_writes_normalized() {
-        let path = scratch("store.env");
+        let (_dir, path) = scratch("store.env");
         drop(std::fs::remove_file(&path));
         let mut map = BTreeMap::new();
         map.insert("A".into(), "hello world".into());
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn preserves_export_prefix_and_quoting() {
-        let path = scratch("export.env");
+        let (_dir, path) = scratch("export.env");
         std::fs::write(&path, "export FOO='bar baz'\n").unwrap();
         edit(&path, |m| {
             m.insert("FOO".into(), "new value".into());
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn writing_leaves_backup() {
-        let path = scratch("backed.env");
+        let (_dir, path) = scratch("backed.env");
         std::fs::write(&path, "FOO=old\n").unwrap();
         edit(&path, |m| {
             m.insert("FOO".into(), "new".into());

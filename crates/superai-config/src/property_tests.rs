@@ -22,7 +22,7 @@ mod tests {
     use crate::document::Selector;
     use crate::quarantine::validate_quarantine_target;
     use crate::snapshot::{is_modified, snapshot};
-    use crate::test_util::temp_dir_unique;
+    use crate::test_util::{TempDir, temp_dir_unique};
 
     struct Prng {
         state: u64,
@@ -153,10 +153,10 @@ mod tests {
         map
     }
 
-    fn scratch_path(prefix: &str, name: &str) -> PathBuf {
+    fn scratch_path(prefix: &str, name: &str) -> (TempDir, PathBuf) {
         let dir = temp_dir_unique(prefix);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
     #[test]
@@ -173,7 +173,7 @@ mod tests {
             let mut file_bytes = json_text.into_bytes();
             file_bytes.push(b'\n');
 
-            let path = scratch_path("prop-noop-json", &format!("iter-{iter}.json"));
+            let (_dir, path) = scratch_path("prop-noop-json", &format!("iter-{iter}.json"));
             std::fs::write(&path, &file_bytes).unwrap();
             let before = std::fs::read(&path).unwrap();
 
@@ -207,7 +207,7 @@ mod tests {
                 doc[&k] = toml_edit::value(v);
             }
             let text = doc.to_string();
-            let path = scratch_path("prop-noop-toml", &format!("iter-{iter}.toml"));
+            let (_dir, path) = scratch_path("prop-noop-toml", &format!("iter-{iter}.toml"));
             std::fs::write(&path, text.as_bytes()).unwrap();
             let before = std::fs::read(&path).unwrap();
 
@@ -233,7 +233,7 @@ mod tests {
             } else {
                 yaml_serde::to_string(&Value::Object(map.clone())).unwrap()
             };
-            let path = scratch_path("prop-noop-yaml", &format!("iter-{iter}.yaml"));
+            let (_dir, path) = scratch_path("prop-noop-yaml", &format!("iter-{iter}.yaml"));
             std::fs::write(&path, text.as_bytes()).unwrap();
             let before = std::fs::read(&path).unwrap();
 
@@ -268,7 +268,7 @@ mod tests {
                 rng.gen_string(2, 6, VALUE_CHARSET)
             ));
 
-            let path = scratch_path("prop-unrelated-json", &format!("iter-{iter}.json"));
+            let (_dir, path) = scratch_path("prop-unrelated-json", &format!("iter-{iter}.json"));
             std::fs::write(
                 &path,
                 serde_json::to_string_pretty(&Value::Object(map.clone()))
@@ -345,7 +345,7 @@ mod tests {
                     text.push_str("# comment\n");
                 }
             }
-            let path = scratch_path("prop-unrelated-env", &format!("iter-{iter}.env"));
+            let (_dir, path) = scratch_path("prop-unrelated-env", &format!("iter-{iter}.env"));
             std::fs::write(&path, text.as_bytes()).unwrap();
 
             let target = keys[rng.gen_range(0, keys.len())].clone();
@@ -379,7 +379,7 @@ mod tests {
                 let b = rng.gen_range(0, 256) as u8;
                 bytes.push(b);
             }
-            let path = scratch_path("prop-restore", &format!("iter-{iter}.bin"));
+            let (_dir, path) = scratch_path("prop-restore", &format!("iter-{iter}.bin"));
             std::fs::write(&path, &bytes).unwrap();
 
             #[cfg(unix)]
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn property_collision_safe_backup_suffix() {
-        let path = scratch_path("prop-collision", "target.json");
+        let (_dir, path) = scratch_path("prop-collision", "target.json");
         std::fs::write(&path, b"initial").unwrap();
 
         let mut ids = HashSet::new();
@@ -511,7 +511,7 @@ mod tests {
         for iter in 0..50u64 {
             let mut rng = Prng::new(iter + 0x0b_bb);
             let initial = format!("{{\"a\":{}}}", rng.gen_range(0, 100));
-            let path = scratch_path("prop-commit-preview", &format!("iter-{iter}.json"));
+            let (_dir, path) = scratch_path("prop-commit-preview", &format!("iter-{iter}.json"));
             std::fs::write(&path, initial.as_bytes()).unwrap();
 
             let raw = crate::raw_editor::read(&path).unwrap();
@@ -580,7 +580,7 @@ mod tests {
     fn mutant_backup_before_write_is_not_skippable() {
         // Mutant-killer: backup must exist before any successful write; skipping backup must be detectable.
         for iter in 0..30 {
-            let path = scratch_path("prop-backup-mutant", &format!("iter-{iter}.json"));
+            let (_dir, path) = scratch_path("prop-backup-mutant", &format!("iter-{iter}.json"));
             let original = format!(r#"{{"a":{iter}}}"#).into_bytes();
             std::fs::write(&path, &original).unwrap();
             let snap = snapshot(&path);
@@ -706,7 +706,7 @@ mod tests {
             }
             let text = random_jsonc_text(&mut rng, &map);
 
-            let path = scratch_path("prop-noop-jsonc", &format!("iter-{iter}.jsonc"));
+            let (_dir, path) = scratch_path("prop-noop-jsonc", &format!("iter-{iter}.jsonc"));
             std::fs::write(&path, text.as_bytes()).unwrap();
             let before = std::fs::read(&path).unwrap();
 
@@ -750,7 +750,7 @@ mod tests {
             let target_key = keys[target_idx].clone();
             let new_val = Value::String(format!("updated-{iter}"));
 
-            let path = scratch_path("prop-unrelated-jsonc", &format!("iter-{iter}.jsonc"));
+            let (_dir, path) = scratch_path("prop-unrelated-jsonc", &format!("iter-{iter}.jsonc"));
             std::fs::write(
                 &path,
                 serde_json::to_string_pretty(&Value::Object(map.clone()))

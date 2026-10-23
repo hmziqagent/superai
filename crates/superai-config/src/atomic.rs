@@ -369,13 +369,13 @@ pub(crate) fn atomic_write_expecting(
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> (crate::test_util::TempDir, PathBuf) {
         let dir = crate::test_util::temp_dir_unique("config-atomic");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let path = dir.join(name);
+        (dir, path)
     }
 
-    fn unique_scratch(prefix: &str) -> PathBuf {
+    fn unique_scratch(prefix: &str) -> (crate::test_util::TempDir, PathBuf) {
         let millis = timestamp_millis_now();
         let suffix = generate_random_suffix(millis);
         scratch(&format!("{prefix}-{millis}-{suffix}"))
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_file_and_is_not_truncated() {
-        let path = unique_scratch("atomic-create");
+        let (_dir, path) = unique_scratch("atomic-create");
         drop(std::fs::remove_file(&path));
         let data = b"atomic content that must not be truncated";
         atomic_write(&path, data).unwrap();
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn durability_points_fire_in_order_during_a_normal_write() {
         let recorder = Recorder(std::sync::Mutex::new(Vec::new()));
-        let path = unique_scratch("durability-order");
+        let (_dir, path) = unique_scratch("durability-order");
         atomic_write_expecting(
             &path,
             b"durable bytes",
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn atomic_write_overwrites_atomically_without_truncation() {
-        let path = unique_scratch("atomic-overwrite");
+        let (_dir, path) = unique_scratch("atomic-overwrite");
         std::fs::write(&path, b"old content that is longer than new").unwrap();
         let new_data = b"new";
         atomic_write(&path, new_data).unwrap();
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn atomic_write_detects_concurrent_modification_via_expected_digest() {
-        let path = unique_scratch("atomic-conflict");
+        let (_dir, path) = unique_scratch("atomic-conflict");
         std::fs::write(&path, b"original").unwrap();
         let snap_digest = compute_digest(b"original");
         std::fs::write(&path, b"concurrent edit").unwrap();
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn atomic_write_with_none_expected_succeeds_for_new_file() {
-        let path = unique_scratch("atomic-new-none");
+        let (_dir, path) = unique_scratch("atomic-new-none");
         drop(std::fs::remove_file(&path));
         atomic_write_expecting(&path, b"fresh", WriteExpectation::Missing, None, None).unwrap();
         let read = std::fs::read(&path).unwrap();
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn atomic_write_with_none_expected_fails_if_file_appeared_concurrently() {
-        let path = unique_scratch("atomic-appeared");
+        let (_dir, path) = unique_scratch("atomic-appeared");
         drop(std::fs::remove_file(&path));
         std::fs::write(&path, b"concurrent").unwrap();
         let res = atomic_write_expecting(&path, b"new", WriteExpectation::Missing, None, None);
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn atomic_write_with_snapshot_uses_digest() {
-        let path = unique_scratch("atomic-snap");
+        let (_dir, path) = unique_scratch("atomic-snap");
         std::fs::write(&path, b"v1").unwrap();
         let snap = crate::snapshot::snapshot(&path);
         std::fs::write(&path, b"v2").unwrap();
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn atomic_write_verifies_after_write() {
-        let path = unique_scratch("atomic-verify");
+        let (_dir, path) = unique_scratch("atomic-verify");
         let data = b"verify me";
         atomic_write(&path, data).unwrap();
         let digest = compute_digest(data);
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn atomic_write_replaces_readonly_target_with_platform_correct_mode() {
-        let path = unique_scratch("atomic-ro");
+        let (_dir, path) = unique_scratch("atomic-ro");
         std::fs::write(&path, b"old").unwrap();
         mark_readonly(&path);
         atomic_write(&path, b"new").unwrap();
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn atomic_write_new_file_is_never_readonly() {
-        let path = unique_scratch("atomic-fresh-mode");
+        let (_dir, path) = unique_scratch("atomic-fresh-mode");
         atomic_write(&path, b"fresh").unwrap();
         let perm = std::fs::metadata(&path).unwrap().permissions();
         assert!(
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn atomic_write_succeeds_when_digest_expectation_matches_unchanged_file() {
-        let path = unique_scratch("atomic-digest-ok");
+        let (_dir, path) = unique_scratch("atomic-digest-ok");
         std::fs::write(&path, b"v1").unwrap();
         let digest = crate::snapshot::snapshot(&path)
             .digest
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn atomic_write_preserves_existing_target_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let path = unique_scratch("atomic-mode");
+        let (_dir, path) = unique_scratch("atomic-mode");
         std::fs::write(&path, b"old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         atomic_write(&path, b"new").unwrap();
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn atomic_write_reports_io_error_when_target_becomes_unreadable() {
         use std::os::unix::fs::PermissionsExt;
-        let path = unique_scratch("atomic-unreadable");
+        let (_dir, path) = unique_scratch("atomic-unreadable");
         std::fs::write(&path, b"secret").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::File::open(&path).is_ok() {
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn lingering_temp_name_carries_recent_millis_and_compact_hex_suffix() {
-        let path = unique_scratch("atomic-tempname");
+        let (_dir, path) = unique_scratch("atomic-tempname");
         let sabotage = Sabotage {
             at: Point::TempWrite,
             action: SabotageAction::Fail,
@@ -903,7 +903,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sync_parent_tolerates_permission_denied_on_parent_open() {
-        let path = unique_scratch("atomic-sync-eacces");
+        let (_dir, path) = unique_scratch("atomic-sync-eacces");
         let parent = path.parent().unwrap().to_path_buf();
         if !perm_denies_dir_read(&parent) {
             // DAC_OVERRIDE (e.g. root): the PermissionDenied open arm is
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn sync_parent_tolerates_vanishing_parent() {
-        let path = unique_scratch("atomic-sync-enoent");
+        let (_dir, path) = unique_scratch("atomic-sync-enoent");
         let parent = path.parent().unwrap().to_path_buf();
         let sabotage = Sabotage {
             at: Point::ParentSync,
@@ -1010,10 +1010,8 @@ mod tests {
         const ROUNDS: usize = 6;
         const BACKOFF_FLOOR: Duration = Duration::from_millis(40);
 
-        let probe_parent = unique_scratch("atomic-backoff-probe")
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let (_probe_dir, probe) = unique_scratch("atomic-backoff-probe");
+        let probe_parent = probe.parent().unwrap().to_path_buf();
         if !perm_denies_dir_write(&probe_parent) {
             // DAC_OVERRIDE (e.g. root): rename cannot be denied for this
             // process; nothing to assert here.
@@ -1025,7 +1023,7 @@ mod tests {
         // Control measurement: injected failure exactly at the point the retry
         // loop starts: no rename attempts, no sleeps.
         let run_control = |round: usize| {
-            let path = unique_scratch(&format!("atomic-backoff-ctrl-{round}"));
+            let (_dir, path) = unique_scratch(&format!("atomic-backoff-ctrl-{round}"));
             let parent = path.parent().unwrap().to_path_buf();
             let sabotage = Sabotage {
                 at: Point::AtomicReplace,
@@ -1050,7 +1048,7 @@ mod tests {
         // The rename itself is denied and every retry sleeps the backoff; the
         // watchdog keeps a runaway mutant from hanging the suite.
         let run_denied = |round: usize| {
-            let path = unique_scratch(&format!("atomic-backoff-denied-{round}"));
+            let (_dir, path) = unique_scratch(&format!("atomic-backoff-denied-{round}"));
             let parent = path.parent().unwrap().to_path_buf();
             let sabotage = Sabotage {
                 at: Point::AtomicReplace,
@@ -1119,7 +1117,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn atomic_write_reports_permanent_rename_permission_error() {
-        let path = unique_scratch("atomic-rename-permanent");
+        let (_dir, path) = unique_scratch("atomic-rename-permanent");
         let parent = path.parent().unwrap().to_path_buf();
         if !perm_denies_dir_write(&parent) {
             // DAC_OVERRIDE (e.g. root): rename cannot be denied for this
@@ -1161,7 +1159,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn atomic_write_rename_retry_loop_terminates() {
-        let path = unique_scratch("atomic-rename-watchdog");
+        let (_dir, path) = unique_scratch("atomic-rename-watchdog");
         let parent = path.parent().unwrap().to_path_buf();
         if !perm_denies_dir_write(&parent) {
             // DAC_OVERRIDE (e.g. root): rename cannot be denied for this

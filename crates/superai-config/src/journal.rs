@@ -422,10 +422,8 @@ fn remove_committed_creations(journal: &CrashJournal) -> (Vec<PathBuf>, Vec<Path
 mod tests {
     use super::*;
 
-    fn home_dir() -> PathBuf {
-        let dir = crate::test_util::temp_dir_unique("journal");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn home_dir() -> crate::test_util::TempDir {
+        crate::test_util::temp_dir_unique("journal")
     }
 
     #[test]

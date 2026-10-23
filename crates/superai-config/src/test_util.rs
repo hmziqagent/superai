@@ -2,6 +2,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,9 +55,9 @@ pub(crate) fn install_panic_tracker() {
     });
 }
 
-/// Unique temp dir on disk from millis, an atomic counter, pid, and a
+/// Unique temp dir path on disk from millis, an atomic counter, pid, and a
 /// hash; no global `HOME` or cwd mutation.
-pub(crate) fn temp_dir_unique(prefix: &str) -> PathBuf {
+fn unique_dir_path(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
@@ -119,28 +120,26 @@ fn clear_readonly_recursive(root: &Path) {
 }
 
 /// RAII temp dir honoring the retain-on-failure policy from [`KEEP_ENV`].
+/// Every test fixture goes through this guard, so the policy reaches the
+/// whole suite.
 #[derive(Debug)]
 pub(crate) struct TempDir {
     path: PathBuf,
 }
 
-impl TempDir {
-    /// New isolated dir; installs the panic tracker for `SUPERAI_TEST_KEEP=failed`.
-    pub(crate) fn new(prefix: &str) -> Self {
-        install_panic_tracker();
-        Self {
-            path: temp_dir_unique(prefix),
-        }
+/// The suite's only fixture constructor: an isolated dir that deletes on
+/// drop unless the retain-on-failure policy says otherwise.
+pub(crate) fn temp_dir_unique(prefix: &str) -> TempDir {
+    install_panic_tracker();
+    TempDir {
+        path: unique_dir_path(prefix),
     }
+}
 
+impl TempDir {
     /// Borrow the directory path.
     pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Join a file name onto the temp directory.
-    pub(crate) fn join(&self, name: &str) -> PathBuf {
-        self.path.join(name)
     }
 
     /// The drop-time decision, exposed so tests can drive it without the env.
@@ -151,22 +150,56 @@ impl TempDir {
             KeepMode::No => false,
         }
     }
+
+    /// Apply the policy to a fixture dir; the drop path and nothing else.
+    pub(crate) fn teardown(path: &Path, mode: KeepMode, panicked: bool) {
+        if Self::should_keep(mode, panicked) {
+            announce_keep(path);
+            return;
+        }
+        #[cfg(windows)]
+        clear_readonly_recursive(path);
+        drop(std::fs::remove_dir_all(path));
+    }
+}
+
+/// libtest captures `eprintln!` for passing tests, so route the notice to
+/// the real stderr: `SUPERAI_TEST_KEEP` output must stay visible unflagged.
+fn announce_keep(path: &Path) {
+    let message = format!(
+        "superai test util: keeping temp dir {} (SUPERAI_TEST_KEEP)\n",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        if let Ok(mut err) = std::fs::OpenOptions::new().append(true).open("/dev/stderr")
+            && err.write_all(message.as_bytes()).is_ok()
+        {
+            return;
+        }
+    }
+    eprint!("{message}");
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
         let panicked = PANICKED.with(std::cell::Cell::get);
-        let keep = Self::should_keep(keep_mode_from_env(), panicked);
-        if keep {
-            eprintln!(
-                "superai test util: keeping temp dir {} (SUPERAI_TEST_KEEP)",
-                self.path.display()
-            );
-            return;
-        }
-        #[cfg(windows)]
-        clear_readonly_recursive(&self.path);
-        drop(std::fs::remove_dir_all(&self.path));
+        Self::teardown(&self.path, keep_mode_from_env(), panicked);
+    }
+}
+
+impl Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -177,21 +210,19 @@ mod tests {
 
     #[test]
     fn temp_dir_unique_is_isolated_and_exists() {
-        let dir = temp_dir_unique("config-iso");
-        assert!(dir.exists());
-        assert!(dir.is_dir());
-        let file = dir.join("probe.txt");
+        let tmp = temp_dir_unique("config-iso");
+        assert!(tmp.exists());
+        assert!(tmp.is_dir());
+        let file = tmp.join("probe.txt");
         std::fs::write(&file, b"hello").unwrap();
         assert!(file.exists());
-        drop(std::fs::remove_dir_all(&dir));
-        assert!(!dir.exists());
     }
 
     #[test]
     fn temp_dir_drop_cleans_up() {
         let path: PathBuf;
         {
-            let tmp = TempDir::new("config-drop");
+            let tmp = temp_dir_unique("config-drop");
             path = tmp.path().to_path_buf();
             assert!(path.exists());
             std::fs::write(tmp.join("x"), b"y").unwrap();
@@ -210,7 +241,7 @@ mod tests {
                     let probe = dir.join("t.txt");
                     std::fs::write(&probe, format!("{i}").as_bytes()).unwrap();
                     assert_eq!(std::fs::read_to_string(&probe).unwrap(), format!("{i}"));
-                    dir
+                    dir.path().to_path_buf()
                 })
             })
             .collect();
@@ -218,7 +249,6 @@ mod tests {
         for h in handles {
             let dir = h.join().expect("thread panicked");
             assert!(seen.insert(dir.clone()), "duplicate dir {dir:?}");
-            drop(std::fs::remove_dir_all(&dir));
         }
         assert_eq!(seen.len(), threads);
     }
@@ -242,6 +272,22 @@ mod tests {
         assert!(TempDir::should_keep(KeepMode::Failed, true));
         assert!(TempDir::should_keep(KeepMode::All, false));
         assert!(TempDir::should_keep(KeepMode::All, true));
+    }
+
+    #[test]
+    fn teardown_deletes_unless_policy_and_panic_both_agree() {
+        let gone = temp_dir_unique("config-keep-probe");
+        let path = gone.path().to_path_buf();
+        TempDir::teardown(&path, KeepMode::Failed, false);
+        assert!(
+            !path.exists(),
+            "the failed policy must delete a non-panicked test's dir"
+        );
+        TempDir::teardown(&path, KeepMode::No, true);
+        assert!(
+            !path.exists(),
+            "the default policy deletes even after a panic"
+        );
     }
 
     #[test]
