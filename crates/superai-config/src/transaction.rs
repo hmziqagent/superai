@@ -4302,7 +4302,7 @@ mod tests {
     #[test]
     fn windows_long_path_commit_is_verified_or_typed_never_partial() {
         let dir = boundary_scratch("win-long");
-        let mut deep = dir.clone();
+        let mut deep = dir.path().to_path_buf();
         while deep.to_string_lossy().len() < 300 {
             deep = deep.join("nested-level-dir");
         }
